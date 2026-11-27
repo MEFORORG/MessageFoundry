@@ -148,7 +148,8 @@ def test_every_exported_lock_is_verified_and_staged() -> None:
     assert porcelain.search("git commit -a -m x") and porcelain.search("git stage x")
     assert not porcelain.search('git commit-tree "${tree}"')
     every_step = _all_steps()
-    assert len(every_step) >= 5, f"the resync parsed to {len(every_step)} steps"
+    assert len(every_step) >= 10, f"the resync parsed to {len(every_step)} steps"
+    assert {job for job, _ in every_step} == set(_JOB_IDS), "a resync job contributed no steps"
     adders = [
         (job, step.get("name")) for job, step in every_step if porcelain.search(_executed_run(step))
     ]
@@ -440,9 +441,10 @@ def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
 
     The content pins below hash an action's ``uses:`` by its name alone, which left the ref itself
     unchecked: ``actions/checkout@main`` hashed the same as the reviewed SHA. This holds every ref
-    in the workflow to a commit SHA. For the export job that is the only hold, so a Dependabot bump
-    of its actions stays green; the credential jobs' refs are also pinned exactly, by
-    ``test_the_credential_job_actions_are_pinned_to_exact_shas``.
+    in the workflow to a commit SHA. The credential jobs' refs are also pinned exactly, by
+    ``test_the_credential_job_actions_are_pinned_to_exact_shas``, so a Dependabot bump stays green
+    only for an action the export job alone uses (setup-uv, upload-artifact); checkout is shared
+    with the push job, so a bump of it is red there until re-pinned.
     """
     assert not _unpinned_uses(_text(_RESYNC)), _unpinned_uses(_text(_RESYNC))
     sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -1060,8 +1062,11 @@ def test_the_credential_job_steps_are_pinned_by_content() -> None:
 #: ``uses:`` by its name only, and ``test_every_action_is_pinned_to_a_full_commit_sha`` holds only
 #: the form, so without this a swap of one of these actions to any other 40-hex commit, a fork's
 #: included, stayed green. The cost, accepted by the owner: each Dependabot bump of one of these
-#: actions is red here until the same PR re-pins it. The export job holds no credential and is not
-#: pinned here.
+#: actions is red here until the same PR re-pins it. A consequence: the re-pin is a second, human
+#: commit on the Dependabot PR, which dependabot-auto-merge.yml's single-Dependabot-commit check
+#: then sends to manual review, and a grouped actions PR holds its other bumps red until then. The
+#: export job is not pinned here: it already runs code from the Dependabot-changed tree and holds
+#: only the run's read-only GITHUB_TOKEN, not the App key or the minted token.
 _PINNED_CREDENTIAL_JOB_ACTION_REFS: dict[str, list[str]] = {
     "preflight": [],
     "push": [
@@ -1074,6 +1079,8 @@ _PINNED_CREDENTIAL_JOB_ACTION_REFS: dict[str, list[str]] = {
 
 def _credential_job_action_refs(jobs: dict[str, Any]) -> dict[str, list[str]]:
     """Each credential job's ``uses:`` refs, in step order, exactly as written."""
+    missing = sorted(set(_PINNED_CREDENTIAL_JOB_ACTION_REFS) - set(jobs))
+    assert not missing, f"the resync workflow has no {missing} job (jobs: {sorted(jobs)})"
     return {
         job: [str(s["uses"]) for s in (jobs[job] or {}).get("steps") or [] if "uses" in s]
         for job in _PINNED_CREDENTIAL_JOB_ACTION_REFS
@@ -1098,28 +1105,35 @@ def test_the_credential_job_actions_are_pinned_to_exact_shas() -> None:
     assert actual == _PINNED_CREDENTIAL_JOB_ACTION_REFS, (
         "a credential job's action refs changed:\n"
         + pprint.pformat(actual, width=100)
-        + "\nIf this is a Dependabot bump of one of these actions: confirm the new SHA is a commit "
-        "on the action's upstream repository, not only on a fork (for example, open "
-        "https://github.com/<owner>/<repo>/commit/<sha> and check GitHub does not say it belongs "
-        "to no branch of this repository), then update its SHA in "
+        + "\nIf this is a Dependabot bump of one of these actions: confirm the new SHA is the "
+        "commit the release tag in its `# vX.Y.Z` comment resolves to on the action's upstream "
+        "repository, not a commit reachable only from a fork (`gh api repos/<owner>/<repo>/commits/"
+        "<tag> --jq .sha` must print the new SHA; a `commits/<sha>` lookup is not enough, since "
+        "GitHub serves a fork's commits under the upstream name), then update its SHA in "
         "_PINNED_CREDENTIAL_JOB_ACTION_REFS in the same PR as the bump. Any other change here "
         "touches a job that holds the App token: review it before re-pinning."
     )
 
-    # Control: one credential-job action moved to a different well-formed SHA.
-    target = "actions/checkout@"
-    steps = [dict(s) for s in jobs["push"]["steps"]]
-    moved = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith(target)]
-    assert len(moved) == 1, f"the push job has {len(moved)} checkout steps"
-    steps[moved[0]]["uses"] = target + "0" * 40
-    mutated = {**jobs, "push": {**jobs["push"], "steps": steps}}
+    # Control: push's checkout moved to a different well-formed SHA, in a copy of the workflow text.
+    import yaml
+
+    text = _text(_RESYNC)
+    ref = _PINNED_CREDENTIAL_JOB_ACTION_REFS["push"][0]
+    assert ref.startswith("actions/checkout@") and text.count(ref) == 2, (
+        "the control expects the export and push jobs to share one checkout ref"
+    )
+    at = text.index(ref, text.index(ref) + 1)
+    moved = "actions/checkout@" + "0" * 40
+    mutated_text = text[:at] + moved + text[at + len(ref) :]
+    assert not _unpinned_uses(mutated_text), "the control ref is not well-formed"
+    mutated = yaml.safe_load(mutated_text)["jobs"]
+    assert mutated["export"] == jobs["export"], "the control moved the export job's checkout"
     assert _credential_job_action_refs(mutated) != _PINNED_CREDENTIAL_JOB_ACTION_REFS, (
         "the exact-SHA pin let a credential-job action move to another commit SHA"
     )
-    assert _pinned_form(steps[moved[0]]) == _pinned_form(jobs["push"]["steps"][moved[0]]), (
-        "the control no longer isolates the gap: the content pin now sees the SHA"
-    )
-    assert _PINNED_USES.fullmatch(steps[moved[0]]["uses"]), "the control SHA is not well-formed"
+    before = [_content_hash(_pinned_form(step)) for step in jobs["push"]["steps"]]
+    after = [_content_hash(_pinned_form(step)) for step in mutated["push"]["steps"]]
+    assert after == before, "the control no longer isolates the gap: the content pin sees the SHA"
 
 
 def test_no_workflow_or_job_env_is_set() -> None:
@@ -1134,6 +1148,7 @@ def test_no_workflow_or_job_env_is_set() -> None:
     assert "env" not in workflow, f"the resync sets a workflow-level env: {workflow.get('env')}"
     jobs = _jobs()
     assert len(jobs) >= 3, f"the resync parsed to jobs {sorted(jobs)}"
+    assert set(jobs) == set(_JOB_IDS), f"the resync jobs are {sorted(jobs)}"
     with_env = [job for job, body in jobs.items() if "env" in body]
     assert not with_env, f"these resync jobs set a job-level env: {with_env}"
 
@@ -1310,7 +1325,7 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
     wrote straight through to the symlink's target (review of dffb12aeaaf, measured in WSL).
     """
     staged = sorted(set(_exports(_GATE)) | _CLOSURES)
-    assert len(staged) >= 2, f"the staged set parsed to {staged}"
+    assert len(staged) >= 8, f"the staged set parsed to {staged}"
     script = str(_copy_step()["run"])
     bash = require_bash(tmp_path)
     clean = _run_copy(tmp_path / "clean", lambda ws, art: None, staged, script, bash)
@@ -1445,7 +1460,7 @@ def test_the_commit_step_commits_the_staged_content_or_nothing(tmp_path: Path) -
     The file remote ignores the http.extraheader the step sets, so the push needs no token.
     """
     staged = sorted(set(_exports(_GATE)) | _CLOSURES)
-    assert len(staged) >= 2, f"the staged set parsed to {staged}"
+    assert len(staged) >= 8, f"the staged set parsed to {staged}"
     stage, commit = str(_copy_step()["run"]), str(_commit_step()["run"])
     bash = require_bash(tmp_path)
     ref = "refs/heads/dependabot/uv/resync-probe"
