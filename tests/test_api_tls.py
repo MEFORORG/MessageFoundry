@@ -4373,9 +4373,9 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
         # Hostname verification keeps a trailing dot, so a name with one and the same name without
-        # are two names a client dials (#8291 item 1). localhost. is not a loopback spelling
-        # is_loopback lists, so it keeps the loopback names, as LOCALHOST does.
-        ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1"]),
+        # are two names a client dials (#8291 item 1). localhost. is dialled on loopback, so it
+        # keeps every loopback name the old pair named, localhost among them.
+        ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
         ("localhost.", "localhost", ["localhost", "127.0.0.1", "::1"]),
         ("myhost.example", "myhost.example.", ["myhost.example."]),
     ],

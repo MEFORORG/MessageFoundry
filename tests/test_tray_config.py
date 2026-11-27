@@ -741,6 +741,37 @@ def test_a_wildcard_bind_is_probed_on_loopback_and_stays_monitor_only(app_parame
     assert cfg.monitor_only is True
 
 
+#: Spellings of a wildcard that Windows will not bind (BACKLOG #5936 item 2). One list, so the
+#: premise test and the test that relies on it cover the same hosts.
+_WINDOWS_UNBINDABLE_WILDCARDS = ["::ffff:0.0.0.0", "0"]
+
+
+@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
+def test_a_wildcard_spelling_windows_cannot_bind_stays_monitor_only(host: str) -> None:
+    """BACKLOG #5936 item 2. ``::ffff:0.0.0.0`` and ``0`` spell a wildcard on some stacks, but
+    neither binds on Windows, the tray's only platform (the test below), so the engine never runs
+    on one and a tray reading it as down is right. Both must still withhold service control."""
+    cfg = compose_config(None, ServiceRegistryInfo(app_parameters=f"serve --host {host}"))
+    assert cfg.monitor_only is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
+@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
+def test_windows_refuses_a_listener_on_those_wildcard_spellings(host: str) -> None:
+    """The premise of the test above, measured where the tray runs: ``uvicorn.run`` reaches
+    ``loop.create_server``, and that refuses both hosts. If this starts passing a bind, the tray's
+    handling of the spelling is a live question again."""
+    import asyncio
+
+    async def bind() -> None:
+        server = await asyncio.start_server(lambda _r, _w: None, host, 0)
+        server.close()
+        await server.wait_closed()
+
+    with pytest.raises(OSError):
+        asyncio.run(bind())
+
+
 def test_a_tray_toml_engine_url_clears_the_wildcard_hold() -> None:
     """An operator's loopback ``engine_url`` replaces the discovered bind, and with it the hold."""
     reg = ServiceRegistryInfo(app_parameters="serve --host 0.0.0.0 --port 8765")

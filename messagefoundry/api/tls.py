@@ -320,8 +320,8 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
 def _host_key(name: str) -> object:
     """``name`` matched loosely: an IP by address without an IPv6 zone, so ``0:0:0:0:0:0:0:1``
     is ``::1``, and a DNS name without regard to case or a trailing dot. :func:`_kept_loopback_names`
-    uses it to decide whether a client dials a bind through a loopback name, and which of them the
-    bind itself names. :func:`_san_key` is the exact SAN entry."""
+    uses it to decide whether a client dials a bind through a loopback name; ``localhost.``
+    resolves as ``localhost`` does. :func:`_san_key` is the exact SAN entry."""
     try:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
@@ -351,7 +351,9 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
     ``::1``, matched by :func:`_host_key` (:data:`_LOOPBACK_KEYS`): of those three, every one the
     old certificate names, and the default ``[api].host``, which the CLI, the IDE and the harness
-    dial by default, less the one the bind itself names. A bind :attr:`ApiSettings.is_loopback`
+    dial by default. :func:`_make_generated` drops one that is the bind's own SAN entry
+    (:func:`_san_key`), so a ``localhost.`` bind keeps ``localhost``, which a client verifies as a
+    different name (#8291 item 1). A bind :attr:`ApiSettings.is_loopback`
     lists gets all three from :func:`_generated_sans` anyway, so this matters for a wildcard bind
     and for another spelling, such as ``LOCALHOST`` or ``[::1]``: a re-mint for a move from
     ``::`` to ``0.0.0.0`` keeps the ``::1`` the old certificate named, and a renewal at ``::`` of a
@@ -367,9 +369,7 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
         return []
     default = ApiSettings.model_fields["host"].default
     return [
-        name
-        for name in _GENERATED_LOOPBACK_SANS
-        if _host_key(name) != dialled and (name == default or pki.san_names(old_pem, name))
+        name for name in _GENERATED_LOOPBACK_SANS if name == default or pki.san_names(old_pem, name)
     ]
 
 
