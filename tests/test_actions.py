@@ -531,10 +531,15 @@ def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
         # stray byte before the last character does not hide it.
         ("ren\\XC3\\\\XA9\\e", "Ren\\XC3\\\\XA9\\e"),
         ("ren\\XFFC3A9\\e", "Ren\\XFFC3A9\\e"),
-        # Literal text ends the run, so a byte after it starts afresh.
+        # Any other unit ends the run, so a byte after it starts afresh: literal text, a
+        # charset switch, an escape that decodes to nothing and a malformed hex escape.
         ("a\\XC3\\b\\XA9\\c", "A\\XC3\\b\\XA9\\C"),
+        ("ren\\XC3\\\\C2842\\\\XA9\\e", "Ren\\XC3\\\\C2842\\\\XA9\\E"),
+        ("ren\\XC3\\\\.fi\\\\XA9\\e", "Ren\\XC3\\\\.fi\\\\XA9\\E"),
+        ("ren\\XC3\\\\XZZ\\\\XA9\\e", "Ren\\XC3\\\\XZZ\\\\XA9\\E"),
         # Not valid UTF-8, so each byte is its own character: E9 is a Latin-1 e-acute, cased.
         ("jos\\XE9\\e", "Jos\\XE9\\e"),
+        # An ASCII byte reads the same either way.
         ("o\\X41\\b", "O\\X41\\b"),
     ],
 )
@@ -550,16 +555,29 @@ def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
     assert m["PID-5"] == expected
 
 
-def test_convert_case_title_reads_no_msh18() -> None:
-    # The UTF-8 reading is a guess that reads no MSH-18, so a message declaring ISO 8859-1 gets it
-    # too: there the bytes C3 A9 are two characters, the last one uncased, so the "e" would start a
-    # word. Pinned so a change to the guess is seen; whether to read MSH-18 is the owner question
-    # BACKLOG #5928 step 1 raises.
-    msh = _MSH.replace("2.5.1\r", "2.5.1||||||8859/1\r")
+@pytest.mark.parametrize(
+    ("charset", "expected"),
+    [
+        # ISO 8859-1 maps each byte to the character unescape decodes it to, so C3 A9 is two
+        # characters, the last one uncased, and the "e" after it starts a word.
+        ("8859/1", "Ren\\XC3A9\\E"),
+        # Another declared set is read per byte too, as unescape reads it.
+        ("ISO IR87", "Ren\\XC3A9\\E"),
+        ("UNICODE UTF-8", "Ren\\XC3A9\\e"),
+        ("", "Ren\\XC3A9\\e"),
+    ],
+)
+def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
+    charset: str, expected: str
+) -> None:
+    # BACKLOG #5928: the UTF-8 reading of a hex escape's bytes is taken only where MSH-18 is empty
+    # or names UTF-8. NEGATIVE CONTROL: on 630846bffc5, which read no MSH-18, the first two rows
+    # fail.
+    msh = _MSH.replace("2.5.1\r", f"2.5.1||||||{charset}\r")
     m = Message.parse(msh + "PID|1||1||ren\\XC3A9\\e\r")
-    assert m["MSH-18"] == "8859/1"
+    assert m["MSH-18"] == (charset or None)
     convert_case(m, "PID-5", "title")
-    assert m["PID-5"] == "Ren\\XC3A9\\e"
+    assert m["PID-5"] == expected
 
 
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
