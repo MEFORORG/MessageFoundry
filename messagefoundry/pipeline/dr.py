@@ -367,9 +367,10 @@ class DrCoordinator:
         ``dr_activated`` for the same label. Each engine shard reads only the rows its own identity wrote, so each
         alerts on its own. A store that cannot be read is the same loud outcome, since the box may
         have been serving. ``POST /dr/release`` on the passive box records that the operator
-        leaves it passive, and closes the alert this start raised (:meth:`_record_stay_passive`);
-        an alert an earlier start raised is closed only by hand or by a later activation. Returns
-        whether it alerted.
+        leaves it passive, and closes the open alert (:meth:`_record_stay_passive`). On a start
+        that raised none, a release closes nothing, so an alert an earlier start left open stays
+        open until an operator resolves it by hand, or a later activation under the same label
+        closes it. Returns whether it alerted.
 
         It misses at least: an activation whose ``dr.activate`` row was never written (the owed
         row is held in memory only); a box whose host name changed between the activation and
@@ -417,9 +418,9 @@ class DrCoordinator:
         one is set, since the takeover hook may have moved the address here. Nothing drains: the
         box delivers nothing already, so any row left undelivered on it stays queued for the
         operator to reconcile, as after a release. ``None`` when there is nothing to record: then
-        it writes no row and closes no alert, so a ``dr_restarted_passive`` an earlier start
-        raised stays open until an operator resolves it by hand (``POST /alerts/{id}/resolve``)
-        or a later activation closes it. A write error refuses the release."""
+        it writes no row and closes no alert, so a ``dr_restarted_passive`` an earlier start left
+        open stays open until an operator resolves it by hand (``POST /alerts/{id}/resolve``), or
+        a later activation under the same label closes it. A write error refuses the release."""
         try:
             last = await self._own_last_transition()
         except Exception:
@@ -745,17 +746,18 @@ class DrCoordinator:
         optional ``release_hook`` / let the passive LB return it to the primary), then the engine unbinds
         all inbound listeners while the workers drain the staged queue to completion. Returns success only
         once the VIP is off the DR box and intake is unbound, so there is **no dual-accept window** while
-        the VIP moves. **A box already passive is an exception** in at least these cases, and none of
-        them unbinds a listener or drains, so an inbound an operator started on that box stays bound.
-        Where its identity was last activated, or its start raised ``dr_restarted_passive`` with no
-        activation recorded since, the release only runs the release hook when one is set, writes a
-        ``dr.stay_passive`` row and closes that alert (:meth:`_record_stay_passive`). Where its own
-        newest activate or release record is not an activation, as on a box never activated or one
-        whose activation aborted after a hand-back, and this start raised no restart alert, the
-        release writes no row and closes no alert. So a ``dr_restarted_passive`` an earlier start
-        raised stays open until an operator resolves it by hand, with ``POST /alerts/{id}/resolve``
-        or the web console's Resolve on the alert, or a later activation closes it. A retry after a completed hand-back answers with that release's
-        outcome, and a hand-back whose ``dr.release`` row is still owed writes that row first.
+        the VIP moves. **A release on a box already passive** never unbinds a listener or drains,
+        so an inbound an operator started on that box stays bound. A hand-back whose ``dr.release``
+        row is still owed writes that row and runs no hook. Otherwise, once a release has completed
+        on this start, a retry runs no hook, writes no row and answers with that release's
+        outcome. Otherwise, where its identity was last activated, or its start raised ``dr_restarted_passive`` with no
+        activation recorded since, the release runs the release hook when one is set, writes a
+        ``dr.stay_passive`` row and closes that alert (:meth:`_record_stay_passive`). In every
+        other case, as on a box never activated or one whose activation aborted after a hand-back,
+        the release writes no row and closes no alert. So a ``dr_restarted_passive`` an earlier
+        start left open, on a start that raised none, stays open until an operator resolves it by
+        hand, with ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a
+        later activation under the same label closes it.
         **Within the DR store** at-least-once + idempotency are preserved on drain;
         **cross-store** reconciliation with the recovered primary is operator-verified per the runbook
         (the engine gives no cross-store loss/duplicate guarantee — documented, not an engine AC)."""

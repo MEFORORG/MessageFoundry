@@ -1055,10 +1055,10 @@ class AlertSink(Protocol):
         longer describes a box that serves; the next ``dr_activated`` or ``dr_released`` for
         ``node`` closes this one. On a passive box, ``POST /dr/release`` raises ``dr_released``
         only when its start raised this alert or the box's newest own activate or release record
-        is an activation. So an instance an earlier start raised, on a box whose newest own record is
-        not an activation, stays open until an operator resolves it by hand, with
-        ``POST /alerts/{id}/resolve`` or the web console's Resolve on the alert, or a later
-        ``POST /dr/activate`` closes it; a release there changes nothing and does not close it.
+        is an activation. So an instance an earlier start left open, on a start that raised none,
+        stays open until an operator resolves it by hand, with ``POST /alerts/{id}/resolve`` or
+        the web console's Resolve on the alert, or a later ``POST /dr/activate`` under the same
+        ``node`` closes it; a release there changes nothing and does not close it.
         ``node`` is the label the coordinator's ``dr_activated`` carries: the host, and on an
         engine shard the engine shard identity too. No PHI."""
         ...
@@ -1677,10 +1677,8 @@ class LoggingAlertSink:
             "ALERT dr_restarted_passive: DR box %r started PASSIVE and may have been serving when "
             "it went down -- the ERROR line before this says what its store shows. It serves "
             "nothing until POST /dr/activate, to be run only once you have confirmed the "
-            "primary is not serving; POST /dr/release records that it stays passive and closes "
-            "this alert. An instance an earlier start raised is not closed by a release on a "
-            "box whose newest own record is not an activation: resolve it by hand with "
-            "POST /alerts/{id}/resolve or the web console's Resolve",
+            "primary is not serving; POST /dr/release on this start records that it stays "
+            "passive",
             node,
         )
 
