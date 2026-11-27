@@ -138,6 +138,7 @@ tests/test_coord_migrate.py
 tests/test_coord_occupancy_unplaceable.py
 tests/test_coord_overlap_attribution.py
 tests/test_coord_overlap_cache.py
+tests/test_coord_overlap_live_only.py
 tests/test_coord_overlap_signals.py
 tests/test_coord_overlap_work_signal.py
 tests/test_coord_presence.py

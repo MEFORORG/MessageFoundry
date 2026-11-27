@@ -117,6 +117,13 @@ ledger, so it has no public page.
   also dead-letters an object it can never propose instead of retrying it. (`BACKLOG #6637`)
 
 ### Changed
+- **The WARNING for a log spool directory reported in use by another process now states what that
+  means.** It still says off-box log forwarding runs without an on-disk spool. It adds facts, not
+  a procedure, because the same WARNING stands for more than one cause and cannot say which one
+  applies. Each fact holds for every cause the WARNING names, and it no longer restates how the spool
+  directory is derived. It says that two engines can share the spool directory itself, not only
+  its root. The behaviour is unchanged: it is still a WARNING and the engine still starts without
+  a spool. (`BACKLOG #5400`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
@@ -865,6 +872,19 @@ ledger, so it has no public page.
   least two passed False), so no hop's decision changes. (`BACKLOG #3514`)
 
 ### Fixed
+- **A re-ingress token whose own payload is a corrupt cell under a key the store holds is no
+  longer labelled a failed queue tag.** Such a cell, for example bad base64 or a ciphertext too
+  short for a tag, now dead-letters the `Stage.RESPONSE` token with `last_error` "integrity: the
+  re-ingress work-row holds a corrupt payload" and a `dead` event saying the same, on SQLite,
+  PostgreSQL and SQL Server, and the server backends' fenced-write WARNING names it
+  `ingress_handoff(corrupt-token)`. The re-ingress worker's WARNING for a token whose payload its
+  reply read refused now quotes the `last_error` it records, in place of the fixed words "failed
+  its integrity tag"; its other dead-letter WARNINGs are unchanged. Its handling is unchanged: it
+  is still dead-lettered, still audited under
+  `integrity.queue_tag_failed` with cause `corrupt`, and still alerted under the corrupt-cell
+  subject. Known limits, at least: under Vault Transit a corrupt cell is refused with cause
+  `unknown`, not as a corrupt cell, and a blank payload is refused with cause `blank`; both keep
+  the failed-queue-tag label, as before. (`BACKLOG #5982`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
@@ -6416,12 +6436,9 @@ ledger, so it has no public page.
   `BACKLOG #5656`)
 - **The anonymizer's leak-check and site-code scrub read escaped and IPv6 values.** In both the
   toolkit and the tee:
-  - The MRN-typed check reads an `MR` or `MRN` id type in any component, whole or as its first
-    subcomponent, as before, and now also in any subcomponent of CX.5, each as written or
-    decoded, with invisible characters (Unicode Cc and Cf) dropped, and trimmed. Component 5 of any field
-    it reads is read as CX.5 whatever the field's type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a
-    coded field and not a CX, is refused. An `MR` in a later subcomponent of any other component, such as
-    `70553^PET&MR^C4`, passes.
+  - The MRN-typed check reads more forms of an `MR` or `MRN` id type in a field no rule maps,
+    the MSH header's fields excluded. It does not know a field's type, so under the default rules it refuses
+    `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX.
   - A routable IPv6 address in a field no rule maps, the MSH header's fields included, is refused, while at least the loopback, link-local, unique-local and
     documentation ranges pass, and text such as `Note::` or a colon-written EUI-64 is refused
     though it holds no address.

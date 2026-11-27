@@ -16,7 +16,7 @@
     that needs cooperation to work does not work.
 
     ONLY LIVE SESSIONS BLOCK. A dormant worktree with changes cannot be racing you -- its owner is not
-    typing -- so it is reported and allowed. Blocking on dormant worktrees would deny edits to every
+    typing -- so it is allowed, and not even walked (-LiveOnly). Blocking on dormant worktrees would deny edits to every
     file any abandoned branch ever touched, and a gate that cries wolf gets uninstalled.
 
     FAILS OPEN, DELIBERATELY. Any error -- unparseable payload, no git, no registry, a broken overlap
@@ -34,8 +34,8 @@
     would otherwise inject a notice into EVERY Edit and Write. If the throttle state cannot be read or
     written the notice is emitted anyway -- silence is the defect being fixed, so the fallback is noise.
 
-    Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
-    cache read, not a git walk across every worktree.
+    Wired on Edit|Write|MultiEdit|NotebookEdit. It asks overlap.ps1 for the worktrees a live session
+    owns (-LiveOnly), and that map is cached, so the common case is a cache read, not a git walk.
 
     IT CHECKS FROM THE WORKTREE THE EDITED FILE SITS IN, NOT THE ONE IT RUNS IN. The desktop app starts a
     worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
@@ -323,9 +323,13 @@ $code = 0
 # this gate and its callee from the same checkout (docs/WORKTREES.md, "which copy runs"), so they move
 # together; a copy that predates the parameter fails the invocation, which lands on the unresolved
 # notice below -- loud and allowing, which is this gate's posture for everything it cannot check.
+#
+# -LiveOnly because every decision and notice below reads only Live rows, so a dormant worktree's row
+# changes nothing this gate does. Walking them anyway outran the harness timeout once worktrees
+# accumulated (overlap.ps1, at the parameter), and a killed gate checks nothing.
 try {
     $raw = & pwsh -NoProfile -NonInteractive -File $OverlapScript `
-        -File $target -Json -TimeBudgetSeconds $OverlapTimeBudgetSeconds 2>$null
+        -File $target -Json -LiveOnly -TimeBudgetSeconds $OverlapTimeBudgetSeconds 2>$null
     $code = $LASTEXITCODE
 } catch {
     Write-Unresolved "overlap-threw" "invoking the overlap script raised: $($_.Exception.Message)"
@@ -350,7 +354,7 @@ if ($code -ne 0 -and -not $partial) {
 # EMPTY OUTPUT IS NOT AN ANSWER. Under -Json a resolved "nobody else is in this file" is the two bytes
 # `[]`; nothing at all is a script that never produced a verdict. Folding those together is precisely
 # how this gate came to report all-clear while checking nothing.
-$slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so the map below covers only the worktrees it reached and the rest were never looked at"
+$slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, so the map below covers only the worktrees a live session owns that it reached, and the rest were never looked at"
 
 $text = (@($raw) -join "`n").Trim()
 if (-not $text) {
@@ -372,7 +376,7 @@ try { $rows = @($text | ConvertFrom-Json -ErrorAction Stop) } catch {
 # them to assume it was nearly done -- and on the measured runs it was not.
 if ($partial -and $rows.Count -gt 0 -and $null -ne $rows[0].PSObject.Properties['Total']) {
     $slowDetail = "the overlap walk did not finish within its ${OverlapTimeBudgetSeconds}s budget, " +
-        "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees. " +
+        "covering $(Get-SafeForMessage $rows[0].Walked) of $(Get-SafeForMessage $rows[0].Total) worktrees a live session owns. " +
         "Those were checked; the rest were never looked at"
 }
 

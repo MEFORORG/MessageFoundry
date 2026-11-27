@@ -1,6 +1,6 @@
 # ADR 0156 — ASVS scorecard as data: a derived count, verified evidence anchors, and a fail-closed drift gate
 
-**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below
+**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below; on the vault's pre-commit hooks, see the 2026-11-27 note under Amendment 2
 **Date:** 2026-08-01
 **Supersedes:** —
 **Related:** ADR 0155 (DAST) · BACKLOG #205 (risk-acceptance register) · ASVS cell 15.1.3
@@ -149,6 +149,10 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 > rather than on the argument reading well.
 
 > ### Amendment 2 (2026-08-17) — the hook the amendment above calls "the enforcement that works today" HAS NEVER BEEN INSTALLED
+>
+> *(2026-11-27: what this amendment says about the vault's pre-commit hooks, their installation and
+> their remedy is as of 2026-08-17 and is not kept current here; do not act on it. Read instead the
+> dated notes under Amendment 2 in the vault's copy of this ADR, a maintainer-internal document.)*
 >
 > Amendment 1 closes by naming its own lesson: a confident, plausible statement about system state that
 > nobody had checked. **Its replacement claim was never checked either, and it is wrong in the same

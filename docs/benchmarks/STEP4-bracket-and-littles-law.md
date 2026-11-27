@@ -360,7 +360,8 @@ i.e. precisely the region neither `send_ack`/`mark_done` (inside the body) nor t
 only) can see.
 
 **Where to read it.** `messagefoundry/pipeline/phase_timing.py::LaneEpisodeTiming` emits one throttled INFO
-line per stage per ~5 s under `MEFOR_DELIVERY_PHASE_TIMING=1` (the rig **always** sets it). The harness
+line per stage per ~5 s under its own lever, `MEFOR_PIPELINE_LANE_EPISODE_TIMING=1`, not
+`MEFOR_DELIVERY_PHASE_TIMING=1` (kept separate so an instrument-OFF control rung stays possible). The harness
 aggregates it: `shardcert_ladder.aggregate_episode_timing` -> `episode_timing` on `ENGINE_RUNG_REPORT` -> the
 ladder JSON. **Read `episode_timing.by_stage.outbound`, NEVER the flat blend** — the engine emits one line
 per stage and n-weighting all four into one number is an error this programme has already committed once

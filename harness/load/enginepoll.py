@@ -122,8 +122,10 @@ def _pool_wait_attr(status: Any, name: str) -> float | None:
 @dataclass(frozen=True)
 class EngineSample:
     """One engine-side observation. ``read``/``written``/``done``/``dead`` are cumulative since engine
-    start, so run totals are last − first. Under a multi-shard cluster every field is the **sum**
-    across all polled shards."""
+    start, so run totals are last − first. Under a multi-engine-shard cluster most fields are the
+    **sum** across all polled engine shards, store-wide gauges included (BACKLOG #5950). At least
+    the per-process executor gauges (the busiest engine shard's), the pool snapshot and the uptime
+    are not; :meth:`EnginePoller._sample_sync` names the rule per field."""
 
     elapsed_s: float
     pending: int  # outbound stage, status=pending
@@ -145,7 +147,8 @@ class EngineSample:
     uptime_s: float
     # B11 connection-scale instrumentation (read-only, additive; default 0/None so an OLDER engine
     # without these fields deserializes to zeros — the established back-compat pattern). Summed across
-    # shards where summable; pool gauges take the first server-store shard reporting one.
+    # engine shards where summable; executor gauges take the busiest engine shard, and the legacy
+    # pool gauges the first server-store engine shard reporting one.
     empty_claims: int = 0  # Σ cumulative empty claims (wall #3)
     empty_claims_idle_poll: int = 0  # the idle-poll re-SELECT share
     empty_claims_wake_fanout: int = 0  # the per-commit wake-fanout (thundering-herd) share
@@ -205,6 +208,12 @@ class EngineSample:
     # committed_txns is, so the two deltas cover the same requests. Summed across shards.
     poller_requests: int = 0  # requests the engine answered, renewal probes included
     poller_renewals: int = 0  # sessions the poller signed in again after the engine ended one
+    #: Σ inbound ``errored`` from ``/connections`` (BACKLOG #5436): messages received since engine
+    #: start whose disposition is ERROR. That counts a dead-letter at ANY stage, ingress and routed
+    #: included, which ``dead`` and ``out_dead`` (outbound stage only) cannot see, and also a frame
+    #: the listener refused and NAKed. Like ``read`` it is cumulative and offset by a per-inbound
+    #: stats reset, and a replay of an errored message lowers it. Default 0 for a fake sample.
+    in_errored: int = 0
 
     @property
     def outbound_backlog(self) -> int:
@@ -294,6 +303,7 @@ class _ShardSample:
     #: The engine's OWN configured pool maximum (``status.pool.max_size``) — see EngineSample.pool_max_size.
     pool_max_size: int | None = None
     poller_requests: int = 0  # this shard's poller request count at its /stats read (#2794)
+    in_errored: int = 0  # Σ this engine shard's inbound `errored` (BACKLOG #5436)
 
 
 #: The pool ``acquire_wait`` MEAN measured on the STEP-2 rig at the ~16 msg/s broadcast plateau, where the
@@ -539,9 +549,10 @@ def _min_not_none(values: Iterable[int | None]) -> int | None:
     return min(seen) if seen else None
 
 
-def _max_not_none(values: Iterable[float | None]) -> float | None:
+def _max_not_none[N: (int, float)](values: Iterable[N | None]) -> N | None:
     """The MAX over the non-``None`` values (``None`` if all are ``None``). Used for the pool WAIT
-    percentiles: the fleet is bound if ANY shard's pool is bound, so the worst shard is the reading."""
+    percentiles and the executor gauges: the fleet is bound if ANY engine shard is bound, so the
+    worst engine shard is the reading."""
     seen = [v for v in values if v is not None]
     return max(seen) if seen else None
 
@@ -1056,7 +1067,11 @@ class EnginePoller:
             # B11: empty-claim counts SUM across shards (each shard runs its own workers). Executor
             # gauges + the pool snapshot are per-process; take the MAX queue depth/busy and the first
             # shard reporting a pool (in practice the connscale harness runs a single engine, so this
-            # is exactly that one engine's reading).
+            # is exactly that one engine's reading). The executor pair read the first engine shard
+            # until BACKLOG #5950 item 1, which hid a saturated executor on any later engine shard.
+            # Unlike `pool_wait_max_ms` below, this moves no banked key: the MAX was these fields'
+            # stated meaning, and their only reader, connscale/runner.py, polls a single engine.
+            # Each is its own peak, so one sample's two figures can come from different processes.
             empty_claims=sum(s.empty_claims for s in shard_samples),
             empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
@@ -1073,8 +1088,8 @@ class EnginePoller:
                 if (_wait_n := sum(s.pool_acquire_wait_count for s in shard_samples))
                 else 0.0
             ),
-            executor_queue_depth=_first_not_none(s.executor_queue_depth for s in shard_samples),
-            executor_busy=_first_not_none(s.executor_busy for s in shard_samples),
+            executor_queue_depth=_max_not_none(s.executor_queue_depth for s in shard_samples),
+            executor_busy=_max_not_none(s.executor_busy for s in shard_samples),
             pool_size=_first_not_none(s.pool_size for s in shard_samples),
             pool_idle=_first_not_none(s.pool_idle for s in shard_samples),
             pool_wait_p50_ms=_first_not_none(s.pool_wait_p50_ms for s in shard_samples),
@@ -1096,6 +1111,8 @@ class EnginePoller:
             pool_shards_reporting=sum(1 for s in shard_samples if s.pool_size is not None),
             poller_requests=sum(s.poller_requests for s in shard_samples),  # #2794
             poller_renewals=self._renewals,  # #2794
+            # Per engine shard, like `read`: /connections carries only that engine's own inbounds.
+            in_errored=sum(s.in_errored for s in shard_samples),  # BACKLOG #5436
         )
 
     def _renew_if_signed_out(self, index: int, client: EngineClient, url: str) -> None:
@@ -1138,6 +1155,9 @@ class EnginePoller:
         read = sum(r.read for r in conns if r.read is not None)
         written = sum(r.written for r in conns if r.written is not None)
         out_dead = sum(r.errored or 0 for r in conns if r.written is not None)
+        # The same `errored` field on the inbound rows means something else: messages whose
+        # disposition is ERROR, a dead-letter at any stage included (BACKLOG #5436).
+        in_errored = sum(r.errored or 0 for r in conns if r.read is not None)
         queue_depth = sum(r.queue_depth or 0 for r in conns if r.queue_depth is not None)
         return _ShardSample(
             pending=ob.get("pending", 0),
@@ -1180,4 +1200,5 @@ class EnginePoller:
             pool_acquire_wait_count=int(_pool_wait_attr(status, "count") or 0),
             pool_acquire_wait_mean_ms=float(_pool_wait_attr(status, "mean_ms") or 0.0),
             poller_requests=requests_at_stats,
+            in_errored=in_errored,
         )

@@ -216,6 +216,43 @@ function Get-SeatsDirForMail {
     return (Join-Path $r.Path 'seats')
 }
 
+function Get-PrintableField {
+    # A message-supplied field made safe to print on one line. A minimal copy of the drain's Get-Fold
+    # (mail-drain.ps1), which lives in a hook this file cannot dot-source: control characters and line
+    # breaks become spaces, anything else outside printable ASCII becomes '?', whitespace collapses,
+    # and the result is capped. Without it a to.cwd holding a newline would print its own line.
+    param($Text, [int]$Cap = 240)
+    $t = ([string]$Text) -replace '[\p{C}]', ' '
+    $t = ($t -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Cap) { $t = $t.Substring(0, $Cap - 3) + '...' }
+    return $t
+}
+
+function Get-EndedSeatWarning {
+    # One WARNING line when the newest seat record in a recipient's box reads lifecycle `closed` or
+    # `handed` (coord-root.ps1, Get-CoordSeatEnded), else $null. That record need not be the
+    # recipient session's own: at least -SessionId, -Worktree, a CLI run from a cwd in that worktree
+    # and the shared nosid.json put other sessions' records in the box, and a later pass carries a
+    # lifecycle it did not set. So the line names what the record reads, never who wrote it or that
+    # anyone ended. A warning and never a refusal: a session that started in that worktree, the
+    # closer included, can still read the box. Any read failure says nothing, so the send still
+    # fails open.
+    param([string]$SeatsDir, [string]$Key, [string]$Label)
+    try {
+        $ended = Get-CoordSeatEnded -Dir (Join-Path $SeatsDir $Key)
+        if (-not $ended) { return $null }
+        # Hedged, because the drain never reads lifecycle: where the drain hook is wired, a session
+        # that closed and stays open, even idle, can drain the box when it finishes its next turn,
+        # and so can another session that started in that worktree (the drain reads the box of the
+        # worktree a session started in, so one that cd'd in does not). The drain runs at
+        # SessionStart and Stop, so the consequent names both, and says "may" because at least a
+        # root that does not wire the hook drains at neither.
+        return ("WARNING: the newest seat record for $(Get-PrintableField $Label) reads lifecycle " +
+            "'$($ended.Lifecycle)' at $($ended.At). This mail may sit unread until a session starts " +
+            "in that worktree or one that started there finishes another turn, or expire unshown at its TTL.")
+    } catch { return $null }
+}
+
 function Resolve-SeatRecipient {
     # A seat id -> the mailbox it names, or $null when the registry holds no such seat. Returns the
     # newest readable record's worktree and host for the message's `to` block, as recorded facts.
@@ -660,6 +697,23 @@ if ($Send) {
         }
     }
 
+    # On stderr, so -Json output stays parseable. Get-MailRoot above already refused an unresolved
+    # shared root, so a throw here is only a read failure, and it says nothing.
+    # The records read are the ones under the box the mail went to, which is where any session keyed
+    # to that box writes now; a legacy seat id's own directory is frozen and shared across PCs. Mail
+    # addressed to one session is not judged by the box's newest record of any session, so it gets
+    # none.
+    $seatsDir = $null
+    if (-not $ToSessionId) {
+        try { $seatsDir = Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot } catch { }
+    }
+    if ($seatsDir) {
+        foreach ($w in @($written | Where-Object { $_.Status -eq 'queued' })) {
+            $warn = Get-EndedSeatWarning -SeatsDir $seatsDir -Key $w.Key -Label $w.To
+            if ($warn) { [Console]::Error.WriteLine("mail.ps1: $warn") }
+        }
+    }
+
     if ($Json) { ($written | ConvertTo-Json -Depth 5 -AsArray) | Write-Output }
     else {
         $ok = @($written | Where-Object { $_.Status -eq 'queued' })
@@ -730,18 +784,6 @@ function ConvertTo-ExpiringUtc {
     if ($Value -isnot [DateTime]) { return $null }
     if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
     return $Value.ToUniversalTime()
-}
-
-function Get-PrintableField {
-    # A message-supplied field made safe to print on one line. A minimal copy of the drain's Get-Fold
-    # (mail-drain.ps1), which lives in a hook this file cannot dot-source: control characters and line
-    # breaks become spaces, anything else outside printable ASCII becomes '?', whitespace collapses,
-    # and the result is capped. Without it a to.cwd holding a newline would print its own line.
-    param($Text, [int]$Cap = 240)
-    $t = ([string]$Text) -replace '[\p{C}]', ' '
-    $t = ($t -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
-    if ($t.Length -gt $Cap) { $t = $t.Substring(0, $Cap - 3) + '...' }
-    return $t
 }
 
 if ($Expiring) {

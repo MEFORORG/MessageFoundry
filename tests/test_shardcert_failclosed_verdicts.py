@@ -82,7 +82,7 @@ def test_routed_stage_dead_letters_fail_the_single_box_report() -> None:
     js = rep.to_json_dict()
     assert js["verdict"] == "FAIL"
     assert js["correctness"]["dead_total"] == 1000  # type: ignore[index]
-    assert js["schema_version"] == 6
+    assert js["schema_version"] == 7
 
 
 def test_unmeasured_dead_total_fails_closed() -> None:
@@ -450,7 +450,7 @@ def _sustained(index: int, rate: float, pool: PoolStats = _HEALTHY_POOL) -> Rung
 
 
 def _consolidated(
-    climb: list[RungOutcome], soak: RungOutcome | None = None
+    climb: list[RungOutcome], soak: RungOutcome | None = None, *, soak_aborted: bool = False
 ) -> ConsolidatedLadderReport:
     return build_consolidated_report(
         shards=("a", "b"),
@@ -464,7 +464,7 @@ def _consolidated(
         climb=climb,
         soak=soak,
         climb_aborted=False,
-        soak_aborted=False,
+        soak_aborted=soak_aborted,
     )
 
 
