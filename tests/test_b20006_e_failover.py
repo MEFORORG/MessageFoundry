@@ -174,7 +174,7 @@ def test_dead_rows_not_judged_per_copy_still_fail() -> None:
     # The absolute check of main stands wherever the per-copy reading was not conclusive.
     rep = _report(dead=3, dead_opening=3, dead_new=None)
     assert rep.result_ok is False
-    assert any("could not tell" in n for n in rep.notes)
+    assert any("the per-copy check judged nothing" in n for n in rep.notes)
     js = rep.to_json_dict()
     assert js["no_loss"]["dead_new"] is None  # type: ignore[index]
     assert js["no_loss"]["dead_opening"] == 3  # type: ignore[index]
@@ -361,12 +361,15 @@ def _final(
     stats: NodeStats | None | list[NodeStats | None],
     carried: frozenset[tuple[str, float]] | None,
     tracker: FailoverTracker | None = None,
+    notes: list[str] | None = None,
 ) -> tuple[_FinalNode, tuple[NodeStats, Counters, FailoverTracker, int | None]]:
     counters = Counters(sink_received=10)
     tracker = tracker or FailoverTracker()
     script = stats if isinstance(stats, list) else [stats]
     node = _FinalNode(copies, script, counters, tracker)
-    got = asyncio.run(failover._final_reads(node, object(), carried, counters, tracker))  # type: ignore[arg-type]
+    got = asyncio.run(
+        failover._final_reads(node, object(), carried, counters, tracker, notes=notes)  # type: ignore[arg-type]
+    )
     return node, got
 
 
@@ -702,18 +705,53 @@ def test_more_dead_rows_than_were_carried_are_never_listed(
             "the counts moved",
         ),
         ([frozenset({_A, _B}), frozenset({_A, _C})], [_stats_dead(2)], "the dead copies moved"),
+        ([None], [_stats_dead(2)], "the dead-letter read at the end was not whole"),
+        (
+            [frozenset({_A, _B}), None],
+            [_stats_dead(2)],
+            "the second dead-letter read was not whole",
+        ),
     ],
 )
-def test_a_final_fallback_logs_why(
+def test_a_final_fallback_logs_and_notes_why(
     copies: list[frozenset[tuple[str, float]] | None],
     stats: list[NodeStats | None],
     why: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    notes: list[str] = []
     with caplog.at_level(logging.WARNING):
-        _, (_, _, _, dead_new) = _final(copies, stats, frozenset({_A, _B, _C}))
+        _, (_, _, _, dead_new) = _final(copies, stats, frozenset({_A, _B, _C}), notes=notes)
     assert dead_new is None
     assert f"dead-row check stays absolute: {why}" in caplog.text
+    assert any(n.startswith(f"the per-copy dead-row check judged nothing: {why}") for n in notes)
+
+
+def test_a_store_that_held_no_dead_rows_counts_every_final_one_new() -> None:
+    rep = _report(dead=2, dead_opening=0, dead_new=None)
+    assert rep.dead_new == 2
+    assert rep.result_ok is False
+    assert any("2 of them new this run" in n for n in rep.notes)
+
+
+def test_more_dead_than_carried_names_the_lower_bound() -> None:
+    notes: list[str] = []
+    _final([], _stats_dead(5), frozenset({_A, _B, _C}), notes=notes)
+    assert any("so at least 2 are new" in n for n in notes)
+
+
+def test_no_opening_read_that_was_whole_is_noted() -> None:
+    notes: list[str] = []
+    got = asyncio.run(
+        failover._opening_dead_copies(
+            [_CopyNode(None), _CopyNode(None)],  # type: ignore[list-item]
+            object(),  # type: ignore[arg-type]
+            _stats_dead(2),
+            notes=notes,
+        )
+    )
+    assert got is None
+    assert any("no node gave a whole dead-letter read" in n for n in notes)
 
 
 def test_an_opening_count_mismatch_logs_why(caplog: pytest.LogCaptureFixture) -> None:

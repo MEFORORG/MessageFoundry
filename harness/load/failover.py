@@ -80,9 +80,9 @@ _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
 _OPENING_STATS_ATTEMPTS = 5
 _OPENING_STATS_RETRY_S = 0.5
-#: One ``/dead-letters`` page. It copies that route's ``limit`` ceiling (``le=500``) and nothing pins
-#: the two: if the route lowers it, every page is refused, the read logs the refusal, and the dead-row
-#: check stays absolute.
+#: One ``/dead-letters`` page. It copies that route's ``limit`` ceiling (``le=500``), and
+#: ``tests/test_b20006_e_failover.py`` pins the two: if the route lowered it, every page would be
+#: refused and the dead-row check would stay absolute.
 _DEAD_PAGE = 500
 #: The most dead copies the per-copy check reads (BACKLOG #5572). Past it the check stays absolute,
 #: so a store carrying more fails a clean run, as every reused store with dead rows did before. Each
@@ -807,7 +807,7 @@ async def run_failover_load(
             notes.append(f"elected {leader.node_id} as the initial primary")
             await _await_port("127.0.0.1", ports.inbound_adt, timeout=15.0)
             opening = await _opening_stats(nodes, client)
-            carried = await _opening_dead_copies(nodes, client, opening)
+            carried = await _opening_dead_copies(nodes, client, opening, notes=notes)
 
             dispatcher.start()
             stop = asyncio.Event()
@@ -836,7 +836,7 @@ async def run_failover_load(
             notes.append(f"SIGKILLed primary {primary.node_id} at kill time")
             # Measure promotion + functional recovery in the BACKGROUND so a slow-but-successful recovery
             # (e.g. delivery that only resumes during the post-load drain) is MEASURED, not a false timeout.
-            monitor_deadline = 4.0 * fo.leader_lease_ttl_seconds + profile.drain_timeout_s + 30.0
+            monitor_deadline = _monitor_deadline(fo, profile.drain_timeout_s)
             monitor = asyncio.create_task(
                 _monitor_failover(primary, survivor, client, kill_ns, monitor_deadline, notes)
             )
@@ -850,7 +850,7 @@ async def run_failover_load(
                 await monitor
             )  # recovery was observed during the phase/drain (or hit the deadline)
             final, counters, held, dead_new = await _final_reads(
-                survivor, client, carried, metrics.counters, tracker
+                survivor, client, carried, metrics.counters, tracker, notes=notes
             )
             return _build_report(
                 profile,
@@ -1006,17 +1006,17 @@ def _build_report(
     intake_gap = max(0, c.sent - c.acked)
     if final.dead == 0:
         dead_new = 0
+    elif dead_new is None and dead_opening == 0:
+        dead_new = final.dead  # the store held none at the opening read, so every one is new
     dead_ok = dead_new == 0
     if not dead_ok:
         if dead_new is not None:
             why = f"{dead_new} of them new this run"
-        elif dead_opening:
-            why = (
-                f"the store held {dead_opening} at the opening read and the run could not tell "
-                "carried-over rows from new ones, so every one counts"
-            )
         else:
-            why = "the store held none at the opening read"
+            why = (
+                f"the store held {dead_opening} at the opening read and the per-copy check "
+                "judged nothing, so every one counts"
+            )
         notes.append(f"{final.dead} dead-lettered outbound row(s) at the end; {why}")
     if tracker.lanes_observed < 2:
         notes.append(
@@ -1055,7 +1055,8 @@ def _build_report(
         # fans out to several destinations, so fewer than two lanes means a lane key that collapsed
         # (MSH-6 not stamped, every destination on one label) or too few destinations reached. Zero
         # inversions then does not show per-destination order, so the check FAILS. The lane count is
-        # also its own named check, so a console line never reads FAIL with observed equal to its bar.
+        # also its own named check below, which names the cause: this line alone would read FAIL
+        # with observed equal to its bar.
         SloCheck(
             "per_lane_ordering",
             0,
@@ -1248,18 +1249,24 @@ async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> 
 
 
 async def _opening_dead_copies(
-    nodes: list[EngineNode], client: httpx.AsyncClient, opening: NodeStats
+    nodes: list[EngineNode],
+    client: httpx.AsyncClient,
+    opening: NodeStats,
+    *,
+    notes: list[str] | None = None,
 ) -> frozenset[DeadCopy] | None:
     """The dead copies the store already held before any load: the only rows the run may excuse
     (BACKLOG #5572). ``None`` when there are none, when no node gives a whole read, and when the read
     does not match the opening count, so that every excused copy is one the report counts in
-    ``dead_opening``; each way the dead-row check stays absolute. A store with no dead rows is never
-    listed, and nor is one past :data:`_DEAD_COPIES_MAX`, which no read could cover."""
+    ``dead_opening``; each way the dead-row check stays absolute, and each but the first says why
+    in ``notes``. A store with no dead rows is never listed, and nor is one past
+    :data:`_DEAD_COPIES_MAX`, which no read could cover."""
     if opening.dead == 0:
         return None
     if opening.dead > _DEAD_COPIES_MAX:
         _absolute(
-            f"{opening.dead} dead rows at the opening read, past the {_DEAD_COPIES_MAX} it reads"
+            notes,
+            f"{opening.dead} dead rows at the opening read, past the {_DEAD_COPIES_MAX} it reads",
         )
         return None
     for n in nodes:
@@ -1267,15 +1274,21 @@ async def _opening_dead_copies(
         if copies is not None:
             if len(copies) == opening.dead:
                 return copies
-            _absolute(f"{len(copies)} dead copies read at the opening, of {opening.dead} counted")
+            _absolute(
+                notes, f"{len(copies)} dead copies read at the opening, of {opening.dead} counted"
+            )
             return None
+    _absolute(notes, "no node gave a whole dead-letter read at the opening; the log says why")
     return None
 
 
-def _absolute(why: str) -> None:
-    """Log why the per-copy dead-row check judged nothing, so the run's dead rows all count. The
-    reason holds counts only, never a copy's id (BACKLOG #5572)."""
+def _absolute(notes: list[str] | None, why: str) -> None:
+    """Record why the per-copy dead-row check judged nothing, so the run's dead rows all count: in
+    the log, and in the report's notes. The reason holds counts only, never a copy's id (BACKLOG
+    #5572)."""
     log.warning("dead-row check stays absolute: %s", why)
+    if notes is not None:
+        notes.append(f"the per-copy dead-row check judged nothing: {why}")
 
 
 async def _final_reads(
@@ -1284,56 +1297,67 @@ async def _final_reads(
     carried: frozenset[DeadCopy] | None,
     counters: Counters,
     tracker: FailoverTracker,
+    *,
+    notes: list[str] | None = None,
 ) -> tuple[NodeStats, Counters, FailoverTracker, int | None]:
     """The final stats read, the harness counters and tracker at that moment, and
     :func:`_judge_new_dead`'s count.
 
     The stats read comes first, straight after the drain and the monitor, as it did before the
-    per-copy check existed, and the counters and the tracker are copied straight after it, with no
+    per-copy check existed, and the counters and the tracker are taken straight after it, with no
     await between. So every verdict the report draws from them sees the same moment it did then: a
     drain that had not finished by then still fails, and a delivery the sink records during the
-    dead-copy reads below counts for nothing (BACKLOG #5572).
+    dead-copy reads below counts for nothing (BACKLOG #5572). Where no read follows, the tracker is
+    returned as it is, since nothing can move it before the report reads it.
 
     Only then are the dead copies read, and only when there is something to excuse: a reused store
     whose opening copies were read whole, with dead rows at the end and no more of them than were
-    carried over (more means at least one is new, so the run fails unread). The copies are read twice, on
-    both sides of a second stats read, and judged only when the two reads are the same set, its size
-    is the dead count, and the second stats read matches the first in every count. Each later read
-    is skipped wherever its answer could not change that, so it spends no PHI-read budget for
-    nothing."""
+    carried over (more means at least one is new, so the run fails unread). The copies are read
+    twice, on both sides of a second stats read, and judged only when the two reads are the same
+    set, its size is the dead count, and the second stats read matches the first in every count.
+    Each later read is skipped wherever its answer could not change that, so it spends no PHI-read
+    budget for nothing. Every way it judges nothing is said in ``notes``."""
     final = await survivor.stats(client)
     if final is None:
         raise FailoverError("could not read the survivor's final /stats for reconciliation")
     snapshot = counters.snapshot()
-    held = copy.deepcopy(tracker)
     if not carried or final.dead == 0:
-        return final, snapshot, held, None
+        return final, snapshot, tracker, None
     if final.dead > len(carried):
         # At most every carried copy is still dead, so at least the difference is new and the run
-        # fails whatever the copies say: reading them would spend PHI-read budget on a settled verdict.
-        _absolute(f"{final.dead} dead rows at the end, more than the {len(carried)} carried over")
-        return final, snapshot, held, None
+        # fails whatever the copies say: reading them would spend PHI-read budget on a settled
+        # verdict.
+        _absolute(
+            notes,
+            f"{final.dead} dead rows at the end, more than the {len(carried)} carried over, so at "
+            f"least {final.dead - len(carried)} are new",
+        )
+        return final, snapshot, tracker, None
+    # Frozen before the first await, so a delivery during the reads below cannot reach the verdict.
+    held = copy.deepcopy(tracker)
     first = await survivor.dead_copies(client)
-    if first is None:  # dead_copies logged why
+    if first is None:
+        _absolute(notes, "the dead-letter read at the end was not whole; the log says why")
         return final, snapshot, held, None
     if len(first) != final.dead:
-        _absolute(f"{len(first)} dead copies read at the end, of {final.dead} counted")
+        _absolute(notes, f"{len(first)} dead copies read at the end, of {final.dead} counted")
         return final, snapshot, held, None
     try:
         again = await survivor.stats(client)
     except FailoverError as exc:
         # As in dead_copies: this read is optional, so a refused session judges nothing and does
         # not end a run whose verdict is already read.
-        _absolute(
-            f"the second stats read was refused: {escape_for_terminal(str(exc), single_line=True)}"
-        )
+        reason = escape_for_terminal(str(exc), single_line=True)
+        _absolute(notes, f"the second stats read was refused: {reason}")
         return final, snapshot, held, None
     if again != final:
-        _absolute("the counts moved across the dead-copy read")
+        _absolute(notes, "the counts moved across the dead-copy read")
         return final, snapshot, held, None
     second = await survivor.dead_copies(client)
-    if second is not None and second != first:
-        _absolute("the dead copies moved between the two reads")
+    if second is None:
+        _absolute(notes, "the second dead-letter read was not whole; the log says why")
+    elif second != first:
+        _absolute(notes, "the dead copies moved between the two reads")
     return final, snapshot, held, _judge_new_dead(carried, first, second, final.dead)
 
 
@@ -1360,6 +1384,18 @@ def _judge_new_dead(
     return len(second - opening)
 
 
+#: The monitor's deadline is this many lease TTLs, plus the drain timeout, plus a margin.
+_MONITOR_LEASE_MULTIPLE = 4.0
+_MONITOR_MARGIN_S = 30.0
+
+
+def _monitor_deadline(fo: Failover, drain_timeout_s: float) -> float:
+    """How long the failover monitor watches for promotion and recovery after the kill."""
+    return (
+        _MONITOR_LEASE_MULTIPLE * fo.leader_lease_ttl_seconds + drain_timeout_s + _MONITOR_MARGIN_S
+    )
+
+
 def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
     """Refuse a ``[load.failover]`` knob that is NaN or infinite, before anything starts (S26-62).
 
@@ -1378,8 +1414,8 @@ def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
         value = getattr(fo, f.name)
         if isinstance(value, float) and not math.isfinite(value):
             raise FailoverError(f"[load.failover] {f.name} must be a finite number, not {value}")
-    # 4 x the lease is the monitor's deadline term, the largest multiple of it the run computes.
-    for derived in (fo.recovery_ttl_multiple, 4.0):
+    # The monitor's lease multiple is the largest the run computes.
+    for derived in (fo.recovery_ttl_multiple, _MONITOR_LEASE_MULTIPLE):
         if not math.isfinite(derived * fo.leader_lease_ttl_seconds):
             raise FailoverError(
                 "[load.failover] leader_lease_ttl_seconds is too large: a bound computed from it "
@@ -1389,8 +1425,7 @@ def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
         raise FailoverError(
             f"[load] drain_timeout_s must be a finite number, not {drain_timeout_s}"
         )
-    # The monitor's deadline, as run_failover_load computes it.
-    if not math.isfinite(4.0 * fo.leader_lease_ttl_seconds + drain_timeout_s + 30.0):
+    if not math.isfinite(_monitor_deadline(fo, drain_timeout_s)):
         raise FailoverError(
             "[load] drain_timeout_s is too large: the monitor deadline computed from it is not a "
             "finite number"

@@ -343,7 +343,8 @@ integration tests:
   dead-letters from this run. On a store whose opening `/stats` already shows dead rows, the rig reads each
   dead outbound copy's `(outbox_id, failed_at)` from `/dead-letters` before the load and after the final
   `/stats` read, and fails the run on any copy not dead, unchanged, at the opening read; where it cannot read
-  those copies whole and consistent, every dead row at the end fails the run, as on a fresh store. The un-ACKed-at-kill window (`sent − acked`) is the expected MLLP reconnect gap — a real
+  those copies whole and consistent, every dead row at the end fails the run, as on a fresh store. The gated integration tests start
+  from an emptied store, so there they require no dead rows at all. The un-ACKed-at-kill window (`sent − acked`) is the expected MLLP reconnect gap — a real
   partner resends un-ACKed frames; the harness sender does not — so it is reported, **not** counted as loss.
 - **No split-brain** (`/cluster/status` never shows two primaries) and **bounded duplicates** (re-deliveries
   `= sink_received − engine done`, under `max_dup_rate` — a crash *expects* some at-least-once re-delivery).
