@@ -1815,6 +1815,11 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert in_use.levelno == logging.WARNING
     assert "[logging].forward_spool_dir" in in_use.getMessage()
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
+    # Moving a duplicate start of one service would strand its segments, so that case says stop.
+    assert "second start of the same service, stop the duplicate" in in_use.getMessage()
+    assert "would strand the segments already in it" in in_use.getMessage()
+    assert "as an absolute path" in in_use.getMessage()
+    assert in_use.getMessage().endswith(".")
     earlier.close()
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
