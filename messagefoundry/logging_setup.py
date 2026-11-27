@@ -2156,10 +2156,9 @@ _SPOOL_IN_USE_FACTS = (
     "restarts with a spool it can lock, the forwarder this WARNING belongs to has no on-disk spool "
     "and sends nothing from that directory. A spool directory's segments are sent only by a process "
     "that holds its lock, so a change to a process's spool directory can leave segments in its old "
-    "directory unsent. Processes whose spool directories resolve to one path share that directory. "
-    "For example, two engines that are not engine shards, whose store paths resolve into one "
-    "directory and whose [logging].forward_spool_dir is unset or empty, share one spool directory, "
-    "not only its root. "
+    "directory unsent. Two engines that are not engine shards share one spool directory, not only "
+    "its root, at least when their [logging].forward_spool_dir values resolve to one path, or are "
+    "both unset or empty and their store paths resolve into one directory. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 

@@ -1812,9 +1812,9 @@ _IN_USE_FACTS = (
     "process's spool directory can leave segments in its old directory unsent. "
     # The example is tied through ``__main__._forward_spool_dir`` by
     # ``test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory``.
-    "Processes whose spool directories resolve to one path share that directory. For example, two "
-    "engines that are not engine shards, whose store paths resolve into one directory and whose "
-    "[logging].forward_spool_dir is unset or empty, share one spool directory, not only its root. "
+    "Two engines that are not engine shards share one spool directory, not only its root, at least "
+    "when their [logging].forward_spool_dir values resolve to one path, or are both unset or empty "
+    "and their store paths resolve into one directory. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
@@ -1906,9 +1906,11 @@ def test_a_lock_fault_reads_as_in_use_and_claims_no_move_strands_nothing(
 def test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory(
     tmp_path: Path,
 ) -> None:
-    """The in-use WARNING's example: two engines that are not engine shards, with store paths in
-    one directory and ``[logging].forward_spool_dir`` unset or empty, resolve to one spool
-    directory, not only one root (BACKLOG #5400)."""
+    """The in-use WARNING's two cases: two engines that are not engine shards resolve to one spool
+    directory, not only one root, when their ``[logging].forward_spool_dir`` values are one path,
+    or when both are unset or empty and their store paths are in one directory (BACKLOG #5400).
+    That engine shards get a directory each is
+    ``test_supervisor_log_forwarding.test_no_shard_can_be_given_the_supervisor_spool_directory``."""
     from messagefoundry.__main__ import _forward_spool_dir
     from messagefoundry.config.settings import (
         LoggingSettings,
@@ -1934,9 +1936,12 @@ def test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory
     )
     assert default(tmp_path / "b.db", spool="") == beside_a  # empty reads as unset
     assert beside_a != default(tmp_path / "other" / "a.db")
-    # Engine shards of one store get a directory each, so the example names engines that are not.
-    shards = {default(tmp_path / "a.db", "1"), default(tmp_path / "a.db", "2"), beside_a}
-    assert len(shards) == 3
+    shared = str(tmp_path / "spool")
+    assert (
+        default(tmp_path / "a.db", spool=shared)
+        == default(tmp_path / "other" / "b.db", spool=shared)
+        == str(Path(shared) / "engine")
+    )
     postgres = {"backend": StoreBackend.POSTGRES, "server": "db", "database": "mf", "username": "u"}
     assert default(tmp_path / "a.db", **postgres) == beside_a
 
