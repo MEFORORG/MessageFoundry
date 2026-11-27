@@ -448,6 +448,40 @@ def _fault_reaches_no_reply(which: str, *, reply: str = PEEKED_REPLY) -> Contrac
     return case
 
 
+async def seal_outage_reaches_no_reply(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
+    """BACKLOG #5727: a key service that gave no verdict on one of the handoff's seals says nothing
+    about the token. It leaves the step as a QueueOpenFault with no chain to the raw key-service
+    error and no traceback frame holding the reply, and the token is retried."""
+    needles = (PEEKED_REPLY, *PEEKED_VALUES)
+    mid = await captured(store, control="SO-HEAD", now=1.0, reply=PEEKED_REPLY)
+    item = await store.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+    assert item is not None and item.message_id == mid
+    step = runner(store)
+    real_handoff = store.ingress_handoff
+    with faulting_cipher(store) as fault:
+
+        async def armed_handoff(**kwargs: Any) -> bool:
+            fault.seal_error = CipherUnavailableError("synthetic")  # after the step's own read
+            produced: bool = await real_handoff(**kwargs)
+            return produced
+
+        store.ingress_handoff = armed_handoff
+        try:
+            with pytest.raises(QueueOpenFault) as caught:
+                await step._process_response_item(LOOP, item)
+        finally:
+            del store.ingress_handoff
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+        walked, holding = _engine_frames_holding(caught.value, needles)
+        assert "_process_response_item" in walked
+        assert holding == []
+        await _assert_token_live(store, fetch, mid)
+        # CONTROL: the same token re-ingresses once the fault clears.
+        fault.heal()
+        await step._process_response_item(LOOP, item)
+    assert len(await children(fetch)) == 1
+
+
 #: Retries of the same token under one outage, each of which opens the faulting cell again.
 OUTAGE_RETRIES = 3
 
@@ -557,6 +591,7 @@ HANDOFF_CASES: list[ContractCase] = [
     _fault_reaches_no_reply("ref", reply=REFUSED_REPLY),
     _fault_reaches_no_reply("reply", reply=REFUSED_REPLY),
     _fault_reaches_no_reply("metadata", reply=REFUSED_REPLY),
+    seal_outage_reaches_no_reply,
     _outage_open_leaves_the_loop("worker_ref"),
     _outage_open_leaves_the_loop("worker_reply"),
     _outage_open_leaves_the_loop("ref"),

@@ -6578,6 +6578,7 @@ class PostgresStore(ServerCipherWalk):
         tag_failures: list[CellTagError] = []
         # BACKLOG #5982: reported after the transaction.
         queue_tag_rows: list[tuple[Any, QueueTagError]] = []
+        seal_fault: QueueOpenFault | None = None
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction(isolation=_FINALIZE_ISOLATION):
@@ -6922,6 +6923,12 @@ class PostgresStore(ServerCipherWalk):
             # the response worker's next claim is itself fenced — so there is no hot spin.
             await self._after_fenced_write(exc)
             return False
+        except CipherError as exc:
+            # BACKLOG #5727: a seal the key service gave no verdict on is retried as a
+            # QueueOpenFault, raised below, outside this handler, as on SQLite.
+            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+                raise
+            seal_fault = queue_open_fault(exc)
         finally:
             # BACKLOG #2593: after the transaction, never inside it.
             await report_cell_tag_failures(self, tag_failures)
@@ -6929,6 +6936,8 @@ class PostgresStore(ServerCipherWalk):
                 await report_queue_tag_failure(
                     self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
+        if seal_fault is not None:
+            raise seal_fault
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:

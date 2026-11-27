@@ -9876,12 +9876,19 @@ class SqlServerStore(ServerCipherWalk):
                 tag_failures=tag_failures,
                 queue_tag_rows=queue_tag_rows,
             )
+        except CipherError as exc:
+            # BACKLOG #5727: a seal the key service gave no verdict on is retried as a
+            # QueueOpenFault, raised below, outside this handler, as on SQLite.
+            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+                raise
+            seal_fault: QueueOpenFault = queue_open_fault(exc)
         finally:
             await report_cell_tag_failures(self, tag_failures)
             for row, error in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
                 await report_queue_tag_failure(
                     self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
+        raise seal_fault
 
     async def _ingress_handoff_txn(
         self,
