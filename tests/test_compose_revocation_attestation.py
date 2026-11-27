@@ -309,8 +309,9 @@ def test_every_required_substitution_names_the_same_sources() -> None:
 # pins, rather than restating where substitution reads.
 _SECRETS_EXAMPLE = _COMPOSE.parent / "secrets.env.example"
 _STORE_PASSWORD = "MEFOR_STORE_PASSWORD"
-#: Every ha service that logs in to the Postgres store (tests/test_b622_5827_compose_ha_store_tls.py).
-_HA_STORE_USERS = ("schema-provision", "engine-ha", "engine-standby")
+_README = _COMPOSE.parent / "README.md"
+#: Positive control: at least these ha services log in to the Postgres store.
+_HA_STORE_USERS = frozenset({"schema-provision", "engine-ha", "engine-standby"})
 
 
 @functools.cache
@@ -349,7 +350,9 @@ def test_the_ha_profile_reads_the_store_password_from_two_sources() -> None:
     services = _all_services()
     m = _SUBSTITUTION.fullmatch(str(_env(services["postgres"])["POSTGRES_PASSWORD"]))
     assert m and m["var"] == _STORE_PASSWORD
-    for name in _HA_STORE_USERS:
+    users = {n for n, s in services.items() if _env(s).get("MEFOR_STORE_BACKEND") == "postgres"}
+    assert users >= _HA_STORE_USERS, users
+    for name in sorted(users):
         svc = services[name]
         assert "./secrets.env" in _env_file_paths(svc), name
         # An environment: entry would override the env_file, leaving one source, not two.
@@ -361,8 +364,20 @@ def test_the_store_password_note_names_the_ha_image_and_points_at_the_substituti
     image = str(_all_services()["engine-ha"]["image"])
     # Parenthesised, so a shorter tag that is a prefix of the note's does not match.
     assert f"({image})" in note, f"the {_STORE_PASSWORD} note does not name {image}"
-    for phrase in ("SUBSTITUTION", "does NOT feed", "POSTGRES_PASSWORD", "docker/README.md"):
+    for phrase in (
+        "SUBSTITUTION",
+        "does NOT feed",
+        "with or without --profile ha",
+        "POSTGRES_PASSWORD",
+        "docker/README.md, topology (A)",
+    ):
         assert phrase in note, f"the {_STORE_PASSWORD} note omits {phrase!r}"
+    # The pointer lands: README's topology (A) bullet is the one that names both sources.
+    [bullet] = [
+        b for b in _README.read_text(encoding="utf-8").split("\n- ") if b.startswith("**(A)")
+    ]
+    for phrase in ("env_file:", "--env-file", "secrets.env"):
+        assert phrase in bullet, f"README topology (A) omits {phrase!r}"
 
 
 # --- the k8s manifests (BACKLOG #5400 item 1) ----------------------------------------------------
