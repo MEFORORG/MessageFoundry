@@ -6,10 +6,12 @@
 // G1-G4 in ai-policy-model.test.ts, added with the allow-list, already cover most unrecognized and
 // non-string modes. This file exists because that one cannot compile against the source before the
 // allow-list (it imports `narrowMode` and later symbols), so no run of it there can fail as an
-// assertion. These cases name only what aiPolicyModel.ts exported before the allow-list
-// (`assistantState`, `mergeAuthoritativePolicy`, `cachedPolicyOffline`), so they run against that
-// earlier source too. They add an absent `mode` key, near-miss spellings, more non-string values, and
-// managed_endpoint with a retained ai:assist deny, which no earlier test built.
+// assertion. These cases import only `assistantState`, `mergeAuthoritativePolicy`,
+// `cachedPolicyOffline`, `CACHED_PERMIT_MAX_AGE_MS` and the `AiPolicy` type, all exported before the
+// allow-list, so they run against that earlier source too. They add an absent `mode` key, near-miss
+// spellings, more non-string values, and managed_endpoint with a retained ai:assist deny, which no
+// earlier test built through the merge. Some cases repeat G1-G3 on purpose, so the pre-allow-list
+// run covers them too.
 // Zero-import model, so this runs node-side on every ide leg.
 import * as assert from "assert";
 
@@ -74,7 +76,13 @@ suite("assistantState: a mode outside the allow-list disables assistance (BACKLO
   }
 
   test("M-unknown via the merge: a fresh answer in an unknown mode disables, whatever was cached", () => {
-    const cachedChoices = [null, policy({ assistPermitted: true }), policy({ mode: "managed_endpoint", assistPermitted: true })];
+    const cachedChoices = [
+      null,
+      policy({ assistPermitted: true }),
+      policy({ mode: "managed_endpoint", assistPermitted: true }),
+      policy({ assistPermitted: false }),
+      policy({ mode: "off" }),
+    ];
     for (const cached of cachedChoices) {
       for (const ap of PERMITTING) {
         const merged = mergeAuthoritativePolicy(cached, withMode("managed_future", ap));
@@ -84,7 +92,9 @@ suite("assistantState: a mode outside the allow-list disables assistance (BACKLO
   });
 
   test("M-unknown offline: a cached answer in an unknown mode disables, fresh or old", () => {
-    // Fresh is an age of 0 ms; old is ten times the bound, so both branches of cachedPolicyOffline run.
+    // Fresh is an age of 0 ms; old is ten times the bound. Where the gate disables the mode, as on the
+    // allow-list, cachedPolicyOffline returns it before the age is read, so the old arm adds detection
+    // only where the gate would enable the mode and the age bound is what disables it.
     for (const now of [CACHED_AT, CACHED_AT + 10 * CACHED_PERMIT_MAX_AGE_MS]) {
       const cached = { ...withMode("managed_future", true), cachedAt: CACHED_AT };
       assert.strictEqual(assistantState(cachedPolicyOffline(cached, now)).enabled, false, `now=${now}`);

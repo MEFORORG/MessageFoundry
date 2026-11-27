@@ -11,9 +11,11 @@
 // cannot compile against that earlier source (it imports `aiPolicyCacheKey`); this file runs
 // node-side, on every ide leg, and skips in the Extension Host, which resolves the real `vscode`.
 //
-// What each test pins on main: K-A1 pins the per-engine key alone. K-B1 and K-B2 pass on main
-// through either the per-engine key or the deny carrier, so a change that shared only the cache
-// would leave them green; against the single unscoped key before both, they fail.
+// What each test pins on main: all three go red if aiPolicyCacheKey gives every engine one key,
+// since the deny carrier names its issuer by that key too. A change that shared only the stored
+// cache entry, keeping the carrier's issuer per engine, turns K-A1 red and leaves K-B1 and K-B2
+// green, as the carrier still holds B's deny. Against the single unscoped key before both, all three
+// fail.
 import * as assert from "assert";
 import * as path from "node:path";
 
@@ -27,20 +29,10 @@ const ENGINE_B = "http://127.0.0.1:9876";
 /** A fixed clock, so a cached permit is never too old to stand and the age bound decides nothing. */
 const NOW = 1_800_000_000_000;
 
-const vscodeStub = {
-  workspace: {
-    workspaceFolders: undefined,
-    isTrusted: true,
-    getConfiguration: () => ({ get: (_key: string, fallback: unknown): unknown => fallback, inspect: () => undefined }),
-  },
-  window: {
-    showErrorMessage: (): Promise<undefined> => Promise.resolve(undefined),
-    showWarningMessage: (): Promise<undefined> => Promise.resolve(undefined),
-    showInformationMessage: (): Promise<undefined> => Promise.resolve(undefined),
-  },
-  env: { openExternal: (): Promise<boolean> => Promise.resolve(false) },
-  Uri: { parse: (v: string): string => v },
-};
+// Empty on purpose: loading the modules touches no vscode member, and the injected IO means the
+// resolve does not either. A later change that reads vscode on this path then throws here, rather
+// than reading a stubbed fallback.
+const vscodeStub = {};
 
 interface Loader {
   _load(request: string, parent: unknown, isMain: boolean): unknown;
