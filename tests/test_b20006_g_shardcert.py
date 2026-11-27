@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import sys
 import time
 import types
 from pathlib import Path
@@ -162,7 +163,8 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """The two-box test's offline fakes, two engine shards of one lane each, with every node's lifecycle
     logged as ``(event, node index)`` in ``rec.events``. ``rec.fail_start`` names the engine shards, or
     the node indexes, whose start raises; ``rec.kill_fails`` the engine shards whose ``kill()`` fails
-    silently, as ``EngineNode.kill`` can. ``rec.kill_times`` and ``rec.submit_times`` hold the monotonic
+    silently, as ``EngineNode.kill`` can; ``rec.already_exited`` those whose process had exited on its
+    own before the kill. ``rec.kill_times`` and ``rec.submit_times`` hold the monotonic
     instants of each kill and each message offered; ``rec.stall_first_submit`` blocks the event loop
     for that many seconds on the first message, as a stalled loop would."""
     monkeypatch.setenv("MEFOR_SHARDCERT_SHARDS", "a,b")
@@ -174,13 +176,13 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     rec.events = []
     rec.fail_start = set()
     rec.kill_fails = set()
+    rec.already_exited = set()
     rec.kill_times = []
     rec.submit_times = []
     rec.stall_first_submit = 0.0
     base: Any = sc.ShardCertNode
-    base_conn: Any = vars(sc)[
-        "PersistentConnection"
-    ]  # the fixture's fake, which the module now names
+    # The fixture's fake, which the module now names.
+    base_conn: Any = vars(sc)["PersistentConnection"]
 
     class Node(base):  # type: ignore[misc]
         """Logs start/kill/stop and, under MEFOR_BENCH_KEEP_NODE_LOGS, keeps a log the way EngineNode
@@ -206,7 +208,13 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
         def kill(self) -> None:
             rec.kill_times.append(time.monotonic())
             rec.events.append(("kill", self.index))
-            if self.shard not in rec.kill_fails:
+            if self.shard in rec.already_exited:
+                self.kill_calls += (
+                    1  # gone already: kill() finds nothing running, and it stays gone
+                )
+            elif self.shard in rec.kill_fails:
+                self.killed_while_running = True  # running, and the kill silently missed it
+            else:
                 super().kill()
 
         async def stop(self) -> None:
@@ -316,6 +324,7 @@ async def test_engine_clears_a_stale_setup_failure_before_it_checks_the_kill_leg
     started after this run began never reads it as this run's."""
     coord = FileDropCoord(tmp_path, run_id="stale")
     coord.post(sc.ENGINE_SETUP_FAILED, {"reason": "an earlier run"})
+    assert coord.read(sc.ENGINE_SETUP_FAILED) is not None  # control: the stale refusal is readable
     seen: list[object] = []
     real_discover = sc._discover
 
@@ -397,9 +406,9 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     before the deadline and the next is past the hold, so before the fix the loop ended unkilled, the
     restart started over the live engine shard, and the report still named it killed. The tick now wakes at
     the kill instant."""
-    monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 0.6)
+    monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 1.5)
     rep = await sc.run_shardcert(
-        **_sizes(aggregate_rate=1.0, hold_seconds=0.4, kill=True, kill_at_fraction=0.25)
+        **_sizes(aggregate_rate=1.0, hold_seconds=1.0, kill=True, kill_at_fraction=0.1)
     )
     killed = [i for ev, i in fleet.events if ev == "kill"]
     assert len(killed) == 1
@@ -408,8 +417,9 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     assert fleet.events.index(("kill", killed[0])) < fleet.events.index(("start", restart.index))
     assert rep.recovery_seconds is not None
     # Inside the hold: the first message is offered as the hold starts and the kill is due 0.1 s after it,
-    # while a tick that slept to its own next wake would not come back before 0.6 s, past the 0.4 s hold.
-    assert _kill_offset(fleet) < 0.4
+    # while a tick that slept to its own next wake (the next message, due at 1 s) would come back only at
+    # the end of the 1 s hold. The 0.9 s between leaves room for a loaded runner.
+    assert _kill_offset(fleet) < 1.0
 
 
 def _kill_offset(rec: types.SimpleNamespace) -> float:
@@ -484,6 +494,47 @@ async def test_colocated_kill_that_did_not_take_effect_fails_the_run(
         await sc.run_shardcert(**_sizes(kill=True, kill_at_fraction=0.3))
     assert len(fleet.nodes) == 2  # nothing was restarted over the live engine shard
     assert [n.stops for n in fleet.nodes] == [1, 1]  # the teardown stopped it, not the restart
+
+
+async def test_colocated_kill_of_an_engine_shard_that_had_already_exited_fails_the_run(
+    fleet: types.SimpleNamespace,
+) -> None:
+    """BACKLOG #5440: an engine shard that crashed on its own before the kill made kill() a no-op, and the
+    run certified a recovery from a crash the rig never caused."""
+    fleet.already_exited.update({"a", "b"})
+    with pytest.raises(RuntimeError, match="had already exited"):
+        await sc.run_shardcert(**_sizes(kill=True, kill_at_fraction=0.3))
+    assert len(fleet.nodes) == 2
+    assert [n.stops for n in fleet.nodes] == [1, 1]
+
+
+class _SleeperNode(sc.ShardCertNode):
+    """The real ShardCertNode, over a sleeping interpreter instead of ``serve`` (the ``_exec`` seam)."""
+
+    async def _exec(self, *argv: str) -> asyncio.subprocess.Process:
+        return await super()._exec(sys.executable, "-c", "import time; time.sleep(60)")
+
+
+async def test_real_node_wait_exited_sees_the_kill_and_only_the_kill(tmp_path: Path) -> None:
+    """The real kill-took-effect check, not the fakes': a running node is not read as exited, a killed one
+    is, and the kill records that the process was running when it came."""
+    unstarted = _SleeperNode("u", 1, env={}, config_dir=str(tmp_path), cwd=tmp_path)
+    try:
+        assert await unstarted.wait_exited(0.1) is False
+    finally:
+        await unstarted.stop()
+    node = _SleeperNode("a", 1, env={}, config_dir=str(tmp_path), cwd=tmp_path)
+    try:
+        await node.start(provision=False)
+        assert node.killed_while_running is False
+        assert await node.wait_exited(0.3) is False  # control: still running
+        node.kill()
+        assert node.killed_while_running is True
+        assert await node.wait_exited(10.0) is True
+        node.kill()  # a second kill finds it gone
+        assert node.killed_while_running is False
+    finally:
+        await node.stop()
 
 
 async def test_engine_kill_that_did_not_take_effect_fails_the_run(

@@ -947,14 +947,25 @@ class ShardCertNode(EngineNode):
             *_insecure_bind_args(self._env),
         )
 
-    async def wait_exited(self, timeout: float) -> bool:
-        """True once this node's ``serve`` process has exited, waiting at most ``timeout`` seconds. False
-        if it is still running then, or was never started.
+    #: Whether the process was still running when :meth:`kill` was last called. False until then, so a
+    #: node the rig never killed, or one that had already exited, is never read as a crash the rig caused.
+    killed_while_running = False
 
-        The kill leg's proof that :meth:`kill` took effect (BACKLOG #5440). ``kill()`` is silent when it
-        fails: ``terminate_job`` ignores a failed ``TerminateJobObject``, and a ``PermissionError`` from
-        the root's own kill is suppressed. :meth:`stop` would then shut the live process down GRACEFULLY,
-        and the run would certify that graceful stop as crash recovery."""
+    def kill(self) -> None:
+        self.killed_while_running = self.alive
+        super().kill()
+
+    async def wait_exited(self, timeout: float) -> bool:
+        """True once this node's root process has exited, waiting at most ``timeout`` seconds. False if
+        it is still running then, or was never started. On Windows the root is the venv launcher where
+        there is one, and ending it ends the interpreter under it (measured in
+        ``tests/test_engine_node_process_tree.py``).
+
+        The kill leg's check that :meth:`kill` took effect (BACKLOG #5440). ``kill()`` reports nothing:
+        ``terminate_job`` ignores a failed ``TerminateJobObject``, and a ``PermissionError`` from the
+        root's own kill is suppressed. So the effect is checked rather than the call trusted; otherwise
+        :meth:`stop` would shut a live process down GRACEFULLY, and the run would certify that graceful
+        stop as crash recovery."""
         proc = self._proc
         if proc is None:
             return False
@@ -3285,12 +3296,20 @@ async def _restart_killed(
     silently (:meth:`ShardCertNode.wait_exited`), and ``stop()`` would then end the live process
     gracefully, so a recovery timed after it would certify a graceful stop as crash recovery. A process
     still running :data:`_KILL_EXIT_TIMEOUT` seconds on fails the run; it stays in ``nodes``, so the
-    caller's teardown stops it.
+    caller's teardown stops it. So does a process that had already exited when it was killed: the rig
+    caused no crash then.
 
     The caller's ``recovery_seconds`` runs from the kill instant to the restart's health, so it includes
     this wait for the exit, the old node's ``stop()`` (on a process already gone, the log close and the job
     teardown) and the restart's start, besides what the caller itself spends before calling this."""
     old = nodes[killed]
+    if not old.killed_while_running:
+        # It exited on its own before the kill (an engine crash the rig did not cause), so kill() was a
+        # no-op and a recovery timed from it would be credited to a crash the rig never made.
+        raise RuntimeError(
+            f"engine shard {killed} had already exited when the kill leg killed it, so the rig caused no "
+            "crash and no crash recovery can be certified"
+        )
     if not await old.wait_exited(_KILL_EXIT_TIMEOUT):
         raise RuntimeError(
             f"the kill of engine shard {killed} did not take effect: its process was still running when "
@@ -3995,20 +4014,25 @@ async def run_shardcert_engine(
             )
         await asyncio.sleep(post_drain_grace)
     finally:
-        if kill_task is not None and not kill_task.done():
-            kill_task.cancel()
+        # Cancelled first, so the timer cannot fire on a node being stopped; awaited only after the stops,
+        # so a cancel of THIS task that arrives during that wait cannot leave the fleet running.
+        pending_kill = kill_task if kill_task is not None and not kill_task.done() else None
+        if pending_kill is not None:
+            pending_kill.cancel()
+        for node in nodes.values():
+            with contextlib.suppress(Exception):
+                await node.stop()
+        if pending_kill is not None:
             # Swallow only the timer's own CancelledError (R11): a cancel of THIS task that arrives while it
             # waits here raises the cancelling() count, and that one propagates.
             me = asyncio.current_task()
             cancels = me.cancelling() if me is not None else 0
             try:
-                await kill_task
+                await pending_kill
             except asyncio.CancelledError:
                 if me is not None and me.cancelling() > cancels:
                     raise
-        for node in nodes.values():
-            with contextlib.suppress(Exception):
-                await node.stop()
+                _log.info("cancelled the pending kill timer of engine shard %s in teardown", killed)
 
     return ShardCertEngineReport(
         shards=tuple(ids_list),
