@@ -111,7 +111,8 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
             open_queue_cell(cipher, {**row, "payload": payload})
         assert not corrupt.value.drift
         assert isinstance(corrupt.value, QueueTagError)  # still contained as one
-        assert cause not in str(corrupt.value) and corrupt.value.__cause__ is None
+        assert cause not in str(corrupt.value)
+        assert corrupt.value.__cause__ is None and corrupt.value.__context__ is None
 
 
 def test_a_corrupt_payload_keeps_its_audit_and_alert_naming_no_payload(

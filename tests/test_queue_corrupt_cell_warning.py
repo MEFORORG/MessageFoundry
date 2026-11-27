@@ -77,12 +77,19 @@ def test_a_corrupt_cell_alert_warns_without_the_ciphers_text(
     with pytest.raises(CorruptQueueCellError) as corrupt:
         open_queue_cell(cipher, {**row, "payload": _bad_base64(sealed)})
 
-    alert_queue_tag_failure(cipher, row, error=corrupt.value, outcome="the read was refused")
+    # The real refusal, and one built WITH the cipher's words, so the report itself is guarded:
+    # the real one holds none of them, and a report that printed its error would pass on it.
+    planted = CorruptQueueCellError("corrupt (malformed ciphertext (bad base64, key_id='ab'))")
+    for error in (corrupt.value, planted):
+        caplog.clear()
+        seen.clear()
+        alert_queue_tag_failure(cipher, row, error=error, outcome="the read was refused")
 
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warned) == 1 and "is corrupt" in warned[0] and "row-5982-cor" in warned[0], warned
-    assert _cipher_texts(caplog.records) == []  # at any level, DEBUG included
-    assert len(seen) == 1 and not any(word in seen[0] for word in _CIPHER_WORDS), seen
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warned) == 1 and "is corrupt" in warned[0], warned
+        assert "row-5982-cor" in warned[0], warned
+        assert _cipher_texts(caplog.records) == []  # at any level, DEBUG included
+        assert len(seen) == 1 and not any(word in seen[0] for word in _CIPHER_WORDS), seen
 
 
 def _refused_row(cipher: AesGcmCipher, kind: str) -> dict[str, Any]:
@@ -147,7 +154,8 @@ async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
                 break
             await asyncio.sleep(0.01)
         assert server.started
-        async with httpx.AsyncClient() as client:
+        # Loopback only, never through a proxy the runner's environment names.
+        async with httpx.AsyncClient(trust_env=False) as client:
             answer = await client.get(f"http://127.0.0.1:{port}/read")
     finally:
         server.should_exit = True
