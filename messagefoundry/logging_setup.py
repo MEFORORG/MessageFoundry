@@ -2150,6 +2150,12 @@ def _warn_leftover_segments(spool_dir: str, why: str) -> None:
         )
 
 
+_SPOOL_IN_USE_REMEDY = (
+    ". If another process shares this directory, give each process its own "
+    "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
+)
+
+
 def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     """The opened on-disk spool for ``forward``, or ``None`` when it has none or cannot use it.
 
@@ -2168,7 +2174,14 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     try:
         spool.open()
     except SpoolUnavailable as exc:
-        _log.warning("%s; off-box log forwarding runs without an on-disk spool", exc)
+        # Only the in-use case names the remedy: a directory of its own does not cure an unusable
+        # one. Keying the default directory by HA node id was declined instead (BACKLOG #5400),
+        # because an unset node id is new on every start and would strand the last run's records.
+        _log.warning(
+            "%s; off-box log forwarding runs without an on-disk spool%s",
+            exc,
+            _SPOOL_IN_USE_REMEDY if exc.in_use else "",
+        )
         if not exc.in_use:  # the process that holds it sends what it holds
             _warn_leftover_segments(forward.spool_dir, "the on-disk log spool could not be opened")
         return None
