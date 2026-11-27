@@ -18,12 +18,23 @@ integration test), matching the house style of ``test_dependabot_automerge_guard
 from __future__ import annotations
 
 import ast
+import functools
+import hashlib
+import json
+import os
+import pprint
 import re
+import shutil
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from tests._workflow_contexts import load_workflow
+import pytest
+
+from tests._bash_resolver import require_bash
+from tests._workflow_contexts import jobs_of, load_workflow, needs_of
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOWS = _ROOT / ".github" / "workflows"
@@ -45,17 +56,22 @@ _REGENERATOR = "python3 scripts/security/runtime_closure.py"
 _EXPORT_RE = re.compile(r"^\s*uv export\s+(?P<flags>.*?)\s+-o\s+(?P<path>\S+)\s*$", re.MULTILINE)
 # The gate's own verification list.
 _DIFF_EXIT_RE = re.compile(r"^\s*git diff --exit-code --\s+(?P<paths>.+?)\s*$", re.MULTILINE)
-# The resync's "nothing changed, skip the push" short-circuit (inside `if ...; then`).
+# The resync's "nothing changed, skip the push" compare. It compares the index, which the staging
+# step writes by content, with HEAD, and keeps its exit code so that a failed compare is not read as
+# a change (BACKLOG #5477).
 _DIFF_QUIET_RE = re.compile(
-    r"^\s*if git diff --quiet --\s+(?P<paths>.+?);\s*then\s*$", re.MULTILINE
+    r"^\s*git diff --cached --quiet --\s+(?P<paths>.+?)\s*\|\|\s*diff_rc=\$\?\s*$", re.MULTILINE
 )
-# The resync's staging list.
-_GIT_ADD_RE = re.compile(r"^\s*git add\s+(?P<paths>.+?)\s*$", re.MULTILINE)
+
+
+@functools.cache
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
 def _exports(path: Path) -> dict[str, str]:
     """Map each exported lock path to the exact flag string that produces it."""
-    text = path.read_text(encoding="utf-8")
+    text = _text(path)
     found: dict[str, str] = {}
     for match in _EXPORT_RE.finditer(text):
         target = match.group("path")
@@ -76,7 +92,7 @@ def _exports(path: Path) -> dict[str, str]:
 
 
 def _paths(pattern: re.Pattern[str], path: Path) -> tuple[str, ...]:
-    text = path.read_text(encoding="utf-8")
+    text = _text(path)
     matches = pattern.findall(text)
     assert matches, f"no match for {pattern.pattern!r} in {path.name}"
     # SAME RULE AS `_exports`: repeats are fine while they agree. The verification list is duplicated
@@ -122,12 +138,22 @@ def test_every_exported_lock_is_verified_and_staged() -> None:
     staged = exported | _CLOSURES
     assert set(_paths(_DIFF_EXIT_RE, _GATE)) == exported, "DEP-1 exports a lock it never diffs"
     assert set(_paths(_DIFF_QUIET_RE, _RESYNC)) == staged, (
-        "the resync's `git diff --quiet` short-circuit omits an exported lock or a closure file "
-        "-- it would report 'already in sync' and skip the push while that file is stale"
+        "the resync's `git diff --cached --quiet` short-circuit omits an exported lock or a closure "
+        "file -- it would report 'already in sync' and skip the push while that file is stale"
     )
-    assert set(_paths(_GIT_ADD_RE, _RESYNC)) == staged, (
-        "the resync writes a file it never `git add`s -- the push would carry an incomplete set"
-    )
+    # The staging step's list is checked against the same set in
+    # test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set. A `git add` after it would
+    # stage the PR head's working-tree bytes back over the staged content.
+    porcelain = re.compile(r"\bgit\s+(?:add|stage|commit)(?![\w-])")
+    assert porcelain.search("git commit -a -m x") and porcelain.search("git stage x")
+    assert not porcelain.search('git commit-tree "${tree}"')
+    every_step = _all_steps()
+    assert len(every_step) >= 10, f"the resync parsed to {len(every_step)} steps"
+    assert {job for job, _ in every_step} == set(_JOB_IDS), "a resync job contributed no steps"
+    adders = [
+        (job, step.get("name")) for job, step in every_step if porcelain.search(_executed_run(step))
+    ]
+    assert not adders, f"the resync stages or commits from the working tree: {adders}"
 
 
 def test_the_resync_regenerates_the_closure_file() -> None:
@@ -143,40 +169,52 @@ def test_the_resync_regenerates_the_closure_file() -> None:
     stale lock. It runs before the commit step, or its output is never pushed. It may not block the
     commit, or one closure problem strands every re-exported lock. A later step must still fail the
     run when it fails.
+
+    The export and the rewrite run in the secretless ``export`` job and the commit in the ``push``
+    job (BACKLOG #5477), so the rewrite's outcome crosses as an ``export`` job output that a step
+    after the commit reads.
     """
-    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
+    steps = _job_steps("export")
     names = [str(step.get("name", "")) for step in steps]
 
-    def index_of(needle: str) -> int:
-        found = [i for i, step in enumerate(steps) if needle in str(step.get("run", ""))]
-        assert len(found) == 1, f"expected one resync step running {needle!r}, found {found}"
+    def index_of(needle: str, where: list[dict[str, Any]]) -> int:
+        found = [i for i, step in enumerate(where) if needle in _executed_run(step)]
+        assert len(found) == 1, f"expected one step running {needle!r}, found {found}"
         return found[0]
 
     export = max(
-        index_of("-o docker/locks/requirements-core.lock"),
-        index_of("-o docker/locks/requirements-sqlserver.lock"),
-        index_of("-o security/locks/requirements-harness.lock"),
+        index_of("-o docker/locks/requirements-core.lock", steps),
+        index_of("-o docker/locks/requirements-sqlserver.lock", steps),
+        index_of("-o security/locks/requirements-harness.lock", steps),
     )
-    regen = index_of(_REGENERATOR)
-    commit = index_of("git commit")
-    assert export < regen < commit, (
-        f"the closure rewrite must sit between the export and the commit steps: {names}"
+    regen = index_of(_REGENERATOR, steps)
+    handoff = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith(_UPLOAD)]
+    assert len(handoff) == 1, f"expected one artifact upload in the export job: {names}"
+    assert export < regen < handoff[0], (
+        f"the closure rewrite must sit between the export and the artifact upload: {names}"
     )
     step = steps[regen]
     # With no arguments the script rewrites every closure pair. Naming one would silently leave the
     # others stale on every Dependabot PR (BACKLOG #1955).
-    calls = [ln.strip() for ln in str(step["run"]).splitlines() if "runtime_closure.py" in ln]
+    calls = [ln.strip() for ln in _executed_run(step).splitlines() if "runtime_closure.py" in ln]
     assert calls == [_REGENERATOR], f"the resync must run {_REGENERATOR!r} bare, found {calls}"
     assert step.get("continue-on-error") is True, (
         "the closure rewrite must not block the commit step, or its failure strands the locks"
     )
     step_id = step.get("id")
     assert step_id, "the closure rewrite step needs an id, so a later step can read its outcome"
+    outputs = _job("export").get("outputs") or {}
+    output = [k for k, v in outputs.items() if str(v) == f"${{{{ steps.{step_id}.outcome }}}}"]
+    assert len(output) == 1, f"the export job must output the closure step's outcome: {outputs}"
+    push = _job_steps("push")
+    commits = [i for i, s in enumerate(push) if _COMMITS.search(_executed_run(s))]
+    assert len(commits) == 1, f"expected one push job step that commits, found {commits}"
+    commit = commits[0]
     failing = [
         s
-        for s in steps[commit + 1 :]
-        if f"steps.{step_id}.outcome == 'failure'" in str(s.get("if", ""))
-        and "exit 1" in str(s.get("run", ""))
+        for s in push[commit + 1 :]
+        if str(s.get("if", "")).strip() == f"needs.export.outputs.{output[0]} == 'failure'"
+        and re.search(r"^\s*exit 1\s*$", _executed_run(s), re.MULTILINE)
     ]
     assert failing, "no step after the commit fails the run when the closure rewrite fails"
     script = _ROOT / _REGENERATOR.split()[1]
@@ -187,11 +225,16 @@ def test_the_resync_checks_out_the_triggering_sha() -> None:
     """RED when: the resync checks out the moving branch tip instead of the triggering SHA.
 
     The closure step runs a repository script from this checkout. Pinned to the SHA, a commit
-    pushed after the trigger never runs, and the push is refused if the branch has moved.
+    pushed after the trigger never runs, and the push is refused if the branch has moved. The export
+    and push jobs each check out, and both must take the same SHA, or the push job would commit the
+    export job's files over a different tree.
     """
     checkouts = _steps_using("actions/checkout@")
-    assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
-    assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    assert [job for job, _ in checkouts] == ["export", "push"], (
+        f"expected one checkout in each of export and push, found {checkouts}"
+    )
+    for job, step in checkouts:
+        assert step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}", job
 
 
 def test_the_regenerator_imports_only_the_standard_library() -> None:
@@ -270,36 +313,173 @@ def test_release_tools_lock_is_in_the_set() -> None:
 def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
     """The zizmor ``bot-conditions`` suppression is sound only while clause 1 is present.
 
-    zizmor flags ``github.triggering_actor`` in this job's ``if:``. That is safe ONLY because it is
-    conjoined with the immutable PR-author check: a conjunction can only narrow, so a spoofed actor
-    makes the job skip, never run. Drop clause 1 -- or turn the ``&&`` into ``||`` -- and the residual
-    actor check becomes a SOLE gate, the exploitable shape. ``.github/zizmor.yml``'s bot-conditions
-    entry asserts that shape is absent; this is what makes the assertion true rather than asserted.
+    zizmor flags ``github.triggering_actor`` in the preflight job's ``if:``. That is safe ONLY because
+    it is conjoined with the immutable PR-author check: a conjunction can only narrow, so a spoofed
+    actor makes the job skip, never run. Drop clause 1 -- or turn the ``&&`` into ``||`` -- and the
+    residual actor check becomes a SOLE gate, the exploitable shape. ``.github/zizmor.yml``'s
+    bot-conditions entry asserts that shape is absent; this is what makes the assertion true rather
+    than asserted. Every other job repeats the author check beside its need on the preflight job,
+    under the same no-``||`` rule, so a job added later is held to it too.
     """
-    condition = load_workflow("dependabot-lock-resync.yml")["jobs"]["resync"]["if"]
-    assert "github.event.pull_request.user.login == 'dependabot[bot]'" in condition, (
-        "the immutable author gate is gone; the zizmor bot-conditions suppression is now unsound"
-    )
-    assert "&&" in condition, "the author gate must CONJOIN the actor check, not replace it"
-    assert "||" not in condition, (
-        "a disjunction lets the spoofable actor check alone open the job — the dominating shape"
-    )
+    assert sorted(_jobs()) == sorted(_JOB_IDS), f"the resync jobs are {sorted(_jobs())}"
+    for job in _jobs():
+        condition = str(_job(job).get("if", ""))
+        assert "github.event.pull_request.user.login == 'dependabot[bot]'" in condition, (
+            f"{job}: the immutable author gate is gone; the zizmor bot-conditions suppression is now "
+            "unsound"
+        )
+        assert "&&" in condition, f"{job}: the author gate must CONJOIN the other check"
+        assert "||" not in condition, (
+            f"{job}: a disjunction lets the other check alone open the job — the dominating shape"
+        )
+    assert "github.triggering_actor == 'dependabot[bot]'" in str(_job("preflight")["if"])
 
 
-def _resync_steps() -> list[dict[str, Any]]:
-    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
-    assert isinstance(steps, list) and steps, "the resync job parsed to no steps"
+#: The three jobs, split by what they hold (BACKLOG #5477), in the order they run.
+_JOB_IDS = ("preflight", "export", "push")
+_UPLOAD = "actions/upload-artifact@"
+_DOWNLOAD = "actions/download-artifact@"
+_MINT = "actions/create-github-app-token@"
+
+
+@functools.cache
+def _jobs() -> dict[str, dict[str, Any]]:
+    """The resync workflow's jobs, parsed once. Read-only: every test shares this mapping."""
+    jobs = jobs_of(_RESYNC.name)
+    assert jobs, "the resync workflow parsed to no jobs"
+    return jobs
+
+
+def _job(name: str) -> dict[str, Any]:
+    jobs = _jobs()
+    assert name in jobs, f"the resync workflow has no {name!r} job (jobs: {sorted(jobs)})"
+    return jobs[name]
+
+
+def _job_steps(name: str) -> list[dict[str, Any]]:
+    steps = _job(name).get("steps")
+    assert isinstance(steps, list) and steps, f"the {name} job parsed to no steps"
     return steps
 
 
-def _steps_using(prefix: str) -> list[dict[str, Any]]:
-    return [s for s in _resync_steps() if str(s.get("uses", "")).startswith(prefix)]
+def _all_steps() -> list[tuple[str, dict[str, Any]]]:
+    return [(job, s) for job, body in _jobs().items() for s in body.get("steps") or []]
+
+
+def _steps_using(prefix: str) -> list[tuple[str, dict[str, Any]]]:
+    return [(j, s) for j, s in _all_steps() if str(s.get("uses", "")).startswith(prefix)]
+
+
+def _executed_run(step: dict[str, Any]) -> str:
+    """``step``'s run body without its comment lines, so a step is located by what it runs and not
+    by a comment that quotes a command (BACKLOG #5477)."""
+    from tests.test_ci_venv_pinning import _executed_shell
+
+    return _executed_shell(str(step.get("run") or ""))
+
+
+#: An executable ``git commit`` or ``git commit-tree``, the commit step's locator.
+_COMMITS = re.compile(r"\bgit\s+commit(?:-tree)?(?![\w-])")
+
+
+def test_the_step_locators_read_only_executed_lines() -> None:
+    """RED when: a step is located by a command that appears only in one of its comments.
+
+    The push step's comments quote `git commit`, which it deliberately does not run. A locator
+    that matched the whole run body would keep finding a commit step whose executable commit was
+    gone, and the order and closure-failure checks that rest on it would pass against a comment.
+    """
+    commented = {"run": "# git commit refreshes the index\n# git push origin x\necho hi"}
+    assert not _COMMITS.search(_executed_run(commented))
+    assert "git push" not in _executed_run(commented)
+    assert _COMMITS.search(_executed_run({"run": 'commit="$(git commit-tree "${tree}")"'}))
+    assert _COMMITS.search(_executed_run({"run": "git commit -m x"}))
+    assert not _COMMITS.search("git commit-graph write")
+    located = [s.get("name") for s in _job_steps("push") if _COMMITS.search(_executed_run(s))]
+    assert located == ["Commit and push the resynced locks"], located
+
+
+#: An action reference in the one form this workflow allows: ``owner/repo@<40 lower-case hex>``.
+#: A tag or a branch can be moved to other code after review; a commit SHA cannot. The owner is
+#: letters, digits and hyphens, as a GitHub account name is, so ``./dir@<sha>`` (a local action
+#: from the PR tree) does not match.
+_PINNED_USES = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
+#: The same, as the line spells it, with an optional trailing ``# <version>`` comment.
+_PINNED_USES_LINE = re.compile(
+    rf"\s*(?:-\s+)?uses:\s+(?P<ref>{_PINNED_USES.pattern})(?:\s+#\s*\S.*?)?\s*"
+)
+#: Any line with a ``uses`` key, bare or quoted.
+_USES_LINE = re.compile(r"""\s*(?:-\s+)?["']?uses["']?\s*:""")
+
+
+def _unpinned_uses(text: str) -> list[str]:
+    """Every ``uses:`` in the workflow ``text``, a step's or a job's (a reusable-workflow call),
+    that is not ``owner/repo@<40-hex SHA>``, read both from the parsed workflow and from the lines
+    that spell a ``uses`` key."""
+    import yaml
+
+    parsed = yaml.safe_load(text)
+    refs: list[str] = []
+    for body in (parsed.get("jobs") or {}).values():
+        body = body or {}
+        if "uses" in body:
+            refs.append(str(body["uses"]))
+        refs += [str(step["uses"]) for step in body.get("steps") or [] if "uses" in step]
+    bad = [
+        f"{ref} is not owner/repo@<40-hex SHA>" for ref in refs if not _PINNED_USES.fullmatch(ref)
+    ]
+    lines = [ln for ln in text.splitlines() if _USES_LINE.match(ln)]
+    bad += [f"line {ln.strip()!r}" for ln in lines if not _PINNED_USES_LINE.fullmatch(ln)]
+    if len(lines) != len(refs):
+        bad.append(f"{len(refs)} parsed uses: but {len(lines)} lines spell one")
+    return bad
+
+
+def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
+    """RED when: any step's ``uses:`` names a tag, a branch, a short SHA, a local path or a docker
+    image rather than ``owner/repo@<40-hex SHA>`` (BACKLOG #5477).
+
+    The content pins below hash an action's ``uses:`` by its name alone, which left the ref itself
+    unchecked: ``actions/checkout@main`` hashed the same as the reviewed SHA. This holds every ref
+    in the workflow to a commit SHA. The credential jobs' refs are also pinned exactly, by
+    ``test_the_credential_job_actions_are_pinned_to_exact_shas``, so a Dependabot bump stays green
+    only for an action the export job alone uses (setup-uv, upload-artifact); checkout is shared
+    with the push job, so a bump of it is red there until re-pinned.
+    """
+    assert not _unpinned_uses(_text(_RESYNC)), _unpinned_uses(_text(_RESYNC))
+    sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    good = f"jobs:\n  j:\n    steps:\n      - uses: actions/checkout@{sha} # v7.0.1\n"
+    assert not _unpinned_uses(good), _unpinned_uses(good)
+    assert not _unpinned_uses(good.replace(" # v7.0.1", "")), "a SHA without a comment is pinned"
+    assert not _unpinned_uses(good.replace(" # v7.0.1", " # v7.0.1   ")), "trailing space refused"
+    for ref in (
+        "actions/checkout@main",
+        "actions/checkout@v7",
+        "actions/checkout@v7.0.1",
+        "actions/checkout@3d3c42e",
+        f"actions/checkout@{sha.upper()}",
+        f"actions/checkout@{sha}0",
+        "./.github/actions/local",
+        f"./tools@{sha}",
+        f"../x@{sha}",
+        f"./.github@{sha}",
+        "docker://alpine:3",
+        f"actions/checkout/sub@{sha}",
+    ):
+        mutated = good.replace(f"actions/checkout@{sha}", ref)
+        assert _unpinned_uses(mutated), ref
+    hidden = good.replace(f"actions/checkout@{sha} # v7.0.1", f'"actions/checkout@main" # {sha}')
+    assert _unpinned_uses(hidden), "a quoted mutable ref with a SHA in its comment passed"
+    called = good + '  k:\n    "uses": ./.github/workflows/evil.yml\n'
+    assert _unpinned_uses(called), "a quoted job-level reusable-workflow call passed"
 
 
 # What hands a step the minted token or the App key, in any spelling a step could use: the dotted or
 # indexed reference (both name the step id or the secret), or a dump of the whole context.
 _TOKEN_NEEDLES = ("steps.app-token", "steps['app-token']", 'steps["app-token"]', "tojson(steps")
 _KEY_NEEDLES = ("lock_resync_app_private_key", "tojson(secrets")
+# Any secret at all, in any spelling: the dotted or indexed context, or a dump of it.
+_SECRET_NEEDLES = ("secrets.", "secrets[", "tojson(secrets", *_TOKEN_NEEDLES, _MINT)
 
 
 def _strings_in(value: object) -> list[str]:
@@ -314,57 +494,65 @@ def _normalised(value: object) -> str:
     return " | ".join(_strings_in(value)).casefold().replace(" ", "")
 
 
-def _steps_naming(needles: tuple[str, ...]) -> list[str]:
+def _named(value: object, needles: tuple[str, ...]) -> list[str]:
+    """The needles ``value``'s text names, case and spacing ignored."""
+    text = _normalised(value)
+    return [n for n in needles if n.casefold().replace(" ", "") in text]
+
+
+def _steps_naming(needles: tuple[str, ...]) -> list[tuple[str, str]]:
     """Steps whose text (their own ``id`` aside) names any needle, case and spacing ignored."""
-    named = []
-    for s in _resync_steps():
-        text = _normalised({k: v for k, v in s.items() if k != "id"})
-        if any(n in text for n in needles):
-            named.append(str(s.get("id") or s.get("name") or s.get("uses")))
-    return named
+    return [
+        (job, str(s.get("id") or s.get("name") or s.get("uses")))
+        for job, s in _all_steps()
+        if _named({k: v for k, v in s.items() if k != "id"}, needles)
+    ]
 
 
 def test_the_resync_job_env_hands_out_no_credential() -> None:
-    """RED when: the workflow's or the job's ``env:`` names the token or the key, which hands it to
-    every step."""
+    """RED when: the workflow's ``env:`` or any job-level key (``env:``, ``outputs:``, ...) names
+    the token or the key, which hands it to every step of that scope or out of the job."""
     workflow = load_workflow(_RESYNC.name)
-    for where, env in (
-        ("workflow", workflow.get("env")),
-        ("job", workflow["jobs"]["resync"].get("env")),
-    ):
-        text = _normalised(env or {})
-        assert not any(n in text for n in _TOKEN_NEEDLES + _KEY_NEEDLES), (
-            f"the resync {where}-level env names the App token or key"
+    scopes = [("workflow env", workflow.get("env"))]
+    scopes += [
+        (f"{job} job", {k: v for k, v in body.items() if k != "steps"})
+        for job, body in _jobs().items()
+    ]
+    for where, value in scopes:
+        assert not _named(value or {}, _TOKEN_NEEDLES + _KEY_NEEDLES), (
+            f"the resync {where} names the App token or key"
         )
 
 
 def test_the_resync_checkout_persists_no_credential() -> None:
-    """RED when: the checkout writes a credential into .git/config (BACKLOG #5477).
+    """RED when: a checkout writes a credential into .git/config (BACKLOG #5477).
 
-    uv and a repository script run on the Dependabot-changed tree after the checkout. A persisted
-    contents-write App token would sit on disk for both; the push step takes it from its own
-    environment instead.
+    uv and a repository script run on the Dependabot-changed tree after the export job's checkout. A
+    persisted contents-write App token would sit on disk for both; the push step takes it from its
+    own environment instead, and the push job's checkout persists nothing either.
     """
     checkouts = _steps_using("actions/checkout@")
-    assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
-    with_ = checkouts[0].get("with") or {}
-    assert isinstance(with_, dict)
-    assert with_.get("persist-credentials") is False, (
-        "the resync checkout must set persist-credentials: false"
-    )
-    assert "token" not in with_, (
-        "the checkout needs no App token: the run's read-only token fetches the PR head"
-    )
+    assert checkouts, "no checkout step found"
+    for job, step in checkouts:
+        with_ = step.get("with") or {}
+        assert isinstance(with_, dict)
+        assert with_.get("persist-credentials") is False, (
+            f"the {job} checkout must set persist-credentials: false"
+        )
+        assert "token" not in with_, (
+            f"the {job} checkout needs no App token: the run's read-only token fetches the PR head"
+        )
 
 
 def test_only_the_push_step_receives_the_app_token() -> None:
     """RED when: a step other than the push names the minted token's output (BACKLOG #5477).
 
     This pins the expression reference only, dotted, indexed or as a ``toJSON(steps)`` dump. The token
-    is live on the runner from the mint step on; what this holds is that no other step is handed it.
+    is live on the push job's runner from the mint step on; what this holds is that no other step is
+    handed it.
     """
     readers = _steps_naming(_TOKEN_NEEDLES)
-    assert readers == ["Commit and push the resynced locks"], (
+    assert readers == [("push", "Commit and push the resynced locks")], (
         f"steps reading the App token: {readers}"
     )
 
@@ -380,32 +568,924 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
     uv, whose export format can move ahead of the gate's, so the bot would push locks the gate then
     finds stale -- or, worse, an unreviewed uv would serialize the locks the project audits.
     """
-    gate_pins = set(_GATE_UV_PIN_RE.findall(_GATE.read_text(encoding="utf-8")))
+    gate_pins = set(_GATE_UV_PIN_RE.findall(_text(_GATE)))
     assert len(gate_pins) == 1, f"security.yml pins uv at {sorted(gate_pins)}; expected one version"
     setups = _steps_using("astral-sh/setup-uv@")
     assert len(setups) == 1, f"expected one setup-uv step, found {len(setups)}"
-    with_ = setups[0].get("with") or {}
+    with_ = setups[0][1].get("with") or {}
     assert isinstance(with_, dict)
     assert str(with_.get("version", "")) == gate_pins.pop(), (
         f"setup-uv installs uv {with_.get('version')!r}, not the uv security.yml's DEP-1 step pins"
     )
 
 
-def test_the_app_key_is_used_before_any_step_runs_on_the_pr_tree() -> None:
-    """RED when: the mint step, which takes the App's long-lived private key, runs after the checkout,
-    or another step is handed the key.
+def test_the_app_key_is_used_only_by_the_mint_step_of_the_push_job() -> None:
+    """RED when: the mint step, which takes the App's long-lived private key, is not the push job's
+    step directly before the commit, or another step is handed the key.
 
-    Every step from the checkout on can run code from the Dependabot-changed tree as the runner user,
-    who could tamper with a later step's action or environment. Minting first means that code cannot
-    tamper with the mint itself. It does NOT keep the key off the runner while that code runs: the key
-    is a secret of this job, on the runner for the whole job, and create-github-app-token's post step
-    runs at job end with the key in its inputs. The minted token is live on the runner from the mint
-    on and is handed only to the push step (pinned above). Keeping the key and token away from that
-    code entirely needs the re-export in a separate job holding no secret, a follow-up not built.
+    The push job runs no code from the Dependabot-changed tree (pinned below). Minting directly
+    before the commit means the token does not exist while the untrusted artifact is fetched and
+    staged, and a refused artifact mints nothing. The key is a secret of the push job only; the
+    export job, which runs uv and the repository script, references no secret at all (pinned below).
     """
-    steps = _resync_steps()
+    steps = _job_steps("push")
     position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
-    checkout = position["Check out the PR head"]
-    assert position["app-token"] < checkout, "the App private key is used after the PR checkout"
+    assert position["app-token"] + 1 == position["Commit and push the resynced locks"], (
+        "the App token must be minted directly before the commit step"
+    )
+    assert position["app-token"] > position[_COPY_STEP], (
+        "the token is minted before the staging step"
+    )
     key_readers = _steps_naming(_KEY_NEEDLES)
-    assert key_readers == ["app-token"], f"steps handed the App private key: {key_readers}"
+    assert key_readers == [("push", "app-token")], (
+        f"steps handed the App private key: {key_readers}"
+    )
+
+
+#: The actions a job that holds the App key or token may use. None of them runs code from the checkout.
+_CREDENTIAL_JOB_ACTIONS = ("actions/checkout@", _DOWNLOAD, _MINT)
+#: The commands such a job's run blocks may invoke. An ALLOWLIST, so a command nobody listed is
+#: refused; the argument rules in ``_disallowed_commands`` narrow git and find further.
+#:
+#: BEST-EFFORT, AND NOT THE CONTROL THAT HOLDS THE PUSH JOB. ``_shell_words`` is not a shell parser,
+#: so at least these get past it: a ``(`` or ``)`` inside quotes inside a substitution (the body is
+#: cut by counting parentheses), a variable assigned by ``printf -v`` or ``read``, a redirect target
+#: (skipped, never checked), and the path arguments after ``git diff --cached --quiet --``. What
+#: holds the credential jobs is ``test_the_credential_job_steps_are_pinned_by_content``: any edit to
+#: one of their steps is red until the same change re-pins it. This screen is kept as a reviewer's
+#: aid that names the obvious cases.
+_CREDENTIAL_COMMANDS = frozenset(
+    {":", "[", "[[", "base64", "echo", "exit", "export", "find", "git", "printf", "pwd"}
+    | {"read", "realpath", "set", "test", "true"}
+)
+#: Words that may stand ahead of a command name without being one.
+_SHELL_KEYWORDS = frozenset({"!", "{", "}", "if", "then", "elif", "else", "fi", "while", "until"})
+_SHELL_KEYWORDS |= {"do", "done", "esac"}
+#: The git subcommands the push may run, and the git config keys it may set. git reads others as
+#: programs to run (an alias, a submodule foreach, a rebase --exec, core.fsmonitor, diff drivers).
+_GIT_SUBCOMMANDS = frozenset(
+    {"commit-tree", "config", "diff", "hash-object", "push", "update-index", "write-tree"}
+)
+_GIT_CONFIG_SET = frozenset({"user.name", "user.email"})
+#: The git subcommands that stage, commit and push, each with the only argument list it may take.
+#: hash-object without ``--no-filters`` runs the filter driver the tree's .gitattributes names;
+#: update-index has ``--index-info`` and other forms that read arbitrary entries; push has
+#: ``--receive-pack`` and ``--exec``, which name a program.
+_GIT_EXACT_ARGS = {
+    "hash-object": ["hash-object", "-w", "--no-filters", "--", "${src}/${rel}"],
+    "update-index": ["update-index", "--add", "--cacheinfo", "100644,${oid},${rel}"],
+    "write-tree": ["write-tree"],
+    "commit-tree": [
+        "commit-tree",
+        "${tree}",
+        "-p",
+        "HEAD",
+        "-m",
+        "chore(deps): resync exported lock files (DEP-1)",
+    ],
+    "push": ["push", "origin", "${commit}:refs/heads/${HEAD_REF}"],
+}
+#: ``git diff`` may take only this prefix, then paths. ``--ext-diff`` or ``--textconv`` run programs.
+_GIT_DIFF_PREFIX = ["diff", "--cached", "--quiet", "--"]
+#: The git config the push may set through GIT_CONFIG_*, each key with the exact value it must
+#: carry. Any other key, or the same key with another value (core.fsmonitor naming a program), is
+#: refused.
+_GIT_ENV_CONFIG = {
+    "core.hooksPath": "/dev/null",
+    "core.fsmonitor": "false",
+    "http.https://github.com/.extraheader": "AUTHORIZATION: basic ${auth}",
+}
+_GIT_ENV_PAIR = re.compile(
+    r"\bGIT_CONFIG_(?P<kind>KEY|VALUE)_(?P<index>\d+)="
+    r"(?:'(?P<sq>[^']*)'|\"(?P<dq>[^\"]*)\"|(?P<bare>\S*))"
+)
+#: A shell variable a credential job may assign: lower-case script locals, IFS for one read, and the
+#: GIT_CONFIG_* triple. Anything else upper-case can change what the shell or git runs (at least
+#: BASH_ENV, ENV, PATH, LD_PRELOAD, GIT_EXEC_PATH, GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND).
+_ASSIGNABLE = re.compile(r"[a-z_][a-z0-9_]*|IFS|GIT_CONFIG_COUNT|GIT_CONFIG_(?:KEY|VALUE)_\d+")
+_ASSIGNMENT = re.compile(r"(?P<name>[A-Za-z_]\w*)=(?P<value>.*)", re.DOTALL)
+_REDIRECT = re.compile(r"\d*(?:<|>|>>|&>)")
+#: find's actions that run a program (-exec, -execdir, -ok, -okdir), delete (-delete), or write a
+#: file the step names (-fprint, -fprint0, -fprintf, -fls).
+_FIND_REFUSED = ("-exec", "-ok", "-delete", "-fprint", "-fls")
+
+
+def _substitutions(text: str) -> tuple[str, list[str]]:
+    """``text`` with each ``$(...)``, ``<(...)`` and ``>(...)`` replaced by a placeholder word, and
+    the bodies it replaced. Parentheses are matched by count; quotes inside a body are not parsed."""
+    outer: list[str] = []
+    bodies: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] in "$<>" and text[i + 1 : i + 2] == "(":
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            bodies.append(text[i + 2 : j - 1])
+            outer.append(f"__substitution_{len(bodies)}__")
+            i = j
+        else:
+            outer.append(text[i])
+            i += 1
+    return "".join(outer), bodies
+
+
+def _assignment_offence(word: str) -> str | None:
+    match = _ASSIGNMENT.fullmatch(word)
+    assert match
+    name, value = match["name"], match["value"]
+    if not _ASSIGNABLE.fullmatch(name):
+        return f"assigns {name}"
+    if name.startswith("GIT_CONFIG_KEY_") and value not in _GIT_ENV_CONFIG:
+        return f"sets git config {value!r} through the environment"
+    return None
+
+
+def _disallowed_commands(script: str) -> list[str]:
+    """Every simple command in ``script`` that is not on ``_CREDENTIAL_COMMANDS``, every allowed
+    command used in a way that runs or plants something else, and every variable assignment off
+    ``_ASSIGNABLE``. Substitutions are read too; a backtick substitution is refused outright, and so
+    is any mention of $GITHUB_ENV or $GITHUB_PATH, which hand a later step an environment or PATH."""
+    from tests.test_ci_venv_pinning import _commands, _executed_shell
+
+    text = _executed_shell(script).replace("\\\n", " ")
+    bad = ["a backtick substitution"] if "`" in text else []
+    bad += [f"names {v}" for v in ("GITHUB_ENV", "GITHUB_PATH") if v in text]
+    outer, bodies = _substitutions(text)
+    for body in bodies:
+        bad += _disallowed_commands(body)
+    pairs: dict[str, dict[str, str]] = {}
+    for m in _GIT_ENV_PAIR.finditer(text):
+        value = next(v for v in (m["sq"], m["dq"], m["bare"]) if v is not None)
+        pairs.setdefault(m["index"], {})[m["kind"]] = value
+    for index, pair in sorted(pairs.items()):
+        key, value = pair.get("KEY", ""), pair.get("VALUE")
+        if _GIT_ENV_CONFIG.get(key) != value:
+            bad.append(f"GIT_CONFIG_*_{index} sets {key!r} to {value!r}")
+    for line in outer.splitlines():
+        for raw in _commands(line):
+            words: list[str] = []
+            skip_target = False
+            for word in raw:
+                if skip_target:
+                    skip_target = False
+                elif _REDIRECT.fullmatch(word):
+                    skip_target = True  # `< file`: the next word is the target, not an argument
+                elif not _REDIRECT.match(word):
+                    words.append(word)
+            while words and (words[0] in _SHELL_KEYWORDS or _ASSIGNMENT.fullmatch(words[0])):
+                if _ASSIGNMENT.fullmatch(words[0]):
+                    offence = _assignment_offence(words[0])
+                    if offence:
+                        bad.append(f"{offence} in {line.strip()!r}")
+                words = words[1:]
+            if not words or words[0] == "for":
+                continue  # a loop header; its body lines are read on their own
+            name, args = words[0], words[1:]
+            shown = line.strip()
+            if name not in _CREDENTIAL_COMMANDS:
+                bad.append(f"{name!r} in {shown!r}")
+            elif name == "export":
+                for arg in args:
+                    offence = _assignment_offence(arg) if _ASSIGNMENT.fullmatch(arg) else None
+                    if offence or not _ASSIGNMENT.fullmatch(arg):
+                        bad.append(f"export {arg!r} in {shown!r}")
+            elif name == "git":
+                if not args or args[0] not in _GIT_SUBCOMMANDS:
+                    bad.append(f"git {args[:1]} in {shown!r}")
+                elif args[0] == "config" and (len(args) != 3 or args[1] not in _GIT_CONFIG_SET):
+                    bad.append(f"git config {args[1:2]} in {shown!r}")
+                elif args[0] in _GIT_EXACT_ARGS and args != _GIT_EXACT_ARGS[args[0]]:
+                    bad.append(f"git {args[0]} with other arguments: {shown!r}")
+                elif args[0] == "diff" and (
+                    args[:4] != _GIT_DIFF_PREFIX or any(a.startswith("-") for a in args[4:])
+                ):
+                    bad.append(
+                        f"git diff other than `git diff --cached --quiet -- <paths>`: {shown!r}"
+                    )
+            elif name == "find" and any(a.startswith(_FIND_REFUSED) for a in args):
+                bad.append(f"find runs, deletes or writes a file: {shown!r}")
+    return bad
+
+
+def _step_offences(step: dict[str, Any]) -> list[str]:
+    """What in ``step`` could run code a job holding the App key or token must not run."""
+    uses = str(step.get("uses", ""))
+    offences = [f"uses {uses}"] if uses and not uses.startswith(_CREDENTIAL_JOB_ACTIONS) else []
+    if "shell" in step:
+        offences.append(f"shell: {step['shell']}")
+    for name in step.get("env") or {}:
+        if str(name) not in _CREDENTIAL_STEP_ENV:
+            offences.append(f"env {name}")
+    return offences + _disallowed_commands(str(step.get("run") or ""))
+
+
+#: The step env names a credential job may set. Each carries data, and none is a variable the
+#: shell, git or the runner reads as configuration.
+_CREDENTIAL_STEP_ENV = frozenset({"APP_ID", "APP_TOKEN", "HEAD_REF"})
+
+
+def test_the_command_allowlist_refuses_what_it_must() -> None:
+    """Positive and negative controls for the allowlist the two job-split tests below rest on."""
+    for run in (
+        "uv lock --check",
+        "set -e\n  python3 scripts/security/runtime_closure.py",
+        "FOO=1 python -c pass",
+        "FOO='a b' python3 x.py",
+        "./run.sh",
+        "docker/build.sh",
+        "if python3 x.py; then :; fi",
+        "if true; then bash x; fi",
+        ". ./env.sh",
+        "sudo python3 x.py",
+        "sudo cp -- evil ${rel}",
+        "time python3 scripts/x.py",
+        "echo `python3 x.py`",
+        'x="$(echo a | python3 -)"',
+        ">/dev/null python3 evil.py",
+        "</dev/null python3 evil.py",
+        "find . -exec python3 {} \\;",
+        "find . -execdir python3 {} +",
+        "find . -delete",
+        "find . -fprint /tmp/x",
+        "find . -fprint0 ~/.bashrc",
+        "find . -fprintf ~/.bashrc %p",
+        "find . -fls /tmp/x",
+        "git -c alias.x=!sh x",
+        "git submodule foreach python3 evil.py",
+        "git config alias.x '!python3 evil.py'",
+        "git x",
+        "GIT_EXTERNAL_DIFF='python3 evil.py' git diff",
+        "GIT_EXEC_PATH=./tree git push",
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=./evil.sh",
+        "export BASH_ENV=./evil.sh",
+        "PATH=./bin:$PATH git push",
+        'echo "BASH_ENV=${PWD}/evil.sh" >> "$GITHUB_ENV"',
+        'echo "${PWD}/bin" >> "$GITHUB_PATH"',
+        "cp scripts/evil ~/.local/bin/git",
+        'cp -- "${src}/${rel}" "${rel}"',
+        "git add requirements.lock",
+        "git commit -a -m x",
+        "git stage requirements.lock",
+        'git push --receive-pack=./evil origin "${commit}:refs/heads/${HEAD_REF}"',
+        'git push origin "HEAD:refs/heads/${HEAD_REF}"',
+        "git diff --ext-diff --cached --quiet -- a",
+        "git diff --cached --quiet -- a --textconv",
+        'git hash-object -w -- "${src}/${rel}"',
+        "git hash-object --stdin-paths -w",
+        "git update-index --index-info",
+        'git update-index --add --cacheinfo "100755,${oid},${rel}"',
+        "awk 1 f",
+        "while python3 x.py; do :; done",
+    ):
+        assert _disallowed_commands(run), run
+    assert _step_offences({"uses": "astral-sh/setup-uv@abc"})
+    assert _step_offences({"run": "print(1)", "shell": "python {0}"})
+    assert _step_offences({"run": "git push", "env": {"BASH_ENV": "scripts/evil.sh"}})
+    for run in (
+        'git push origin "${commit}:refs/heads/${HEAD_REF}"',
+        'tree="$(git write-tree)"',
+        "git diff --cached --quiet -- requirements.lock constraints.lock",
+        'echo "::error::scripts/security/runtime_closure.py failed"',
+        'oid="$(git hash-object -w --no-filters -- "${src}/${rel}")"',
+        'git update-index --add --cacheinfo "100644,${oid},${rel}"',
+        "# python3 scripts/x.py",
+        'root="$(pwd -P)"',
+        "export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'",
+        "git config user.name 'dependabot[bot]'",
+        "done < __substitution_1__",
+    ):
+        assert not _disallowed_commands(run), (run, _disallowed_commands(run))
+
+
+def test_the_job_that_runs_pr_tree_code_holds_no_secret() -> None:
+    """RED when: a job that runs uv, an interpreter or a repository script on the Dependabot-changed
+    tree also references a secret or the minted token, or the workflow's env or defaults reach it
+    (BACKLOG #5477, added closing step 1).
+
+    Before the split, one job held the App key and the minted token while uv and the repository
+    script ran. Now that code runs in a job whose text names no secret and no token, so no step of
+    it is handed either, and the key and token live only in the push job, a separate runner that
+    starts after this job ends. Whether the service ever delivers a secret a job does not reference
+    to that job's runner is not measured here.
+    """
+    workflow = load_workflow(_RESYNC.name)
+    assert not _named(workflow.get("env") or {}, _SECRET_NEEDLES), "the workflow env names a secret"
+    assert "defaults" not in workflow, "a workflow-level defaults block reaches every job"
+    tree_jobs = [
+        j for j, body in _jobs().items() if any(_step_offences(s) for s in body.get("steps") or [])
+    ]
+    assert tree_jobs == ["export"], f"jobs running code off the credential allowlist: {tree_jobs}"
+    named = _named(_job("export"), _SECRET_NEEDLES)
+    assert not named, f"the export job, which runs PR-tree code, names {named}"
+    assert _job("export").get("permissions") == {"contents": "read"}, (
+        "the export job's GITHUB_TOKEN must be read-only"
+    )
+    assert _job("export").get("runs-on") == "ubuntu-latest", "the export job must be GitHub-hosted"
+
+
+def test_the_credential_jobs_run_no_code_from_the_pr_tree() -> None:
+    """RED when: a job that references a secret or the minted token runs a command or an action off
+    a short allowlist, or sets a shell (BACKLOG #5477, added closing steps 1 and 2).
+
+    The token routes engine PR 3117 named (GITHUB_PATH, BASH_ENV, a filter driver, gpg.program) all
+    need code from the Dependabot-changed tree to run on the runner that holds the token, earlier in
+    the same job. Each job is a fresh GitHub-hosted runner, so with no such code in the credential
+    jobs, nothing that code writes to $GITHUB_ENV, $GITHUB_PATH, .git/config or disk reaches them.
+    """
+    holders = [j for j, body in _jobs().items() if _named(body, _SECRET_NEEDLES)]
+    assert holders == ["preflight", "push"], f"jobs naming a secret or the token: {holders}"
+    for job in holders:
+        body = _job(job)
+        assert body.get("runs-on") == "ubuntu-latest", (
+            f"{job} must run on a fresh GitHub-hosted runner, not one a PR-tree job could have used"
+        )
+        assert not {"defaults", "container", "env", "services"} & set(body), (
+            f"{job} sets a job-level defaults, container, env or services"
+        )
+        for step in _job_steps(job):
+            label = step.get("name") or step.get("uses")
+            offences = _step_offences(step)
+            assert not offences, f"{job}: step {label!r}: {offences}"
+
+
+def _pinned_form(step: dict[str, Any]) -> dict[str, Any]:
+    """``step`` with an action's ``uses:`` cut to its name, so the content hash below does not move
+    on a Dependabot SHA bump. The credential jobs' exact refs are held apart, by
+    ``_PINNED_CREDENTIAL_JOB_ACTION_REFS``, so a bump re-pins one line there and not a hash."""
+    if "uses" not in step:
+        return step
+    return {**step, "uses": str(step["uses"]).partition("@")[0]}
+
+
+def _content_hash(value: object) -> str:
+    """A sha256 over ``value``'s whole parsed content, every key and value, in a stable spelling."""
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+#: Each credential job's own keys (everything but ``steps``), then each of its steps in order, by
+#: the sha256 of its whole parsed content. RE-PIN ONLY AFTER A REVIEW OF THE EDIT: these jobs hold
+#: the App key or the minted token, and a pinned step is how an edit to one is forced past a
+#: reviewer rather than past the best-effort command screen above (BACKLOG #5477).
+_PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
+    "preflight": [
+        ("preflight job keys", "16a15909e2be5bd198d7f324dcbeed055d5eda7e2c80cdcf2836b7e1bade574f"),
+        (
+            "Are the App credentials visible to this run?",
+            "85adb327a30b388ea8083c49df0d2189cd90bc8d79af657621684053e6bddd35",
+        ),
+    ],
+    "push": [
+        ("push job keys", "2e5e3a208d0ada173fe5ae457147ded7e9626fcd4fa88e9b9a9f758770ead824"),
+        (
+            "Check out the PR head",
+            "6fa7fb3f00652e59f28b00f18630c7055b48d7e1918e873833a30f13d5774c00",
+        ),
+        (
+            "Fetch the re-exported files from the export job",
+            "878ce3b1dd270c684ec38c64958955e4828dc186446cafb0b731282403a46aae",
+        ),
+        (
+            "Stage the re-exported files by content",
+            "1db538a0bc3e036c0a9fbf9d72e41e03e53c55bb3957f450f4a33ec91f5514b7",
+        ),
+        (
+            "Mint a scoped GitHub App token",
+            "87a5155a5cc00447acc0b9c47a68ad90ebfc4d2202ec231240f9753116888d85",
+        ),
+        (
+            "Commit and push the resynced locks",
+            "ebf46e375b47d858b943f9d83e49bcf593ee43fce2b82b12463c59a07a8a213e",
+        ),
+        (
+            "Fail if the closure inventory could not be regenerated",
+            "1cea2d429629c458fff71587a8943fc7426e9f5afd9d44aae485e8af124ff130",
+        ),
+    ],
+}
+
+
+#: The workflow's ``on:``, ``permissions:`` and ``concurrency:``, by the sha256 of their parsed
+#: content. RE-PIN ONLY AFTER A REVIEW OF THE EDIT: the triggers decide which events run the jobs
+#: that hold the App key, the permissions are the GITHUB_TOKEN default for a job that sets no
+#: ``permissions:`` of its own (each job here sets its own, which replaces it, so this holds the
+#: default a job added later would get), and the concurrency group decides which run cancels which
+#: (BACKLOG #5477).
+_PINNED_WORKFLOW_SETTINGS = "8cbb320284637a3c46e5f357ba14871b55e073544f8bb4474f931b7c84805c29"
+#: The top-level keys the workflow may carry. Any other (``env``, ``defaults``, ``run-name``, ...)
+#: is refused rather than left unpinned.
+_WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "concurrency", "jobs"})
+
+
+def _workflow_key_pin(workflow: dict[Any, Any]) -> str:
+    # YAML 1.1 reads a bare `on:` as the boolean True; a quoted "on": stays a string.
+    on = workflow["on"] if "on" in workflow else workflow.get(True)
+    return _content_hash(
+        {
+            "on": on,
+            "permissions": workflow.get("permissions"),
+            "concurrency": workflow.get("concurrency"),
+        }
+    )
+
+
+def test_the_workflow_triggers_permissions_and_concurrency_are_pinned_by_content() -> None:
+    """RED when: the workflow's ``on:``, ``permissions:`` or ``concurrency:`` changes at all, or the
+    workflow gains a top-level key off ``_WORKFLOW_KEYS`` (BACKLOG #5477).
+
+    The step and job pins below hold what the credential jobs run; these keys decide when they run
+    and with what default token, and were held only by the tests that read one property each. The
+    failure prints the new pin to paste in.
+    """
+    workflow = load_workflow(_RESYNC.name)
+
+    def off_list(parsed: dict[Any, Any]) -> list[str]:
+        keys = {"on" if k is True else str(k) for k in parsed}
+        return sorted(keys - _WORKFLOW_KEYS)
+
+    assert not off_list(workflow), f"the resync has top-level keys {off_list(workflow)}"
+    for extra in ("run-name", "env", "defaults"):
+        assert off_list({**workflow, extra: {}}) == [extra], f"the key gate let {extra} through"
+    assert {"on", "permissions", "concurrency"} <= {
+        "on" if k is True else str(k) for k in workflow
+    }, "the resync lost on:, permissions: or concurrency:"
+    actual = _workflow_key_pin(workflow)
+    assert actual == _PINNED_WORKFLOW_SETTINGS, (
+        f"the resync's on:, permissions: or concurrency: changed; review the edit, then re-pin "
+        f"_PINNED_WORKFLOW_SETTINGS = {actual!r}"
+    )
+    widened = {**workflow, "permissions": {"contents": "write"}}
+    assert _workflow_key_pin(widened) != actual, "the pin does not cover permissions:"
+    retriggered = {k: v for k, v in workflow.items() if k not in ("on", True)}
+    retriggered["on"] = {"pull_request_target": None}
+    assert _workflow_key_pin(retriggered) != actual, "the pin does not cover on:"
+    regrouped = {**workflow, "concurrency": {"group": "x", "cancel-in-progress": False}}
+    assert _workflow_key_pin(regrouped) != actual, "the pin does not cover concurrency:"
+
+
+def _credential_job_pins() -> dict[str, list[tuple[str, str]]]:
+    pins: dict[str, list[tuple[str, str]]] = {}
+    for job in _PINNED_CREDENTIAL_JOBS:
+        body = _job(job)
+        rows = [(f"{job} job keys", _content_hash({k: v for k, v in body.items() if k != "steps"}))]
+        rows += [
+            (str(s.get("name") or s.get("uses")), _content_hash(_pinned_form(s)))
+            for s in _job_steps(job)
+        ]
+        pins[job] = rows
+    return pins
+
+
+def test_the_credential_job_steps_are_pinned_by_content() -> None:
+    """RED when: any step of the preflight or push job changes at all, other than an action's
+    pinned SHA, or a step is added, removed or reordered, or either job's own keys (``if:``,
+    ``needs``, ``permissions``, ...) change (BACKLOG #5477).
+
+    The command screen above parses shell with a word splitter, so a run block can be written to get
+    past it. Pinning each step's whole content (its run body, env, with, if, continue-on-error and
+    every other key) holds the jobs that hold the App key or token unchanged since they were last
+    pinned: an edit is red until the same change re-pins it, so the re-pin shows in the diff. That is
+    reviewed only as the rest of the diff is; the pin does not judge whether the edit is safe. The
+    failure prints the new pins as a literal to paste in.
+    """
+    actual = _credential_job_pins()
+    assert actual == _PINNED_CREDENTIAL_JOBS, (
+        "a credential job's content changed; review the edit, then re-pin with:\n"
+        + pprint.pformat(actual, width=100)
+    )
+
+
+#: Every action the credential jobs use, in step order, by its exact ``owner/repo@<40-hex SHA>``
+#: (BACKLOG #5477; owner decision 2026-11-27, "Pin exact SHAs"). The content pins above hash a
+#: ``uses:`` by its name only, and ``test_every_action_is_pinned_to_a_full_commit_sha`` holds only
+#: the form, so without this a swap of one of these actions to any other 40-hex commit, a fork's
+#: included, stayed green. The cost, accepted by the owner: each Dependabot bump of one of these
+#: actions is red here until the same PR re-pins it. A consequence: the re-pin is a second, human
+#: commit on the Dependabot PR, which dependabot-auto-merge.yml's single-Dependabot-commit check
+#: then sends to manual review, and a grouped actions PR holds its other bumps red until then. The
+#: export job is not pinned here: it already runs code from the Dependabot-changed tree and holds
+#: only the run's read-only GITHUB_TOKEN, not the App key or the minted token.
+_PINNED_CREDENTIAL_JOB_ACTION_REFS: dict[str, list[str]] = {
+    "preflight": [],
+    "push": [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+        "actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc",
+    ],
+}
+
+
+def _credential_job_action_refs(jobs: dict[str, Any]) -> dict[str, list[str]]:
+    """Each credential job's ``uses:`` refs, in step order, exactly as written."""
+    missing = sorted(set(_PINNED_CREDENTIAL_JOB_ACTION_REFS) - set(jobs))
+    assert not missing, f"the resync workflow has no {missing} job (jobs: {sorted(jobs)})"
+    return {
+        job: [str(s["uses"]) for s in (jobs[job] or {}).get("steps") or [] if "uses" in s]
+        for job in _PINNED_CREDENTIAL_JOB_ACTION_REFS
+    }
+
+
+def test_the_credential_job_actions_are_pinned_to_exact_shas() -> None:
+    """RED when: an action a credential job (preflight or push) uses moves to any other ref, a
+    different 40-hex commit SHA included, or such an action is added, removed or reordered (BACKLOG
+    #5477).
+
+    The control below moves one action to another well-formed SHA, which the name-only content
+    pins and the form check both let through, and shows this test refuses it.
+    """
+    assert set(_PINNED_CREDENTIAL_JOB_ACTION_REFS) == set(_PINNED_CREDENTIAL_JOBS), (
+        "the exact-SHA pins and the content pins name different credential jobs"
+    )
+    pinned = [ref for refs in _PINNED_CREDENTIAL_JOB_ACTION_REFS.values() for ref in refs]
+    assert len(pinned) >= 3, f"the exact-SHA pin table holds {pinned}"
+    jobs = _jobs()
+    actual = _credential_job_action_refs(jobs)
+    assert actual == _PINNED_CREDENTIAL_JOB_ACTION_REFS, (
+        "a credential job's action refs changed:\n"
+        + pprint.pformat(actual, width=100)
+        + "\nIf this is a Dependabot bump of one of these actions: confirm the new SHA is the "
+        "commit the release tag in its `# vX.Y.Z` comment resolves to on the action's upstream "
+        "repository, not a commit reachable only from a fork (`gh api repos/<owner>/<repo>/commits/"
+        "<tag> --jq .sha` must print the new SHA; a `commits/<sha>` lookup is not enough, since "
+        "GitHub serves a fork's commits under the upstream name), then update its SHA in "
+        "_PINNED_CREDENTIAL_JOB_ACTION_REFS in the same PR as the bump. Any other change here "
+        "touches a job that holds the App token: review it before re-pinning."
+    )
+
+    # Control: push's checkout moved to a different well-formed SHA, in a copy of the workflow text.
+    import yaml
+
+    text = _text(_RESYNC)
+    ref = _PINNED_CREDENTIAL_JOB_ACTION_REFS["push"][0]
+    assert ref.startswith("actions/checkout@") and text.count(ref) == 2, (
+        "the control expects the export and push jobs to share one checkout ref"
+    )
+    at = text.index(ref, text.index(ref) + 1)
+    moved = "actions/checkout@" + "0" * 40
+    mutated_text = text[:at] + moved + text[at + len(ref) :]
+    assert not _unpinned_uses(mutated_text), "the control ref is not well-formed"
+    mutated = yaml.safe_load(mutated_text)["jobs"]
+    assert mutated["export"] == jobs["export"], "the control moved the export job's checkout"
+    assert _credential_job_action_refs(mutated) != _PINNED_CREDENTIAL_JOB_ACTION_REFS, (
+        "the exact-SHA pin let a credential-job action move to another commit SHA"
+    )
+    before = [_content_hash(_pinned_form(step)) for step in jobs["push"]["steps"]]
+    after = [_content_hash(_pinned_form(step)) for step in mutated["push"]["steps"]]
+    assert after == before, "the control no longer isolates the gap: the content pin sees the SHA"
+
+
+def test_no_workflow_or_job_env_is_set() -> None:
+    """RED when: the workflow or any of its jobs sets an ``env:`` block (BACKLOG #5477).
+
+    A workflow-level env reaches every step of the credential jobs, beside the token, and a job-level
+    one every step of its job; either could set BASH_ENV, GIT_CONFIG_*, PATH or LD_PRELOAD. No job
+    needs one, so none is allowed, rather than a denylist of names to keep complete. Step-level env
+    in the credential jobs is held to ``_CREDENTIAL_STEP_ENV`` above, and their steps are pinned.
+    """
+    workflow = load_workflow(_RESYNC.name)
+    assert "env" not in workflow, f"the resync sets a workflow-level env: {workflow.get('env')}"
+    jobs = _jobs()
+    assert len(jobs) >= 3, f"the resync parsed to jobs {sorted(jobs)}"
+    assert set(jobs) == set(_JOB_IDS), f"the resync jobs are {sorted(jobs)}"
+    with_env = [job for job, body in jobs.items() if "env" in body]
+    assert not with_env, f"these resync jobs set a job-level env: {with_env}"
+
+
+def test_the_push_job_reads_the_export_job_only_through_the_artifact_and_an_if() -> None:
+    """RED when: the push job does not need the export job, or puts anything the export job produced
+    into a shell or an environment rather than an ``if:`` (BACKLOG #5477).
+
+    The export job ran code from the Dependabot-changed tree, so its outputs are untrusted. In an
+    ``if:`` an output is compared, never executed; interpolated into a ``run:`` or an ``env:`` it is
+    template injection beside the token. No ``run:`` of the push job interpolates anything, so its
+    inputs reach the shell through ``env:`` alone.
+    """
+    push = _job("push")
+    needs = needs_of(push)
+    assert set(needs) == {"preflight", "export"}, f"the push job needs {needs}"
+    assert "needs.preflight.outputs.present == 'true'" in str(push.get("if", ""))
+    job_level = _normalised({k: v for k, v in push.items() if k not in ("if", "needs", "steps")})
+    assert "needs." not in job_level, "the push job reads a job output outside its if:"
+    for step in push["steps"]:
+        label = step.get("name") or step.get("uses")
+        assert "${{" not in str(step.get("run", "")), f"push step {label!r} interpolates in run:"
+        rest = _normalised({k: v for k, v in step.items() if k != "if"})
+        assert "needs." not in rest, f"push step {label!r} reads a job output outside its if:"
+    export = _job("export")
+    assert export.get("needs") == "preflight", "the export job must wait on the preflight job"
+    assert "needs.preflight.outputs.present == 'true'" in str(export.get("if", ""))
+
+
+def _copy_step() -> dict[str, Any]:
+    steps = [s for s in _job_steps("push") if s.get("name") == _COPY_STEP]
+    assert len(steps) == 1, f"expected one {_COPY_STEP!r} step in the push job"
+    return steps[0]
+
+
+_COPY_STEP = "Stage the re-exported files by content"
+
+
+def _artifact_dir() -> str:
+    """Where the push job downloads the artifact, as the staging step's shell spells it."""
+    [(_, download)] = _steps_using(_DOWNLOAD)
+    path = str(download["with"]["path"])
+    assert path.startswith("${{ runner.temp }}/"), f"the artifact downloads to {path}"
+    return path.replace("${{ runner.temp }}", "${RUNNER_TEMP}")
+
+
+_COPY_LIST_RE = re.compile(r"^\s*files='(?P<paths>[^']+)'\s*$", re.MULTILINE)
+
+
+def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
+    """RED when: the export job hands over a set other than what the push job stages, or the push job
+    copies anything but that set (BACKLOG #5477).
+
+    The three lists (upload, staging, ``git diff --cached --quiet``) must agree: a file uploaded but
+    not staged would be pushed stale, and a path staged from the artifact but not in the list would
+    let the export job write anywhere in the commit.
+    """
+    staged = set(_exports(_GATE)) | _CLOSURES
+    uploads, downloads = _steps_using(_UPLOAD), _steps_using(_DOWNLOAD)
+    assert [j for j, _ in uploads] == ["export"], f"expected one upload, in export: {uploads}"
+    assert [j for j, _ in downloads] == ["push"], f"expected one download, in push: {downloads}"
+    up, down = uploads[0][1]["with"], downloads[0][1]["with"]
+    # Any other input could fetch another run's artifact (run-id, github-token, repository) or
+    # several at once (pattern, merge-multiple), or change what is uploaded.
+    assert set(down) == {"name", "path"}, f"the download step takes {sorted(down)}"
+    assert set(up) <= {"name", "path", "retention-days", "if-no-files-found", "overwrite"}, (
+        f"the upload step takes {sorted(up)}"
+    )
+    assert up["name"] == down["name"], "the push job downloads a different artifact"
+    assert set(str(up["path"]).split()) == staged, "the uploaded set is not the staged set"
+    assert up.get("include-hidden-files") in (None, False)
+    assert f'src="{_artifact_dir()}"' in _executed_run(_copy_step()), (
+        "the staging step reads a directory other than the one the download step writes"
+    )
+    copy = _COPY_LIST_RE.findall(str(_copy_step()["run"]))
+    assert len(copy) == 1 and set(copy[0].split()) == staged, (
+        "the staging step's list is not the staged set"
+    )
+    push = _job_steps("push")
+    order = [str(s.get("name") or s.get("uses")) for s in push]
+    download_at = next(
+        i for i, s in enumerate(push) if str(s.get("uses", "")).startswith(_DOWNLOAD)
+    )
+    commit_at = next(i for i, s in enumerate(push) if _COMMITS.search(_executed_run(s)))
+    assert download_at < order.index(_COPY_STEP) < commit_at, f"push job order: {order}"
+
+
+_GIT_TEST_CONFIG = (
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.symlinks=true",
+)
+
+
+def _scratch_env(**extra: str) -> dict[str, str]:
+    """The environment with every GIT_* variable removed. A hook or ``rebase -x`` that runs pytest
+    exports GIT_DIR and GIT_INDEX_FILE, which would point these scratch git commands at the live
+    repository."""
+    return {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **extra}
+
+
+def _git(workspace: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *_GIT_TEST_CONFIG, "-C", str(workspace), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=_scratch_env(),
+    ).stdout
+
+
+def _run_copy(
+    tmp_path: Path,
+    build: Callable[[Path, Path], None],
+    staged: list[str],
+    script: str,
+    bash: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run the shipped staging step verbatim in a scratch checkout and artifact directory.
+
+    The checkout is a git repository whose HEAD holds whatever ``build`` made of the tree, the way
+    actions/checkout would have written a PR head carrying it.
+    """
+    workspace, temp = tmp_path / "ws", tmp_path / "rt"
+    artifact = temp / _artifact_dir().removeprefix("${RUNNER_TEMP}/")
+    for rel in staged:
+        for base, body in ((workspace, "old\n"), (artifact, "new\n")):
+            (base / rel).parent.mkdir(parents=True, exist_ok=True)
+            (base / rel).write_text(body, encoding="utf-8")
+    build(workspace, artifact)
+    _git(workspace, "init", "-q")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "PR head")
+    _git(tmp_path, "init", "-q", "--bare", "origin.git")
+    _git(workspace, "remote", "add", "origin", str(tmp_path / "origin.git"))
+    return _run_step(workspace, script, bash, RUNNER_TEMP=str(temp))
+
+
+def _run_step(
+    workspace: Path, script: str, bash: str, **env: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [bash, "-c", script],
+        cwd=workspace,
+        env=_scratch_env(**env),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the step runs on an ubuntu runner; GNU realpath and POSIX symlinks are needed",
+)
+def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: Path) -> None:
+    """RED when: the staging step writes through a checkout path, writes outside the checkout, or
+    stages anything off its list (BACKLOG #5477).
+
+    Executes the step's own script against a git checkout. A clean artifact stages every file by
+    content and leaves the working tree as checked out. An extra artifact entry, a missing file, a
+    symlink in the artifact, a lock path the tree made a symlink, a lock path under a symlinked
+    directory, and a lock path the tree made a directory holding a same-named symlink each fail the
+    step before anything lands outside the checkout. The last case is what a `cp` onto the lock path
+    wrote straight through to the symlink's target (review of dffb12aeaaf, measured in WSL).
+    """
+    staged = sorted(set(_exports(_GATE)) | _CLOSURES)
+    assert len(staged) >= 8, f"the staged set parsed to {staged}"
+    script = str(_copy_step()["run"])
+    bash = require_bash(tmp_path)
+    clean = _run_copy(tmp_path / "clean", lambda ws, art: None, staged, script, bash)
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+    ws = tmp_path / "clean" / "ws"
+    stale = [r for r in staged if _git(ws, "show", f":{r}") != "new\n"]
+    assert not stale, f"the staging step left these unstaged: {stale}"
+    written = [r for r in staged if (ws / r).read_text(encoding="utf-8") != "old\n"]
+    assert not written, f"the staging step wrote through these checkout paths: {written}"
+    changed = sorted(_git(ws, "diff", "--cached", "--name-only").split())
+    assert changed == staged, f"the index differs from HEAD at {changed}, not the staged set"
+
+    # A runner file the tree or the artifact could point at: it exists, so a write would follow a link.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_text("victim\n", encoding="utf-8")
+
+    def extra(ws: Path, art: Path) -> None:
+        (art / ".github").mkdir()
+        (art / ".github" / "evil.yml").write_text("x", encoding="utf-8")
+
+    def missing(ws: Path, art: Path) -> None:
+        (art / "constraints.lock").unlink()
+
+    def artifact_link(ws: Path, art: Path) -> None:
+        (art / "constraints.lock").unlink()
+        (art / "constraints.lock").symlink_to(victim)
+
+    def dest_link(ws: Path, art: Path) -> None:
+        (ws / "constraints.lock").unlink()
+        (ws / "constraints.lock").symlink_to(victim)
+
+    def dir_link(ws: Path, art: Path) -> None:
+        shutil.rmtree(ws / "ci" / "locks")
+        (ws / "ci" / "locks").symlink_to(outside, target_is_directory=True)
+
+    def dir_holding_link(ws: Path, art: Path) -> None:
+        # `cp -- src constraints.lock` copies INTO a directory, through the same-named link inside.
+        (ws / "constraints.lock").unlink()
+        (ws / "constraints.lock").mkdir()
+        (ws / "constraints.lock" / "constraints.lock").symlink_to(victim)
+
+    def unlisted(ws: Path, art: Path) -> None:
+        # A directory find cannot read: the listing fails, and the step must fail with it rather
+        # than check part of the artifact. (Root reads it anyway, so the case is skipped there.)
+        hidden = art / "hidden"
+        hidden.mkdir()
+        (hidden / "extra").write_text("x", encoding="utf-8")
+        hidden.chmod(0)
+
+    cases = [extra, missing, artifact_link, dest_link, dir_link, dir_holding_link]
+    if os.geteuid() != 0:
+        cases.append(unlisted)
+    for build in cases:
+        result = _run_copy(tmp_path / build.__name__, build, staged, script, bash)
+        if build is unlisted:
+            (tmp_path / build.__name__ / "rt" / "lock-resync-exports" / "hidden").chmod(0o700)
+        assert result.returncode != 0, f"{build.__name__}: the staging step accepted it"
+        if build is not unlisted:  # find reports its own error; the step prints no annotation
+            assert "::error" in result.stdout, f"{build.__name__}: {result.stdout}{result.stderr}"
+        assert victim.read_text(encoding="utf-8") == "victim\n", f"{build.__name__} wrote outside"
+        assert sorted(p.name for p in outside.iterdir()) == ["victim"], build.__name__
+        landed = tmp_path / build.__name__ / "ws" / "constraints.lock"
+        assert (
+            landed.is_symlink()
+            or not landed.is_file()
+            or landed.read_text(encoding="utf-8") != "victim\n"
+        ), f"{build.__name__}: a file from outside the artifact was written into the checkout"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the steps run on an ubuntu runner; GNU realpath and base64 -w0 are needed",
+)
+@pytest.mark.parametrize("code", [128, 2])
+def test_the_commit_step_fails_when_git_cannot_compare(tmp_path: Path, code: int) -> None:
+    """RED when: a ``git diff --cached --quiet`` that exits other than 0 or 1 is read as a change
+    and the step goes on to push (BACKLOG #5477).
+
+    Executes the staging step, then the commit step with a ``git`` shim ahead on PATH that fails
+    every ``diff`` with ``code`` and hands every other command to the real git. Before the fix the
+    error fell into the ``if``'s change branch, and the step committed and pushed.
+    """
+    staged = sorted(set(_exports(_GATE)) | _CLOSURES)
+    stage, commit = str(_copy_step()["run"]), str(_commit_step()["run"])
+    bash = require_bash(tmp_path)
+    real_git = shutil.which("git")
+    assert real_git, "git is not on PATH"
+    staging = _run_copy(tmp_path, lambda ws, art: None, staged, stage, bash)
+    assert staging.returncode == 0, staging.stdout + staging.stderr
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'for a in "$@"; do [ "$a" = diff ] && exit {code}; done\n'
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    ref = "refs/heads/dependabot/uv/resync-probe"
+    env = {
+        "HEAD_REF": ref.removeprefix("refs/heads/"),
+        "APP_TOKEN": "not-a-token",
+        "PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+    result = _run_step(tmp_path / "ws", commit, bash, **env)
+    pushed = _git(tmp_path / "origin.git", "for-each-ref", "--format=%(objectname)", ref).strip()
+    assert not pushed, f"the commit step pushed after git diff exited {code}: {result.stdout}"
+    assert result.returncode != 0, f"the commit step passed after git diff exited {code}"
+    assert f"lock-resync compare::git diff --cached --quiet exited {code}" in result.stdout, (
+        result.stdout + result.stderr
+    )
+
+
+def _commit_step() -> dict[str, Any]:
+    steps = [s for s in _job_steps("push") if "git push" in _executed_run(s)]
+    assert len(steps) == 1, "expected one push job step that runs git push"
+    return steps[0]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the steps run on an ubuntu runner; GNU realpath and base64 -w0 are needed",
+)
+def test_the_commit_step_commits_the_staged_content_or_nothing(tmp_path: Path) -> None:
+    """RED when: the commit step does not commit exactly what the staging step put in the index,
+    on top of the PR head, or pushes when the artifact already matches the PR head (BACKLOG #5477).
+
+    Executes the staging step and then the commit step verbatim against a local bare ``origin``.
+    The file remote ignores the http.extraheader the step sets, so the push needs no token.
+    """
+    staged = sorted(set(_exports(_GATE)) | _CLOSURES)
+    assert len(staged) >= 8, f"the staged set parsed to {staged}"
+    stage, commit = str(_copy_step()["run"]), str(_commit_step()["run"])
+    bash = require_bash(tmp_path)
+    ref = "refs/heads/dependabot/uv/resync-probe"
+    env = {"HEAD_REF": ref.removeprefix("refs/heads/"), "APP_TOKEN": "not-a-token"}
+
+    def in_sync(ws: Path, art: Path) -> None:
+        for rel in staged:
+            (art / rel).write_text("old\n", encoding="utf-8")
+
+    for build, changes in ((lambda ws, art: None, True), (in_sync, False)):
+        case = tmp_path / ("changed" if changes else "in-sync")
+        staging = _run_copy(case, build, staged, stage, bash)
+        assert staging.returncode == 0, staging.stdout + staging.stderr
+        ws, origin = case / "ws", case / "origin.git"
+        result = _run_step(ws, commit, bash, **env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        pushed = _git(origin, "for-each-ref", "--format=%(objectname)", ref).strip()
+        if not changes:
+            assert not pushed, "the commit step pushed although the artifact matches the PR head"
+            assert "already in sync" in result.stdout, result.stdout
+            continue
+        assert pushed, f"the commit step pushed nothing: {result.stdout}{result.stderr}"
+        head = _git(ws, "rev-parse", "HEAD").strip()
+        assert _git(origin, "rev-parse", f"{pushed}^").strip() == head, "not committed on the head"
+        changed = sorted(_git(origin, "diff", "--name-only", head, pushed).split())
+        assert changed == staged, f"the pushed commit changes {changed}, not the staged set"
+        stale = [r for r in staged if _git(origin, "show", f"{pushed}:{r}") != "new\n"]
+        assert not stale, f"the pushed commit carries the PR head's bytes at {stale}"

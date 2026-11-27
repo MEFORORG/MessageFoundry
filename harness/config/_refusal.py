@@ -6,7 +6,12 @@ The ``load_*shape`` readers run at config import. Their ``ValueError`` names the
 it, but the loader reports only a config module's exception type and line (vault BACKLOG #3249), so
 the engine's output says ``ValueError in _shape.py at line N``. Printing the text here puts it in
 the engine node's captured output, which the runners show on a failed start (vault BACKLOG #3765
-item 3). The text is the harness's own: knob names and the value of a ``MEFOR_*`` load knob."""
+item 3). The text is the harness's own: knob names and the value of a ``MEFOR_*`` load knob.
+
+No graph imports this file. Each graph's ``_shape.py`` is served to it as a bare sibling helper and
+must not need the harness package, so each holds its own copy of the decorator (BACKLOG #5850,
+#5852, #5853, #5854). This file is the reference those copies are held equal to, by
+``tests/test_harness_graph_engine_only.py``: edit it here, then copy the change into each one."""
 
 from __future__ import annotations
 

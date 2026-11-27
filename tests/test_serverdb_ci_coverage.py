@@ -20,9 +20,10 @@ The mechanical invariants, at least these:
    the leg first runs on it in the merge queue (``merge_group``) or on the nightly cron, after
    review rather than beside it. The regex's own comment already demands this
    ("Keep this in sync with those steps"); nothing enforced it.
-3. **It also admits the engine SOURCES those suites import** (BACKLOG #1322), as far as a
-   static read of the suites' own import statements finds them; the scan's docstring names at
-   least four routes it does not follow. Invariant 2 binds the
+3. **It also admits the ``tests/`` helpers those suites import, and the engine SOURCES the suites
+   and those helpers import** (BACKLOG #1322, and #5472's S31-23 for the helpers), as far as a
+   static read of their import statements finds them; the scan's docstring names at least four
+   routes it does not follow. Invariant 2 binds the
    ASSERTING file and not the ASSERTED-ON file, so it is structurally blind to a source change that
    breaks a server-DB assertion. That is not hypothetical: a PR added a key to the ``summary_access``
    audit detail built in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was
@@ -49,6 +50,8 @@ import re
 from pathlib import Path
 
 import pytest
+
+from tests._ci_paths import arm_list_name, ci_path_list, joined
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
@@ -137,16 +140,21 @@ def test_every_module_gated_suite_is_named_by_a_workflow() -> None:
     )
 
 
+def _serverdb_lines() -> list[str]:
+    """The ``serverdb`` change-detection list: the one ci.yml's ``serverdb`` arm names, read from
+    ``.github/ci-paths/`` (BACKLOG #5472), so a re-pointed arm is followed rather than assumed."""
+    return ci_path_list(arm_list_name(CI_YML.read_text(encoding="utf-8"), "serverdb"))
+
+
 def _serverdb_alternation() -> re.Pattern[str]:
-    """The ``tests/test_(...)`` alternation inside the ``serverdb`` change-detection regex."""
-    for line in CI_YML.read_text(encoding="utf-8").splitlines():
-        if "grep -qE" in line and "tests/test_(" in line:
-            match = re.search(r"tests/test_\(([^)]*)\)", line)
-            if match:
-                return re.compile(rf"^test_({match.group(1)})")
+    """The ``tests/test_(...)`` alternation inside the ``serverdb`` change-detection list."""
+    for line in _serverdb_lines():
+        match = re.fullmatch(r"\^tests/test_\(([^)]*)\)", line)
+        if match:
+            return re.compile(rf"^test_({match.group(1)})")
     pytest.fail(
-        "could not locate the `serverdb` change-detection alternation (a `grep -qE` line "
-        "containing `tests/test_(...)`) in .github/workflows/ci.yml"
+        "could not locate the `serverdb` change-detection alternation (a `^tests/test_(...)` line "
+        "in the list ci.yml's `paths_match serverdb` reads, .github/ci-paths/serverdb.txt)"
     )
 
 
@@ -180,7 +188,7 @@ def test_serverdb_path_gate_admits_every_file_those_legs_run() -> None:
 
     assert not unmatched, (
         f"{len(unmatched)} test file(s) run by a SQL Server / PostgreSQL step are not matched by "
-        "the `serverdb` change-detection alternation in .github/workflows/ci.yml, so editing one "
+        "the `serverdb` change-detection alternation in .github/ci-paths/serverdb.txt, so editing one "
         "does NOT pull the leg that proves it on the PR — it first runs in the merge queue or on "
         "the nightly cron:\n  "
         + "\n  ".join(unmatched)
@@ -195,15 +203,13 @@ def _serverdb_full_pattern() -> re.Pattern[str]:
     because the invariant IT guards is about test files. This one keeps every arm, because BACKLOG
     #1322's invariant is about the SOURCES those suites assert against.
     """
-    for line in CI_YML.read_text(encoding="utf-8").splitlines():
-        if "grep -qE" in line and "tests/test_(" in line:
-            match = re.search(r"grep -qE '(\^\(.*\))'", line)
-            if match:
-                return re.compile(match.group(1))
-    pytest.fail(
-        "could not locate the `serverdb` change-detection regex (a `grep -qE` line containing "
-        "`tests/test_(...)`) in .github/workflows/ci.yml"
-    )
+    lines = _serverdb_lines()
+    if not any(line.startswith("^tests/test_(") for line in lines):
+        pytest.fail(
+            "could not locate the `serverdb` change-detection regex (a list holding a "
+            "`^tests/test_(...)` line) behind ci.yml's `paths_match serverdb`"
+        )
+    return re.compile(joined(lines))
 
 
 def _module_path(module: str) -> str | None:
@@ -259,11 +265,13 @@ def _engine_modules_imported_by(text: str) -> dict[str, str]:
 
     Not recorded, by at least these routes, though Python runs or reaches the source: the ancestor
     packages' ``__init__`` files above the one a statement names, which run for every spelling; the
-    modules an imported engine module itself imports; a re-exported attribute's defining module; the
-    helper modules a suite imports from ``tests/``; and ``importlib.import_module``. Measured
+    modules an imported engine module itself imports; a re-exported attribute's defining module; and
+    ``importlib.import_module``. The ``tests/`` helpers a suite imports are not followed HERE: this
+    reads one source, and ``_helpers_reached_by_server_db_suites`` hands it each helper. Measured
     2026-11-23: ``messagefoundry/__init__.py``, ``messagefoundry/auth/__init__.py`` and
-    ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route, and the
-    ``serverdb`` regex admits none of them. Closing that is a ``ci.yml`` edit, not made here.
+    ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route; the
+    ``serverdb`` regex admits all three since #5472, and ``messagefoundry_toolkit/__init__.py``,
+    reached the same way. CORRECTED 2026-11-26: this read "admits none of them".
     """
     modules: list[str] = []
     for node in ast.walk(ast.parse(text)):
@@ -278,14 +286,147 @@ def _engine_modules_imported_by(text: str) -> dict[str, str]:
     return {module: path for module in modules if (path := _module_path(module)) is not None}
 
 
+def _server_db_suite_files() -> set[str]:
+    """The repo-relative files of the suites the server-DB steps run."""
+    return {
+        f"tests/{name}.py"
+        for name in _files_run_by_server_db_steps()
+        if (TESTS_DIR / f"{name}.py").is_file()
+    }
+
+
+#: The repo trees whose modules a server-DB suite may import beside the engine: its own test
+#: helpers, and the load drivers the failover and connscale suites run.
+_HELPER_ROOTS = ("tests", "harness")
+
+
+@functools.cache
+def _repo_helper_sources() -> frozenset[str]:
+    """Every source under ``tests/`` and ``harness/``, repo-relative, case as the tree spells it."""
+    return frozenset(
+        p.relative_to(REPO_ROOT).as_posix()
+        for root in _HELPER_ROOTS
+        for p in (REPO_ROOT / root).rglob("*.py")
+    )
+
+
+def _helpers_imported_by(text: str) -> set[str]:
+    """The ``tests/`` and ``harness/`` files one source's imports name, as repo-relative paths.
+
+    ``from tests.pkg import name`` names ``pkg`` and, when it is a file, ``pkg.name``, as the
+    engine scan above does, and the same for ``harness.*``. A bare name that is a root ``tests/``
+    file, as in ``from _totp_clock import ...``, is that file: ``tests/`` is on ``sys.path`` when
+    the suites run. Not followed, at least: a relative import (no file under ``tests/`` uses one),
+    and ``importlib.import_module``.
+    """
+    names: list[str] = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                continue
+            names += [node.module] + [f"{node.module}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.Import):
+            names += [a.name for a in node.names]
+    found: set[str] = set()
+    sources = _repo_helper_sources()
+    for module in names:
+        base = module.replace(".", "/")
+        if base.split("/")[0] not in _HELPER_ROOTS:
+            base = f"tests/{base}"
+            if "/" in base.removeprefix("tests/"):
+                continue
+        found.update(c for c in (f"{base}.py", f"{base}/__init__.py") if c in sources)
+    return found
+
+
+@functools.cache
+def _helpers_reached_by_server_db_suites() -> frozenset[str]:
+    """The helper files the server-DB suites import, and the files those import, to a fixed point.
+
+    Seeded with the step-run suites and ``tests/conftest.py``, which runs in every leg. A suite
+    itself is left out of the result: invariant 2 already binds it. A helper runs inside the leg as
+    surely as the suite does, so an edit to one alone must pull the leg too (#5472, S31-23).
+    """
+    suites = _server_db_suite_files()
+    seeds = suites | {"tests/conftest.py"}
+    reached: set[str] = {"tests/conftest.py"}
+    todo = sorted(seeds)
+    while todo:
+        path = todo.pop()
+        text = (REPO_ROOT / path).read_text(encoding="utf-8")
+        new = _helpers_imported_by(text) - reached - suites
+        reached |= new
+        todo.extend(sorted(new))
+    return frozenset(reached)
+
+
 def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
-    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path."""
+    """Each ``messagefoundry`` module those suites, or the helpers they reach, import, by path.
+
+    A fresh dict over one memoised scan, so a caller may change what it gets.
+    """
+    return dict(_engine_scan())
+
+
+@functools.cache
+def _engine_scan() -> tuple[tuple[str, str], ...]:
     paths: dict[str, str] = {}
-    for name in sorted(_files_run_by_server_db_steps()):
-        source = REPO_ROOT / "tests" / f"{name}.py"
-        if source.is_file():
-            paths.update(_engine_modules_imported_by(source.read_text(encoding="utf-8")))
-    return paths
+    for path in sorted(_server_db_suite_files() | _helpers_reached_by_server_db_suites()):
+        text = (REPO_ROOT / path).read_text(encoding="utf-8")
+        paths.update(_engine_modules_imported_by(text))
+    return tuple(paths.items())
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from tests._session_seal_contract import run", {"tests/_session_seal_contract.py"}),
+        ("from tests import _session_seal_contract", {"tests/_session_seal_contract.py"}),
+        ("import tests._live_scratch as scratch", {"tests/_live_scratch.py"}),
+        ("from tests.test_alert_sinks import _sink", {"tests/test_alert_sinks.py"}),
+        ("from messagefoundry import pki\nimport os", set()),
+        ("from ._session_seal_contract import run", set()),
+        ("from _totp_clock import FakeClock", {"tests/_totp_clock.py"}),
+        ("import _failover_load_support", {"tests/_failover_load_support.py"}),
+        (
+            "from harness.load import failover",
+            {"harness/load/__init__.py", "harness/load/failover.py"},
+        ),
+        ("import json, os.path", set()),
+    ],
+)
+def test_the_helper_scan_resolves_tests_imports(source: str, expected: set[str]) -> None:
+    assert _helpers_imported_by(source) == expected
+
+
+def test_serverdb_path_gate_admits_every_tests_helper_those_suites_import() -> None:
+    """A ``tests/`` helper a server-DB suite imports must pull the leg when edited (S31-23).
+
+    Before #5472's S31-23 fix the gate named eight such helpers by file and missed at least 41
+    others and 12 ``tests/test_*.py`` modules the suites import, among them
+    ``tests/_session_seal_contract.py``, through which the suites reach ``auth/tokens``.
+    """
+    pattern = _serverdb_full_pattern()
+    helpers = _helpers_reached_by_server_db_suites()
+    assert len(helpers) >= 100, (
+        f"the helper scan reached {len(helpers)} files, under the 107 measured on 2026-11-26; "
+        "either it or the step parsing in _files_run_by_server_db_steps has drifted"
+    )
+    # One sentinel per route the scan follows: a tests.* import, a bare sys.path name, a harness.*
+    # import, and the conftest seed. Dropping any one route reds here, whatever the count.
+    sentinels = {
+        "tests/_session_seal_contract.py",
+        "tests/_failover_load_support.py",
+        "harness/load/failover.py",
+        "tests/conftest.py",
+    }
+    assert sentinels <= helpers, f"the scan lost a route: {sorted(sentinels - helpers)}"
+    missed = sorted(path for path in helpers if not pattern.match(path))
+    assert not missed, (
+        f"{len(missed)} tests/ file(s) a SQL Server / PostgreSQL suite imports are not matched by "
+        "the `serverdb` list in .github/ci-paths/serverdb.txt, so editing one does NOT pull the leg "
+        "that runs it on the PR:\n  " + "\n  ".join(missed)
+    )
 
 
 @pytest.mark.parametrize(
@@ -410,7 +551,8 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
     IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST". It is what a machine can check without
     running anything. It is wider than the assertion set in some ways, for example a module a suite
     imports and asserts nothing about, which costs extra leg-runs. It is NARROWER in others: it
-    reads only the static import statements in the suites themselves, and
+    reads only the static import statements in the suites and the ``tests/`` helpers they reach,
+    and
     ``_engine_modules_imported_by`` names at least four routes to a source it does not record. A
     green here does not show that every source a server-DB leg exercises pulls that leg.
     """
@@ -427,7 +569,7 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
 
     assert not unmatched, (
         f"{len(unmatched)} engine source(s) imported by a SQL Server / PostgreSQL suite are not "
-        "matched by the `serverdb` change-detection regex in .github/workflows/ci.yml, so editing "
+        "matched by the `serverdb` change-detection list in .github/ci-paths/serverdb.txt, so editing "
         "one does NOT pull the leg that would catch a regression in it on the PR — the leg first "
         "runs on it in the merge queue or on the nightly cron:\n  "
         + "\n  ".join(unmatched)
@@ -443,7 +585,20 @@ def test_the_serverdb_gate_still_refuses_unrelated_paths() -> None:
     """
     pattern = _serverdb_full_pattern()
 
-    never_engine = [path for path in ("README.md", "docs/BACKLOG.md") if pattern.match(path)]
+    never_engine = [
+        path
+        for path in (
+            "README.md",
+            "docs/BACKLOG.md",
+            # SHAPE probes for the helper arms #5472 added: each matches only if an arm loses its
+            # `$`, or widens to the whole of tests/ or harness/.
+            "tests/_live_scratch.py.orig",
+            "tests/fixtures/_x.py",
+            "tests/test_retention.py",
+            "harness/window.py",
+        )
+        if pattern.match(path)
+    ]
     assert not never_engine, (
         f"the `serverdb` regex admits {never_engine}, which no server-DB leg asserts against — the "
         "source arms have over-widened"

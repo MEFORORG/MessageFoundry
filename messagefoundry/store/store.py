@@ -195,6 +195,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
+    no_verdict_fault,
     open_queue_cell,
     queue_open_fault,
     queue_payload_aad,
@@ -17183,12 +17184,23 @@ class MessageStore:
                 tag_failures=tag_failures,
                 queue_tag_rows=queue_tag_rows,
             )
+        except CipherError as exc:
+            # BACKLOG #5727: a key service that gave no verdict says nothing about the token, so it
+            # is retried as a QueueOpenFault, raised below, outside this handler, so it carries no
+            # chain to the raw key-service error. Aimed at the transaction's seals, it also takes any
+            # other cipher call no inner arm contains, the finalizer's opens among them. The
+            # invocation ceiling stays a verdict, re-raised here; the response step replaces it with
+            # a fault named by its type and own text, with no chain, before it reaches a log.
+            seal_fault = no_verdict_fault(exc)
+            if seal_fault is None:
+                raise
         finally:
             await report_cell_tag_failures(self, tag_failures)
             for row, error in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
                 await report_queue_tag_failure(
                     self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
+        raise seal_fault
 
     async def _ingress_handoff_txn(
         self,
@@ -17248,6 +17260,10 @@ class MessageStore:
                 await self._commit()
                 return True
 
+            # BACKLOG #5727: each dead-letter on the reference runs after the try, so a failed seal
+            # in it chains no raw open error; the handlers only record which one is owed.
+            ref_fault: QueueOpenFault | None = None
+            ref_tag_failed = ref_corrupt = False
             try:
                 ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -17259,15 +17275,27 @@ class MessageStore:
                 # that fails is still reported.
                 # Without its traceback, so the queued error holds no frame of this transaction.
                 queue_tag_rows.append((wr, err.with_traceback(None)))
+                ref_tag_failed = True
+            except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
+                # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
+                # fault carries no chain to the raw key-service error.
+                # Not no_verdict_fault, which never retries an engine fault: this arm retries any
+                # failure the no-verdict rule reads as transient, as it did before #5727.
+                ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                # Otherwise a corrupt/undecryptable work-row reference (DB corruption, a key the
+                # store lacks) cannot be re-ingressed as it stands; a replay can retry it once the
+                # cause is fixed. Mirrors the depth-cap branch.
+                ref_corrupt = ref_fault is None
+            if ref_tag_failed:
                 return await _consume_dead(
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
-            except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
-                # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
-                # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
-                # unrecoverable-token case).
+            if ref_fault is not None:
+                raise ref_fault
+            if ref_corrupt:
                 return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
+                    "re-ingress work-row reference is corrupt/unparseable",
+                    "re-ingress ref corrupt",
                 )
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
@@ -17293,12 +17321,51 @@ class MessageStore:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
                 )
-            body = (
-                await self._adec(
-                    art["body"],
-                    aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+
+            # BACKLOG #5727, as on Postgres (#5689): a decrypt failure on a reply or origin cell
+            # dead-letters the token, so the loopback lane moves. A failure that dead-letters can
+            # still clear later, for example a key the store lacks, so the token keeps its reference
+            # and a replay can recover it. A key service that gave no verdict says nothing about
+            # the cell: it leaves as a QueueOpenFault, raised outside the handler so it carries no
+            # chain to the raw key-service error, and the token is retried. An engine fault
+            # propagates from the reply cell. On a token reference or origin metadata it can
+            # dead-letter the token instead: whether an AADComponentError there reads as a corrupt
+            # cell depends on the cipher.
+            # The encrypts are contained only in ingress_handoff, and only where the key service
+            # gave no verdict: the invocation ceiling stays a hard stop.
+            # The dead-letter runs after the handler, so a failure in it chains no raw decrypt error,
+            # whose cause can echo the key service's URL or body; only the error's type name is kept.
+            async def _dead_unopenable(error_type: str, what: str) -> bool:
+                log.warning(
+                    "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",
+                    what,
+                    response_row_id,
+                    error_type,
                 )
-            ) or ""
+                return await _consume_dead(
+                    f"re-ingress {what} does not decrypt ({error_type})",
+                    f"re-ingress {what} undecryptable",
+                )
+
+            open_fault: QueueOpenFault | None = None
+            unopenable: str | None = None
+            try:
+                body = (
+                    await self._adec(
+                        art["body"],
+                        aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                    )
+                ) or ""
+            except CipherError as exc:
+                if isinstance(exc, PROGRAMMING_ERRORS):
+                    raise
+                open_fault = no_verdict_fault(exc)
+                if open_fault is None:
+                    unopenable = type(exc).__name__
+            if open_fault is not None:
+                raise open_fault
+            if unopenable is not None:
+                return await _dead_unopenable(unopenable, "reply")
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
             cur = await self._db.execute(
                 "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
@@ -17306,7 +17373,9 @@ class MessageStore:
             mrow = await cur.fetchone()
             origin_meta: dict[str, Any] = {}
             # EF-3: ciphered at rest, bound to the origin message's metadata cell and its channel
-            # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+            # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable; its
+            # dead-letter runs after the try, as above, with only the error's text kept.
+            origin_tag_error: str | None = None
             try:
                 meta_json = (
                     (
@@ -17325,12 +17394,48 @@ class MessageStore:
                 )
             except CellTagError as err:
                 tag_failures.append(err)  # audited by ingress_handoff once the lock is released
-                return await _consume_dead(str(err), "re-ingress origin failed its integrity check")
+                origin_tag_error = str(err)
+            except CipherError as exc:
+                if isinstance(exc, PROGRAMMING_ERRORS):
+                    raise
+                open_fault = no_verdict_fault(exc)
+                if open_fault is None:
+                    unopenable = type(exc).__name__
+            if origin_tag_error is not None:
+                return await _consume_dead(
+                    origin_tag_error, "re-ingress origin failed its integrity check"
+                )
+            if open_fault is not None:
+                raise open_fault
+            if unopenable is not None:
+                return await _dead_unopenable(unopenable, "origin metadata")
+            # BACKLOG #5727, as on Postgres (#5689): metadata that is not JSON, or a depth int()
+            # cannot read (a list, an infinity, a word), leaves the lineage unreadable, so the token
+            # is dead-lettered. The refusal is content-free: a decode error holds the decrypted text.
+            refusal: str | None = None
             if meta_json:
-                loaded = json.loads(meta_json)
+                loaded, refusal = json_loads_or_refusal(meta_json)
                 if isinstance(loaded, dict):
                     origin_meta = loaded
-            child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                elif refusal is None:
+                    # Valid JSON that is not an object (null, a list, a number, a string) holds no
+                    # lineage, and read as none it would restart a re-ingress loop's depth count.
+                    refusal = f"not an object: {type(loaded).__name__}"
+            try:
+                child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+            except (ValueError, TypeError, OverflowError) as exc:
+                refusal = type(exc).__name__
+            if refusal is not None:
+                log.warning(
+                    "ingress_handoff: origin metadata of work-row %s is unparseable (%s);"
+                    " dead-lettering",
+                    response_row_id,
+                    refusal,
+                )
+                return await _consume_dead(
+                    f"re-ingress origin metadata is unparseable ({refusal})",
+                    "re-ingress origin metadata unparseable",
+                )
             root = origin_meta.get("correlation_root_id") or origin_id
             if child_depth > correlation_depth_cap:
                 # Depth-cap breach: dead-letter the token, ERROR the origin (Q4). Consume (don't

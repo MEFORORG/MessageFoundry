@@ -23,6 +23,9 @@ messagefoundry_toolkit/requirements-audit.lock text eol=lf
 # would stop being summoned by an edit to any listed test. The Python parser cannot see a CR on a
 # CRLF checkout, so the line ending is pinned here instead (BACKLOG #1434).
 tests/tooling_manifest.txt text eol=lf
+# ci.yml's changes-job path lists: grep -f would carry a CR into every pattern, and the step
+# refuses a CR line, so a CRLF checkout must not reach them (BACKLOG #5472).
+.github/ci-paths/*.txt text eol=lf
 
 # The bundled breach-screening corpus (BACKLOG #1134). Git already stores it LF, so this pin is an
 # empty content diff -- it only stops `core.autocrlf=true` from checking out CRLF. Two reasons it is

@@ -10,10 +10,7 @@ store-once-deliver-many.
 This graph fans out via **one** handler returning ``list[Send]`` of the **identical** body to N
 destinations — a single ``transform_handoff`` with N deliveries — which is exactly the shape that
 triggers L2b: the body is content-addressed and written **once** to ``shared_body``, referenced by N
-``queue.body_ref`` rows (instead of N inline copies).
-
-Prerequisite: the harness wheel or an editable install of this repo. Under ``-P``, a bare checkout with
-only the engine wheel fails on the ``harness`` import below. Serve it for §7 **J1/S7.1** (store-once
+``queue.body_ref`` rows (instead of N inline copies). Serve it for §7 **J1/S7.1** (store-once
 functional) and **J9/S7.6** (write-amplification)::
 
     MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_SINK_PORT=2700 \
@@ -22,14 +19,14 @@ functional) and **J9/S7.6** (write-amplification)::
 then inject a few ADT messages on the inbound port and inspect the store (``shared_body`` row count,
 ``queue.body_ref``). Synthetic + generic; reuses the load graph's ``_shape`` for ports/sink/fan-out so
 ``MEFOR_LOAD_FANOUT`` / ``MEFOR_LOAD_SINK_PORT`` / ``MEFOR_LOAD_ADT_PORT`` behave the same as there.
+The ``_shape.py`` beside this file is a byte copy of that graph's, so this directory loads with only
+the engine installed (BACKLOG #5853).
 """
 
 from __future__ import annotations
 
-# Needs the harness package importable under -P (the harness wheel, or an editable install of this
-# repo): the helper is in another directory, and the loader serves a bare import only from this one
-# (BACKLOG #5853).
-from harness.config.load._shape import NO_PER_HOST_CAP, load_shape
+from _shape import NO_PER_HOST_CAP, load_shape
+
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.parsing.message import Message, RawMessage

@@ -34,10 +34,12 @@ import ast
 import functools
 import json
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
 
+from tests import _workflow_contexts as workflow_contexts
 from tests._workflow_contexts import changes_arm_pattern, jobs_of
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -92,16 +94,17 @@ _STEP_MODULE = re.compile(r"-m\s+((?:harness|scripts|tests)(?:\.\w+)+)")
 
 @functools.cache
 def _docker_pattern() -> re.Pattern[str]:
-    """The pull-request arm's ``grep -qE`` pattern for ``docker``.
+    """The pull-request arm's pattern for ``docker``, from ``.github/ci-paths/docker.txt``.
 
     Anchored on the LAST ``docker=true`` emission: the workflow_dispatch arm emits one first, with
-    no grep in front of it. The last ``grep -qE`` before the emission is the arm that decides it.
+    no matcher in front of it. The last ``paths_match`` before the emission is the arm that decides
+    it.
     """
     return re.compile(changes_arm_pattern("docker", "dockerignore"))
 
 
 def gate(changed: list[str]) -> bool:
-    """Mirror of the shell decision: ``echo "$changed" | grep -qE P`` over one path per line."""
+    """Mirror of the shell decision: ``echo "$changed" | grep -qEf LIST`` over one path per line."""
     pattern = _docker_pattern()
     return any(pattern.search(path) for path in changed)
 
@@ -297,25 +300,117 @@ def test_the_existing_arms_still_trip_the_gate(path: str) -> None:
     assert gate([path]), f"the docker arm no longer admits {path}"
 
 
-#: A COPY line's arguments. The last source-shaped token is the destination.
-_COPY = re.compile(r"^COPY\s+(?P<args>.+)$", re.M)
+#: A COPY or ADD instruction, any case, after line continuations are joined: its leading
+#: ``--flag`` options, then its arguments, the last of which is the destination.
+_COPY = re.compile(
+    r"^[ \t]*(?:COPY|ADD)[ \t]+(?P<flags>(?:--\S+[ \t]+)*)(?P<args>.+)$", re.M | re.I
+)
+
+
+#: The start of a heredoc on an instruction line: ``<<EOF``, ``<<-EOF`` or a quoted word. Not a
+#: here-string (``<<<``), and not a shift such as ``1<<2``, whose word does not start with a letter.
+_HEREDOC = re.compile(r"""(?<!<)<<-?["']?(?P<word>[A-Za-z_][\w-]*)["']?""")
+
+
+def _checkout_sources_copied(dockerfile: str) -> list[str]:
+    """Each source a COPY or ADD instruction reads from the build context, in file order.
+
+    Reads the shell form and the JSON form, and an instruction continued over several lines with
+    a trailing backslash, the default escape character. Comment lines go first, as Docker drops
+    them before it joins continuations, and a heredoc body is skipped, so neither is read as an
+    instruction. A leading ``./`` is dropped from a source. A ``--from`` copy reads another build
+    stage, not the checkout, so it is skipped. Blank lines go too: Docker skips one inside a
+    continuation. Not read, at least: a heredoc SOURCE, and a
+    ``# escape=`` directive that changes the escape character.
+    """
+    kept: list[str] = []
+    terminator: str | None = None
+    for line in dockerfile.splitlines():
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        if line.lstrip().startswith("#") or not line.strip():
+            continue
+        kept.append(line)
+        heredoc = _HEREDOC.search(line)
+        if heredoc:
+            terminator = heredoc.group("word")
+    joined = re.sub(r"\\[ \t]*\n", " ", "\n".join(kept))
+    found: list[str] = []
+    for match in _COPY.finditer(joined):
+        if "--from" in match.group("flags"):
+            continue
+        args = match.group("args").strip()
+        if args.startswith("["):
+            try:
+                tokens = [str(t) for t in json.loads(args)]
+            except json.JSONDecodeError:
+                pytest.fail(f"a JSON-form COPY does not parse, so its sources are unread: {args}")
+        else:
+            tokens = args.split()
+        found += [token.removeprefix("./") for token in tokens[:-1]]
+    return found
 
 
 def _root_files_the_image_copies() -> set[str]:
     """Every repo-ROOT file a Dockerfile COPY line reads from the checkout (BACKLOG #5472).
 
     A root file only: a directory source (``messagefoundry``) is the start-path set above, and a
-    nested source (``docker/locks/...``) sits under an arm of its own. A ``--from`` copy reads
-    another build stage, not the checkout, so it is skipped.
+    nested source (``docker/locks/...``) sits under an arm of its own.
     """
-    found: set[str] = set()
-    for match in _COPY.finditer(_DOCKERFILE.read_text(encoding="utf-8")):
-        tokens = match.group("args").split()
-        if any(token.startswith("--from") for token in tokens):
-            continue
-        sources = [token for token in tokens if not token.startswith("--")][:-1]
-        found |= {s for s in sources if "/" not in s and (_ROOT / s).is_file()}
-    return found
+    sources = _checkout_sources_copied(_DOCKERFILE.read_text(encoding="utf-8"))
+    return {s for s in sources if "/" not in s and (_ROOT / s).is_file()}
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "expected"),
+    [
+        ("COPY pyproject.toml README.md ./\n", ["pyproject.toml", "README.md"]),
+        ("COPY pyproject.toml \\\n    README.md \\\n    ./\n", ["pyproject.toml", "README.md"]),
+        ('COPY ["LICENSE", "NOTICE", "./"]\n', ["LICENSE", "NOTICE"]),
+        ('COPY --chown=0:0 ["LICENSE", "./"]\n', ["LICENSE"]),
+        ("copy --chmod=644 NOTICE /src/\n", ["NOTICE"]),
+        ("ADD README.md /src/\n", ["README.md"]),
+        ("COPY --from=builder /opt/venv /opt/venv\n", []),
+        ("RUN echo COPY LICENSE ./\n", []),
+        (
+            "COPY pyproject.toml \\\n# the readme\n    README.md ./\n",
+            ["pyproject.toml", "README.md"],
+        ),
+        ("# see C:\\\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("COPY ./README.md ./messagefoundry ./\n", ["README.md", "messagefoundry"]),
+        ("RUN <<EOF\ncopy NOTICE /tmp/x\nEOF\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("RUN <<END-OF-FILE\nadd x y\nEND-OF-FILE\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("RUN echo $((1<<2))\nCOPY CHANGELOG.md ./\n", ["CHANGELOG.md"]),
+        ("RUN cat <<<hello\nCOPY CHANGELOG.md ./\n", ["CHANGELOG.md"]),
+        ("COPY README.md \\\n\n    CHANGELOG.md ./\n", ["README.md", "CHANGELOG.md"]),
+    ],
+)
+def test_the_copy_reader_on_planted_dockerfiles(dockerfile: str, expected: list[str]) -> None:
+    """The shapes a COPY may take, so a source spelled across lines or as JSON is not missed."""
+    assert _checkout_sources_copied(dockerfile) == expected
+
+
+def test_every_licence_and_readme_the_image_build_reads_trips_the_gate() -> None:
+    """The image builds the engine wheel, which reads pyproject's ``readme`` and every
+    ``license-files`` entry by name, so a rename or a removal fails the image build. Each one the
+    image COPYs, as a file or inside a copied directory, must run the smoke. Before #5472's fix the
+    vendored defusedxml LICENSE, inside the copied ``messagefoundry`` tree, did not."""
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    named = {project["readme"], *project["license-files"]}
+    sources = _checkout_sources_copied(_DOCKERFILE.read_text(encoding="utf-8"))
+    copied = sorted(
+        path
+        for path in named
+        if any(path == s or path.startswith(s.rstrip("/") + "/") for s in sources)
+    )
+    assert copied, f"the readers found none of {sorted(named)} copied; they have gone blind"
+    assert "messagefoundry/_vendor/defusedxml/LICENSE" in copied, (
+        f"the readers found {copied} copied of {sorted(named)}; they have drifted"
+    )
+    missed = [path for path in copied if not gate([path])]
+    assert not missed, f"the image's wheel build reads these, yet editing one skips it: {missed}"
 
 
 def test_every_root_file_the_image_copies_trips_the_gate() -> None:
@@ -323,17 +418,58 @@ def test_every_root_file_the_image_copies_trips_the_gate() -> None:
     build reads them by name, so a rename or a removal fails the image build. Before BACKLOG #5472
     only pyproject.toml matched, so a PR touching only one of the other three skipped this job."""
     copied = _root_files_the_image_copies()
+    assert len(copied) >= 4, f"the COPY reader found only {sorted(copied)}; it has gone blind"
     assert {"pyproject.toml", "README.md", "LICENSE", "NOTICE"} <= copied, (
         f"the Dockerfile COPY reader found {sorted(copied)}; it has drifted from the Dockerfile"
     )
     missed = sorted(path for path in copied if not gate([path]))
-    assert len(copied) >= 4, "the COPY reader found too little, so the check below is vacuous"
     assert not missed, (
         f"the image COPYs these root files, yet editing one skips the smoke: {missed}"
     )
 
 
-@pytest.mark.parametrize("path", ["README.md.orig", "LICENSE-3RD", "NOTICE.txt", "docs/README.md"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "README.md.orig",
+        "LICENSE-3RD",
+        "NOTICE.txt",
+        "docs/README.md",
+        "COMMERCIAL-LICENSE",
+        "messagefoundry/_vendor/defusedxml/LICENSE.txt",
+    ],
+)
 def test_the_root_file_arm_is_anchored(path: str) -> None:
     """SHAPE: each matches only if the root-file alternation loses its ``$`` or its ``^``."""
     assert not gate([path]), f"the docker arm admits {path}"
+
+
+def test_the_arm_reader_follows_a_repointed_workflows_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A test that repoints ``WORKFLOWS`` must read the file it pointed at, not a cached pattern of
+    the real ci.yml (BACKLOG #5472). The arm reader was memoised on its arguments alone. It is
+    here, not in the tooling tier, because an edit to tests/_workflow_contexts.py alone trips no
+    tooling arm."""
+    real = changes_arm_pattern("docker", "dockerignore")
+    planted = "^planted/dockerignore"
+    workflows = tmp_path / "workflows"
+    workflows.mkdir()
+    step = 'if paths_match docker; then\necho "docker=true" >> "$GITHUB_OUTPUT"\n'
+    (workflows / "ci.yml").write_text(step, encoding="utf-8")
+    # The arm's list, beside the repointed workflows dir as .github/ci-paths/ is (BACKLOG #5472).
+    (tmp_path / "ci-paths").mkdir()
+    (tmp_path / "ci-paths" / "docker.txt").write_bytes(f"{planted}\n".encode())
+    monkeypatch.setattr(workflow_contexts, "WORKFLOWS", workflows)
+    assert changes_arm_pattern("docker", "dockerignore") == f"(?:{planted})" != real
+
+
+def test_a_parsed_workflow_is_a_fresh_copy_each_call() -> None:
+    """The parse is memoised, so each caller must get its own copy to mutate (BACKLOG #5472)."""
+    first = workflow_contexts.load_workflow("ci.yml")
+    second = workflow_contexts.load_workflow("ci.yml")
+    assert first == second
+    assert first is not second
+    first["jobs"]["changes"]["steps"].append({"planted": True})
+    again = workflow_contexts.load_workflow("ci.yml")
+    assert again == second, "a mutation of one caller's parse reached the next caller's"

@@ -32,6 +32,7 @@ import logging
 import math
 import threading
 import time
+import traceback
 from collections.abc import (
     Awaitable,
     Callable,
@@ -276,7 +277,13 @@ from messagefoundry.store.crypto import (
     gave_no_verdict,
 )
 from messagefoundry.store.metadata import intake_metadata_json, user_metadata
-from messagefoundry.store.queue_tag import QueueTagError
+from messagefoundry.store.queue_tag import (
+    QueueOpenFault,
+    QueueTagError,
+    fault_text,
+    no_verdict_fault,
+    unopenable_log_text,
+)
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
     REINGRESS_PEEK_FAILED,
@@ -1726,6 +1733,75 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
         return guarded
 
     return wrap
+
+
+def _reply_step_fault(exc: Exception) -> Exception:
+    """What leaves the re-ingress step in place of ``exc`` (BACKLOG #5727), always fresh, with no
+    cause, context or traceback. A :class:`QueueOpenFault` keeps its own text. A key service that
+    gave no verdict becomes a :class:`QueueOpenFault` named by :func:`fault_text`: its type and
+    the cipher's own text, which is not value-free (BACKLOG #5982) and which the claim's
+    :class:`QueueOpenFault` for the same silence keeps too. Anything else becomes a
+    :class:`_ReplyStepFault` named by :func:`unopenable_log_text`: its class, and a queue-tag
+    refusal's cause, never a cipher's text, which can echo stored text such as a ``key_id``.
+    Neither carries a driver's text or a chain. Each also lists the file, line and function of
+    every frame ``exc`` passed through, never a local."""
+    if isinstance(exc, QueueOpenFault):
+        return QueueOpenFault(*exc.args)
+    frames = "".join(
+        f"\n  {frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+        for frame, lineno in traceback.walk_tb(exc.__traceback__)
+    )
+    if no_verdict_fault(exc) is not None:
+        return QueueOpenFault(f"{fault_text(exc)}{frames}")
+    return _ReplyStepFault(f"{unopenable_log_text(exc)}{frames}")
+
+
+def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
+    """Wrap the re-ingress step so whatever escapes it leaves only as a :class:`QueueOpenFault`
+    or a :class:`_ReplyStepFault`, each named as :func:`_reply_step_fault` says (BACKLOG #5727;
+    the Lander's hold on PR 3155). The step's store calls seal and open cells, and a raw cipher
+    error can chain a key service's URL or body, a driver error its statement, and a traceback
+    the frames that hold the reply. The fault arm that catches it logs it with its traceback.
+    Every ``Exception``, a :class:`QueueOpenFault` included, is replaced by a fresh one, raised
+    here, outside the handler, so it carries no chain and its traceback starts in this frame. The
+    outcome does not change: both claim modes re-pend on any ``Exception``. A ``BaseException``
+    that is not one passes."""
+
+    @functools.wraps(body)
+    async def bounded(
+        self: RegistryRunner, name: str, item: OutboxItem
+    ) -> tuple[_ItemOutcome, float | None]:
+        fault: Exception | None
+        unnamed: tuple[str, str] | None = None
+        try:
+            return await body(self, name, item)
+        except Exception as exc:  # noqa: BLE001 -- replaced, never swallowed; see the docstring
+            try:
+                fault = _reply_step_fault(exc)
+            except Exception as build_exc:  # noqa: BLE001 -- logged by type, and stood in for
+                # Building the replacement failed. Its error would carry ``exc``, and so the raw
+                # key-service chain, as its context, so it is dropped and only the two type names
+                # are kept, which carry no content (the Lander's hold on PR 3155).
+                fault = None
+                unnamed = (type(exc).__name__, type(build_exc).__name__)
+        if fault is None:
+            original, build = unnamed or ("unknown", "unknown")
+            log.warning(
+                "re-ingress step fault could not be named (%s; building its fault raised %s)",
+                original,
+                build,
+            )
+            # Raised outside the handler, so it carries no context and needs no ``from None``.
+            raise QueueOpenFault(
+                f"re-ingress step fault could not be named ({original}; building its fault"
+                f" raised {build})"
+            )
+        try:
+            raise fault
+        finally:
+            del fault  # the fault's traceback holds this frame: no cycle through a local
+
+    return bounded
 
 
 @dataclass(eq=False)
@@ -8944,8 +9020,8 @@ class RegistryRunner:
         # broadcast above cannot lift it (BACKLOG #5704).
 
     async def _pooled_maybe_buildup(self, lane: str, stage: str) -> None:
-        """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1). The per_lane buildup depth check lives
-        in the router/transform worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
+        """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1; the RESPONSE stage paces the same
+        way in :meth:`_dispatch_response`). The per_lane buildup depth check lives in the router/transform worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
         calls this after each processed item — rate-limited per (stage, lane) to ``_BUILDUP_CHECK_INTERVAL``
         so it never runs a COUNT+MIN per claimed item. ``_maybe_alert_buildup`` additionally self-throttles
         the actual alert emit via ``_next_buildup_alert`` (300 s)."""
@@ -13270,6 +13346,7 @@ class RegistryRunner:
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
+        last_buildup_check = 0.0
         woken = False  # B11: previous wait was a wake (herd) vs poll-interval timeout (idle)?
         # B12 (ADR 0061): wait on THIS loopback's RESPONSE lane Event when per-lane wake is on; else the
         # shared singleton (byte-identical). Resolved once.
@@ -13290,6 +13367,18 @@ class RegistryRunner:
                 if item is None:
                     faults.healthy()
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
+                    # BACKLOG #5727: a claim whose open of the token's payload gets no verdict sets
+                    # the token aside and returns None, so a full key-service outage reaches only
+                    # this branch. The set-aside token is pending, so the check counts it. A fenced
+                    # claim on a node that no longer leads also returns None, so only the leader
+                    # checks here, as only the leader pages from the in-flight watch.
+                    now = time.time()
+                    if (
+                        now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                        and self._coordinator.is_leader()
+                    ):
+                        last_buildup_check = now
+                        await self._response_buildup_check(name)
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 gate = await self._log_gate_after_claim("response", name, claimed, faults, fence)
@@ -13301,6 +13390,15 @@ class RegistryRunner:
                 if outcome[0] is _ItemOutcome.STOPPED:
                     return
                 claimed.clear()  # #1844: resolved, before anything else in the pass can raise
+                # Off the hot path (rate-limited), as the router and transform workers check theirs.
+                # On the leader only, as on the empty-claim branch (BACKLOG #5727).
+                now = time.time()
+                if (
+                    now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                    and self._coordinator.is_leader()
+                ):
+                    last_buildup_check = now
+                    await self._response_buildup_check(name)
                 faults.healthy()
             except asyncio.CancelledError:
                 raise
@@ -13315,10 +13413,47 @@ class RegistryRunner:
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
                 claimed.clear()
+                # BACKLOG #5727: a token whose step faults with no verdict on every pass takes this
+                # arm, never the success path, and is re-pended between claims, so the in-flight
+                # watch never sees it held. Checked here too, only once the re-pend landed, so the
+                # token counts as pending and this node still owns the lane.
+                now = time.time()
+                if (
+                    held is HoldResult.LANDED
+                    and now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL
+                    and self._coordinator.is_leader()
+                ):
+                    last_buildup_check = now
+                    await self._response_buildup_check(name)
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
+    async def _response_buildup_check(self, name: str) -> None:
+        """The response worker's build-up check (BACKLOG #5727). A diagnostic: a store read that
+        fails here never escapes, which would count it as a worker fault, and is logged as a
+        redacted stand-in through a per-lane :class:`~messagefoundry.log_backoff.FailureRun`, as
+        :meth:`_delivery_failure_alert_checks` logs its checks, since the driver's text can quote
+        a cell and the fault arm runs it about once a second while the store is down."""
+        key = f"response-buildup:{name}"
+        try:
+            await self._maybe_alert_buildup(
+                name, stage=Stage.RESPONSE.value, threshold=self._buildup_default
+            )
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic; see the docstring
+            stand_in = _RedactedFault(safe_exc(exc)).with_traceback(exc.__traceback__)
+            failures = self._delivery_alert_check_runs.get(key, FailureRun())
+            self._delivery_alert_check_runs[key] = failures.record(
+                log, stand_in, "response build-up check failed for loopback %r", name
+            )
+        else:
+            open_run = self._delivery_alert_check_runs.pop(key, None)
+            if open_run is not None:
+                open_run.clear(
+                    log, "response build-up check for loopback %r", name, level=logging.WARNING
+                )
+
     @_records_worker_death("response")
+    @_reply_step_boundary
     async def _process_response_item(
         self, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
@@ -13344,12 +13479,48 @@ class RegistryRunner:
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree. A
         # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
+        read_fault: QueueOpenFault | None = None
+        # BACKLOG #5727: each dead-letter below runs after the try, so a failed seal in it chains no
+        # raw open error, whose cause can echo a key service's URL or body. The handlers keep only
+        # strings: the error's type name, and the unopenable_log_text the dead-letter records. A
+        # cipher's own text is not recorded: it can echo stored text, a key_id (BACKLOG #5982).
+        tag_failed = False
+        unopenable: tuple[str, str] | None = None
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
         except QueueTagError:
             # BACKLOG #5982: the token's own payload failed its tag after the claim opened it. The
             # store has audited and alerted it; dead-letter it under the error the handoff records
             # for the same failure, not as an undecryptable reply.
+            tag_failed = True
+        except CipherError as exc:
+            # BACKLOG #5727: a key service that gave no verdict says nothing about this reply. It
+            # takes the fault arm, which re-pends the token with a backoff and dead-letters
+            # nothing. A per-lane worker retries until the service answers; a pooled lane under
+            # infra_fault_policy "stop" goes STOPPED after infra_fault_stop_after such faults, its
+            # token left pending. Raised below, outside this handler, so the fault carries no chain
+            # to the raw key-service error, which can echo a URL or a body (BACKLOG #2318). An
+            # engine fault, such as an AADComponentError, is dead-lettered with every other
+            # verdict, as on main before #5727; held, it would fail on every pass at the lane's
+            # head (the Lander's hold on PR 3155, item 7).
+            read_fault = no_verdict_fault(exc)
+            if read_fault is None:
+                # BACKLOG #4995: a reply body that fails this way fails again on a retry until its
+                # cause clears, and the fault arm re-pended it at the head of this FIFO lane each
+                # time. Dead-letter it at once, as a claim does an unopenable payload. The cause can
+                # clear later, for example a key the store lacks, so the token keeps its reference
+                # and a replay can recover it. Each store's handoff contains its own decrypts the
+                # same way (BACKLOG #5689, #5727), and a key service with no verdict at any of them
+                # takes the fault arm. In the handoff, an engine fault propagates from the reply
+                # cell, dead-letters on a token reference, and on origin metadata dead-letters where
+                # the cipher reads it as a corrupt cell and propagates otherwise. The read above
+                # opens the same reference first: an engine fault it does not read as a tag failure
+                # is dead-lettered here, with every other verdict, so that token never reaches the
+                # handoff. A key service with no verdict on one of the handoff's encrypts leaves it
+                # as a QueueOpenFault too; its invocation ceiling, a plain CipherError, is a
+                # deliberate hard stop.
+                unopenable = (type(exc).__name__, unopenable_log_text(exc))
+        if tag_failed:
             log.warning(
                 "response worker %r: work-row %s failed its integrity tag; dead-lettering",
                 name,
@@ -13357,21 +13528,24 @@ class RegistryRunner:
             )
             await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
             return _ItemOutcome.PROCESSED, None
-        except CipherError as exc:
-            # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
-            # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
-            # does an unopenable payload; the token keeps its reference for a replay. The handoff
-            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
-            # any CipherError the handoff raises still takes the fault arm. The Postgres handoff
-            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689).
+        if read_fault is not None:
+            try:
+                raise read_fault
+            finally:
+                del read_fault  # the fault's traceback holds this frame: no cycle through a local
+        if unopenable is not None:
+            error_type, error_text = unopenable
+            # The read opens the token's reference first, then the reply, and either can fail
+            # here, so the wording names both (the Lander's hold on PR 3155, item 8).
             log.warning(
-                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                "response worker %r: the reference or the reply of work-row %s does not decrypt"
+                " (%s); dead-lettering",
                 name,
                 item.id,
-                type(exc).__name__,
+                error_type,
             )
             await self.store.dead_letter_now(
-                item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
+                item.id, f"undecryptable re-ingress token reference or reply: {error_text}"
             )
             return _ItemOutcome.PROCESSED, None
         unstorable = _unstorable_reply(body)
@@ -13423,18 +13597,31 @@ class RegistryRunner:
                 refusal,
                 cipher=self.store.cipher(),
             )
-        produced = await self.store.ingress_handoff(
-            response_row_id=item.id,
-            loopback_channel_id=name,
-            correlation_depth_cap=self._max_correlation_depth,
-            control_id=control_id,
-            message_type=message_type,
-            summary=summary,
-            peek_failed=peek_failed,
-            peek_error=None if refused is None else refused.error,
-            refused_raw=None if refused is None else refused.raw,
-            refused_metadata=None if refused is None else refused.fields,
-        )
+        handoff_fault: QueueOpenFault | None = None
+        try:
+            produced = await self.store.ingress_handoff(
+                response_row_id=item.id,
+                loopback_channel_id=name,
+                correlation_depth_cap=self._max_correlation_depth,
+                control_id=control_id,
+                message_type=message_type,
+                summary=summary,
+                peek_failed=peek_failed,
+                peek_error=None if refused is None else refused.error,
+                refused_raw=None if refused is None else refused.raw,
+                refused_metadata=None if refused is None else refused.fields,
+            )
+        except QueueOpenFault as fault:
+            handoff_fault = fault
+        if handoff_fault is not None:
+            # BACKLOG #5727: the fault arm logs this fault with its traceback. Drop the handoff's
+            # frames, whose arguments carry values from the reply, and this frame's own copies,
+            # before it goes on. The token is still re-pended by the fault arm.
+            del body, control_id, message_type, summary, refused
+            try:
+                raise handoff_fault.with_traceback(None)
+            finally:
+                del handoff_fault  # as for read_fault above
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
             # wake for a depth-capped / peek-failed token that produced no ingress row). B12 (ADR
@@ -14952,7 +15139,22 @@ class RegistryRunner:
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         if self._inbound_log_halted(lane):  # #122 claim gate, pooled half (BACKLOG #5704)
             return await self._refuse_log_halted(item)
-        return _to_lane_result(await self._process_response_item(lane, item))
+        outcome = await self._process_response_item(lane, item)
+        result = _to_lane_result(outcome)
+        # D1 (see _dispatch_ingress), on the same per-(stage, lane) pacing. Through the per-lane
+        # worker's redacted check, not _pooled_maybe_buildup's log.exception, which writes the
+        # driver's raw text (BACKLOG #5727). Skipped after a STOPPED result, the missing-inbound
+        # revert, as the per-lane worker skips it.
+        key = f"{Stage.RESPONSE.value}:{lane}"
+        now = time.time()
+        if (
+            outcome[0] is not _ItemOutcome.STOPPED
+            and now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL
+            and self._coordinator.is_leader()
+        ):
+            self._pooled_buildup_at[key] = now
+            await self._response_buildup_check(lane)
+        return result
 
     async def _wait_for_work(self, event: asyncio.Event) -> bool:
         """Wait up to the idle backstop for ``event`` (this worker class's wake event), then clear it.
@@ -15244,6 +15446,15 @@ class RegistryRunner:
 class _RedactedFault(Exception):
     """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class _ReplyStepFault(Exception):
+    """An error that left the re-ingress step (:func:`_reply_step_boundary`, BACKLOG #5727), named
+    by :func:`~messagefoundry.store.queue_tag.unopenable_log_text` (its class, and a queue-tag
+    refusal's cause) and its frames' file, line and function. It keeps none of the error's own
+    text: a cipher's can echo stored text such as a ``key_id`` (BACKLOG #5982). Not a
+    :class:`_RedactedFault`, whose message is :func:`safe_exc` output; this one's is built from
+    names alone."""
 
 
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:

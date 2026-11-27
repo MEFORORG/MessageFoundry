@@ -19,6 +19,11 @@
 # you pass it.
 x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
 
+# The Postgres store password, as a required compose substitution with no default, held once
+# (BACKLOG #5400). The postgres service and the `ha` engines alias this one copy, so the password
+# Postgres is initialized with and the one the engines log in with come from the same place.
+x-store-password: &store-password "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
+
 # The default engine's image, named once: the revocation-attestation-check service must run the
 # same image as that engine so it reads the value with the same parser. Change it here, for example to
 # messagefoundry:sqlserver or a config-baked derived image. It does NOT set the `ha` engines'
@@ -110,6 +115,20 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_PORT: "5432"
   MEFOR_STORE_DATABASE: "messagefoundry"
   MEFOR_STORE_USERNAME: "mefor"
+  # The store password is the x-store-password anchor at the top, the value postgres reads as
+  # POSTGRES_PASSWORD (BACKLOG #5400). environment: beats env_file:, so a MEFOR_STORE_PASSWORD
+  # line in secrets.env does not reach these engines. At least these can still split the two,
+  # and the engines then fail at store login: a MEFOR_STORE_PASSWORD file in a
+  # MEFOR_SECRETS_DIRECTORY, which wins over this variable; an override file that sets this
+  # key; `docker compose run -e MEFOR_STORE_PASSWORD=...`; and changing the value after
+  # Postgres first initializes the mefor-pg volume, since it reads POSTGRES_PASSWORD only then,
+  # until that volume is recreated or the role's password is changed to match. A deployment
+  # that gives the engines their own row-only role (the DEV-ONLY note below) sets
+  # MEFOR_STORE_PASSWORD on engine-ha and engine-standby only, not in this anchor, since
+  # schema-provision merges it too and keeps the DDL-capable role's password, and sets it to
+  # ANOTHER required `${...:?...}` substitution with no default, never a literal password in
+  # this file (BACKLOG #1091).
+  MEFOR_STORE_PASSWORD: *store-password
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
   # The store hop is verified TLS at every posture: the engine refuses a store login over
@@ -463,8 +482,9 @@ services:
       # variable is unset, and the two required secret gates cannot see it -- bandit does not parse
       # yaml, gitleaks' generic rule is entropy-gated. NOTE this is COMPOSE SUBSTITUTION, which is a
       # different mechanism from the `env_file:` the other services use: env_file sets variables
-      # INSIDE the container and does not feed substitution at all.
-      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
+      # INSIDE the container and does not feed substitution at all. The value is the
+      # x-store-password anchor at the top of this file, which the `ha` engines alias too.
+      POSTGRES_PASSWORD: *store-password
     volumes:
       - mefor-pg:/var/lib/postgresql/data
       - ./pg-tls:/etc/postgresql/tls:ro

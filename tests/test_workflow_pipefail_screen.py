@@ -11,7 +11,7 @@ pipeline report the first non-zero member instead.
 **This is a SCREEN with a grandfathered baseline.** It records the unguarded pipelines already in
 the tree and fails on a NEW one. It does not sweep the existing ones: that is separate work, per
 site, because ``pipefail`` is not always the right answer -- see ``_ALLOWLIST_JOBS`` for a job where
-turning it on would turn a real test skip into a silent false green. A screen that demanded the
+turning it on could turn a needed test run into a skip that reports green. A screen that demanded the
 whole sweep in one change would land as a blanket exemption instead, and a blanket exemption is a
 control reporting success without exercising what it names.
 
@@ -697,15 +697,31 @@ def gating_jobs() -> set[tuple[str, str]]:
 #: "unexamined", and an allowlist nobody can audit is how a screen quietly stops screening.
 _ALLOWLIST_JOBS: dict[tuple[str, str], str] = {
     ("ci.yml", "changes"): (
-        "PIPEFAIL WOULD BREAK THIS JOB, NOT FIX IT. Its path classification is a run of if/elif "
-        'conditions shaped `echo "$changed" | grep -qE ...` -- at least eight piped greps across '
-        "at least seven conditions, one joining two with `||` and the last using `grep -qvE`. "
-        "`grep -q` exits the moment it matches, so its reader closes the pipe and the producing "
-        "`echo` takes SIGPIPE once the payload passes the 65,536-byte pipe buffer. With pipefail "
-        "on, that SIGPIPE becomes the pipeline's status and the condition silently flips: "
-        "`serverdb=false` on a pull request that DID touch the store, `sqlserver-store` skips, and "
-        "`CI gate` reports success over an untested store change. A false green on the job whose "
-        "whole purpose is deciding which legs run is strictly worse than the defect being fixed."
+        "PIPEFAIL WOULD BREAK THIS JOB, NOT FIX IT. This entry exempts the WHOLE job, and the "
+        "reason below is about its `f` step alone, so a pipe in any other step of `changes` needs "
+        "its own reading. At e143bb2c64d the `f` step holds six pipes, at least five of them "
+        '`echo "$changed"` into a `grep -q`: the match inside `paths_match`, which at least the '
+        "serverdb, docker, packaging, ide and tooling arms call; the tooling manifest arm "
+        "(`grep -qxFf`); and the three piped `code` conditions (`grep -qE` twice, then "
+        "`grep -qvE`). The sixth, `paths_match`'s own list guard (`printf '\\n' | grep -qEf`), "
+        "is neutral either way: it reads false on any non-zero status. `grep -q` exits on its "
+        "first match, so the producing `echo` can take SIGPIPE when grep matches before it has "
+        "finished writing, reliably once the changed-path list passes the pipe buffer (65,536 "
+        "bytes on Linux) with an early match. Without pipefail each piped condition reads grep's "
+        "status. With pipefail a SIGPIPE makes it 141. In `paths_match` that is above 1, so the "
+        "job fails: a false red. The manifest arm and the `code` chain read 141 as false and do "
+        "not fail, so they can write `tooling=false` when the tooling path arm missed, and "
+        "`code=false` on a pull request that touches code, which skips at least the expensive "
+        "steps of the required `test` legs while `CI gate` reports success. They run after every "
+        "`paths_match` arm, so that false green needs each of those arms to have missed or "
+        "matched without SIGPIPE first. A false green on the job whose purpose is deciding which "
+        "legs run is worse than leaving pipefail off, which loses no producer failure here: "
+        "every pipe's producer is an `echo` or `printf` of a string already in memory. What is NOT "
+        "covered either way: `paths_match` fails closed on at least the list faults its ci.yml "
+        "comment names and a grep exit above 1, but a silent false from it can still come from "
+        "at least a list that does not name a path its arm needs, or an empty `$changed`; and "
+        "the manifest arm reads its patterns through a process substitution whose failure no "
+        "status here sees, so an unreadable or all-comment manifest reads as `tooling=false`."
     ),
 }
 

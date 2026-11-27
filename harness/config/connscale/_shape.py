@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Shape parameters for the connection-scale system-under-test graph (B11).
+"""Shape parameters and wiring for the connection-scale system-under-test graph (B11).
 
 Loader skips ``_*`` modules, so this file is *imported* by :mod:`graph` rather than loaded as config.
 It centralizes the ``MEFOR_CONNSCALE_*`` env knobs (mirroring ``harness/config/load/_shape.py``'s
 pattern) so the N-inbound graph reads them in one place — no copy-paste across registered modules.
+
+It is imported two ways, so it imports nothing from the ``harness`` package. ``graph.py`` imports it
+as the bare sibling helper ``_shape``, which the config loader serves from this directory, so
+``serve --config harness/config/connscale`` works with only the engine installed (BACKLOG #5852).
+The connscale runner, its tests, and the module the runner generates per sweep step import it as
+``harness.config.connscale._shape``. :func:`wire_graph` lives here rather than in a second helper
+for the same reason: a second helper would have to name this one, bare under the loader and
+package-qualified everywhere else, and one import cannot be both.
 
 Serving ``harness/config/connscale`` reads the shape from ``MEFOR_CONNSCALE_COUNT=N`` (and the
 matching sink env), so ONE graph file serves every N by env alone. That env route reaches the engine
@@ -38,9 +46,15 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
 
-from harness.config._refusal import prints_its_refusal
+from messagefoundry import MLLP, Send, handler, inbound, outbound, router
+from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.wiring import HandlerFn, RouterFn
+from messagefoundry.parsing.message import Message, RawMessage
 
 # Transform cost modes (a subset of the load graph's — connscale only needs cheapest + a representative
 # whole-field rewrite, never the CPU-spin SLOW mode; the wall here is per-connection machinery, not CPU).
@@ -57,6 +71,23 @@ _MAX_COUNT = 5000  # generous headroom over the 1500 ceiling; a typo of 50000 fa
 # A per-engine name prefix must be safe inside a connection name (no HL7 separators / no whitespace /
 # nothing the loader or the registry would choke on). Empty is allowed (the single-engine default).
 _NAME_PREFIX_RE = re.compile(r"^[A-Za-z0-9_]*$")
+
+
+# A copy of harness/config/_refusal.py, because this file is served to its graph as a bare sibling
+# helper and must not need the harness package (BACKLOG #5852).
+# tests/test_harness_graph_engine_only.py holds the two equal.
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
+    """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
+
+    @wraps(read_shape)
+    def reading() -> R:
+        try:
+            return read_shape()
+        except ValueError as exc:
+            print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
+            raise
+
+    return reading
 
 
 def _env_int(name: str) -> int | None:
@@ -193,3 +224,68 @@ def load_connscale_shape() -> ConnScaleShape:
         if text:
             knobs[key] = text.lower() if key == "transform" else text
     return make_connscale_shape(**knobs)  # type: ignore[arg-type]
+
+
+# -- Wiring ------------------------------------------------------------------------------------
+# graph.py and the runner's generated per-step module both call wire_graph: one wiring, so the two
+# routes cannot build different graphs for the same shape.
+
+# A few attempts with brief backoff: the sink always AA's, so retries shouldn't fire — but a transient
+# hiccup under heavy connection count should ride out rather than dead-letter and dirty the no-loss check.
+_RETRY = RetryPolicy(
+    max_attempts=5, backoff_seconds=0.5, backoff_multiplier=2.0, max_backoff_seconds=5.0
+)
+
+
+def _apply_transform(
+    msg: Message | RawMessage, shape: ConnScaleShape, index: int
+) -> Message | RawMessage:
+    """Apply the configured transform cost. ``cheap`` returns the receipt unchanged (cheapest graph);
+    ``edit`` rewrites representative whole fields via the Message model (never string slicing). MSH-10
+    is left intact — the correlation sink matches on the control id, so the delivered copy must carry
+    the same one it arrived with."""
+    if shape.transform == EDIT and isinstance(msg, Message):
+        msg["MSH-4"] = "MEFOR_CONNSCALE"  # sending facility
+        msg["MSH-6"] = f"SINK_{index:05d}"  # receiving facility = this destination
+    return msg
+
+
+def _make_passthrough(dest: str, shape: ConnScaleShape, index: int) -> HandlerFn:
+    """A per-connection handler: apply the (trivial) transform, deliver to its own outbound. Each
+    handler runs on its own fresh parse of the raw (one routed row per handler), so mutation is
+    isolated."""
+
+    def handle(msg: Message | RawMessage) -> Send:
+        return Send(dest, _apply_transform(msg, shape, index))
+
+    return handle
+
+
+def _route_to(handler_name: str) -> RouterFn:
+    """A trivial router: every received message goes to the one handler bound to this inbound."""
+
+    def route(_msg: Message | RawMessage) -> list[str]:
+        return [handler_name]
+
+    return route
+
+
+def wire_graph(shape: ConnScaleShape) -> None:
+    """Register N independent inbound->router->handler->outbound chains by name. Conn i: IB_CS_{i}
+    on base_port+i -> R_CS_{i} -> H_CS_{i} -> OB_CS_{i} -> the sink. Names run through
+    ``ConnScaleShape.conn_name``, so a per-engine name prefix gives each engine DISTINCT names on a
+    shared store (disjoint FIFO lanes); an empty prefix is byte-identical to the historical
+    single-engine names."""
+    for i in range(shape.count):
+        dest = shape.conn_name("OB", i)
+        host, port = shape.sink_endpoint(i)
+        outbound(
+            dest,
+            MLLP(host=host, port=port, connect_timeout=2.0, timeout_seconds=5.0),
+            retry=_RETRY,
+        )
+        hname = shape.conn_name("H", i)
+        handler(hname)(_make_passthrough(dest, shape, i))
+        rname = shape.conn_name("R", i)
+        router(rname)(_route_to(hname))
+        inbound(shape.conn_name("IB", i), MLLP(port=shape.base_port + i), router=rname)
