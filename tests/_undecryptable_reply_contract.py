@@ -498,10 +498,16 @@ async def seal_outage_reaches_no_reply(store: Any, fetch: RawFetch, _raw: RawSql
 KEY_SERVICE_TEXT = "https://vault.example.test/v1/transit/decrypt/mefor body=SYNTHETIC-BODY"
 
 
-def _dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
+def _dead_letter_seal_failure_carries_no_open_error(
+    which: str, kind: type[CipherError] = CipherError, *, unheld: bool | None = None, arm: str = ""
+) -> ContractCase:
     """BACKLOG #5727: a verdict on the ``which`` cell dead-letters the token, and a dead-letter
     whose seal then fails must not chain the raw decrypt error, whose cause can echo the key
-    service's URL and body, into the error that leaves."""
+    service's URL and body, into the error that leaves. ``kind`` and ``unheld`` pick the arm: a
+    plain ``CipherError`` under a key the store does not hold is not a tag failure, and an
+    :class:`UnauthenticatedCipherError` under a held key is one (the QueueTagError or CellTagError
+    arm). ``unheld`` defaults to on for a plain error on metadata, the CipherError arm there."""
+    unheld = (which == "metadata" and kind is CipherError) if unheld is None else unheld
 
     async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
@@ -509,11 +515,11 @@ def _dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
             await _plant_metadata(store._cipher, raw, mid)
         target = await _cell(fetch, which, mid)
         with faulting_cipher(store) as fault:
-            if which == "metadata":
-                # A key the store does not hold, so the open reaches the CipherError arm. Under a
-                # held key a plain CipherError reads as a corrupt cell, the CellTagError arm.
+            if unheld:
+                # A key the store does not hold, so the open is no tag failure. Under a held key
+                # a plain CipherError reads as a corrupt cell.
                 fault.unheld = target
-            open_error = CipherError("synthetic verdict")
+            open_error = kind("synthetic verdict")
             open_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
             fault.target, fault.open_error = target, open_error
             fault.seal_error = CipherError("synthetic invocation ceiling")
@@ -534,7 +540,7 @@ def _dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
             assert await _handoff(store, item.id, LOOP) is True
         assert len(await children(fetch)) == 1
 
-    case.__name__ = f"dead_letter_seal_failure_at_{which}_carries_no_open_error"
+    case.__name__ = f"dead_letter_seal_failure_at_{which}{arm}_carries_no_open_error"
     return case
 
 
@@ -687,6 +693,13 @@ HANDOFF_CASES: list[ContractCase] = [
     seal_outage_reaches_no_reply,
     _dead_letter_seal_failure_carries_no_open_error("reply"),
     _dead_letter_seal_failure_carries_no_open_error("metadata"),
+    _dead_letter_seal_failure_carries_no_open_error(
+        "ref", UnauthenticatedCipherError, arm="_tag_failed"
+    ),
+    _dead_letter_seal_failure_carries_no_open_error("ref", unheld=True, arm="_corrupt"),
+    _dead_letter_seal_failure_carries_no_open_error(
+        "metadata", UnauthenticatedCipherError, arm="_cell_tag"
+    ),
     _worker_dead_letter_seal_failure_carries_no_open_error("reply"),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref"),
     _outage_open_leaves_the_loop("worker_ref"),

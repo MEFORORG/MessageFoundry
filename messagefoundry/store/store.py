@@ -17255,7 +17255,10 @@ class MessageStore:
                 await self._commit()
                 return True
 
+            # BACKLOG #5727: each dead-letter on the reference runs after the try, so a failed seal
+            # in it chains no raw open error; the handlers only record which one is owed.
             ref_fault: QueueOpenFault | None = None
+            ref_tag_failed = ref_corrupt = False
             try:
                 ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
@@ -17267,23 +17270,26 @@ class MessageStore:
                 # that fails is still reported.
                 # Without its traceback, so the queued error holds no frame of this transaction.
                 queue_tag_rows.append((wr, err.with_traceback(None)))
-                return await _consume_dead(
-                    REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
-                )
+                ref_tag_failed = True
             except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                 # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so the
                 # fault carries no chain to the raw key-service error.
                 ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
-                if ref_fault is None:
-                    # A corrupt/undecryptable work-row reference (DB corruption, a key the store
-                    # lacks) cannot be re-ingressed as it stands; a replay can retry it once the
-                    # cause is fixed. Mirrors the depth-cap branch.
-                    return await _consume_dead(
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
-                    )
+                # Otherwise a corrupt/undecryptable work-row reference (DB corruption, a key the
+                # store lacks) cannot be re-ingressed as it stands; a replay can retry it once the
+                # cause is fixed. Mirrors the depth-cap branch.
+                ref_corrupt = ref_fault is None
+            if ref_tag_failed:
+                return await _consume_dead(
+                    REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
+                )
             if ref_fault is not None:
                 raise ref_fault
+            if ref_corrupt:
+                return await _consume_dead(
+                    "re-ingress work-row reference is corrupt/unparseable",
+                    "re-ingress ref corrupt",
+                )
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    means retention erased it (BACKLOG #1560). A PENDING or INFLIGHT token keeps its
             #    message purge-ineligible, and a DEAD one is blanked with its reply. But on a server
@@ -17360,7 +17366,9 @@ class MessageStore:
             mrow = await cur.fetchone()
             origin_meta: dict[str, Any] = {}
             # EF-3: ciphered at rest, bound to the origin message's metadata cell and its channel
-            # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+            # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable; its
+            # dead-letter runs after the try, as above, with only the error's text kept.
+            origin_tag_error: str | None = None
             try:
                 meta_json = (
                     (
@@ -17379,13 +17387,17 @@ class MessageStore:
                 )
             except CellTagError as err:
                 tag_failures.append(err)  # audited by ingress_handoff once the lock is released
-                return await _consume_dead(str(err), "re-ingress origin failed its integrity check")
+                origin_tag_error = str(err)
             except CipherError as exc:
                 if isinstance(exc, PROGRAMMING_ERRORS):
                     raise
                 open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                 if open_fault is None:
                     unopenable = type(exc).__name__
+            if origin_tag_error is not None:
+                return await _consume_dead(
+                    origin_tag_error, "re-ingress origin failed its integrity check"
+                )
             if open_fault is not None:
                 raise open_fault
             if unopenable is not None:

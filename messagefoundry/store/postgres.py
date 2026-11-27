@@ -6623,7 +6623,10 @@ class PostgresStore(ServerCipherWalk):
                         await self._maybe_finalize_message(conn, origin_id, now)
                         return True
 
+                    # BACKLOG #5727: each dead-letter on the reference runs after the try, as on
+                    # SQLite.
                     ref_fault: QueueOpenFault | None = None
+                    ref_tag_failed = ref_corrupt = False
                     try:
                         ref = (
                             await cipher_call(self._cipher, open_queue_cell, self._cipher, wr)
@@ -6636,27 +6639,31 @@ class PostgresStore(ServerCipherWalk):
                         # first, so a dead-letter write that fails is still reported.
                         # Without its traceback, so the queued error holds no frame of this transaction.
                         queue_tag_rows.append((wr, err.with_traceback(None)))
-                        return await _consume_dead(
-                            "ingress_handoff(tag-failed)",
-                            REINGRESS_TOKEN_TAG_FAILED,
-                            "re-ingress work-row failed its integrity check",
-                        )
+                        ref_tag_failed = True
                     except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
                         # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler,
                         # so the fault carries no chain to the raw key-service error.
                         ref_fault = (
                             queue_open_fault(exc) if is_transient_open_failure(exc) else None
                         )
-                        if ref_fault is None:
-                            # A corrupt/undecryptable work-row reference cannot be re-ingressed as
-                            # it stands. Mirrors the SQLite branch and the depth-cap branch.
-                            return await _consume_dead(
-                                "ingress_handoff(corrupt-ref)",
-                                "re-ingress work-row reference is corrupt/unparseable",
-                                "re-ingress ref corrupt",
-                            )
+                        # Otherwise a corrupt/undecryptable work-row reference cannot be
+                        # re-ingressed as it stands. Mirrors the SQLite branch and the depth-cap
+                        # branch.
+                        ref_corrupt = ref_fault is None
+                    if ref_tag_failed:
+                        return await _consume_dead(
+                            "ingress_handoff(tag-failed)",
+                            REINGRESS_TOKEN_TAG_FAILED,
+                            "re-ingress work-row failed its integrity check",
+                        )
                     if ref_fault is not None:
                         raise ref_fault
+                    if ref_corrupt:
+                        return await _consume_dead(
+                            "ingress_handoff(corrupt-ref)",
+                            "re-ingress work-row reference is corrupt/unparseable",
+                            "re-ingress ref corrupt",
+                        )
                     art = await conn.fetchrow(
                         "SELECT body FROM response"
                         " WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
@@ -6738,7 +6745,9 @@ class PostgresStore(ServerCipherWalk):
                     )
                     origin_meta: dict[str, Any] = {}
                     # EF-3: ciphered, bound to the origin message's metadata cell and its channel
-                    # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+                    # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable; its
+                    # dead-letter runs after the try, with only the error's text kept, as on SQLite.
+                    origin_tag_error: str | None = None
                     try:
                         meta_json = (
                             (
@@ -6757,11 +6766,7 @@ class PostgresStore(ServerCipherWalk):
                         )
                     except CellTagError as err:
                         tag_failures.append(err)  # audited once the transaction has closed
-                        return await _consume_dead(
-                            "ingress_handoff(origin-tag)",
-                            str(err),
-                            "re-ingress origin failed its integrity check",
-                        )
+                        origin_tag_error = str(err)
                     except CipherError as exc:
                         if isinstance(exc, PROGRAMMING_ERRORS):
                             raise
@@ -6770,6 +6775,12 @@ class PostgresStore(ServerCipherWalk):
                         )
                         if open_fault is None:
                             unopenable = type(exc).__name__
+                    if origin_tag_error is not None:
+                        return await _consume_dead(
+                            "ingress_handoff(origin-tag)",
+                            origin_tag_error,
+                            "re-ingress origin failed its integrity check",
+                        )
                     if open_fault is not None:
                         raise open_fault
                     if unopenable is not None:
