@@ -15069,14 +15069,17 @@ class RegistryRunner:
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         if self._inbound_log_halted(lane):  # #122 claim gate, pooled half (BACKLOG #5704)
             return await self._refuse_log_halted(item)
-        result = _to_lane_result(await self._process_response_item(lane, item))
+        outcome = await self._process_response_item(lane, item)
+        result = _to_lane_result(outcome)
         # D1 (see _dispatch_ingress), on the same per-(stage, lane) pacing. Through the per-lane
         # worker's redacted check, not _pooled_maybe_buildup's log.exception, which writes the
-        # driver's raw text (BACKLOG #5727).
+        # driver's raw text (BACKLOG #5727). Skipped after a STOPPED result, the missing-inbound
+        # revert, as the per-lane worker skips it.
         key = f"{Stage.RESPONSE.value}:{lane}"
         now = time.time()
         if (
-            now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL
+            outcome[0] is not _ItemOutcome.STOPPED
+            and now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL
             and self._coordinator.is_leader()
         ):
             self._pooled_buildup_at[key] = now

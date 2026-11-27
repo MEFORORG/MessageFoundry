@@ -201,6 +201,27 @@ async def test_a_failed_pooled_reply_buildup_check_logs_no_driver_text(
     assert REPLY_MARK not in caplog.text
 
 
+async def test_a_pooled_reply_buildup_check_is_skipped_after_a_stopped_result(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last loop's item 3: a STOPPED result, the missing-inbound revert, runs no build-up
+    check on the pooled reply lane, as the per-lane worker runs none. CONTROL: the step did
+    revert the token, so the STOPPED path is the one that ran."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    del step.registry.inbound[LOOP]
+    reads: list[str] = []
+
+    async def _depth(name: str, *, stage: str = "") -> tuple[int, float | None]:
+        reads.append(name)
+        return 0, None
+
+    monkeypatch.setattr(store, "pending_depth", _depth)
+    await step._dispatch_response(LOOP, item)
+    assert await _status(store, item.id) == OutboxStatus.PENDING.value
+    assert reads == []
+
+
 async def test_a_pooled_reply_buildup_check_runs_on_the_leader_only(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
