@@ -1238,12 +1238,14 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
-        4,
+        5,
         OPERATOR,
         "Every join runs only after securityConfigTarget has refused an untrusted workspace, so each "
         "part is the workspace folder, the messagefoundry.serviceConfig setting from user settings "
         "or from a workspace the operator has trusted, or a component of the path those two "
         "resolve to, a user value spelled with a non-ASCII case variant of the folder included. "
+        "The folders on a user-set path outside the workspace folder are joined one at a time to "
+        "read their file id, and nothing is opened through them (BACKLOG #8237 item 16). "
         "Not guarded: the containment and link checks run on the joined path. "
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),

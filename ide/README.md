@@ -244,12 +244,12 @@ and uses your user value or the default instead, until you trust the workspace (
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
-  that passes through a link it can detect; set an outside file in user settings. The workspace
-  folder itself is taken as given, a link included: it is the first folder the workspace opens,
-  which a repository's `.code-workspace` file can set to any folder, the repository's own or not,
-  so a value that file sets can name a file outside the repository. It does not catch a user-set
-  alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
-  the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
+  that passes through a link it can detect; set an outside file in user settings. A user-set path
+  that reaches the workspace folder by another spelling, such as a UNC loopback admin share or a
+  junction outside the folder, is found by file id and gets the same checks. In a window opened
+  from a `.code-workspace` file, which chooses the workspace folder, a workspace-set value is
+  refused unless that folder lies inside the folder holding the file. The rules and the open
+  limits are in the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
   it is blank (a value that is not used refuses the edit, above), as `--service-config`, whether or not the file exists, so a missing file fails the edit with

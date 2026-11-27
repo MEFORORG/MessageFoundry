@@ -11,6 +11,7 @@ import {
   saveUpdatesProblem,
   securityConfigInput,
   securityConfigTarget,
+  securityFileId,
   securitySetArgs,
   securityShowArgs,
 } from "../../securityEditorModel";
@@ -154,11 +155,16 @@ suite("security editor host checks", () => {
     assert.strictEqual(securityConfigInput(undefined, containedPathSetting(undefined, ws, "d")).fromWorkspace, true);
   });
 
-  test("rule 3: a user-set path outside the workspace folder is accepted as written, with no file-system call", () => {
+  test("rule 3: a user-set path outside the workspace folder is accepted as written once no folder on it is the workspace", () => {
+    // BACKLOG #8237 item 16 replaced "with no file-system call": the folders on the path are now
+    // read for their file id, so an alias of the workspace folder is placed.
     const file = path.join(outside, "messagefoundry.toml");
+    const withId = { ...real, fileId: securityFileId };
+    assert.deepStrictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, withId), { ok: true, path: file });
+    // With no fileId the walk cannot place the path, so it is refused, and no link check runs.
     const spy = modelFs({});
-    assert.deepStrictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, spy), { ok: true, path: file });
-    assert.deepStrictEqual(spy.calls, [], "a user-set path outside the folder touched the file system");
+    assert.strictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, spy).ok, false);
+    assert.deepStrictEqual(spy.calls, [], "the refusal made a link-check call");
     // The folder itself, and a blank or non-text value, are refused at this scope too.
     for (const setting of [".", ws, "", "  ", undefined, 5]) {
       assert.strictEqual(securityConfigTarget(ws, setting, { fromWorkspace: false, trusted: true }, real).ok, false, `${JSON.stringify(setting)} was accepted`);
@@ -365,11 +371,9 @@ suite("security editor host checks", () => {
     }
   });
 
-  test("known open limit, recorded and not desired: a user-set alias into the workspace folder is not checked", function () {
-    // This records a KNOWN OPEN LIMIT, not a wanted outcome. Rule 3 compares spellings only, so an
-    // alias outside the folder that leads into it, and then out through a link the repository
-    // holds, is not caught; the securityConfigTarget docblock documents it. A change that closes
-    // the limit should replace this assertion with a refusal, not be reverted to keep it green.
+  test("a user-set alias into the workspace folder gets the link check (BACKLOG #8237 item 16)", function () {
+    // This recorded a known open limit until the file-id walk closed it: the path was returned as
+    // written, with no link check. It now gets rule 2's checks from the workspace folder.
     const alias = path.join(outside, "alias");
     try {
       fs.symlinkSync(ws, alias, "junction");
@@ -377,9 +381,16 @@ suite("security editor host checks", () => {
     } catch {
       this.skip();
     }
+    const withId = { ...real, fileId: securityFileId };
     const file = path.join(alias, "linked", "messagefoundry.toml");
-    // The documented behaviour today: returned as written, with no link check.
-    assert.deepStrictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, real), { ok: true, path: file });
+    const got = securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, withId);
+    assert.ok(!got.ok && got.problem.includes("passes through a link"), JSON.stringify(got));
+    // THE CONTROL: a plain folder reached through the same alias is accepted, spelled from the folder.
+    fs.mkdirSync(path.join(ws, "plain"));
+    assert.deepStrictEqual(
+      securityConfigTarget(ws, path.join(alias, "plain", "messagefoundry.toml"), { fromWorkspace: false, trusted: true }, withId),
+      { ok: true, path: path.join(ws, "plain", "messagefoundry.toml") },
+    );
     // The same path set in workspace settings is still refused, as it is outside the folder as spelled.
     assert.strictEqual(securityConfigTarget(ws, file, { fromWorkspace: true, trusted: true }, real).ok, false);
   });
