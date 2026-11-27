@@ -2150,10 +2150,23 @@ def _warn_leftover_segments(spool_dir: str, why: str) -> None:
         )
 
 
+_SPOOL_IN_USE_FACTS = (
+    ". This WARNING reads the same for at least these causes: another process holds the lock, this "
+    "process already holds it on another handle, or taking the lock failed. Until this process "
+    "restarts with a spool it can lock, the forwarder this WARNING belongs to has no on-disk spool "
+    "and sends nothing from that directory. A spool directory's segments are sent only by a process "
+    "that holds its lock, so a change to a process's spool directory can leave segments in its old "
+    "directory unsent. Two engines that are not engine shards share one spool directory, not only "
+    "its root, at least when their [logging].forward_spool_dir values resolve to one path, or are "
+    "both unset or empty and their store paths resolve into one directory. "
+    'One directory serves one process (ADR 0200, "One process per directory").'
+)
+
+
 def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     """The opened on-disk spool for ``forward``, or ``None`` when it has none or cannot use it.
 
-    A spool that cannot be opened (an unwritable directory, or one another process holds) warns and
+    A spool that cannot be opened (an unwritable directory, or one whose lock it cannot take) warns and
     leaves the forwarder spool-less rather than refusing to start: the spool adds durability to a
     best-effort stream, and losing it must not cost the message path its start (BACKLOG #1966)."""
     if not forward.spool_dir:
@@ -2168,8 +2181,20 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     try:
         spool.open()
     except SpoolUnavailable as exc:
-        _log.warning("%s; off-box log forwarding runs without an on-disk spool", exc)
-        if not exc.in_use:  # the process that holds it sends what it holds
+        # Only the in-use case gets the extra facts. They are facts, not a procedure: the WARNING
+        # cannot say who holds the lock, and ``in_use`` is also set on a lock fault and when this
+        # process holds the lock on another handle (``_try_lock``), so any instruction would be
+        # wrong for some deployment (BACKLOG #5400). Keying the default directory by HA node id
+        # was declined (decision d20261127T075251741-b90a7b): an unset node id is new on every
+        # start and would strand the last run's records.
+        _log.warning(
+            "%s; off-box log forwarding runs without an on-disk spool%s",
+            exc,
+            _SPOOL_IN_USE_FACTS if exc.in_use else "",
+        )
+        # Whoever holds the lock sends what it holds. A lock fault also reads as in use, though,
+        # and gets no leftover count here (BACKLOG #8138 item 43).
+        if not exc.in_use:
             _warn_leftover_segments(forward.spool_dir, "the on-disk log spool could not be opened")
         return None
     return spool
