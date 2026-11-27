@@ -156,8 +156,7 @@ recorded in
 [ADR 0217](adr/0217-an-unverifiable-transit-row-seal-is-denied-like-a-failed-one-and-the-ad-reconciler-ends-sessions-rather-than-holding.md)
 and vault BACKLOG #8202; the alert sink's throttle settings are in
 [CONFIGURATION.md](CONFIGURATION.md#alerts). What each refusal does is in the changelog entries for
-vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the next release, then
-[CHANGELOG.md](../CHANGELOG.md)). The seal format is in
+vault BACKLOG #2592, #2593 and #3510, under 0.5.3 in [CHANGELOG.md](../CHANGELOG.md). The seal format is in
 [`store/row_seal.py`](../messagefoundry/store/row_seal.py).
 
 On a first deployment, a writer could still do at least these:

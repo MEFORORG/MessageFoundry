@@ -58,9 +58,9 @@ digest moved.
 - **The event log's kind filter reads the engine's one connection-event vocabulary.** The console
   no longer keeps its own list; it imports `CONNECTION_EVENT_KIND_ORDER` from the engine module
   `messagefoundry.connection_events`, and the choices and their order are unchanged. Needs an engine
-  that ships that module, which no published engine does yet, so the release that carries this
-  raises the `messagefoundry` floor to the engine release that adds it. The seam digest does not
-  cover a module constant, so the handshake will not catch an engine without it. (BACKLOG #1624)
+  that ships that module, engine 0.5.3 or later, so this release's `messagefoundry>=0.5.3` floor
+  requires it. The seam digest does not cover a module constant, so the handshake will not catch an
+  engine without it. (BACKLOG #1624)
 - **The flag toggle is on every row but a draining one, and the store holds the flag.** A code-first connection takes
   the flag like any other, and a cluster node no longer refuses it. The refused-toggle page's hint
   now covers a name the running graph does not have and an engine that is stopping. Needs the
@@ -90,6 +90,109 @@ digest moved.
   list is not complete, and points at the section "Outbound TLS trust anchor" of docs/SECURITY.md
   in the MessageFoundry repository, at the paragraph "What a reload's restart_required list
   covers". (vault BACKLOG #3746)
+
+### Fixed
+
+- **A refused code on a verified session no longer lands as a success does, except at least for a
+  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
+  21).**
+  `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
+  the same landing a success gets, so the refusal showed nothing. It now lands on
+  `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
+  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
+  the notice for a code within the form's length bound: that code is refused unread
+  (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
+- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
+  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
+  stored credential id that does not decode; before, the decode error escaped as a 500. Every
+  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
+  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
+  of the origin-migration notice its `None` would have shown. The notice sends a holder with
+  another factor to sign in with it and remove the unreadable passkey. One with no other factor
+  is sent first to "Sign in with password and passkey", which names no credential and so may
+  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
+  for an MFA reset only if that fails too. The supported engine seam moved with it:
+  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
+  (`BACKLOG #6886`)
+- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
+  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
+  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
+  channel-denial text, which would send the operator after a scope that is not the problem. No seam
+  changes. (BACKLOG #6589)
+- **The High Availability pages degrade when the store does not answer.** The page, its live
+  fragment and both step-down confirm pages read the cluster membership and lease rows with no error
+  handling, so a store timeout or outage answered with an error body in place of the page. The page
+  and its fragment now show this node's in-memory status and the reason, with no node list and no
+  step-down control, and the confirm pages show the reason with no form. The page and the confirm
+  pages answer 503, and the live fragment answers 200 so the poller replaces the last view. The role shown is the node's
+  in-memory one and is marked unconfirmed. These pages log the failure once per run of failed reads.
+  (BACKLOG #5932)
+
+- **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
+  `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
+  `form-action 'self'` because it checks that directive again on the redirect after a form POST.
+  Both now answer 200 with a page that navigates to the same target by meta refresh, with a
+  Continue link as the fallback, and so does `GET /ui/oidc/start` when it skips its interstitial.
+  The CSP is unchanged. The "leaving this site" page and that hop now carry Sign-out and the
+  session watchdog only when the request carries a live session: before, the watchdog on the
+  interstitial sent a browser with no session to the login page before Continue could be clicked.
+  The interstitial sends `Clear-Site-Data: "cache"` to a browser whose session cookie no longer
+  authenticates; the hop does not. Both pages decide through `AuthService.session_shows_signed_in`,
+  which ends a refused session as the watchdog's probe would, except one whose temporary
+  credential has lapsed, which it leaves for the sign-in callback to end and record. Needs the
+  engine seam that carries `AuthService.session_shows_signed_in`.
+- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
+  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
+  changed its terminators. The editor now carries the original's style in a hidden `eol` field
+  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
+  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
+  that set, an empty one included, is refused with the generic "invalid input". A body that starts
+  with a line break keeps it. The seam digest moved because the route's form parser changed, and
+  it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
+- **A resubmit with no `eol` field gives an HL7 body CR terminators.** A form the editor did not
+  render, such as a stale page or a hand-built POST, used to resubmit the browser's line breaks. A
+  submitted body that starts with MSH, or with a `BHS` or `FHS` batch header in its separator
+  shape, now goes out with CR, whatever the original used, since the parser has no original to
+  read; any other body goes out as sent. The seam digest moved again, because the form parser and
+  its new helper changed. (BACKLOG #5930)
+
+- **TOTP enrolment no longer drops the first code.** Under the default
+  `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
+  gate refused for want of its own single-use proof, sending the operator to re-auth and losing the
+  code. While no confirm proof is held, the enroll page now shows the secret with a code-less
+  Continue button that takes the operator through that re-auth to the code form first. Enroll and
+  confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
+  the re-rendered page offers the same Continue instead of a form that would drop the next code.
+  The confirm page, opened while no confirm proof is held (for example after Back from a refused
+  code, or after an engine restart), offers the same Continue instead of a code form. A Continue
+  can be posted while the confirm proof is already held, from another tab or after Back. It now
+  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is
+  recorded. The verify gate makes that check itself, just before it spends the proof, and the
+  gate's closure changed with it, so the engine seam moves. (BACKLOG #5931)
+- **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
+  gave that page for any 503 the engine's flag handler raised, relying on a comment that the
+  handler had no other. The handler raises no other today, so nothing an operator sees changes; a
+  503 a later handler change adds is no longer named as the store's refusal. The console now catches
+  the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
+  carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **An uploaded-log browse, resend or delete that meets a key-service outage says so.** The engine
+  now answers a Vault Transit outage on an uploaded file 503 with `Retry-After`. The console mapped
+  every 503 on those routes to "Uploaded logs are not available on this engine", which tells an
+  administrator to set an uploads directory that is already set. A 503 that carries `Retry-After`
+  now lands on the list page with its own notice, `key_service_busy`, which says nothing was opened,
+  injected or removed and to try again. The no-store 503, which carries no `Retry-After`, keeps its
+  notice. An engine without that change never sends it, so nothing changes there.
+  (`BACKLOG #3734`)
+- **The Approvals page offers no Approve on a held reload that names no config digest.** The
+  engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
+  Withdraw on the requester's own row, with a note saying why. A held reload's digest parameter
+  that is null or not of the form the engine writes is shown as that refusal, never raw.
+  Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
+  which the page never read. (vault `BACKLOG #3192`, `#3193`)
+- **The Interrupted releases table heads its time column "Cut off or claimed".** It read "Cut off",
+  but a release a restart or an operator interrupt moved keeps its claim time there, not the time
+  it stopped. Its note no longer says every such release was cut off while it ran: it says the
+  engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
 
 ### Security
 
@@ -167,9 +270,9 @@ digest moved.
   channel and carries no operation. A channel-scoped actor's bulk selection whose name fails the
   connection-name rule writes a row with no channel, marked `"malformed_name": true`, so it is
   told apart from the confirm page's refusal; an all-channels actor's writes none. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
-  `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
-  carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
-  digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
+  `operation`, engine 0.5.3 or later. As for BACKLOG #3378 below, this release's
+  `messagefoundry>=0.5.3` floor requires it: the seam digest does not cover that callback's
+  signature. (vault BACKLOG #3748 item 7)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there
@@ -177,10 +280,9 @@ digest moved.
   `"flag_direction_not_inbound": true`, and answers the 403 the handler gives a non-inbound target.
   An all-channels caller still gets the 404. Needs an engine whose `messagefoundry.api.message_scope`
   has `CONNECTION_DENIED_DETAIL` and whose `audit_channel_denied` takes
-  `flag_direction_not_inbound`, which no published engine does yet. As for BACKLOG #1624 above, the
-  release that carries this raises the `messagefoundry` floor to the engine release that adds them:
-  the seam digest covers neither a module constant nor that callback's signature, so the handshake
-  will not catch an older engine. (BACKLOG #3378)
+  `flag_direction_not_inbound`, engine 0.5.3 or later. As for BACKLOG #1624 above, this release's
+  `messagefoundry>=0.5.3` floor requires them: the seam digest covers neither a module constant nor
+  that callback's signature, so the handshake will not catch an older engine. (BACKLOG #3378)
 - **On a GET, the same-origin check reads `Origin` when `Sec-Fetch-Site` is empty or unknown.**
   Such a value now counts as absent there, so a foreign `Origin` beside it is refused. Before, any
   present value settled a GET and `Origin` was never read. A value an intermediary folded from two
@@ -312,109 +414,6 @@ digest moved.
   the store write. That re-auth reopens the editor on the stored body, so the typed edit is lost.
   Any other refusal before the store write still gives the proof back. The change is in the
   engine handler the console calls; no seam changes. (BACKLOG #3241)
-
-### Fixed
-
-- **A refused code on a verified session no longer lands as a success does, except at least for a
-  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
-  21).**
-  `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
-  the same landing a success gets, so the refusal showed nothing. It now lands on
-  `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
-  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
-  the notice for a code within the form's length bound: that code is refused unread
-  (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
-- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
-  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
-  stored credential id that does not decode; before, the decode error escaped as a 500. Every
-  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
-  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
-  of the origin-migration notice its `None` would have shown. The notice sends a holder with
-  another factor to sign in with it and remove the unreadable passkey. One with no other factor
-  is sent first to "Sign in with password and passkey", which names no credential and so may
-  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
-  for an MFA reset only if that fails too. The supported engine seam moved with it:
-  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
-  (`BACKLOG #6886`)
-- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
-  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
-  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
-  channel-denial text, which would send the operator after a scope that is not the problem. No seam
-  changes. (BACKLOG #6589)
-- **The High Availability pages degrade when the store does not answer.** The page, its live
-  fragment and both step-down confirm pages read the cluster membership and lease rows with no error
-  handling, so a store timeout or outage answered with an error body in place of the page. The page
-  and its fragment now show this node's in-memory status and the reason, with no node list and no
-  step-down control, and the confirm pages show the reason with no form. The page and the confirm
-  pages answer 503, and the live fragment answers 200 so the poller replaces the last view. The role shown is the node's
-  in-memory one and is marked unconfirmed. These pages log the failure once per run of failed reads.
-  (BACKLOG #5932)
-
-- **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
-  `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
-  `form-action 'self'` because it checks that directive again on the redirect after a form POST.
-  Both now answer 200 with a page that navigates to the same target by meta refresh, with a
-  Continue link as the fallback, and so does `GET /ui/oidc/start` when it skips its interstitial.
-  The CSP is unchanged. The "leaving this site" page and that hop now carry Sign-out and the
-  session watchdog only when the request carries a live session: before, the watchdog on the
-  interstitial sent a browser with no session to the login page before Continue could be clicked.
-  The interstitial sends `Clear-Site-Data: "cache"` to a browser whose session cookie no longer
-  authenticates; the hop does not. Both pages decide through `AuthService.session_shows_signed_in`,
-  which ends a refused session as the watchdog's probe would, except one whose temporary
-  credential has lapsed, which it leaves for the sign-in callback to end and record. Needs the
-  engine seam that carries `AuthService.session_shows_signed_in`.
-- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
-  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
-  changed its terminators. The editor now carries the original's style in a hidden `eol` field
-  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
-  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
-  that set, an empty one included, is refused with the generic "invalid input". A body that starts
-  with a line break keeps it. The seam digest moved because the route's form parser changed, and
-  it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
-- **A resubmit with no `eol` field gives an HL7 body CR terminators.** A form the editor did not
-  render, such as a stale page or a hand-built POST, used to resubmit the browser's line breaks. A
-  submitted body that starts with MSH, or with a `BHS` or `FHS` batch header in its separator
-  shape, now goes out with CR, whatever the original used, since the parser has no original to
-  read; any other body goes out as sent. The seam digest moved again, because the form parser and
-  its new helper changed. (BACKLOG #5930)
-
-- **TOTP enrolment no longer drops the first code.** Under the default
-  `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
-  gate refused for want of its own single-use proof, sending the operator to re-auth and losing the
-  code. While no confirm proof is held, the enroll page now shows the secret with a code-less
-  Continue button that takes the operator through that re-auth to the code form first. Enroll and
-  confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
-  the re-rendered page offers the same Continue instead of a form that would drop the next code.
-  The confirm page, opened while no confirm proof is held (for example after Back from a refused
-  code, or after an engine restart), offers the same Continue instead of a code form. A Continue
-  can be posted while the confirm proof is already held, from another tab or after Back. It now
-  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is
-  recorded. The verify gate makes that check itself, just before it spends the proof, and the
-  gate's closure changed with it, so the engine seam moves. (BACKLOG #5931)
-- **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
-  gave that page for any 503 the engine's flag handler raised, relying on a comment that the
-  handler had no other. The handler raises no other today, so nothing an operator sees changes; a
-  503 a later handler change adds is no longer named as the store's refusal. The console now catches
-  the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
-  carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
-- **An uploaded-log browse, resend or delete that meets a key-service outage says so.** The engine
-  now answers a Vault Transit outage on an uploaded file 503 with `Retry-After`. The console mapped
-  every 503 on those routes to "Uploaded logs are not available on this engine", which tells an
-  administrator to set an uploads directory that is already set. A 503 that carries `Retry-After`
-  now lands on the list page with its own notice, `key_service_busy`, which says nothing was opened,
-  injected or removed and to try again. The no-store 503, which carries no `Retry-After`, keeps its
-  notice. An engine without that change never sends it, so nothing changes there.
-  (`BACKLOG #3734`)
-- **The Approvals page offers no Approve on a held reload that names no config digest.** The
-  engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
-  Withdraw on the requester's own row, with a note saying why. A held reload's digest parameter
-  that is null or not of the form the engine writes is shown as that refusal, never raw.
-  Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
-  which the page never read. (vault `BACKLOG #3192`, `#3193`)
-- **The Interrupted releases table heads its time column "Cut off or claimed".** It read "Cut off",
-  but a release a restart or an operator interrupt moved keeps its claim time there, not the time
-  it stopped. Its note no longer says every such release was cut off while it ran: it says the
-  engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

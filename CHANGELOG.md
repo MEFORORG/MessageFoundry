@@ -6874,8 +6874,8 @@ ledger, so it has no public page.
   `traceparent` longer than 512 characters before matching it. fastapi depends on opentelemetry-api,
   so every engine install carries it, but fastapi requires only 1.44.0 or later. The engine wheel
   now declares its own floor, `opentelemetry-api>=1.45.2`, so `pip install "messagefoundry==0.5.3"`
-  upgrades an older copy, and the locks pin 1.45.2. The engine turns fastapi's own telemetry off;
-  this entry does not claim that any engine path passes untrusted input to that propagator.
+  upgrades an older copy, and the locks pin 1.45.2. The engine turns fastapi's own telemetry off,
+  and [RISKY-COMPONENTS.md](docs/RISKY-COMPONENTS.md) says what that keeps from the propagators.
 - **A passkey assertion now re-anchors the session, as a TOTP code does.** After a verified
   assertion at `POST /ui/reauth/webauthn` that completes a factor the session had not yet met,
   the session's address anchor moves to the address that proved it, on any session but an
