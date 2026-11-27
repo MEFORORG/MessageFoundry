@@ -80,11 +80,12 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
-def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
-    """The control: an empty key is harmless when the next item's first line sets a variable
-    Windows itself sets, spelled as Windows spells it, or the secrets directory. Any other item,
-    Windows' own nameless entries such as ``=C:`` among them, may be the key itself, so it
-    refuses: ``tests/test_b532w3_serviceenv_split_shapes.py`` pins those."""
+def test_an_empty_store_key_item_above_an_ordinary_item_is_read_as_empty(key: str) -> None:
+    """The control: an empty key is not read as set when the next item's first line sets a
+    variable Windows itself sets, spelled as Windows spells it, or the secrets directory. Any
+    other item, Windows' own nameless entries such as ``=C:`` among them, may be the key itself,
+    so it is read as the key's value: ``tests/test_b532w3_serviceenv_split_shapes.py`` pins
+    those. The empty entry refuses on its own all the same (vault BACKLOG #5394)."""
     followers = (
         "ProgramFiles(x86)=C:\\x",
         "Path=C:\\x",
@@ -92,8 +93,9 @@ def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str
     )
     for follower in followers:
         posture = _read([f"{key}=", follower])
-        assert posture.listed_keys == (), follower
-        assert service_env_refusal(posture) is None, follower
+        assert posture.empty_class_names == (key,), follower
+        assert not posture.value_runs_on, follower
+        assert service_env_refusal(posture) is not None, follower
 
 
 @pytest.mark.parametrize("item", [f'"{_KEY_B64}"', f",{_KEY_B64},{_KEY_B64}"])
@@ -144,9 +146,9 @@ def test_the_refusal_says_to_remove_the_strings_a_value_runs_on_into() -> None:
 
 def test_a_broken_value_name_item_does_not_continue_an_empty_key() -> None:
     """``MEFOR_VALUE_A<LF>MEFOR_VALUE_B=1`` starts a variable under the whole-string reading, so
-    the empty store key above it stays empty."""
+    the empty store key above it stays empty, and is named as an empty entry."""
     posture = _read([f"{KEY_CLASS_NAMES[0]}=", "MEFOR_VALUE_A\nMEFOR_VALUE_B=1"])
-    assert posture.listed_keys == ()
+    assert posture.empty_class_names == (KEY_CLASS_NAMES[0],)
     assert posture.listed_value_names == ("MEFOR_VALUE_B",)
 
 
@@ -183,7 +185,9 @@ def test_a_continued_variable_replaces_its_empty_reading_in_place() -> None:
 def test_an_item_continues_only_the_value_its_own_registry_value_ends_on() -> None:
     key = KEY_CLASS_NAMES[0]
     posture = _read([(_PLAIN, f"{key}="), (_EXTRA, _KEY_B64)])
-    assert posture.listed_keys == ()
+    # Not joined, so the key is an empty entry, which refuses on its own (vault BACKLOG #5394).
+    assert posture.empty_class_names == (key,)
+    assert not posture.value_runs_on
 
 
 def test_a_long_run_of_continuing_items_is_read_in_linear_memory() -> None:
@@ -400,17 +404,24 @@ def test_the_first_line_shapes_the_readings_once_differed_on_now_agree(
     (vault BACKLOG #5394). ``Path=C:\\x`` ends the key's value both ways; Windows' own ``=C:``
     entry, an empty directory entry or an empty ``HTTP_PROXY`` is not positively a variable of
     its own, so both readings take it into the key's value and refuse, as origin/main 9421dcbf27
-    did for the later line of one string."""
+    did for the later line of one string. ``refuses`` says the key is read as set to the item;
+    where it is not, the key is an empty entry, which refuses on its own (vault BACKLOG #5394)."""
     key = KEY_CLASS_NAMES[0]
-    expected = (key,) if refuses else ()
-    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == expected
-    assert _read([f"{key}=", item]).listed_keys == expected
+    empty = () if refuses else (key,)
+    for posture in (
+        _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]),
+        _read([f"{key}=", item]),
+    ):
+        assert posture.listed_keys == (key,), item
+        assert posture.empty_class_names == empty, item
 
 
 def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_above() -> None:
     posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=C:\\s"]
     posture = _read(posture_items)
-    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
+    # The password stays empty, an entry that refuses on its own (vault BACKLOG #5394).
+    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY", "MEFOR_STORE_PASSWORD")
+    assert posture.empty_class_names == ("MEFOR_STORE_PASSWORD",)
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
     # Without the directory item, the same refusal says no entry names it: the control.
     secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"

@@ -100,6 +100,8 @@ def test_a_split_secret_in_the_next_item_refuses(name: str, shape: str) -> None:
     refused through the key-run rule, and stay as pins."""
     posture = _read([f"{name}=", _SHAPES[shape]])
     assert posture.listed == (name,), shape
+    # Read as set to the secret, not as an entry with nothing in it, which refuses on its own.
+    assert posture.empty_class_names == (), shape
     assert posture.value_runs_on, shape
     assert service_env_refusal(posture) is not None
 
@@ -112,6 +114,7 @@ def test_a_split_secret_in_the_next_item_below_another_variable_refuses(
     """The empty name on a later line of its own item, so only the line reading can keep it."""
     posture = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=", _SHAPES[shape]])
     assert posture.listed == (name,), shape
+    assert posture.empty_class_names == (), shape
     assert service_env_refusal(posture) is not None
 
 
@@ -124,6 +127,7 @@ def test_a_split_secret_on_a_later_line_below_another_variable_refuses(
     other variable and only the line reading can keep the secret's name."""
     posture = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=\n{_SHAPES[shape]}"])
     assert posture.listed == (name,), shape
+    assert posture.empty_class_names == (), shape
     assert service_env_refusal(posture) is not None
 
 
@@ -158,13 +162,17 @@ _WINDOWS_NAMELESS = (
 
 @pytest.mark.parametrize("item", _ORDINARY_ITEMS)
 def test_an_ordinary_item_still_ends_the_empty_value_above_it(item: str) -> None:
-    """As the next item and as a later line of one string alike."""
+    """As the next item and as a later line of one string alike. The key is still read as
+    empty, not as set to the item, and an entry that names a secret-class variable with nothing
+    in it now refuses on its own (vault BACKLOG #5394), so the refusal names it as one."""
     for posture in (
         _read([f"{KEY_CLASS_NAMES[0]}=", item]),
         _read([f"MEFOR_AI_ENVIRONMENT=prod\n{KEY_CLASS_NAMES[0]}=\n{item}"]),
     ):
-        assert posture.listed_keys == (), item
-        assert service_env_refusal(posture) is None, item
+        assert posture.empty_class_names == (KEY_CLASS_NAMES[0],), item
+        assert not posture.value_runs_on, item
+        refusal = service_env_refusal(posture)
+        assert refusal is not None and "with nothing set in it" in refusal, item
 
 
 #: Lines below an empty secret-class value that are not positively a variable of their own, so
@@ -241,6 +249,8 @@ def test_a_line_that_may_be_the_secret_refuses_as_an_item_and_on_a_later_line(
     items = _read([f"{name}=", line])
     later = _read([f"Path=x\n{name}=\n{line}"])
     assert items.listed == later.listed == (name,), line
+    # Read as set to the line, not as an empty entry, which refuses on its own.
+    assert items.empty_class_names == later.empty_class_names == (), line
     assert items.value_runs_on, line
     assert service_env_refusal(items) is not None
     assert service_env_refusal(later) is not None
@@ -294,10 +304,16 @@ def test_a_name_alone_below_an_empty_secret_is_read_into_its_value() -> None:
     assert _read(["MEFOR_VALUE_A\nMEFOR_STORE_PASSWORD\nX=1"]).listed == ("MEFOR_VALUE_A",)
 
 
-def test_a_name_written_alone_with_nothing_below_it_does_not_refuse() -> None:
-    """The control: a secret-class name alone carries no value, so it is not listed."""
-    assert _read(["MEFOR_AUTH_AD_BIND_PASSWORD"]).listed == ()
-    assert _read(["MEFOR_AUTH_AD_BIND_PASSWORD", "Path=C:\\x"]).listed == ()
+def test_a_name_written_alone_with_nothing_below_it_refuses_as_empty() -> None:
+    """The control: a secret-class name alone carries no value, so it is not read as set. It
+    is an entry that names a secret-class variable with nothing in it, which refuses on its own
+    (vault BACKLOG #5394), as ``nssm set ... NAME =value`` writes the name apart from its value.
+    A non-secret name alone still refuses nothing."""
+    for entries in (["MEFOR_AUTH_AD_BIND_PASSWORD"], ["MEFOR_AUTH_AD_BIND_PASSWORD", "Path=C:\\x"]):
+        posture = _read(entries)
+        assert posture.empty_class_names == ("MEFOR_AUTH_AD_BIND_PASSWORD",), entries
+        assert service_env_refusal(posture) is not None, entries
+    assert service_env_refusal(_read(["HTTP_PROXY", "Path=C:\\x"])) is None
 
 
 def test_a_long_name_below_an_empty_secret_reads_in_linear_time() -> None:
@@ -320,7 +336,9 @@ def test_an_empty_secret_kept_on_a_later_line_reads_the_line_below_it_too() -> N
     """The fail-closed rule follows a kept variable, not only a string's first line."""
     name = "MEFOR_STORE_PASSWORD"
     posture = _read([f"PATH=x\n{KEY_CLASS_NAMES[0]}=\n{name}=\nWinter=2026!"])
-    assert posture.listed == (name,)
+    # The password is set to the line below it; the key above it is named with nothing in it.
+    assert posture.listed == (name, KEY_CLASS_NAMES[0])
+    assert posture.empty_class_names == (KEY_CLASS_NAMES[0],)
 
 
 def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable() -> None:
@@ -459,7 +477,11 @@ def test_a_value_name_set_to_equals_signs_does_not_run_on(item: str) -> None:
     next item is its own, as on origin/main 9421dcbf27, and the remedy does not say to remove it.
     Failed on fc3ebdef6c9."""
     posture = _read(["MEFOR_VALUE_X==", item])
-    assert posture.listed == ("MEFOR_VALUE_X",), item
+    # A secret-class name alone in its own item is named with nothing in it, which refuses on
+    # its own (vault BACKLOG #5394); it is not taken into the value above.
+    alone = (item,) if item == "MEFOR_STORE_PASSWORD" else ()
+    assert posture.listed == ("MEFOR_VALUE_X", *alone), item
+    assert posture.empty_class_names == alone, item
     assert not posture.value_runs_on, item
 
 
@@ -496,9 +518,12 @@ def test_a_mixed_case_refused_name_below_an_empty_secret_is_its_value(items: lis
 
 
 def test_an_upper_case_path_form_key_still_ends_an_empty_secret() -> None:
-    """The control: the engine's own name in upper case is a variable of its own, a path."""
+    """The control: the engine's own name in upper case is a variable of its own, a path, so it
+    is not listed, and the password above it is read as empty, not as set to it. An entry that
+    names a secret-class variable with nothing in it refuses on its own (vault BACKLOG #5394),
+    so only the password is listed, as one."""
     posture = _read(["MEFOR_STORE_PASSWORD=", f"{_PEM}=C:\\k.pem"])
-    assert posture.listed == ()
+    assert posture.listed == posture.empty_class_names == ("MEFOR_STORE_PASSWORD",)
 
 
 def test_a_secret_name_alone_in_a_later_item_below_a_value_name_alone_is_kept() -> None:
@@ -526,4 +551,6 @@ def test_a_lower_case_secret_name_below_an_empty_key_is_still_named() -> None:
     only the path-form key's name. Any other refused name in any case is its own variable, as
     Windows compares names, so the refusal names it and gives its own remedy."""
     posture = _read([f"{KEY_CLASS_NAMES[0]}=", "mefor_store_password=hunter2"])
-    assert posture.listed == ("MEFOR_STORE_PASSWORD",)
+    # The key above it is named with nothing in it, which refuses on its own (vault BACKLOG #5394).
+    assert posture.listed == ("MEFOR_STORE_PASSWORD", KEY_CLASS_NAMES[0])
+    assert posture.empty_class_names == (KEY_CLASS_NAMES[0],)

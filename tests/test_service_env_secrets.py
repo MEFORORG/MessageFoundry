@@ -252,10 +252,24 @@ def test_no_identifier_in_the_module_reads_as_a_secret_to_codeql() -> None:
     assert not sorted(name for name in identifiers if _SENSITIVE_IDENTIFIER.search(name))
 
 
-def test_a_name_set_to_nothing_is_not_listed() -> None:
+def test_a_name_set_to_nothing_refuses_as_an_empty_entry() -> None:
+    """A secret-class name set to nothing sets no secret, but a secret can be written apart from
+    its name into the entry after it, so the empty entry refuses on its own (vault BACKLOG #5394,
+    the deferred scope of engine PR 3134). The remedy says to delete it, not to move it."""
     posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "Path=C:\\x"])
-    assert posture.listed == ()
-    assert service_env_refusal(posture) is None
+    assert posture.listed == ("MEFOR_STORE_ENCRYPTION_KEY", "MEFOR_STORE_PASSWORD")
+    assert posture.empty_class_names == posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert (
+        "MEFOR_STORE_ENCRYPTION_KEY, MEFOR_STORE_PASSWORD is named in the service's lists with "
+        "nothing set in it" in refusal
+    )
+    # Nothing to move, so no step says to move either.
+    assert "protect-key" not in refusal
+    assert "Put MEFOR_STORE_PASSWORD" not in refusal
+    # The negative control: an empty entry for a name that is no secret refuses nothing.
+    assert service_env_refusal(_service(["HTTP_PROXY=", "MEFOR_SECRETS_DIRECTORY=", "TZ="])) is None
     # An equals-led item may be the password itself, split from its name, so it is read as its
     # value and refuses, Windows' own nameless entries among them (vault BACKLOG #5394).
     for item in ("=orphan", "=C:=C:\\x"):
@@ -519,10 +533,12 @@ def test_an_unlisted_directory_not_in_doubt_keeps_the_plain_create_step() -> Non
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str) -> None:
     """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line, so an empty later
-    ``KEY=`` above it stays empty and nothing refuses."""
+    ``KEY=`` above it stays empty, and so refuses as an entry with nothing in it (vault BACKLOG
+    #5394), not as a key set to that line."""
     posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
-    assert posture.listed_keys == ()
-    assert service_env_refusal(posture) is None
+    assert posture.empty_class_names == (key,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and f"{key} is named in the service's lists with nothing" in refusal
 
 
 def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses() -> None:
