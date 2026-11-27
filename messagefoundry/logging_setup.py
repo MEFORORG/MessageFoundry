@@ -2151,15 +2151,16 @@ def _warn_leftover_segments(spool_dir: str, why: str) -> None:
 
 
 _SPOOL_IN_USE_FACTS = (
-    ". It reads the same whether another process holds the lock, this process already holds it on "
-    "another handle, or taking the lock failed. Until it restarts with a spool it can lock, this "
-    "process runs without an on-disk spool and sends nothing from that directory. Only the process "
-    "holding a spool directory's lock sends that directory's segments, so a change to that "
-    "process's spool directory leaves the segments in its old directory unsent until a process "
-    "opens that directory again. The directory changes with at least [logging].forward_spool_dir "
-    "(environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR), the working directory when that "
-    "setting is a relative path, and an engine shard's shard id. With no setting, it also changes "
-    "with the directory that holds the store. "
+    ". This WARNING reads the same whether another process holds the lock, this process already "
+    "holds it on another handle, or taking the lock failed. Until this process restarts with a "
+    "spool it can lock, the forwarder this WARNING belongs to has no on-disk spool and sends "
+    "nothing from that directory. Only the process holding a spool directory's lock sends that "
+    "directory's segments, so a change to that process's spool directory leaves the segments in "
+    "its old directory unsent until a process opens that directory again. The directory changes "
+    "with at least [logging].forward_spool_dir (environment variable "
+    "MEFOR_LOGGING_FORWARD_SPOOL_DIR), the working directory when that setting is a relative path, "
+    "and an engine shard's shard id. With no setting, it also changes with the directory that "
+    "holds the resolved [store].path, which is read even when the store is on a database server. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
