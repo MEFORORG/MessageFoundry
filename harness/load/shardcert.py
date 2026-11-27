@@ -1719,6 +1719,7 @@ async def run_shardcert(
         reg = load_config(_CONFIG_DIR)
     ids_list = shard_ids(reg)
     owned = {s: sorted(owned_destination_set(reg, s, ids_list)) for s in ids_list}
+    require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list)
     n = len(ids_list)
     # Lanes per shard (many-thin-lanes): the built graph has N*lanes inbound rows, so derive it from the
     # registry rather than re-reading the env (keeps the driver and the served graph in lock-step).
@@ -1817,28 +1818,20 @@ async def run_shardcert(
     e2e_first_hist: Histogram | None = None
     e2e_second_hist: Histogram | None = None
     e2e_drain_hist: Histogram | None = None
-    killed = kill_shard if kill else None
-    if kill and killed is None:
-        # Kill the shard that owns the MOST lanes (maximizes recovery coverage).
-        killed = max(ids_list, key=lambda s: len(owned[s]))
+    killed = _choose_killed(kill, kill_shard, ids_list, owned)
     recovery_seconds: float | None = None
 
     try:
-        # Start shards STRICTLY one-at-a-time behind a health gate — the SS schema-init applock convoys
-        # at N>=4 simultaneous opens (multishard.py:426 documents the 30s-timeout blowout).
-        for i, s in enumerate(ids_list):
-            node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
-            # One store for the fleet: the first shard provisions the rig Administrator.
-            await node.start(provision=i == 0)
-            nodes[s] = node
-            if not await _await_health(node.url, timeout=60.0):
-                raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
-            # Each shard binds `lanes` inbound ports (base + i*lanes + l); wait for every one.
-            for lane in range(lanes):
-                port = inbound_base + i * lanes + lane
-                if not await _await_port("127.0.0.1", port, timeout=30.0):
-                    raise RuntimeError(f"shard {s} inbound lane port {port} never bound")
-        await _sign_in_before_load([nodes[s].url for s in ids_list])
+        await _start_shards(
+            ids_list,
+            api_ports,
+            node_env=node_env,
+            cwd=cwd,
+            inbound_base=inbound_base,
+            lanes=lanes,
+            preflight_host="127.0.0.1",
+            nodes=nodes,
+        )
 
         # One persistent connection per (shard, lane) inbound (tracker wired for on_ack) — N*lanes now.
         for i, _s in enumerate(ids_list):
@@ -1912,6 +1905,14 @@ async def run_shardcert(
                 metrics.counters.deferred_schedule += behind
                 next_due = now + interval
             await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
+        if kill and not did_kill:
+            # BACKLOG #5440 (S27-55): the hold ended before a tick reached the kill deadline (a fraction
+            # close to 1 with ticks further apart than the hold's remainder). Fire it now, as the two-box
+            # engine's timer does, so the restart below never starts a second process over a live shard.
+            nodes[killed].kill()  # type: ignore[index]
+            kill_at = time.monotonic()
+            did_kill = True
+            report_notes.append(f"SIGKILLed shard {killed} at the end of the hold")
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything
         # from this instant on (the 2 s ACK grace, the kill/restart leg, the whole `await_drain` window) is
@@ -1931,13 +1932,10 @@ async def run_shardcert(
 
         # Kill leg: restart the killed shard (supervisor-style) so its startup runs the
         # ownership-scoped reset over ITS lanes; time functional recovery.
-        if kill and killed is not None:
-            idx = ids_list.index(killed)
-            restart = ShardCertNode(
-                killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
+        if did_kill and killed is not None:
+            restart = await _restart_killed(
+                nodes, killed, api_ports[ids_list.index(killed)], env=node_env, cwd=cwd
             )
-            await restart.start(provision=False)
-            nodes[killed] = restart
             if not await _await_health(restart.url, timeout=60.0):
                 raise RuntimeError(f"shard {killed} did not restart\n{_shown_tail(restart)}")
             if kill_at is not None:
@@ -2012,9 +2010,11 @@ async def run_shardcert(
         lane_inversions=tracker.lane_inversions,
         lanes_observed=tracker.lanes_observed,
         lane_repeats=tracker.lane_repeats,
-        engine_done=(final.done if final else 0),
+        # BACKLOG #5440 (S27-57): every engine shard's /stats counts the ONE unified store, so the poller's
+        # sum is N times the store's count; de-dup it as in_pipeline_final below is.
+        engine_done=(_store_view_rounded_up(final.done, max(1, len(ids_list))) if final else 0),
         # -1 = no poller sample, so an unmeasured dead count fails the pass bars rather than reading clean.
-        engine_dead=(final.dead if final else -1),
+        engine_dead=(_store_view_rounded_up(final.dead, max(1, len(ids_list))) if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
         in_pipeline_final=(
@@ -3159,6 +3159,68 @@ def _escapes(inbound_bind_host: str) -> dict[str, str]:
     }
 
 
+class KillLegError(ValueError):
+    """A kill leg asked for a shard the fleet does not have, or a kill instant outside the hold
+    (:func:`require_kill_leg`)."""
+
+
+def require_kill_leg(
+    kill: bool, kill_shard: str | None, kill_at_fraction: float, ids_list: Sequence[str]
+) -> None:
+    """Refuse a kill leg that cannot kill a shard of this fleet during the hold (BACKLOG #5440, S27-55).
+
+    Checked before the store reset and the fleet launch. A ``kill_shard`` outside ``ids_list`` used to
+    surface as a ``KeyError`` at the kill instant, mid-hold. A ``kill_at_fraction`` of 1 or more never fired
+    on the co-located bench, which then started a second process over the live shard, and fired after the
+    hold on the two-box engine, so neither run killed anything under load. Nothing is checked when ``kill``
+    is false, as nothing reads the other two then."""
+    if not kill:
+        return
+    if not (math.isfinite(kill_at_fraction) and 0.0 <= kill_at_fraction < 1.0):
+        raise KillLegError(
+            f"kill_at_fraction must be at least 0 and below 1, got {kill_at_fraction!r}"
+        )
+    if kill_shard is not None and kill_shard not in ids_list:
+        raise KillLegError(
+            f"kill_shard {kill_shard!r} is not a shard of this fleet ({', '.join(ids_list)})"
+        )
+
+
+def _set_aside_kept_log(node_id: str, env: Mapping[str, str]) -> None:
+    """Move a killed node's kept log to ``<node_id>.prekill.log`` before its restart opens
+    ``<node_id>.log`` for writing, which would truncate it (BACKLOG #5440, S27-56). Only under
+    ``MEFOR_BENCH_KEEP_NODE_LOGS``, named as :class:`EngineNode` names it; otherwise the log is a temp file
+    the node's own ``stop()`` removed."""
+    keep_dir = env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
+    if not keep_dir:
+        return
+    log = Path(keep_dir) / f"{node_id}.log"
+    with contextlib.suppress(FileNotFoundError):
+        log.replace(log.with_name(f"{node_id}.prekill.log"))
+
+
+async def _restart_killed(
+    nodes: dict[str, ShardCertNode],
+    killed: str,
+    api_port: int,
+    *,
+    env: Mapping[str, str],
+    cwd: Path,
+) -> ShardCertNode:
+    """Replace the SIGKILLed ``nodes[killed]`` with a fresh ``serve --shard`` (supervisor-style).
+
+    BACKLOG #5440 (S27-56): the killed node is stopped first, because ``kill()`` neither reaps the process
+    nor closes its log, and overwriting its entry dropped the only reference the caller's teardown had. The
+    restart is registered BEFORE it starts, so a start that raises is still stopped by that teardown."""
+    old = nodes[killed]
+    await old.stop()
+    _set_aside_kept_log(old.node_id, env)
+    restart = ShardCertNode(killed, api_port, env=env, config_dir=_CONFIG_DIR, cwd=cwd)
+    nodes[killed] = restart
+    await restart.start(provision=False)
+    return restart
+
+
 def _choose_killed(
     kill: bool, kill_shard: str | None, ids_list: list[str], owned: dict[str, list[str]]
 ) -> str | None:
@@ -3186,12 +3248,13 @@ async def _start_shards(
     (the SS schema-init applock convoys at N>=4 simultaneous opens). Each shard binds ``lanes`` inbound
     ports (lane ``l`` of shard ``i`` on ``inbound_base + i*lanes + l``); EVERY one is readiness-gated at
     ``preflight_host``. Populates ``nodes`` as it goes — a partially-started fleet is left in ``nodes`` so
-    the caller's ``finally`` still tears it down."""
+    the caller's ``finally`` still tears it down. Each node is registered BEFORE it starts (BACKLOG #5440,
+    S27-56): it opens its log when it is built, so one whose start raised must be stopped too."""
     for i, s in enumerate(ids_list):
         node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
+        nodes[s] = node
         # One store for the fleet: the first shard provisions the rig Administrator.
         await node.start(provision=i == 0)
-        nodes[s] = node
         if not await _await_health(node.url, timeout=60.0):
             raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
         for lane in range(lanes):
@@ -3552,6 +3615,7 @@ async def run_shardcert_engine(
     ids_list, owned, n, lanes, band_note = _discover(
         dests, handlers, delivering, routing, strict_bands=strict_bands
     )
+    require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list)
     # The ACCOUNTING pair the DRIVE box must gate on. Under `partitioned` the graph BUILDS H = D = dests
     # (every handler owns a destination) but the router selects ONE, so the fan-out per message is 1 and the
     # reported pair is (1, 1). Posting the BUILD pair instead would make the drive expect S == A*dests against
@@ -3601,6 +3665,9 @@ async def run_shardcert_engine(
     in_pipeline_final = -1
     node_pids: dict[str, tuple[str, int | None]] = {}
     in_pipeline_trace: list[list[float]] = []
+    # Out here so the teardown can cancel it: a hold that is cancelled or raises must not leave the timer to
+    # SIGKILL a shard after the run is over (BACKLOG #5440, S27-55).
+    kill_task: asyncio.Task[float] | None = None
     try:
         # Bring the fleet up. Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a
         # 0.0.0.0 listener) — the DRIVER separately proves off-box reachability from its side.
@@ -3681,7 +3748,6 @@ async def run_shardcert_engine(
 
         # Arm the LOCAL SIGKILL timer relative to WHEN WE OBSERVED DRIVE_START (no cross-box clock
         # compare). The kill is a local PID op on a timer — WS-C has no remote-kill leg.
-        kill_task: asyncio.Task[float] | None = None
         if kill and killed is not None:
             delay = _kill_delay(kill_at_fraction, hold_seconds)
             kill_task = asyncio.create_task(_kill_after(nodes[killed], delay))
@@ -3718,12 +3784,9 @@ async def run_shardcert_engine(
         # Kill leg: restart the killed shard (supervisor-style) so its startup runs the ownership-scoped
         # reset over ITS lanes; time functional recovery from the kill instant.
         if kill and killed is not None:
-            idx = ids_list.index(killed)
-            restart = ShardCertNode(
-                killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
+            restart = await _restart_killed(
+                nodes, killed, api_ports[ids_list.index(killed)], env=node_env, cwd=cwd
             )
-            await restart.start(provision=False)
-            nodes[killed] = restart
             # The restarted shard is a NEW subprocess (new PID) — refresh the correlation map so a
             # post-kill CPU sample attributes to the survivor process, not the reaped pre-kill one.
             node_pids[killed] = (restart.node_id, getattr(restart, "pid", None))
@@ -3755,7 +3818,9 @@ async def run_shardcert_engine(
             with contextlib.suppress(CoordTimeout):
                 await coord.await_message(abort_signal, timeout=_ABORT_MARKER_GRACE)
                 rung_aborted = True
-        engine_dead = final.dead if final else 0
+        # BACKLOG #5440 (S27-57): the poller sums N shards' /stats over ONE unified store, so de-dup the dead
+        # count as in_pipeline_final below is.
+        engine_dead = _store_view_rounded_up(final.dead, max(1, len(ids_list))) if final else 0
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
@@ -3829,6 +3894,10 @@ async def run_shardcert_engine(
             )
         await asyncio.sleep(post_drain_grace)
     finally:
+        if kill_task is not None and not kill_task.done():
+            kill_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await kill_task
         for node in nodes.values():
             with contextlib.suppress(Exception):
                 await node.stop()
