@@ -221,19 +221,21 @@ So the defect to track is the driver's, which is one more reason to keep the dri
 The PostgreSQL store backend reaches its database through `asyncpg`, the one name the extra adds to
 the core closure. `messagefoundry/store/postgres.py` imports it when the store opens and opens one
 connection pool through it. The HA coordinator in `messagefoundry/pipeline/cluster.py` runs its
-lease and node statements on that same pool. Elsewhere in the engine, `messagefoundry/store/base.py`
-imports it only to name its error classes, and `messagefoundry verify` only to read whether its
-`create_pool` takes a `connect` hook. The same criterion applies.
+lease and node statements on that same pool. Elsewhere in the engine it is imported at least by
+`messagefoundry/store/base.py`, to name its error classes, and by `messagefoundry verify`, to read
+whether its `create_pool` takes a `connect` hook. The same criterion applies.
 
 Unlike the `sqlserver` extra, no driver sits beneath it. `asyncpg` implements the PostgreSQL wire
-protocol itself, in compiled Cython, so everything the `sqlserver` section puts on the ODBC driver
-falls on this one distribution.
+protocol itself, in compiled Cython, so the protocol, the parsing of every response and the
+credential handling that the `sqlserver` section puts on the ODBC driver fall on this one
+distribution. TLS does not: the handshake and the trust decision are the standard library's `ssl`,
+as tier 2 below says.
 
 ### Designated
 
 | Component | Tier | Why | Native |
 |---|---|---|---|
-| `asyncpg` | 1, 2 and 3 | the store's whole path to PostgreSQL. It encodes every value the store writes into binary statement parameters, the raw inbound message among them, and decodes every row and every server message that comes back, so bytes a sending system chose pass through its codecs both ways. It holds the store credential and answers the server's password challenge, computing the SCRAM-SHA-256 exchange in its own code. It starts TLS on each connection with the context the engine builds for it, and speaks the PostgreSQL protocol to every server the store dials | **yes** |
+| `asyncpg` | 1, 2 and 3 | the store's whole path to PostgreSQL. It encodes every value the store writes into binary statement parameters, and decodes every row and every server message that comes back, so values a sending system chose pass through its codecs both ways. It holds the store credential, or reads one from the environment or a password file, and answers the server's password challenge, computing the SCRAM-SHA-256 exchange in its own code. It starts TLS on each TCP connection with the context the engine builds for it, and speaks the PostgreSQL protocol to every server the store dials | **yes** |
 
 ### Assessed and NOT designated
 
@@ -246,22 +248,29 @@ So 1 plus 0 is 1, and 35 plus 1 is 36.
 1. **Hostile input.** The rows the store reads back were written by the engine, but they carry what
    a sending system chose: the raw message and the values parsed from it. `asyncpg`'s codecs decode
    them, and its protocol code parses every message the server sends, error and notice text
-   included.
+   included. Where the store's at-rest encryption is on, the columns it encrypts reach `asyncpg`
+   as ciphertext. What it leaves in plaintext, and every server message, still pass through.
 2. **Secrets and trust.** It is handed the store's user name and password, and keeps them for the
-   pool's lifetime, so it can open new connections, as `aioodbc` keeps the connection string. It
+   pool's lifetime, so it can open new connections, as `aioodbc` keeps the connection string. With
+   no password set it reads one itself, from `PGPASSWORD` or from a password file (`PGPASSFILE`, or
+   `.pgpass` in the home directory), and with an empty `[store].server` it reads the host from
+   `PGHOST`. It
    runs the SCRAM-SHA-256 exchange in its own code, `asyncpg/protocol/scram.pyx`, on the standard
    library's `hashlib` and `hmac`, and checks the server's signature there too. It also answers a
    cleartext or MD5 password request, if the server makes one. Whether the server's certificate is
    trusted is decided by the context the engine passes and by the standard library's `ssl`, not by
    `asyncpg`. It still decides when TLS starts. On the pinned 0.32.0, read for this section, a
-   context passed in is taken as TLS required: a server that refuses TLS gets an error, not a
-   plaintext connection.
+   context passed in is taken as TLS required on a TCP connection: a server that refuses TLS gets an
+   error, not a plaintext connection. A Unix-domain socket connection carries no TLS at all, whatever
+   the context. `asyncpg` opens one when its host names a socket directory, which on Linux its own
+   default does first when `[store].server` and `PGHOST` are both empty.
 3. **Protocol termination.** It speaks the PostgreSQL frontend and backend protocol, framing and
    startup included, to every server the store dials.
 
 Its extension modules bundle no library. On the wheels read, they name only the C library and the
-maths and thread libraries on Linux, and the C runtime and Python itself on Windows. So a fault in
-its protocol or codec code is a memory-safety event in the engine's process, not a Python exception.
+maths and thread libraries on Linux, and the C runtime and Python itself on Windows. Most errors in
+its protocol code still surface as Python exceptions, but a memory-safety bug there is a fault in the
+engine's process, not an exception.
 
 The ASVS reading further down reads `asyncpg` with every other component on this page. Its results
 are in *The names the assessed extras add*, and what its wheels carry is in *What each wheel

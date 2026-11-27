@@ -165,7 +165,7 @@ def probe_python_runtime() -> ProbeResult:
 def probe_optional_extras() -> ProbeResult:
     """A2 — the server-relevant optional extras import (postgres, sqlserver, dicom)."""
     groups: dict[str, tuple[str, ...]] = {
-        "postgres": ("asyncpg",),  # the [postgres] extra (pure-Python driver — no libpq)
+        "postgres": ("asyncpg",),  # the [postgres] extra (its own wire-protocol driver — no libpq)
         "sqlserver": ("aioodbc",),  # the [sqlserver] extra (drags pyodbc)
         "dicom": ("pydicom", "pynetdicom"),
     }
