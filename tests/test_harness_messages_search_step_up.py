@@ -67,10 +67,12 @@ class _StepUp:
         self.answer = answer
         self.calls = 0
         self.threads: list[threading.Thread] = []
+        self.actions: list[str | None] = []
 
-    def __call__(self) -> bool:
+    def __call__(self, action: str | None) -> bool:
         self.calls += 1
         self.threads.append(threading.current_thread())
+        self.actions.append(action)
         return self.answer
 
 
@@ -112,6 +114,24 @@ def test_a_refused_search_steps_up_on_the_gui_thread_and_resubmits(qapp: Any) ->
         panel.stop()
 
 
+@pytest.mark.parametrize("action", ["message_search", None], ids=["per-action", "session-window"])
+def test_the_step_up_re_proves_for_the_action_the_refusal_named(
+    qapp: Any, action: str | None
+) -> None:
+    """A per-action gate (ADR 0077) mints its grant only for a re-proof naming its action, and the
+    polling client stashed nothing, so the panel passes the refusal's own action on."""
+    client = _SearchClient(refusals=1, error=StepUpRequired("refused", status=403, action=action))
+    step_up = _StepUp(True)
+    panel, errors = _search(qapp, client, step_up)
+    try:
+        _settle(qapp, panel, client, 2)
+        assert step_up.actions == [action]
+        assert client.searches == 2
+        assert errors == []
+    finally:
+        panel.stop()
+
+
 def test_a_second_refusal_is_reported_not_prompted_again(qapp: Any) -> None:
     client = _SearchClient(refusals=5)
     step_up = _StepUp(True)
@@ -145,7 +165,7 @@ def test_a_refresh_during_the_prompt_neither_searches_nor_prompts_again(qapp: An
     panel_box: list[MessagesPanel] = []
     calls: list[int] = []
 
-    def decline_after_a_refresh() -> bool:
+    def decline_after_a_refresh(_action: str | None) -> bool:
         calls.append(client.searches)
         panel_box[0].refresh(autosize=True)
         return False
@@ -190,7 +210,7 @@ def test_a_403_that_is_not_a_step_up_is_not_answered_with_a_password_prompt(qapp
 def test_a_refused_re_proof_reports_its_own_cause(qapp: Any) -> None:
     client = _SearchClient(refusals=1)
 
-    def refuse() -> bool:
+    def refuse(_action: str | None) -> bool:
         raise ApiError("re-verification failed", status=401)
 
     panel, errors = _search(qapp, client, None)

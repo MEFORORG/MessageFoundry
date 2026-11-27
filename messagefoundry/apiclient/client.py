@@ -227,11 +227,19 @@ class StepUpRequired(ApiError):
     declined, or the retry after it was refused again (BACKLOG #5945).
 
     It lets a caller tell a step-up refusal from a role or scope refusal, which shares the status.
-    For a session-window gate the caller can re-prove the password on its own GUI thread and retry.
-    It carries no ``X-Step-Up-Action``, so for a per-action gate (ADR 0077) a re-proof made from it
-    binds no action, and the retry is refused again. A subclass of
-    :class:`ApiError`, so a caller that catches only that still sees the refusal. A refusal that
-    carries ``X-Step-Up-Via: idp`` raises :class:`IdpStepUpRequired` instead."""
+    The caller can re-prove the password on its own GUI thread and retry. ``action`` is the
+    refusal's ``X-Step-Up-Action``: the action a per-action gate (ADR 0077) binds its proof to, or
+    None for a session-window gate. A re-proof for a per-action gate must pass it to
+    :meth:`EngineClient.reauth` as ``purpose``, or it mints no grant for that action and the retry
+    is refused again. A subclass of :class:`ApiError`, so a caller that catches only that still
+    sees the refusal. A refusal that carries ``X-Step-Up-Via: idp`` raises
+    :class:`IdpStepUpRequired` instead."""
+
+    def __init__(
+        self, message: str, *, status: int | None = None, action: str | None = None
+    ) -> None:
+        super().__init__(message, status=status)
+        self.action = action
 
 
 def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
@@ -1243,16 +1251,19 @@ class EngineClient:
         # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the
         # user (the handler re-authenticates via reauth()) and retry once, so the action goes through
         # transparently instead of surfacing a raw 403.
+        # ADR 0077: a per-action step-up names the action in X-Step-Up-Action; a plain
+        # session-window step-up omits it. An empty header names no action, since as a purpose it
+        # would win over none and be refused.
+        step_up_action = response.headers.get("X-Step-Up-Action") or None
         if (
             _allow_step_up
             and response.status_code == 403
             and response.headers.get("X-Step-Up-Required")
             and self._step_up_handler is not None
         ):
-            # ADR 0077: a per-action step-up names the action in X-Step-Up-Action; stash it BEFORE the
-            # handler runs so the reauth() it calls binds the fresh proof to that action. A plain
-            # session-window step-up omits the header → None → reauth() posts no purpose (unchanged).
-            self._pending_step_up_action = response.headers.get("X-Step-Up-Action")
+            # Stash the action BEFORE the handler runs so the reauth() it calls binds the fresh proof
+            # to it. None (a session-window step-up) → reauth() posts no purpose (unchanged).
+            self._pending_step_up_action = step_up_action
             proved = False
             try:
                 proved = self._step_up_handler()
@@ -1272,7 +1283,9 @@ class EngineClient:
                     **kw,
                 )
         if response.status_code == 403 and response.headers.get("X-Step-Up-Required"):
-            raise StepUpRequired(_error_detail(response), status=response.status_code)
+            raise StepUpRequired(
+                _error_detail(response), status=response.status_code, action=step_up_action
+            )
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
