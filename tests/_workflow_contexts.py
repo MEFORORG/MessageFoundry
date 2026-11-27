@@ -121,7 +121,8 @@ def changes_arm_pattern(output: str, sanity: str) -> str:
     rather than passing against the wrong pattern.
 
     Read from ``WORKFLOWS`` on each call and memoised on the text, so a test that repoints
-    ``WORKFLOWS`` is never served the pattern of the file it pointed away from.
+    ``WORKFLOWS`` and calls this directly reads the file it pointed at. A caller that memoises the
+    result itself, as the docker and packaging gate tests do, still answers from its first call.
     """
     return _changes_arm_pattern((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"), output, sanity)
 

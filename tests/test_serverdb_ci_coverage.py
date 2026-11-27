@@ -289,50 +289,69 @@ def _server_db_suite_files() -> set[str]:
     }
 
 
+#: The repo trees whose modules a server-DB suite may import beside the engine: its own test
+#: helpers, and the load drivers the failover and connscale suites run.
+_HELPER_ROOTS = ("tests", "harness")
+
+
 @functools.cache
-def _repo_test_sources() -> frozenset[str]:
-    """Every source under ``tests/``, repo-relative, case as the tree spells it."""
-    return frozenset(p.relative_to(REPO_ROOT).as_posix() for p in TESTS_DIR.rglob("*.py"))
+def _repo_helper_sources() -> frozenset[str]:
+    """Every source under ``tests/`` and ``harness/``, repo-relative, case as the tree spells it."""
+    return frozenset(
+        p.relative_to(REPO_ROOT).as_posix()
+        for root in _HELPER_ROOTS
+        for p in (REPO_ROOT / root).rglob("*.py")
+    )
 
 
-def _test_helpers_imported_by(text: str) -> set[str]:
-    """The ``tests/`` files one source's ``tests.*`` imports name, as repo-relative paths.
+def _helpers_imported_by(text: str) -> set[str]:
+    """The ``tests/`` and ``harness/`` files one source's imports name, as repo-relative paths.
 
     ``from tests.pkg import name`` names ``pkg`` and, when it is a file, ``pkg.name``, as the
-    engine scan above does. A relative import is not read: no file under ``tests/`` uses one, and
-    ``tests`` has no ``__init__.py``. ``importlib.import_module`` is not followed either.
+    engine scan above does, and the same for ``harness.*``. A bare name that is a root ``tests/``
+    file, as in ``from _totp_clock import ...``, is that file: ``tests/`` is on ``sys.path`` when
+    the suites run. Not followed, at least: a relative import (no file under ``tests/`` uses one),
+    and ``importlib.import_module``.
     """
     names: list[str] = []
     for node in ast.walk(ast.parse(text)):
         if isinstance(node, ast.ImportFrom):
-            if node.level or (node.module or "").split(".")[0] != "tests":
+            if node.level or not node.module:
                 continue
-            names += [str(node.module)] + [f"{node.module}.{alias.name}" for alias in node.names]
+            names += [node.module] + [f"{node.module}.{alias.name}" for alias in node.names]
         elif isinstance(node, ast.Import):
-            names += [a.name for a in node.names if a.name.split(".")[0] == "tests"]
+            names += [a.name for a in node.names]
     found: set[str] = set()
+    sources = _repo_helper_sources()
     for module in names:
         base = module.replace(".", "/")
-        found.update(c for c in (f"{base}.py", f"{base}/__init__.py") if c in _repo_test_sources())
+        if base.split("/")[0] not in _HELPER_ROOTS:
+            base = f"tests/{base}"
+            if "/" in base.removeprefix("tests/"):
+                continue
+        found.update(c for c in (f"{base}.py", f"{base}/__init__.py") if c in sources)
     return found
 
 
-def _helpers_reached_by_server_db_suites() -> set[str]:
-    """The ``tests/`` files the server-DB suites import, and the files those import, to a fixed point.
+@functools.cache
+def _helpers_reached_by_server_db_suites() -> frozenset[str]:
+    """The helper files the server-DB suites import, and the files those import, to a fixed point.
 
-    A step-run suite is left out: invariant 2 already binds it. A helper runs inside the leg as
+    Seeded with the step-run suites and ``tests/conftest.py``, which runs in every leg. A suite
+    itself is left out of the result: invariant 2 already binds it. A helper runs inside the leg as
     surely as the suite does, so an edit to one alone must pull the leg too (#5472, S31-23).
     """
     suites = _server_db_suite_files()
-    reached: set[str] = set()
-    todo = sorted(suites)
+    seeds = suites | {"tests/conftest.py"}
+    reached: set[str] = {"tests/conftest.py"}
+    todo = sorted(seeds)
     while todo:
         path = todo.pop()
         text = (REPO_ROOT / path).read_text(encoding="utf-8")
-        new = _test_helpers_imported_by(text) - reached - suites
+        new = _helpers_imported_by(text) - reached - suites
         reached |= new
         todo.extend(sorted(new))
-    return reached
+    return frozenset(reached)
 
 
 def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
@@ -353,10 +372,17 @@ def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
         ("from tests.test_alert_sinks import _sink", {"tests/test_alert_sinks.py"}),
         ("from messagefoundry import pki\nimport os", set()),
         ("from ._session_seal_contract import run", set()),
+        ("from _totp_clock import FakeClock", {"tests/_totp_clock.py"}),
+        ("import _failover_load_support", {"tests/_failover_load_support.py"}),
+        (
+            "from harness.load import failover",
+            {"harness/load/__init__.py", "harness/load/failover.py"},
+        ),
+        ("import json, os.path", set()),
     ],
 )
 def test_the_helper_scan_resolves_tests_imports(source: str, expected: set[str]) -> None:
-    assert _test_helpers_imported_by(source) == expected
+    assert _helpers_imported_by(source) == expected
 
 
 def test_serverdb_path_gate_admits_every_tests_helper_those_suites_import() -> None:

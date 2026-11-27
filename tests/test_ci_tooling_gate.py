@@ -41,7 +41,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 from tests import _tooling_manifest as tooling_manifest  # noqa: E402
-from tests import _workflow_contexts as workflow_contexts  # noqa: E402
 from tests._workflow_contexts import changes_arm_pattern  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -608,25 +607,3 @@ def test_the_tooling_verdict_survives_a_coreutils_less_PATH(
         "the docs-only short-circuit did not fire, so `git diff` returned nothing through the shim "
         "and the verdict above was reached without reading the fixture at all"
     )
-
-
-def test_the_arm_reader_follows_a_repointed_workflows_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A test that repoints ``WORKFLOWS`` must read the file it pointed at, not a cached pattern of
-    the real ci.yml (BACKLOG #5472). The arm reader was memoised on its arguments alone."""
-    real = changes_arm_pattern("tooling", "tooling_manifest")
-    planted = "^(planted/tooling_manifest)"
-    step = f'grep -qE \'{planted}\'\necho "tooling=true" >> "$GITHUB_OUTPUT"\n'
-    (tmp_path / "ci.yml").write_text(step, encoding="utf-8")
-    monkeypatch.setattr(workflow_contexts, "WORKFLOWS", tmp_path)
-    assert changes_arm_pattern("tooling", "tooling_manifest") == planted != real
-
-
-def test_a_parsed_workflow_is_a_fresh_copy_each_call() -> None:
-    """The parse is memoised, so each caller must get its own copy to mutate (BACKLOG #5472)."""
-    first = workflow_contexts.load_workflow("ci.yml")
-    second = workflow_contexts.load_workflow("ci.yml")
-    assert first == second
-    assert first is not second
-    assert first["jobs"] is not second["jobs"]

@@ -250,8 +250,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # NOT engine source either, but it meets the criterion above and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
-        # security/runtime-closure-core.txt, holds each runtime-closure file to the exported lock it
-        # copies, and holds the core closure to requirements.lock too: five locks, at least. The
+        # security/runtime-closure-core.txt, and holds each runtime-closure file both to the
+        # exported lock it copies and to requirements.lock: five locks, at least. The
         # gating argument is the one that keeps the repo-wide scanners here. Several paths it
         # reads match neither arm of ci.yml's tooling path gate: security/runtime-closure-*.txt,
         # security/risky-component-readings.json, security/bundled-code-survey.json and

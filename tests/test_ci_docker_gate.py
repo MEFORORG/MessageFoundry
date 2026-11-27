@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import _workflow_contexts as workflow_contexts
 from tests._workflow_contexts import changes_arm_pattern, jobs_of
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -305,15 +306,34 @@ _COPY = re.compile(
 )
 
 
+#: The start of a heredoc on an instruction line: ``<<EOF``, ``<<-EOF`` or a quoted word.
+_HEREDOC = re.compile(r"""<<-?["']?(?P<word>\w+)["']?""")
+
+
 def _checkout_sources_copied(dockerfile: str) -> list[str]:
     """Each source a COPY or ADD instruction reads from the build context, in file order.
 
     Reads the shell form and the JSON form, and an instruction continued over several lines with
-    a trailing backslash, the default escape character. A ``--from`` copy reads another build
-    stage, not the checkout, so it is skipped. A heredoc source is not read, and neither is a
+    a trailing backslash, the default escape character. Comment lines go first, as Docker drops
+    them before it joins continuations, and a heredoc body is skipped, so neither is read as an
+    instruction. A leading ``./`` is dropped from a source. A ``--from`` copy reads another build
+    stage, not the checkout, so it is skipped. Not read, at least: a heredoc SOURCE, and a
     ``# escape=`` directive that changes the escape character.
     """
-    joined = re.sub(r"\\[ \t]*\r?\n", " ", dockerfile)
+    kept: list[str] = []
+    terminator: str | None = None
+    for line in dockerfile.splitlines():
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        kept.append(line)
+        heredoc = _HEREDOC.search(line)
+        if heredoc:
+            terminator = heredoc.group("word")
+    joined = re.sub(r"\\[ \t]*\n", " ", "\n".join(kept))
     found: list[str] = []
     for match in _COPY.finditer(joined):
         if "--from" in match.group("flags"):
@@ -326,7 +346,7 @@ def _checkout_sources_copied(dockerfile: str) -> list[str]:
                 pytest.fail(f"a JSON-form COPY does not parse, so its sources are unread: {args}")
         else:
             tokens = args.split()
-        found += tokens[:-1]
+        found += [token.removeprefix("./") for token in tokens[:-1]]
     return found
 
 
@@ -351,6 +371,13 @@ def _root_files_the_image_copies() -> set[str]:
         ("ADD README.md /src/\n", ["README.md"]),
         ("COPY --from=builder /opt/venv /opt/venv\n", []),
         ("RUN echo COPY LICENSE ./\n", []),
+        (
+            "COPY pyproject.toml \\\n# the readme\n    README.md ./\n",
+            ["pyproject.toml", "README.md"],
+        ),
+        ("# see C:\\\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("COPY ./README.md ./messagefoundry ./\n", ["README.md", "messagefoundry"]),
+        ("RUN <<EOF\ncopy NOTICE /tmp/x\nEOF\nCOPY LICENSE ./\n", ["LICENSE"]),
     ],
 )
 def test_the_copy_reader_on_planted_dockerfiles(dockerfile: str, expected: list[str]) -> None:
@@ -408,3 +435,27 @@ def test_every_root_file_the_image_copies_trips_the_gate() -> None:
 def test_the_root_file_arm_is_anchored(path: str) -> None:
     """SHAPE: each matches only if the root-file alternation loses its ``$`` or its ``^``."""
     assert not gate([path]), f"the docker arm admits {path}"
+
+
+def test_the_arm_reader_follows_a_repointed_workflows_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A test that repoints ``WORKFLOWS`` must read the file it pointed at, not a cached pattern of
+    the real ci.yml (BACKLOG #5472). The arm reader was memoised on its arguments alone. It is
+    here, not in the tooling tier, because an edit to tests/_workflow_contexts.py alone trips no
+    tooling arm."""
+    real = changes_arm_pattern("docker", "dockerignore")
+    planted = "^(planted/dockerignore)"
+    step = f'grep -qE \'{planted}\'\necho "docker=true" >> "$GITHUB_OUTPUT"\n'
+    (tmp_path / "ci.yml").write_text(step, encoding="utf-8")
+    monkeypatch.setattr(workflow_contexts, "WORKFLOWS", tmp_path)
+    assert changes_arm_pattern("docker", "dockerignore") == planted != real
+
+
+def test_a_parsed_workflow_is_a_fresh_copy_each_call() -> None:
+    """The parse is memoised, so each caller must get its own copy to mutate (BACKLOG #5472)."""
+    first = workflow_contexts.load_workflow("ci.yml")
+    second = workflow_contexts.load_workflow("ci.yml")
+    assert first == second
+    assert first is not second
+    assert first["jobs"] is not second["jobs"]

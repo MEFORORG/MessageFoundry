@@ -134,14 +134,15 @@ def _diff_lists_both_sides(line: str) -> bool:
     """A ``changed=`` line runs one ``git diff`` with ``--no-renames`` among its own options.
 
     A substring check passed a ``--no-renames`` in a shell comment after the diff, in another
-    command on the line, or beside a later ``-M`` or ``--find-renames`` that turns it back on.
+    command on the line, or beside an option that turns detection back on (``-M``, ``-C``,
+    ``--find-copies-harder``) or drops one side (``--diff-filter``, ``--relative``). So the
+    options are an allow-list, not a deny-list: exactly ``--name-only`` and ``--no-renames``.
     """
     match = _CHANGED.match(line.strip())
     if not match:
         return False
     options = shlex.split(match.group("cmd"))[2:-1]
-    renames_on = [o for o in options if o.startswith(("-M", "--find-renames", "--renames"))]
-    return "--no-renames" in options and not renames_on
+    return sorted(options) == ["--name-only", "--no-renames"]
 
 
 @pytest.mark.parametrize(
@@ -153,6 +154,12 @@ def _diff_lists_both_sides(line: str) -> bool:
         ('changed=$(git diff --name-only "$BASE_SHA...HEAD") # --no-renames', False),
         ('changed=$(git diff --name-only --no-renames -M "$BASE_SHA...HEAD")', False),
         ('changed=$(git diff --name-only --no-renames --find-renames "$BASE_SHA...HEAD")', False),
+        ('changed=$(git diff --name-only --no-renames -C "$BASE_SHA...HEAD")', False),
+        (
+            'changed=$(git diff --name-only --no-renames --find-copies-harder "$BASE_SHA...HEAD")',
+            False,
+        ),
+        ('changed=$(git diff --name-only --no-renames --diff-filter=d "$BASE_SHA...HEAD")', False),
         ('changed=$(echo --no-renames; git diff --name-only "$BASE_SHA...HEAD")', False),
         ('changed=$(git diff --name-only "$BASE_SHA...HEAD" | grep -v --no-renames)', False),
     ],
