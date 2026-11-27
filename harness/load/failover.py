@@ -14,7 +14,8 @@ the current primary mid-load**, and measures what a failover actually costs:
   lease TTL`` (relative, so it stays valid whatever timings a profile sets);
 * **no loss (acknowledged)** — every message the engine accept-ACKed reached the sink (``acked ⊆
   delivered``, via :class:`~harness.load.failover_track.FailoverTracker`), with nothing stranded
-  (``in_pipeline == 0``) and no dead-letters;
+  (``in_pipeline == 0``) and no dead-letters. A reused store's dead rows from before the run are
+  excused copy by copy when the rig can read them whole, and otherwise count (BACKLOG #5572);
 * **bounded duplicates** — at-least-once re-deliveries (``sink_received − engine done``) under a rate cap;
 * **per-lane FIFO** — first arrivals per engine outbound DESTINATION (the lane, recovered from MSH-6 —
   the MLLP connector opens a fresh connection per delivery, so the lane is the destination, not the
@@ -26,9 +27,10 @@ This run is also the **first live proof** of the on-promotion in-flight recovery
 ``docs/CLUSTERING.md`` and the engine's ``_start_graph``.
 
 The harness reaches the engines only over MLLP (the sender/sink) and the HTTP API (``/health``,
-``/cluster/status``, ``/stats``); it never imports the engine in-process (it shells out to ``serve``, as a
-deployment would) and never touches the store. All metrics are aggregate — never message bodies or
-control-id lists (PHI rule). Two nodes on one host share the **same** inbound MLLP ports: only the leader
+``/cluster/status``, ``/stats``, and ``/dead-letters`` only on a store that already held dead rows);
+it never imports the engine in-process (it shells out to ``serve``, as a deployment would) and never
+touches the store. All metrics are aggregate — never message bodies or control-id lists (PHI rule);
+the dead-letter read keeps only each row's outbox id and failure time, in memory. Two nodes on one host share the **same** inbound MLLP ports: only the leader
 binds them, so the sender hits a fixed port and reconnects through the rebind — the floating-VIP collapsed
 to "one binder, one port".
 """
@@ -39,12 +41,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import IO, Any
 
@@ -63,6 +66,7 @@ from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
 from messagefoundry.proctree import ADOPT_CREATIONFLAGS, resume_into_job, terminate_job
+from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
@@ -75,10 +79,21 @@ _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
 _OPENING_STATS_ATTEMPTS = 5
 _OPENING_STATS_RETRY_S = 0.5
+#: One ``/dead-letters`` page: the route's own ceiling (``limit <= 500``).
+_DEAD_PAGE = 500
+#: The most dead copies the per-copy check reads (BACKLOG #5572). Past it the check stays absolute,
+#: so a store carrying more fails a clean run, as every reused store with dead rows did before.
+_DEAD_COPIES_MAX = 10_000
+
+#: One dead outbound copy, as ``/dead-letters`` names it: ``(outbox_id, failed_at)``. The time is
+#: part of the identity, so a carried-over row that is replayed and dead-lettered again reads as new.
+DeadCopy = tuple[str, float]
 
 #: The most bytes the rig reads of one ``/health``, ``/cluster/status`` or ``/stats`` answer, the
 #: only API routes it polls over ``httpx`` (ASVS 5.1.1, BACKLOG #1127). Each is a role or a few
 #: counters, well under a KiB, so 1 MiB leaves room and still stops a node that streams without end.
+#: A ``/dead-letters`` page is read under the same cap; one past it is no answer, so the dead-row
+#: check stays absolute (BACKLOG #5572).
 MAX_STATUS_REPLY_BYTES = 1 << 20
 
 
@@ -407,6 +422,53 @@ class EngineNode:
             in_pipeline=int(data.get("in_pipeline", 0)),
         )
 
+    async def dead_copies(self, client: httpx.AsyncClient) -> frozenset[DeadCopy] | None:
+        """Every dead outbound copy in the shared store, read from ``/dead-letters`` page by page;
+        ``None`` unless the read is whole (BACKLOG #5572).
+
+        That route lists the rows ``/stats`` counts as ``dead``: outbound stage, status dead. Whole
+        means every page answered, each named the same total, no copy came back twice, and the copies
+        read add up to that total. A row the paging skipped or saw twice breaks one of those, and so
+        does a dead row whose message row is gone, which the count sees and the list does not. Only
+        the copy identities are kept, in memory: the summary and error text the route also returns
+        are dropped here and never reach the report (PHI rule)."""
+        copies: set[DeadCopy] = set()
+        seen: set[str] = set()
+        total: int | None = None
+        while True:
+            data = await self._signed_in_json(
+                client, f"/dead-letters?limit={_DEAD_PAGE}&offset={len(copies)}"
+            )
+            if data is None:
+                return None
+            page_total, rows = data.get("total"), data.get("dead_letters")
+            if type(page_total) is not int or not isinstance(rows, list):
+                return None
+            if total is None:
+                total = page_total
+            if page_total != total or total > _DEAD_COPIES_MAX:
+                return None
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                oid, at = row.get("outbox_id"), row.get("failed_at")
+                # bool is an int, so it is refused by name; NaN never equals itself, so a NaN time
+                # could not match its own opening copy.
+                if (
+                    not isinstance(oid, str)
+                    or not isinstance(at, (int, float))
+                    or isinstance(at, bool)
+                ):
+                    return None
+                failed_at = float(at)
+                if not math.isfinite(failed_at) or oid in seen:
+                    return None
+                seen.add(oid)
+                copies.add((oid, failed_at))
+            if not rows or len(copies) >= total:
+                break
+        return frozenset(copies) if len(copies) == total else None
+
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any] | None:
     """GET ``url`` and return the JSON object, or ``None`` on any error / non-200 (a killed or
@@ -498,7 +560,11 @@ class FailoverReport:
     max_concurrent_leaders: int
     leader_samples: int  # H6: how many times the leader-set size was observed (non-vacuity proof)
     in_pipeline_final: int
-    dead_final: int
+    dead_final: int  # every dead outbound row at the end, carried-over ones included
+    dead_opening: int  # dead outbound rows the store already held at the opening read
+    # dead_final's copies that were not dead, unchanged, at the opening read: the per-copy check
+    # (BACKLOG #5572). None when that reading was not conclusive; the check is then dead_final == 0.
+    dead_new: int | None
     # The in_pipeline_final split at the drain deadline — the decisive failover-recovery diagnostic:
     # PENDING = re-pended (by the on-promotion lease-blind recovery), awaiting (re)claim → a residue here
     # is a discovery/claim gap; INFLIGHT = claimed-not-completed or a stranded lease never re-pended → a
@@ -542,6 +608,8 @@ class FailoverReport:
                 "intake_gap": self.intake_gap,
                 "in_pipeline_final": self.in_pipeline_final,
                 "dead_final": self.dead_final,
+                "dead_opening": self.dead_opening,
+                "dead_new": self.dead_new,
             },
             "duplicates": {"count": self.duplicates, "rate": round(self.dup_rate, 5)},
             "ordering": {
@@ -557,9 +625,10 @@ class FailoverReport:
 
     def render_console(self) -> str:
         lines: list[str] = []
-        lines.append(
-            f"Failover-load report -- profile {self.profile!r} (backend {self.db_backend or '?'})"
-        )
+        # The backend is the operator's own --db-backend text, so it is escaped before it reaches
+        # the terminal; the profile name already prints through repr, which escapes control codes.
+        backend = escape_for_terminal(self.db_backend or "?", single_line=True)
+        lines.append(f"Failover-load report -- profile {self.profile!r} (backend {backend})")
         lines.append("")
         prom = "n/a" if self.promotion_seconds is None else f"{self.promotion_seconds:.2f}s"
         rec = "TIMEOUT" if self.recovery_seconds is None else f"{self.recovery_seconds:.2f}s"
@@ -577,7 +646,8 @@ class FailoverReport:
         lines.append(
             f"no-loss: acked_not_delivered={self.acked_not_delivered} (intake_gap={self.intake_gap}, "
             f"in_pipeline={self.in_pipeline_final} [pending={self.pending_final} "
-            f"inflight={self.inflight_final}], dead={self.dead_final})"
+            f"inflight={self.inflight_final}], dead={self.dead_final} "
+            f"[opening={self.dead_opening} new={'?' if self.dead_new is None else self.dead_new}])"
         )
         lines.append(
             f"duplicates: {self.duplicates} ({self.dup_rate * 100:.2f}%) | "
@@ -624,6 +694,7 @@ async def run_failover_load(
     fo = profile.failover
     if fo is None:
         raise FailoverError("the profile has no [load.failover] table — not a failover profile")
+    _refuse_non_finite(fo)
     if len(profile.targets) != 1:
         raise FailoverError(
             "a failover profile must declare exactly one [[load.target]] (single-stream FIFO ordering)"
@@ -690,6 +761,7 @@ async def run_failover_load(
             notes.append(f"elected {leader.node_id} as the initial primary")
             await _await_port("127.0.0.1", ports.inbound_adt, timeout=15.0)
             opening = await _opening_stats(nodes, client)
+            carried = await _opening_dead_copies(nodes, client, opening)
 
             dispatcher.start()
             stop = asyncio.Event()
@@ -731,9 +803,13 @@ async def run_failover_load(
             outcome = (
                 await monitor
             )  # recovery was observed during the phase/drain (or hit the deadline)
+            # The dead copies are read on both sides of the final stats read, so a copy that dies or
+            # leaves between the reads shows as a moved set and judges nothing (_judge_new_dead).
+            before = await survivor.dead_copies(client) if carried else None
             final = await survivor.stats(client)
             if final is None:
                 raise FailoverError("could not read the survivor's final /stats for reconciliation")
+            after = await survivor.dead_copies(client) if carried and final.dead else None
             return _build_report(
                 profile,
                 db_backend,
@@ -744,6 +820,8 @@ async def run_failover_load(
                 opening.done,
                 fo,
                 notes,
+                dead_opening=opening.dead,
+                dead_new=_judge_new_dead(carried, before, after, final.dead),
             )
         finally:
             for task in (phase_task, monitor):
@@ -871,14 +949,35 @@ def _build_report(
     done_at_start: int,
     fo: Failover,
     notes: list[str],
+    *,
+    dead_opening: int = 0,
+    dead_new: int | None = None,
 ) -> FailoverReport:
+    """The verdict. ``dead_new`` is :func:`_judge_new_dead`'s count; with ``None`` the dead-row
+    check is absolute, ``final.dead == 0``, because the counters alone cannot tell a carried-over
+    dead row from a new one (three leaving and three new read as no change)."""
     c = counters.snapshot()
     engine_delivered = max(0, final.done - done_at_start)
     duplicates = max(0, c.sink_received - engine_delivered)
     dup_rate = duplicates / engine_delivered if engine_delivered else 0.0
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
-    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
+    if final.dead == 0:
+        dead_new = 0
+    dead_ok = dead_new == 0
+    if not dead_ok:
+        notes.append(
+            f"{final.dead} dead-lettered outbound row(s) at the end; "
+            + (
+                f"{dead_new} of them new this run"
+                if dead_new is not None
+                else f"the store held {dead_opening} at the opening read and the run could not tell "
+                "carried-over rows from new ones, so every one counts"
+                if dead_opening
+                else "the store held none at the opening read"
+            )
+        )
+    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_ok
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 
     slos = [
@@ -904,8 +1003,18 @@ def _build_report(
             outcome.leader_samples > 0 and outcome.max_concurrent_leaders <= 1,
         ),
         SloCheck("no_acknowledged_loss", 0, acked_not_delivered, no_loss_ok),
-        SloCheck("per_lane_ordering", 0, tracker.lane_inversions, tracker.lane_inversions == 0),
+        # Non-vacuous like single_leader: with fewer than two lanes observed there is no ordering to
+        # compare, so zero inversions proves nothing and the check FAILS (S26-62).
+        SloCheck(
+            "per_lane_ordering",
+            0,
+            tracker.lane_inversions,
+            tracker.lanes_observed >= 2 and tracker.lane_inversions == 0,
+        ),
         SloCheck("max_dup_rate", fo.max_dup_rate, round(dup_rate, 5), dup_rate <= fo.max_dup_rate),
+        # A run the engine accepted nothing from proves none of the above, so it is a violation of
+        # its own, which the console then counts (S26-62).
+        SloCheck("messages_acked", 1, c.acked, c.acked > 0),
     ]
     if fo.max_promotion_seconds is not None:
         slos.append(
@@ -919,7 +1028,7 @@ def _build_report(
         )
     if c.acked == 0:
         notes.append("WARNING: zero messages were ACKed — the run sent no load the engine accepted")
-    result_ok = all(s.ok for s in slos) and c.acked > 0
+    result_ok = all(s.ok for s in slos)
     return FailoverReport(
         profile=profile.name,
         db_backend=db_backend,
@@ -944,6 +1053,8 @@ def _build_report(
         leader_samples=outcome.leader_samples,
         in_pipeline_final=final.in_pipeline,
         dead_final=final.dead,
+        dead_opening=dead_opening,
+        dead_new=dead_new,
         pending_final=final.pending,
         inflight_final=final.inflight,
         lease_ttl_seconds=fo.leader_lease_ttl_seconds,
@@ -1082,6 +1193,52 @@ async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> 
         f"could not read the opening /stats baseline in {_OPENING_STATS_ATTEMPTS} attempts; "
         "no load was offered"
     )
+
+
+async def _opening_dead_copies(
+    nodes: list[EngineNode], client: httpx.AsyncClient, opening: NodeStats
+) -> frozenset[DeadCopy] | None:
+    """The dead copies the store already held before any load: the only rows the run may excuse
+    (BACKLOG #5572). ``None`` when there are none, and when no node gives a whole read; either way the
+    dead-row check stays absolute. A store with no dead rows is never listed."""
+    if opening.dead == 0:
+        return None
+    for n in nodes:
+        copies = await n.dead_copies(client)
+        if copies is not None:
+            return copies or None
+    return None
+
+
+def _judge_new_dead(
+    opening: frozenset[DeadCopy] | None,
+    before: frozenset[DeadCopy] | None,
+    after: frozenset[DeadCopy] | None,
+    final_dead: int,
+) -> int | None:
+    """How many of the run's final dead copies were not dead, unchanged, at the opening read.
+
+    ``before`` and ``after`` are whole reads taken on either side of the final stats read that gave
+    ``final_dead``. The count is given only when the two are the same set and its size is that dead
+    count; otherwise ``None``, which judges nothing and leaves the check absolute. A new copy cannot
+    hide in a set that held still across the stats read and matched its count: it would need a
+    copy that left before that read to be back in ``after`` with its own ``failed_at``, and a copy
+    that is dead-lettered again takes a new one."""
+    if opening is None or before is None or after is None:
+        return None
+    if before != after or len(after) != final_dead:
+        return None
+    return len(after - opening)
+
+
+def _refuse_non_finite(fo: Failover) -> None:
+    """Refuse a ``[load.failover]`` knob that is NaN or infinite. The profile's range checks let
+    both through (NaN fails every comparison), and either would print as a threshold the JSON report
+    cannot carry: ``NaN`` and ``Infinity`` are not JSON (S26-62)."""
+    for f in fields(fo):
+        value = getattr(fo, f.name)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise FailoverError(f"[load.failover] {f.name} must be a finite number, not {value}")
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:

@@ -358,7 +358,9 @@ def _full_tracker(n: int = 98) -> FailoverTracker:
     t = FailoverTracker()
     for seq in range(n):
         t.on_ack(seq)
-        t.on_delivery("d0", seq)  # in-order on one lane → no inversions
+        # In order on two lanes: no inversions, and enough lanes for per_lane_ordering to judge.
+        t.on_delivery("d0", seq)
+        t.on_delivery("d1", seq)
     return t
 
 
