@@ -576,6 +576,13 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
                 await step._process_response_item(LOOP, item)
             if outage:
                 assert caught.value.__cause__ is None
+                # The fault came from the dead-letter's seal, not from the read.
+                walked, _ = _engine_frames_holding(caught.value, ())
+                assert "_dead_letter_unread_token" in walked, walked
+                # CONTROL: the seal error's own chain renders the key service's text.
+                assert KEY_SERVICE_TEXT in logging.Formatter().formatException(
+                    (type(seal_error), seal_error, None)
+                )
             rendered = logging.Formatter().formatException(
                 (type(caught.value), caught.value, caught.value.__traceback__)
             )

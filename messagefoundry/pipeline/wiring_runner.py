@@ -13325,23 +13325,25 @@ class RegistryRunner:
                 )
 
     async def _dead_letter_unread_token(self, item_id: str, error: str) -> None:
-        """Dead-letter a response token the step could not read (BACKLOG #5727). A key service
-        that gave no verdict on the dead-letter's own seal says nothing about the token, so it
-        leaves as a :class:`QueueOpenFault`, raised outside the handler with no chain to the raw
-        key-service error, and the fault arm re-pends the token, as the handoff does with a seal
-        (its fix A). Any other cipher error, the invocation ceiling among them, is raised as is."""
-        seal_fault: QueueOpenFault | None = None
+        """Dead-letter a response token the step could not read (BACKLOG #5727).
+
+        The dead-letter seals its error text. When the key service gives no verdict on that seal,
+        nothing is known about the token. The error then leaves as a :class:`QueueOpenFault`. It
+        is raised outside the handler, so it carries no chain to the raw key-service error. The
+        fault arm re-pends the token. Each store's ``ingress_handoff`` treats a seal the same way.
+        Any other cipher error, the invocation ceiling among them, is raised as is."""
         try:
             await self.store.dead_letter_now(item_id, error)
         except CipherError as exc:
             if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
                 raise
             seal_fault = queue_open_fault(exc)
-        if seal_fault is not None:
-            try:
-                raise seal_fault
-            finally:
-                del seal_fault  # as for read_fault in _process_response_item
+        else:
+            return
+        try:
+            raise seal_fault
+        finally:
+            del seal_fault  # as for read_fault in _process_response_item
 
     @_records_worker_death("response")
     async def _process_response_item(
