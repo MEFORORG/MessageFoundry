@@ -89,7 +89,7 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_call_gate import require_call_gate as _require_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
+from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -195,6 +195,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
+    no_verdict_fault,
     open_queue_cell,
     queue_open_fault,
     queue_payload_aad,
@@ -9880,9 +9881,9 @@ class SqlServerStore(ServerCipherWalk):
             # BACKLOG #5727: a seal, or any other cipher call no inner arm contains, that the key
             # service gave no verdict on is retried as a QueueOpenFault, raised below, outside this
             # handler, as on SQLite.
-            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+            seal_fault = no_verdict_fault(exc)
+            if seal_fault is None:
                 raise
-            seal_fault: QueueOpenFault = queue_open_fault(exc)
         finally:
             await report_cell_tag_failures(self, tag_failures)
             for row, error in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
@@ -10063,7 +10064,7 @@ class SqlServerStore(ServerCipherWalk):
                 except CipherError as exc:
                     if isinstance(exc, PROGRAMMING_ERRORS):
                         raise
-                    open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    open_fault = no_verdict_fault(exc)
                     if open_fault is None:
                         unopenable = type(exc).__name__
                 if open_fault is not None:
@@ -10103,7 +10104,7 @@ class SqlServerStore(ServerCipherWalk):
                 except CipherError as exc:
                     if isinstance(exc, PROGRAMMING_ERRORS):
                         raise
-                    open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    open_fault = no_verdict_fault(exc)
                     if open_fault is None:
                         unopenable = type(exc).__name__
                 if origin_tag_error is not None:
@@ -10118,9 +10119,29 @@ class SqlServerStore(ServerCipherWalk):
                     return await _dead_unopenable(
                         unopenable, "origin metadata", "ingress_handoff(origin-unopenable)"
                     )
-                loaded = json.loads(meta_json) if meta_json else {}
+                # BACKLOG #5727, as on Postgres (#5689): unparseable metadata, or a depth int()
+                # cannot read, dead-letters the token with a content-free refusal, as on SQLite.
+                refusal: str | None = None
+                loaded: Any = {}
+                if meta_json:
+                    loaded, refusal = json_loads_or_refusal(meta_json)
                 origin_meta = loaded if isinstance(loaded, dict) else {}
-                child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                try:
+                    child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                except (ValueError, TypeError, OverflowError) as exc:
+                    refusal = type(exc).__name__
+                if refusal is not None:
+                    log.warning(
+                        "ingress_handoff: origin metadata of work-row %s is unparseable (%s);"
+                        " dead-lettering",
+                        response_row_id,
+                        refusal,
+                    )
+                    return await _consume_dead(
+                        "ingress_handoff(origin-metadata)",
+                        f"re-ingress origin metadata is unparseable ({refusal})",
+                        "re-ingress origin metadata unparseable",
+                    )
                 root = origin_meta.get("correlation_root_id") or origin_id
                 # (5) Depth-cap -> consume-and-dead-letter.
                 if child_depth > correlation_depth_cap:

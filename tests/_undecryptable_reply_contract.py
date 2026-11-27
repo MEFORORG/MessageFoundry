@@ -32,7 +32,7 @@ import pytest
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ReplyStepFault
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.crypto import (
@@ -552,7 +552,9 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
     whose seal then fails must not chain the raw open error, whose cause can echo the key
     service's URL and body. Armed after the claim, which opens the same reference. With
     ``outage`` the seal gets no verdict, a CipherUnavailableError whose own cause carries the key
-    service's text: it leaves as a QueueOpenFault with no chain, and the token is retried."""
+    service's text: it leaves as a QueueOpenFault with no chain, and the token is retried.
+    Without it the seal is a verdict, the invocation ceiling, whose own cause also carries that
+    text: it leaves as a :class:`_ReplyStepFault` named by type and text, with no chain."""
 
     async def case(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
@@ -563,26 +565,27 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
             open_error = kind("synthetic verdict")
             open_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
             fault.target, fault.open_error = target, open_error
-            seal_error: CipherError
-            if outage:
-                seal_error = CipherUnavailableError("synthetic")
-                seal_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
-            else:
-                seal_error = CipherError("synthetic invocation ceiling")
+            seal_error: CipherError = (
+                CipherUnavailableError("synthetic")
+                if outage
+                else CipherError("synthetic invocation ceiling")
+            )
+            seal_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
             fault.seal_error = seal_error
-            raised: type[Exception] = QueueOpenFault if outage else CipherError
+            raised: type[Exception] = QueueOpenFault if outage else _ReplyStepFault
             match = "CipherUnavailableError" if outage else "invocation ceiling"
             with pytest.raises(raised, match=match) as caught:
                 await step._process_response_item(LOOP, item)
-            if outage:
-                assert caught.value.__cause__ is None
-                # The fault came from the dead-letter's seal, not from the read.
-                walked, _ = _engine_frames_holding(caught.value, ())
-                assert "_dead_letter_unread_token" in walked, walked
-                # CONTROL: the seal error's own chain renders the key service's text.
-                assert KEY_SERVICE_TEXT in logging.Formatter().formatException(
-                    (type(seal_error), seal_error, None)
-                )
+            assert caught.value.__cause__ is None
+            # The fault left through the step boundary, which replaced the seal's raw error: its
+            # traceback starts there and never reaches the step's own frame.
+            walked, _ = _engine_frames_holding(caught.value, ())
+            assert walked and walked[-1] == "bounded", walked
+            assert "_process_response_item" not in walked, walked
+            # CONTROL: the seal error's own chain renders the key service's text.
+            assert KEY_SERVICE_TEXT in logging.Formatter().formatException(
+                (type(seal_error), seal_error, None)
+            )
             rendered = logging.Formatter().formatException(
                 (type(caught.value), caught.value, caught.value.__traceback__)
             )
@@ -600,6 +603,42 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
 
     suffix = "_outage" if outage else ""
     case.__name__ = f"worker_dead_letter_seal{suffix}_failure_at_{which}_carries_no_open_error"
+    return case
+
+
+#: A marker in synthetic origin metadata, to show the decrypted text reaches no log or error.
+META_MARK = "SYNTHETIC-META-MARK"
+
+
+def _unparseable_origin_dead_letters(metadata: str, name: str) -> ContractCase:
+    """BACKLOG #5727, as on Postgres (#5689): origin metadata that opens but does not parse, or
+    whose depth ``int()`` cannot read, makes the lineage unreadable. The handoff dead-letters the
+    token, rather than raising a decode error that holds the decrypted text and re-pending it at
+    the head of the lane, and no log line carries that text."""
+
+    async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
+        mid, item = await _claimed_head(store)
+        sealed = store._cipher.encrypt(
+            metadata, aad=message_cell_aad("metadata", message_id=mid, channel_id="IB_REAL")
+        )
+        await raw("UPDATE messages SET metadata=? WHERE id=?", (sealed, mid))
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            assert await _handoff(store, item.id, LOOP) is True
+        finally:
+            root.removeHandler(handler)
+        assert (await token_of(fetch, mid))["status"] == OutboxStatus.DEAD.value
+        events = await store.events_for(mid)
+        assert [e for e in events if e["event"] == "dead" and "unparseable" in str(e["detail"])]
+        assert await children(fetch) == []
+        assert records  # CONTROL: the handler saw the dead-letter's own warning
+        assert not [r for r in records if META_MARK in r.getMessage()]
+
+    case.__name__ = f"unparseable_origin_{name}_dead_letters"
     return case
 
 
@@ -724,6 +763,9 @@ HANDOFF_CASES: list[ContractCase] = [
     ),
     _worker_dead_letter_seal_failure_carries_no_open_error("reply"),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref"),
+    _unparseable_origin_dead_letters(f"not json {META_MARK}", "not_json"),
+    _unparseable_origin_dead_letters(f'{{"correlation_depth": "{META_MARK}"}}', "word_depth"),
+    _unparseable_origin_dead_letters('{"correlation_depth": [1]}', "list_depth"),
     _worker_dead_letter_seal_failure_carries_no_open_error("reply", outage=True),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref", outage=True),
     _outage_open_leaves_the_loop("worker_ref"),

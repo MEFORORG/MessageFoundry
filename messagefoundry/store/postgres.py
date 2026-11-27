@@ -199,6 +199,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
+    no_verdict_fault,
     open_queue_cell,
     queue_open_fault,
     queue_payload_aad,
@@ -6729,9 +6730,7 @@ class PostgresStore(ServerCipherWalk):
                     except CipherError as exc:
                         if isinstance(exc, PROGRAMMING_ERRORS):
                             raise
-                        open_fault = (
-                            queue_open_fault(exc) if is_transient_open_failure(exc) else None
-                        )
+                        open_fault = no_verdict_fault(exc)
                         if open_fault is None:
                             unopenable = type(exc).__name__
                     if open_fault is not None:
@@ -6770,9 +6769,7 @@ class PostgresStore(ServerCipherWalk):
                     except CipherError as exc:
                         if isinstance(exc, PROGRAMMING_ERRORS):
                             raise
-                        open_fault = (
-                            queue_open_fault(exc) if is_transient_open_failure(exc) else None
-                        )
+                        open_fault = no_verdict_fault(exc)
                         if open_fault is None:
                             unopenable = type(exc).__name__
                     if origin_tag_error is not None:
@@ -6945,9 +6942,9 @@ class PostgresStore(ServerCipherWalk):
             # BACKLOG #5727: a seal, or any other cipher call no inner arm contains, that the key
             # service gave no verdict on is retried as a QueueOpenFault, raised below, outside this
             # handler, as on SQLite.
-            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+            seal_fault = no_verdict_fault(exc)
+            if seal_fault is None:
                 raise
-            seal_fault = queue_open_fault(exc)
         finally:
             # BACKLOG #2593: after the transaction, never inside it.
             await report_cell_tag_failures(self, tag_failures)

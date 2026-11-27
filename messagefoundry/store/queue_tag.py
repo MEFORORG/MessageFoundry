@@ -155,14 +155,30 @@ class QueueOpenFault(Exception):
     are references to the reply rather than its body."""
 
 
-def queue_open_fault(exc: BaseException) -> QueueOpenFault:
-    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
-    is a :class:`CipherError`, whose text never holds a value. Any other error, a failed store read
-    or dead-letter write, is named by its type alone: a driver's text can echo a statement, a key
-    or a truncated value, and the T17 path logs this fault at ERROR."""
+def fault_text(exc: BaseException) -> str:
+    """``exc`` named by its type, and by its own text only where ``exc`` is a
+    :class:`CipherError`, whose text never holds a value. Any other error, a failed store read or
+    dead-letter write, is named by its type alone: a driver's text can echo a statement, a key or
+    a truncated value."""
     if isinstance(exc, CipherError):
-        return QueueOpenFault(f"{type(exc).__name__}: {exc}")
-    return QueueOpenFault(type(exc).__name__)
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
+
+
+def queue_open_fault(exc: BaseException) -> QueueOpenFault:
+    """:class:`QueueOpenFault` named by :func:`fault_text`. The T17 path logs this fault at
+    ERROR, which is why a driver's text is left out."""
+    return QueueOpenFault(fault_text(exc))
+
+
+def no_verdict_fault(exc: BaseException) -> QueueOpenFault | None:
+    """The :class:`QueueOpenFault` for ``exc`` when the key service gave it no verdict
+    (:func:`is_transient_open_failure`), else ``None`` (BACKLOG #5727). A fault in the engine's
+    own code (:data:`PROGRAMMING_ERRORS`) is never one. The caller raises the fault outside its
+    handler, so it carries no chain to the raw key-service error."""
+    if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+        return None
+    return queue_open_fault(exc)
 
 
 class _Releaser(Protocol):

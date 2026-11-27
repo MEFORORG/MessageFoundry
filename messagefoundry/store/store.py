@@ -195,6 +195,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
+    no_verdict_fault,
     open_queue_cell,
     queue_open_fault,
     queue_payload_aad,
@@ -17185,10 +17186,11 @@ class MessageStore:
             # is retried as a QueueOpenFault, raised below, outside this handler, so it carries no
             # chain to the raw key-service error. Aimed at the transaction's seals, it also takes any
             # other cipher call no inner arm contains, the finalizer's opens among them. The
-            # invocation ceiling stays a verdict.
-            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+            # invocation ceiling stays a verdict, re-raised here; the response step names it by type
+            # alone before it reaches a log.
+            seal_fault = no_verdict_fault(exc)
+            if seal_fault is None:
                 raise
-            seal_fault: QueueOpenFault = queue_open_fault(exc)
         finally:
             await report_cell_tag_failures(self, tag_failures)
             for row, error in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
@@ -17352,7 +17354,7 @@ class MessageStore:
             except CipherError as exc:
                 if isinstance(exc, PROGRAMMING_ERRORS):
                     raise
-                open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                open_fault = no_verdict_fault(exc)
                 if open_fault is None:
                     unopenable = type(exc).__name__
             if open_fault is not None:
@@ -17391,7 +17393,7 @@ class MessageStore:
             except CipherError as exc:
                 if isinstance(exc, PROGRAMMING_ERRORS):
                     raise
-                open_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                open_fault = no_verdict_fault(exc)
                 if open_fault is None:
                     unopenable = type(exc).__name__
             if origin_tag_error is not None:
@@ -17402,11 +17404,29 @@ class MessageStore:
                 raise open_fault
             if unopenable is not None:
                 return await _dead_unopenable(unopenable, "origin metadata")
+            # BACKLOG #5727, as on Postgres (#5689): metadata that is not JSON, or a depth int()
+            # cannot read (a list, an infinity, a word), leaves the lineage unreadable, so the token
+            # is dead-lettered. The refusal is content-free: a decode error holds the decrypted text.
+            refusal: str | None = None
             if meta_json:
-                loaded = json.loads(meta_json)
+                loaded, refusal = json_loads_or_refusal(meta_json)
                 if isinstance(loaded, dict):
                     origin_meta = loaded
-            child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+            try:
+                child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+            except (ValueError, TypeError, OverflowError) as exc:
+                refusal = type(exc).__name__
+            if refusal is not None:
+                log.warning(
+                    "ingress_handoff: origin metadata of work-row %s is unparseable (%s);"
+                    " dead-lettering",
+                    response_row_id,
+                    refusal,
+                )
+                return await _consume_dead(
+                    f"re-ingress origin metadata is unparseable ({refusal})",
+                    "re-ingress origin metadata unparseable",
+                )
             root = origin_meta.get("correlation_root_id") or origin_id
             if child_depth > correlation_depth_cap:
                 # Depth-cap breach: dead-letter the token, ERROR the origin (Q4). Consume (don't

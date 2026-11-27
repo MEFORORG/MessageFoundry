@@ -32,6 +32,7 @@ import logging
 import math
 import threading
 import time
+import traceback
 from collections.abc import (
     Awaitable,
     Callable,
@@ -280,8 +281,8 @@ from messagefoundry.store.queue_tag import (
     PROGRAMMING_ERRORS,
     QueueOpenFault,
     QueueTagError,
-    is_transient_open_failure,
-    queue_open_fault,
+    fault_text,
+    no_verdict_fault,
 )
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
@@ -1731,6 +1732,50 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
         return guarded
 
     return wrap
+
+
+def _reply_step_fault(exc: Exception) -> Exception:
+    """What leaves the re-ingress step in place of ``exc`` (BACKLOG #5727): a key service that
+    gave no verdict becomes a :class:`QueueOpenFault`; anything else becomes a
+    :class:`_ReplyStepFault` named by :func:`fault_text` and its frames, never its text or chain.
+    Both are fresh, with no cause, context or traceback."""
+    fault = no_verdict_fault(exc)
+    if fault is not None:
+        return fault
+    frames = "".join(
+        f"\n  {frame.f_code.co_filename}:{lineno} in {frame.f_code.co_name}"
+        for frame, lineno in traceback.walk_tb(exc.__traceback__)
+    )
+    return _ReplyStepFault(f"{fault_text(exc)}{frames}")
+
+
+def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
+    """Wrap the re-ingress step so whatever escapes it leaves only as a :class:`QueueOpenFault`
+    or as a type name (BACKLOG #5727; the Lander's hold on PR 3155). The step's store calls seal
+    and open cells, and a raw cipher error can chain a key service's URL or body, a driver error
+    its statement, and a traceback the frames that hold the reply. The fault arm that catches it
+    logs it with its traceback. A :class:`QueueOpenFault` the step raised itself passes as it is:
+    the step builds it with no chain and drops the frames that hold the reply. Every other
+    ``Exception`` is replaced by :func:`_reply_step_fault`, raised here, outside the handler, so it
+    carries no chain and its traceback starts in this frame. The outcome does not change: both
+    claim modes re-pend on any ``Exception``. A ``BaseException`` that is not one passes."""
+
+    @functools.wraps(body)
+    async def bounded(
+        self: RegistryRunner, name: str, item: OutboxItem
+    ) -> tuple[_ItemOutcome, float | None]:
+        try:
+            return await body(self, name, item)
+        except QueueOpenFault:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- replaced, never swallowed; see the docstring
+            fault = _reply_step_fault(exc)
+        try:
+            raise fault
+        finally:
+            del fault  # the fault's traceback holds this frame: no cycle through a local
+
+    return bounded
 
 
 @dataclass(eq=False)
@@ -8945,8 +8990,8 @@ class RegistryRunner:
         # broadcast above cannot lift it (BACKLOG #5704).
 
     async def _pooled_maybe_buildup(self, lane: str, stage: str) -> None:
-        """Pooled INGRESS/ROUTED/RESPONSE buildup-alert hook (ADR 0066 D1; RESPONSE since BACKLOG
-        #5727). The per_lane buildup depth check lives in the router/transform/response worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
+        """Pooled INGRESS/ROUTED buildup-alert hook (ADR 0066 D1; the RESPONSE stage paces the same
+        way in :meth:`_dispatch_response`). The per_lane buildup depth check lives in the router/transform worker LOOPS (dropped in pooled mode), so the pooled per-stage adapter
         calls this after each processed item — rate-limited per (stage, lane) to ``_BUILDUP_CHECK_INTERVAL``
         so it never runs a COUNT+MIN per claimed item. ``_maybe_alert_buildup`` additionally self-throttles
         the actual alert emit via ``_next_buildup_alert`` (300 s)."""
@@ -13324,28 +13369,8 @@ class RegistryRunner:
                     log, "response build-up check for loopback %r", name, level=logging.WARNING
                 )
 
-    async def _dead_letter_unread_token(self, item_id: str, error: str) -> None:
-        """Dead-letter a response token the step could not read (BACKLOG #5727).
-
-        The dead-letter seals its error text. When the key service gives no verdict on that seal,
-        nothing is known about the token. The error then leaves as a :class:`QueueOpenFault`. It
-        is raised outside the handler, so it carries no chain to the raw key-service error. The
-        fault arm re-pends the token. Each store's ``ingress_handoff`` treats a seal the same way.
-        Any other cipher error, the invocation ceiling among them, is raised as is."""
-        try:
-            await self.store.dead_letter_now(item_id, error)
-        except CipherError as exc:
-            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
-                raise
-            seal_fault = queue_open_fault(exc)
-        else:
-            return
-        try:
-            raise seal_fault
-        finally:
-            del seal_fault  # as for read_fault in _process_response_item
-
     @_records_worker_death("response")
+    @_reply_step_boundary
     async def _process_response_item(
         self, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
@@ -13394,7 +13419,7 @@ class RegistryRunner:
                 raise
             # Raised below, outside this handler, so the fault carries no chain to the raw
             # key-service error, which can echo a URL or a body (BACKLOG #2318).
-            read_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+            read_fault = no_verdict_fault(exc)
             if read_fault is None:
                 # BACKLOG #4995: a reply body that fails this way fails again on a retry until its
                 # cause clears, and the fault arm re-pended it at the head of this FIFO lane each
@@ -13417,7 +13442,7 @@ class RegistryRunner:
                 name,
                 item.id,
             )
-            await self._dead_letter_unread_token(item.id, REINGRESS_TOKEN_TAG_FAILED)
+            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
             return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
             try:
@@ -13432,7 +13457,7 @@ class RegistryRunner:
                 item.id,
                 error_type,
             )
-            await self._dead_letter_unread_token(
+            await self.store.dead_letter_now(
                 item.id, f"undecryptable re-ingress reply: {error_text}"
             )
             return _ItemOutcome.PROCESSED, None
@@ -15028,7 +15053,14 @@ class RegistryRunner:
         if self._inbound_log_halted(lane):  # #122 claim gate, pooled half (BACKLOG #5704)
             return await self._refuse_log_halted(item)
         result = _to_lane_result(await self._process_response_item(lane, item))
-        await self._pooled_maybe_buildup(lane, Stage.RESPONSE.value)  # D1 (see _dispatch_ingress)
+        # D1 (see _dispatch_ingress), on the same per-(stage, lane) pacing. Through the per-lane
+        # worker's redacted check, not _pooled_maybe_buildup's log.exception, which writes the
+        # driver's raw text (BACKLOG #5727).
+        key = f"{Stage.RESPONSE.value}:{lane}"
+        now = time.time()
+        if now - self._pooled_buildup_at.get(key, 0.0) >= _BUILDUP_CHECK_INTERVAL:
+            self._pooled_buildup_at[key] = now
+            await self._response_buildup_check(lane)
         return result
 
     async def _wait_for_work(self, event: asyncio.Event) -> bool:
@@ -15321,6 +15353,12 @@ class RegistryRunner:
 class _RedactedFault(Exception):
     """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
     ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class _ReplyStepFault(_RedactedFault):
+    """An error that left the re-ingress step, named by its type and its frames alone
+    (:func:`_reply_step_boundary`, BACKLOG #5727). A cipher error also keeps its own text, which
+    never holds a value."""
 
 
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:
