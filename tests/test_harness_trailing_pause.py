@@ -4,7 +4,8 @@
 (BACKLOG #5855, #5856).
 
 Both workers paced a batch by pausing after every item, the last one included, so a batch ended a
-whole pause after its last send or drop: 100 seconds of a busy tab at 0.01 a second. PR 3118 made
+whole pause after its last send or drop: 10 seconds of a busy tab at the tabs' lowest rate, 0.1 a
+second. PR 3118 made
 that pause interruptible; these tests pin that no pause follows the last item, and that a stop
 inside a pause between items still ends the batch at once.
 """
@@ -25,7 +26,8 @@ from harness.file_transport import FileDropWorker  # noqa: E402
 from harness.mllp import SendItem, SendResult, SendWorker  # noqa: E402
 
 _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|X1|P|2.5.1\rEVN|A01|20260101\r"
-# 0.01 a second is a 100-second pause: a batch that waits one out cannot finish inside a test.
+# Below the tabs' 0.1 floor, set on the worker directly: 0.01 a second is a 100-second pause, so a
+# batch that waits one out cannot finish inside a test.
 _SLOW_RATE = 0.01
 
 

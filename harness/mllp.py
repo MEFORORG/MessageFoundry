@@ -137,13 +137,16 @@ def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
 
 
 def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator[T]:
-    """Yield ``items`` at ``rate`` a second, with a :func:`pause_unless_stopped` between two of
+    """Yield ``items`` with a :func:`pause_unless_stopped` of ``1 / rate`` seconds between two of
     them (none for a ``rate`` of 0 or less), and end as soon as ``stop`` is set.
 
-    The pause goes before every item but the first, never after the last: a pause after the
-    last would hold the batch open a whole pause with nothing left to send, 100 seconds at
-    0.01 a second (BACKLOG #5855, #5856). The next item is drawn before the pause, because a lazy
-    ``items`` only tells there is none left once it is asked for one."""
+    The pause is a gap after the caller's work on an item, not a schedule, so a slow send makes
+    the batch run below ``rate``. It goes before every item but the first, never after the last:
+    a pause after the last would hold the batch open a whole pause with nothing left to send,
+    10 seconds at the tabs' lowest rate of 0.1 a second (BACKLOG #5855, #5856). The next item is
+    drawn before the pause, because a lazy ``items`` only tells there is none left once it is
+    asked for one; so a stop during the pause drops that drawn item unyielded, as it does every
+    item after it."""
     delay = 1.0 / rate if rate > 0 else 0.0
     for index, item in enumerate(items):
         if stop.is_set() or (index and delay and pause_unless_stopped(stop, delay)):
