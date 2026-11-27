@@ -799,7 +799,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   register text the owner signs, A or B"* and the answer as *"/driver"*, and Manager record
   d20261126T233936172-bb6cdb fits it to the existing rulings). Its companion is korus
   `roles/LANDER.md` *4a-quinquies*. A falsehood in draft register row text must be fixed, or
-  disclosed in the signing guide, before the row is put up for signature. A falsehood false only in
+  disclosed in the signing guide, before the row is put up for signature. On a pull request that
+  neither records a signature nor first puts the row up for signature, a falsehood false only in
   the safe direction does not hold the merge and blocks the signing instead; under 38a483 as
   clarified by 98fe64, that is what the Lander chose over *"A as first put, holding every merge on
   it"*. Every other one keeps the route this bullet already gives it, so one false in the unsafe
