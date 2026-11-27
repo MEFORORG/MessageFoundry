@@ -205,6 +205,12 @@ class EngineSample:
     # committed_txns is, so the two deltas cover the same requests. Summed across shards.
     poller_requests: int = 0  # requests the engine answered, renewal probes included
     poller_renewals: int = 0  # sessions the poller signed in again after the engine ended one
+    #: Σ inbound ``errored`` from ``/connections`` (BACKLOG #5436): messages received since engine
+    #: start whose disposition is ERROR. That counts a dead-letter at ANY stage, ingress and routed
+    #: included, which ``dead`` and ``out_dead`` (outbound stage only) cannot see, and also a frame
+    #: the listener refused and NAKed. Like ``read`` it is cumulative and offset by a per-inbound
+    #: stats reset, and a replay of an errored message lowers it. Default 0 for a fake sample.
+    in_errored: int = 0
 
     @property
     def outbound_backlog(self) -> int:
@@ -294,6 +300,7 @@ class _ShardSample:
     #: The engine's OWN configured pool maximum (``status.pool.max_size``) — see EngineSample.pool_max_size.
     pool_max_size: int | None = None
     poller_requests: int = 0  # this shard's poller request count at its /stats read (#2794)
+    in_errored: int = 0  # Σ this engine shard's inbound `errored` (BACKLOG #5436)
 
 
 #: The pool ``acquire_wait`` MEAN measured on the STEP-2 rig at the ~16 msg/s broadcast plateau, where the
@@ -1098,6 +1105,8 @@ class EnginePoller:
             pool_shards_reporting=sum(1 for s in shard_samples if s.pool_size is not None),
             poller_requests=sum(s.poller_requests for s in shard_samples),  # #2794
             poller_renewals=self._renewals,  # #2794
+            # Per engine shard, like `read`: /connections carries only that engine's own inbounds.
+            in_errored=sum(s.in_errored for s in shard_samples),  # BACKLOG #5436
         )
 
     def _renew_if_signed_out(self, index: int, client: EngineClient, url: str) -> None:
@@ -1140,6 +1149,9 @@ class EnginePoller:
         read = sum(r.read for r in conns if r.read is not None)
         written = sum(r.written for r in conns if r.written is not None)
         out_dead = sum(r.errored or 0 for r in conns if r.written is not None)
+        # The same `errored` field on the inbound rows means something else: messages whose
+        # disposition is ERROR, a dead-letter at any stage included (BACKLOG #5436).
+        in_errored = sum(r.errored or 0 for r in conns if r.read is not None)
         queue_depth = sum(r.queue_depth or 0 for r in conns if r.queue_depth is not None)
         return _ShardSample(
             pending=ob.get("pending", 0),
@@ -1182,4 +1194,5 @@ class EnginePoller:
             pool_acquire_wait_count=int(_pool_wait_attr(status, "count") or 0),
             pool_acquire_wait_mean_ms=float(_pool_wait_attr(status, "mean_ms") or 0.0),
             poller_requests=requests_at_stats,
+            in_errored=in_errored,
         )

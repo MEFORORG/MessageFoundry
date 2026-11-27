@@ -981,17 +981,16 @@ def test_estate_reconcile_dead_delta_across_a_counter_reset_is_not_judged() -> N
     assert "dead-lettered" not in result.detail
 
 
-def test_estate_reconcile_known_remainder_routed_dead_letter_is_not_seen() -> None:
-    # PINS A KNOWN GAP, BACKLOG #5436 stays open on it. A routed dead-letter has no outbound row, so
-    # out_dead stays 0. Without hubs, 40 of 100 are written. With hubs, of 80 simple-feed messages
-    # 60 die and 20 write 20, and 20 hub messages at fan-out 5 write 100. Both must flip to a LOSS
-    # once the check can see a dead-letter at every stage.
+def test_estate_reconcile_routed_dead_letter_is_a_loss() -> None:
+    # A routed dead-letter has no outbound row, so out_dead stays 0. Without hubs, 40 of 100 are
+    # written. With hubs, of 80 simple-feed messages 60 die and 20 write 20, and 20 hub messages at
+    # fan-out 5 write 100. The inbound errored count sees the 60 at any stage (BACKLOG #5436); this
+    # test pinned the gap as passing until it did.
     for written in (40, 120):
         c = Counters(sent=100, acked=100, sink_received=written)
-        result = estate_reconcile(
-            c, _BASE, _sample(read=100, written=written), unconfirmed_budget=_BUDGET
-        )
-        assert result.ok, result.detail
+        final = replace(_sample(read=100, written=written), in_errored=60)
+        result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+        assert not result.ok and not result.inconclusive, result.detail
 
 
 # --- the copies, and where they deliberately part ------------------------------------------------
