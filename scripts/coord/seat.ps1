@@ -1394,16 +1394,12 @@ try {
     #   close is the boundary. The cost: a closer's own later nosid pass reads its claims as inherited.
     # - An ended record with no start (an older writer drops the field) has only a close stamp, which
     #   is not when the episode began, so the start is null and attribution says unknown.
-    # - An open record with no start FIELD (an older writer) still holds its first stamp in
-    #   lifecycleAt. One whose field is present and null was written by this script as unknown --
-    #   a named session reopened from an ended record that had no start -- and lifecycleAt there is
-    #   the reopen, not the episode's start, so it stays unknown.
+    # - An open record with no start still holds its first stamp in lifecycleAt.
     $priorEnded = $lifecycle -in 'closed', 'handed'
     $priorStart = Prior 'episodeStart' $null
-    $startRecorded = $prior -and ($prior.PSObject.Properties.Name -contains 'episodeStart')
     $episodeStart = if ($priorEnded -and $sk.Key -eq 'nosid') { $lifecycleAt }
                     elseif ($null -ne $priorStart) { $priorStart }
-                    elseif ($priorEnded -or $startRecorded) { $null }
+                    elseif ($priorEnded) { $null }
                     else { $lifecycleAt }
     # A DECLARATION ON AN ENDED RECORD REOPENS IT. Before this only -Close ever moved lifecycle, so a
     # session resumed after its own -Close kept reading closed, and announce-session.ps1 hid it from
@@ -1417,6 +1413,14 @@ try {
     if ($Declare -and $priorEnded -and ($Seat -or $Goal)) {
         if ($sk.Key -eq 'nosid' -and $null -eq (ConvertTo-StampInstant $episodeStart)) {
             $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
+        } elseif ($null -eq $episodeStart) {
+            # UNKNOWN AS A VALUE, NOT A NULL. The next -Record sees an open record, and an open record
+            # with a null start takes lifecycleAt -- here the reopen, not the episode's start -- so a
+            # null would read this session's pre-close claims as inherited one pass later. That pass
+            # may be an older copy of this script (the hook runs the primary checkout's), so the
+            # marker must survive any writer: every version carries a non-null start unchanged, and
+            # Get-Attribution reads a start that names no instant as unknown.
+            $episodeStart = 'unknown'
         }
         $lifecycle = 'open'
         $lifecycleAt = $now

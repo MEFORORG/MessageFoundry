@@ -520,7 +520,7 @@ def test_a_reopen_with_no_usable_start_or_close_stamp(repo: Path, session: str |
         assert after["episodeStart"] == after["lifecycleAt"]
     else:
         # A named session's own pre-close claims stay unknown, never inherited.
-        assert after["episodeStart"] is None
+        assert after["episodeStart"] == "unknown"
 
 
 @pytest.mark.parametrize("handback", [False, True])
@@ -540,14 +540,16 @@ def test_a_reopened_unknown_start_stays_unknown_across_later_passes(repo: Path) 
     start = episode_start(rec)
     seat(repo, "-Close")
     # An older writer's ended record: no start field at all.
-    rewrite_record(repo, "episodeStart", lifecycleAt=(start + timedelta(hours=1)).isoformat())
+    rewrite_record(repo, "episodeStart")
+    # Taken before the reopen, so a start pinned to the reopen would call it inherited.
     put_json(
         coord_dir(repo) / "claims" / "9501.json",
-        {"worktree": rec["worktree"], "claimed": (start + timedelta(minutes=10)).isoformat()},
+        {"worktree": rec["worktree"], "claimed": (start - timedelta(minutes=1)).isoformat()},
     )
     seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed")
-    plain_record(repo)
-    after = read_record(repo)
-    assert after["lifecycle"] == "open"
-    assert after["episodeStart"] is None
-    assert [c["attribution"] for c in after["claims"]] == ["unknown"]
+    for _ in range(2):
+        plain_record(repo)
+        after = read_record(repo)
+        assert after["lifecycle"] == "open"
+        assert after["episodeStart"] == "unknown"
+        assert [c["attribution"] for c in after["claims"]] == ["unknown"]
