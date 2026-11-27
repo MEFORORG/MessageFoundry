@@ -334,7 +334,8 @@ def store_pool_warning(pool_size: int, shard_count: int) -> str | None:
     fleet = pool_size * max(1, shard_count)
     if pool_size >= POOL_SIZE_CLIFF:
         return (
-            f"STORE POOL AT/OVER THE ADR 0062 CLIFF: --store-pool-size {pool_size} >= {POOL_SIZE_CLIFF} "
+            f"STORE POOL AT/OVER THE ADR 0062 CLIFF: store pool {pool_size} (--store-pool-size or an ambient "
+            f"MEFOR_STORE_POOL_SIZE) >= {POOL_SIZE_CLIFF} "
             f"({fleet} connections fleet-wide against ONE unified store). ADR 0062 MEASURED throughput "
             f"COLLAPSING past this point (ACK p99 30-90x) as the extra connections thrash a shared instance. "
             "A ceiling measured here is a POOL-THRASH ceiling and is column-for-column identical to the claim "
@@ -348,13 +349,17 @@ def store_pool_warning(pool_size: int, shard_count: int) -> str | None:
 
 
 def check_store_pool_size(pool_size: int, shard_count: int, *, force: bool = False) -> str | None:
-    """Emit the ADR 0062 pool bound: return the note (also printed to stderr) or ``None``. At/over the CLIFF
-    it RAISES :class:`StorePoolOverCliff` unless ``force`` — because a run above the cliff cannot produce an
-    engine ceiling, only a pool-thrash one, and would be indistinguishable from the wall under investigation."""
+    """Enforce the ADR 0062 pool bound. At/over the CLIFF it RAISES :class:`StorePoolOverCliff` unless
+    ``force`` — because a run above the cliff cannot produce an engine ceiling, only a pool-thrash one, and
+    would be indistinguishable from the wall under investigation. A FORCED run past the cliff gets the note
+    back (also printed as a WARNING to stderr) for its report's notes, so the artifact says so too. Below
+    the cliff it returns ``None`` and prints nothing: :func:`announce_store_pool` already states the optimum
+    and the cliff, and a WARNING on the product default would teach an operator to skip the one that
+    matters."""
     note = store_pool_warning(pool_size, shard_count)
-    if note is None:
+    if note is None or pool_size < POOL_SIZE_CLIFF:
         return None
-    if pool_size >= POOL_SIZE_CLIFF and not force:
+    if not force:
         raise StorePoolOverCliff(
             note + " — pass --force-store-pool-size to run above the cliff anyway"
         )
@@ -1407,6 +1412,27 @@ async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, st
         raise
 
 
+def _check_store_pool_or_signal(
+    coord: FileDropCoord, pool_size: int, shard_count: int, *, force: bool
+) -> str | None:
+    """The ENGINE half's :func:`check_store_pool_size` (BACKLOG #5953, S27-74), telling a waiting drive
+    half at once when it refuses, as :func:`_reset_store_or_signal` does. Best-effort post, fixed reason."""
+    try:
+        return check_store_pool_size(pool_size, shard_count, force=force)
+    except StorePoolOverCliff:
+        try:
+            coord.post(
+                ENGINE_SETUP_FAILED,
+                {"reason": "store pool at/over the ADR 0062 cliff (see the engine box's stderr)"},
+            )
+        except OSError as exc:
+            # Logged, so a drive half left waiting out its timeout is explained on this box.
+            _log.warning(
+                "could not post %s for the refused store pool: %s", ENGINE_SETUP_FAILED, exc
+            )
+        raise
+
+
 async def _open_rig_store(env: Mapping[str, str]) -> SqlServerStore:
     """Open the rig's SQL Server store from ``env``, at a warn posture. The caller closes it.
 
@@ -1678,6 +1704,7 @@ async def run_shardcert(
     sink_port: int | None = None,
     capture_peak: bool = False,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertReport:
     """Run the 4-shard certification bench once. ``store_env`` must point every serve process at the
@@ -1772,6 +1799,10 @@ async def run_shardcert(
     # MEFOR_STORE_POOL_SIZE exactly as the old setdefault did, so an operator's out-of-band pin is unchanged
     # — what changed is the DEFAULT (8 -> 40, the product's) and the fact that the value is now RECORDED.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
+    # BACKLOG #5953 (S27-74): refuse a pool at/over the ADR 0062 cliff before the store is touched.
+    pool_note = check_store_pool_size(pool_size, n, force=force_store_pool_size)
+    if pool_note is not None:
+        setup_notes.append(pool_note)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -2869,6 +2900,7 @@ async def _run_ladder_step(
     sink_host: str,
     sink_port: int | None,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertStepRecord:
     """Drive ONE ladder hold step at ``rate`` (a full fresh-fleet ``run_shardcert``, no kill, peak
@@ -2888,6 +2920,7 @@ async def _run_ladder_step(
         sink_port=sink_port,
         capture_peak=True,
         store_pool_size=store_pool_size,
+        force_store_pool_size=force_store_pool_size,
         strict_bands=strict_bands,
     )
     return ShardCertStepRecord.from_report(rate, report, hold_seconds=hold_seconds)
@@ -2906,6 +2939,7 @@ async def run_shardcert_ladder(
     sink_host: str = "127.0.0.1",
     sink_port: int | None = None,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertLadderReport:
     """Run the ascending rate-ladder ceiling hunt: for each aggregate rate (sorted ascending), drive one
@@ -2934,6 +2968,7 @@ async def run_shardcert_ladder(
                 sink_host=sink_host,
                 sink_port=sink_port,
                 store_pool_size=store_pool_size,
+                force_store_pool_size=force_store_pool_size,
                 strict_bands=strict_bands,
             )
         except StoreResetFailed as exc:
@@ -3509,6 +3544,7 @@ async def run_shardcert_engine(
     sample_in_pipeline: bool = False,
     sample_interval: float = 2.0,
     store_pool_size: int | None = None,
+    force_store_pool_size: bool = False,
     strict_bands: bool = False,
 ) -> ShardCertEngineReport:
     """The ENGINE-box half (WS-C option #2). Brings the ``serve --shard`` fleet up against the ONE
@@ -3577,6 +3613,7 @@ async def run_shardcert_engine(
     # default 40) and ASSIGNED, so its value is CHOSEN in one place and RECORDED in the rung's report; it
     # used to be `setdefault`-pinned at 8 (1/5 of product, 32 connections fleet-wide) and recorded nowhere.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
+    pool_note = _check_store_pool_or_signal(coord, pool_size, n, force=force_store_pool_size)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -3593,6 +3630,8 @@ async def run_shardcert_engine(
     # ARTIFACT 5: the G < L pre-flight note leads the rung's notes — it is a setup condition that governs how
     # every number in this report must be read, and it rides the ENGINE_RUNG_REPORT to the drive box.
     notes: list[str] = [] if band_note is None else [band_note]
+    if pool_note is not None:  # a forced run past the ADR 0062 cliff rides the report too
+        notes.append(pool_note)
     recovery_seconds: float | None = None
     stranded = -1
     breakdown = "QUEUE <not-read>"

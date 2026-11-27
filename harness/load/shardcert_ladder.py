@@ -57,6 +57,7 @@ BOTH figures.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import enum
 import logging
@@ -186,7 +187,7 @@ _CLAIM_RE = re.compile(
     r"rearm=(?P<rearm>\d+) empty=(?P<empty>\d+) claimers=(?P<claimers>\d+)"
 )
 
-#: The LANE EPISODE timing line the SAME ``MEFOR_DELIVERY_PHASE_TIMING`` lever emits per window (from
+#: The LANE EPISODE timing line the SEPARATE ``MEFOR_PIPELINE_LANE_EPISODE_TIMING`` lever emits per window (from
 #: ``messagefoundry.pipeline.phase_timing.LaneEpisodeTiming``) — ``S_lane``, the pooled dispatcher's per-lane
 #: SERVICE TIME (STEP 4 ARM 1). Disjoint from ``_PHASE_RE`` and ``_CLAIM_RE`` (distinct "lane episode timing"
 #: substring, distinct fields), so the three phase lines can never cross-match.
@@ -606,7 +607,12 @@ class EpisodeTiming:
 
     def render(self) -> str:
         if self.is_empty:
-            return "lane episode (S_lane): (none captured — MEFOR_DELIVERY_PHASE_TIMING off or no episodes)"
+            # A literal, not phase_timing's constant: harness/ may not import messagefoundry.pipeline
+            # (tests/test_dependency_boundaries.py). A test pins the two equal.
+            return (
+                "lane episode (S_lane): (none captured — MEFOR_PIPELINE_LANE_EPISODE_TIMING off or no "
+                "episodes)"
+            )
         return (
             f"lane episode (S_lane): episodes={self.episodes} windows={self.windows} | "
             f"S_lane mean/max={self.episode_mean_ms:.2f}/{self.episode_max_ms:.2f}ms | "
@@ -660,7 +666,7 @@ class EpisodeTiming:
 
 
 #: An empty :class:`EpisodeTiming` — the default when a rung's ENGINE_RUNG_REPORT carried no episode
-#: aggregate (report absent, or the MEFOR_DELIVERY_PHASE_TIMING lever off).
+#: aggregate (report absent, or the MEFOR_PIPELINE_LANE_EPISODE_TIMING lever off).
 _EMPTY_EPISODE_TIMING = EpisodeTiming(0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
 
 
@@ -2386,7 +2392,8 @@ class ConsolidatedLadderReport:
     def soak_drive_shortfall(self) -> bool:
         """The soak's LOAD GENERATOR could not push the rate (``sent`` short). The long hold was never driven,
         so "it held" would be a readback of the plan — but a collapse would be a FABRICATION too. This is a
-        RIG failure: it folds into :attr:`setup_degraded` (exit 2), NOT into :attr:`soak_not_sustained`."""
+        RIG failure: it folds into :attr:`setup_degraded` (exit 2), NOT into :attr:`soak_not_sustained`. A
+        correctness break that outranks it is exit 1 instead (:attr:`_break_outranks_degradation`)."""
         return (
             self.soak is not None
             and not self.soak_aborted
@@ -2485,16 +2492,9 @@ class ConsolidatedLadderReport:
         correctness break). Mirrors the single-box ShardCertLadderReport.ok, which since BACKLOG #5441 gates
         lanes on its sustained (non-ceiling) rungs only, for the same reason."""
         recs = self.all_records
-        if not recs:
-            return False
-        if any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in recs):
-            return False
-        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape.
-        return all(
-            r.lanes_observed >= 2
-            for r in recs
-            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
-        )
+        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape
+        # (:meth:`_rung_broken` skips it).
+        return bool(recs) and not any(self._rung_broken(r) for r in recs)
 
     @property
     def store_truth_unconfirmed(self) -> bool:
@@ -2637,29 +2637,71 @@ class ConsolidatedLadderReport:
         A pool bind that is the ONLY degradation does not outrank a correctness break: the break is exit 1
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
         a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
-        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2."""
+        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2. A
+        FIFO inversion on the soak is exit 1 whatever the degradation; when a soak duplicate or single-lane
+        term is, is :attr:`_break_outranks_degradation`'s to say (BACKLOG #5862)."""
         if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
 
-    @property
-    def _climb_broken(self) -> bool:
-        """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
-        alone, so the soak's state cannot touch it."""
-        return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
-            r.lanes_observed < 2
-            for r in self.climb
-            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
+    @staticmethod
+    def _rung_broken(r: RungOutcome) -> bool:
+        """One rung broke correctness: the per-rung terms :attr:`correctness_ok` applies."""
+        return r.verdict is RungVerdict.CORRECTNESS_FAIL or (
+            r.verdict is RungVerdict.SUSTAINED and r.offered != 0 and r.lanes_observed < 2
         )
 
     @property
+    def _climb_broken(self) -> bool:
+        """A CLIMB rung broke correctness, read on the climb alone so the soak's state cannot touch it."""
+        return any(self._rung_broken(r) for r in self.climb)
+
+    @property
+    def _soak_broken(self) -> bool:
+        """The SOAK broke correctness, read on the soak alone."""
+        return self.soak is not None and self._rung_broken(self.soak)
+
+    @property
     def _break_outranks_degradation(self) -> bool:
-        """Correctness broke and no CLIMB-side degradation (a climb rendezvous abort, an unconfirmed climb
-        store-truth) leaves the break unproven. Then the break is the answer when the only other degradation
-        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state."""
-        if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
+        """Correctness broke on a rung whose own evidence is proven, so the break is the answer (exit 1 /
+        FAIL) whatever else degraded. A climb rendezvous abort leaves every break but a soak inversion
+        unproven.
+
+        * A FIFO inversion on the SOAK always outranks (BACKLOG #5862). The sink tracker counts one only
+          for a NEW seq below a lane's high-water, which neither a teardown's redelivery nor a late ACK from
+          a starved sink can produce.
+        * A soak DUPLICATE or single-lane term never outranks a soak abort or a rig shortfall: a torn-down
+          or overloaded sink can provoke an at-least-once redelivery, which the tracker counts as a repeat,
+          and an under-driven soak can see few lanes. It outranks an unconfirmed CLIMB rung only on
+          evidence the soak's own fidelity proves: a duplicate on a soak whose rate reached the engine
+          (:attr:`RungOutcome.fidelity_driven`, an engine bind included), a single-lane term only on a soak
+          the rig drove AND the engine took (:attr:`RungOutcome.fidelity_admissible`), since an engine that
+          refused most of the soak also leaves its sinks few lanes. One rung's missing store-truth says
+          nothing about another rung's sink-observed order.
+        * A CLIMB break outranks a soak degradation and a pool bind, but not an unconfirmed climb
+          store-truth."""
+        if self.ok:
             return False
-        return self._climb_broken or not (self.soak_aborted or self.soak_drive_shortfall)
+        if self.soak is not None and self.soak.lane_inversions > 0:
+            return True
+        if self.climb_aborted:
+            return False
+        soak = self.soak
+        soak_break_driven = self._soak_broken and not (
+            self.soak_aborted or self.soak_drive_shortfall
+        )
+        if (
+            soak is not None
+            and soak_break_driven
+            and (
+                soak.fidelity_admissible
+                or (soak.verdict is RungVerdict.CORRECTNESS_FAIL and soak.fidelity_driven)
+            )
+        ):
+            return True
+        if self.store_truth_unconfirmed:
+            return False
+        return self._climb_broken or soak_break_driven
 
     @property
     def result_label(self) -> str:
@@ -3109,7 +3151,15 @@ class ConsolidatedLadderReport:
             # pool tripwire could not fire and a pool-bound run could exit 0); (3) a correctness break whose
             # only companion degradation is a pool bind, or a break on a CLIMB rung whatever the soak's state,
             # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
-            "schema_version": 10,
+            #
+            # v11 (BACKLOG #5862) — no new key, two SCORING changes, each moving a run from SETUP_DEGRADED /
+            # exit 2 to FAIL / exit 1: (1) a FIFO inversion on the soak, under a soak abort, a rig shortfall
+            # or an unconfirmed climb rung; (2) a soak duplicate or single-lane term under an unconfirmed
+            # climb rung, on a soak with no abort whose fidelity proves it (a duplicate needs the rate to have
+            # reached the engine, a single-lane term an admissible soak). A soak duplicate or
+            # single-lane term under a soak abort or rig shortfall still reads SETUP_DEGRADED (a redelivery
+            # counts as a repeat, and an under-driven soak can see few lanes).
+            "schema_version": 11,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -3353,7 +3403,8 @@ class ConsolidatedLadderReport:
             # v6: `soak_ok` now carries a FIDELITY term — a soak nobody drove, or one the engine short-took,
             # cannot certify the ceiling. See `fidelity.soak_*`.
             "soak_ok": self.soak_ok,
-            # A RIG failure means setup_degraded: exit 2, unless a climb rung broke correctness (exit 1).
+            # A RIG failure means setup_degraded: exit 2, unless a climb rung broke correctness or the soak
+            # itself showed a FIFO inversion (exit 1, BACKLOG #5862; see _break_outranks_degradation).
             "soak_drive_shortfall": self.soak_drive_shortfall,
             "soak_engine_intake_bind": self.soak_engine_intake_bind,  # a real PRODUCT finding
             "climb": [r.to_json_dict() for r in self.climb],
@@ -3503,10 +3554,13 @@ def _attach_rung_timings(payload: dict[str, object], rung_logs: Sequence[Path]) 
     """Attach ALL THREE phase-timing aggregates to an ENGINE_RUNG_REPORT payload from the rung's per-shard
     node logs: the delivery ``send_ack``/``mark_done`` split (``phase_timing``), the CLAIM store round-trip
     (``claim_timing``, D6 — the phase #842 could not see), and the LANE EPISODE (``episode_timing`` —
-    ``S_lane``, STEP 4 ARM 1). All three are SIBLINGS gated by the same ``MEFOR_DELIVERY_PHASE_TIMING`` lever;
-    every one must be attached or the drive box's aggregate stays empty despite the node logs carrying the
-    lines — which for ``S_lane`` would mean ARM 1's headline number exists only as an INFO line to be
-    hand-grepped per rung, per shard, with no n-weighting and no ramp-window drop."""
+    ``S_lane``, STEP 4 ARM 1). The first two are gated by ``MEFOR_DELIVERY_PHASE_TIMING``; the episode by
+    its own ``MEFOR_PIPELINE_LANE_EPISODE_TIMING`` (kept separate so an instrument-OFF control rung stays
+    possible; see ``messagefoundry.pipeline.phase_timing``). Both levers are off by default, and a block
+    whose lever is off is empty. Every one must be attached or the drive box's aggregate stays empty
+    despite the node logs carrying the lines — which for ``S_lane`` would mean ARM 1's headline number
+    exists only as an INFO line to be hand-grepped per rung, per shard, with no n-weighting and no
+    ramp-window drop."""
     payload["phase_timing"] = aggregate_phase_timing(rung_logs).to_json_dict()
     payload["claim_timing"] = aggregate_claim_timing(rung_logs).to_json_dict()
     payload["episode_timing"] = aggregate_episode_timing(rung_logs).to_json_dict()
@@ -3541,6 +3595,8 @@ async def run_engine_ladder(
     #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every shard PROCESS. None ⇒ resolve from the
     #: ambient env, else the PRODUCT default (40) — never the old hardcoded 8.
     store_pool_size: int | None = None,
+    #: BACKLOG #5953 (S27-74): run a pool at/over the ADR 0062 cliff anyway (``--force-store-pool-size``).
+    force_store_pool_size: bool = False,
     #: ARTIFACT 5: refuse (rather than warn) to arm a rung whose inbound band count G is below the outbound
     #: lane count L. Off by default because G < L is TRUE at the shipped defaults.
     strict_bands: bool = False,
@@ -3634,6 +3690,7 @@ async def run_engine_ladder(
                 # rung visible on the only path STEP 4 actually runs.
                 sample_in_pipeline=True,
                 store_pool_size=store_pool_size,
+                force_store_pool_size=force_store_pool_size,
                 strict_bands=strict_bands,
             )
         except CoordTimeout:
@@ -3653,7 +3710,11 @@ async def run_engine_ladder(
                 )
             break
         payload = _engine_rung_payload(report)
-        _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
+        # Every engine shard's node log is read here. Nothing else runs on the loop at this point, so this
+        # only keeps the read off the loop thread; the coord writes around it stay on the loop.
+        await asyncio.to_thread(
+            _attach_rung_timings, payload, _rung_log_paths(keep_dir, report.shards)
+        )
         rung_coord.post(ENGINE_RUNG_REPORT, payload)
         result.rungs_armed.append(rung.run_suffix)
         if report.aborted:
@@ -3746,13 +3807,14 @@ async def run_engine_ladder(
             # The soak must run on the SAME pool + band shape as the climb it was pinned from, or the soak
             # is testing a different fleet than the ceiling it is soaking (ARTIFACTS 2/5).
             store_pool_size=store_pool_size,
+            force_store_pool_size=force_store_pool_size,
             strict_bands=strict_bands,
         )
     except CoordTimeout:
         result.notes.append("soak: no DRIVE_START from the drive")
         return result
     payload = _engine_rung_payload(report)
-    _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
+    await asyncio.to_thread(_attach_rung_timings, payload, _rung_log_paths(keep_dir, report.shards))
     soak_coord.post(ENGINE_RUNG_REPORT, payload)
     result.rungs_armed.append("soak")
     return result
@@ -3856,7 +3918,8 @@ async def run_drive_ladder(
                 sign_in=not sign_in_refused,
             )
         except EngineSetupFailed as exc:
-            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset) and it has exited. Not a
+            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset, or since BACKLOG #5953 a
+            # store pool refused at the ADR 0062 cliff) and it has exited. Not a
             # drive abort: say whose it was, and post no RUNG_ABORTED to an engine that is gone. LADDER_STOP
             # still goes out for a half that is still polling. The soak is skipped below.
             base_coord.post(

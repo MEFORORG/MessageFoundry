@@ -450,7 +450,7 @@ def _sustained(index: int, rate: float, pool: PoolStats = _HEALTHY_POOL) -> Rung
 
 
 def _consolidated(
-    climb: list[RungOutcome], soak: RungOutcome | None = None
+    climb: list[RungOutcome], soak: RungOutcome | None = None, *, soak_aborted: bool = False
 ) -> ConsolidatedLadderReport:
     return build_consolidated_report(
         shards=("a", "b"),
@@ -464,7 +464,7 @@ def _consolidated(
         climb=climb,
         soak=soak,
         climb_aborted=False,
-        soak_aborted=False,
+        soak_aborted=soak_aborted,
     )
 
 
