@@ -19,7 +19,7 @@ directory its engine loaded, so nothing about the shape depends on an environmen
 
 ``harness/config/connscale/gen_toml.py`` (the reload-latency directory) is the precedent for a
 generated config directory. The wiring itself stays in one place,
-:func:`harness.config.connscale._wire.wire_graph`, and the shape is validated by
+:func:`harness.config.connscale._shape.wire_graph`, and the shape is validated by
 :func:`harness.config.connscale._shape.make_connscale_shape` here, before anything is written, and
 again when the module runs. Every value is synthetic and generic.
 """
@@ -45,8 +45,7 @@ The shape is written here as literals rather than read from the environment, so 
 builds the same graph as its engine. Synthetic and generic; do not edit.
 """
 
-from harness.config.connscale._shape import make_connscale_shape
-from harness.config.connscale._wire import wire_graph
+from harness.config.connscale._shape import make_connscale_shape, wire_graph
 
 wire_graph(
     make_connscale_shape(
