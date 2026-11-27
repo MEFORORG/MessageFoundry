@@ -146,7 +146,7 @@ Consolidate these before you install anything:
       keep it that way; see §6).
 - [ ] **A writable data directory** for the store + logs (service default: `C:\ProgramData\MessageFoundry`).
 - [ ] **Backend decision (made here, not later):** **SQLite** (default, zero extra deps) for a
-      single-node pilot, or a server DB — **PostgreSQL** (`messagefoundry[postgres]`, pure-Python) or
+      single-node pilot, or a server DB — **PostgreSQL** (`messagefoundry[postgres]`, no libpq needed) or
       **SQL Server** (`messagefoundry[sqlserver]` + OS-level ODBC Driver 18) — if you want a server
       store or a path toward DB-tier HA. See §2.
 - [ ] If you will run the **cluster** path (active-passive failover):

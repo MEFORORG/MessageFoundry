@@ -226,8 +226,8 @@ lease and node statements on that same pool. Elsewhere in the engine it is impor
 whether its `create_pool` takes a `connect` hook. The same criterion applies.
 
 Unlike the `sqlserver` extra, no driver sits beneath it. `asyncpg` implements the PostgreSQL wire
-protocol itself, in compiled Cython, so the protocol, the parsing of every response and the
-credential handling that the `sqlserver` section puts on the ODBC driver fall on this one
+protocol itself, in compiled Cython, so the protocol, the parsing of every response and most of
+the credential handling that the `sqlserver` section puts on the ODBC driver fall on this one
 distribution. TLS does not: the handshake and the trust decision are the standard library's `ssl`,
 as tier 2 below says.
 
@@ -252,23 +252,27 @@ So 1 plus 0 is 1, and 35 plus 1 is 36.
    as ciphertext. What it leaves in plaintext, and every server message, still pass through.
 2. **Secrets and trust.** It is handed the store's user name and password, and keeps them for the
    pool's lifetime, so it can open new connections, as `aioodbc` keeps the connection string. With
-   no password set it reads one itself, from `PGPASSWORD` or from a password file (`PGPASSFILE`, or
-   `.pgpass` in the home directory), and with an empty `[store].server` it reads the host from
-   `PGHOST`. It
-   runs the SCRAM-SHA-256 exchange in its own code, `asyncpg/protocol/scram.pyx`, on the standard
-   library's `hashlib` and `hmac`, and checks the server's signature there too. It also answers a
-   cleartext or MD5 password request, if the server makes one. Whether the server's certificate is
+   no password set it reads one itself, from `PGPASSWORD` or from a password file: `PGPASSFILE`, or
+   by default `postgresql\pgpass.conf` in the account's application-data folder on Windows and
+   `.pgpass` in the home directory elsewhere. With an empty `[store].server` it reads the host from
+   `PGHOST`. It runs the SCRAM-SHA-256 exchange in its own code, `asyncpg/protocol/scram.pyx`, on
+   the standard library's `hashlib` and `hmac`, and checks the server's signature there too. It
+   also answers a cleartext or MD5 password request, and a GSSAPI or SSPI request, if the server
+   makes one. On Windows its default for those two is SSPI through `sspilib`, which is in the core
+   closure, so it can sign in as the engine's own Windows account with no password set; elsewhere it
+   needs the `gssapi` package, which no assessed closure carries. Whether the server's certificate is
    trusted is decided by the context the engine passes and by the standard library's `ssl`, not by
    `asyncpg`. It still decides when TLS starts. On the pinned 0.32.0, read for this section, a
    context passed in is taken as TLS required on a TCP connection: a server that refuses TLS gets an
    error, not a plaintext connection. A Unix-domain socket connection carries no TLS at all, whatever
-   the context. `asyncpg` opens one when its host names a socket directory, which on Linux its own
-   default does first when `[store].server` and `PGHOST` are both empty.
+   the context. `asyncpg` opens one when its host names a socket directory, which on every platform
+   but Windows its own default does first when `[store].server` and `PGHOST` are both empty.
 3. **Protocol termination.** It speaks the PostgreSQL frontend and backend protocol, framing and
    startup included, to every server the store dials.
 
 Its extension modules bundle no library. On the wheels read, they name only the C library and the
-maths and thread libraries on Linux, and the C runtime and Python itself on Windows. Most errors in
+maths and thread libraries on Linux, and `kernel32.dll`, the C runtime and Python itself on
+Windows. Most errors in
 its protocol code still surface as Python exceptions, but a memory-safety bug there is a fault in the
 engine's process, not an exception.
 

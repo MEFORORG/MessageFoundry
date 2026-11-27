@@ -411,19 +411,22 @@ def test_the_postgres_prose_names_what_the_extra_adds_and_the_pin_it_read() -> N
     scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
     assert "It adds one name to the core closure, `asyncpg`," in scope
     pin = _closure_pins(_POSTGRES_CLOSURE)["asyncpg"]
-    section = " ".join(_region(_POSTGRES_START, _HARNESS_START).split())
+    _, start, end, _ = _EXTRAS["postgres"]
+    section = " ".join(_region(start, end).split())
     assert f"On the pinned {pin}, read for this section," in section, (
         f"the postgres section's TLS reading does not name asyncpg {pin}; read the new "
         "connect_utils.py again before changing the version it names"
     )
+    # The section points at the rendered subsection for its results, as the harness one does.
+    assert f"*{component_readings.EXTRAS_HEADING.removeprefix('### ')}*" in section
 
 
 def test_the_scope_section_counts_the_assessed_extras() -> None:
     """RED when: an extra is assessed or dropped and the scope section's counts stay behind."""
-    words = {2: "Two", 3: "Three", 4: "Four", 5: "Five"}
+    assert len(_EXTRAS) + 1 < len(_NUMBER_WORDS), "extend _NUMBER_WORDS to count the extras"
     scope = " ".join(_region("## Scope, and the denominator", "## The criterion").split())
-    assert f"{words[len(_EXTRAS)]} extras are assessed as well." in scope
-    assert f"the {words[len(_EXTRAS) + 1].lower()} assessed sets" in scope
+    assert f"{_NUMBER_WORDS[len(_EXTRAS)].capitalize()} extras are assessed as well." in scope
+    assert f"the {_NUMBER_WORDS[len(_EXTRAS) + 1]} assessed sets" in scope
 
 
 @pytest.mark.parametrize("extra", sorted(_EXTRAS))
