@@ -1970,10 +1970,12 @@ async def run_shardcert(
                 # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill instant, so the loop asks to wake
                 # then. The kill can still come late, at least when timer granularity or a stalled loop wakes
                 # the tick after the instant, or when the instant falls inside a tick's send batch, which runs
-                # after the kill check. Late past the end of the hold fails the run below; late inside the
-                # hold kills at the next check, and nothing detects it. The cap does not mean a message was
-                # sent before the kill: a small enough kill fraction still kills before the first tick sends
-                # (`require_kill_leg`).
+                # after the kill check. While the kill is pending, a tick that wakes past the end of the hold
+                # fails the run below. Otherwise a late kill fires once the loop reaches its next kill check.
+                # That check runs after the hold check and takes its own clock reading, so it can fire past
+                # the end of the hold. Nothing detects such a kill, inside the hold or past its end. The cap
+                # does not mean a message was sent before the kill: a small enough kill fraction still kills
+                # before the first tick sends (`require_kill_leg`).
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
