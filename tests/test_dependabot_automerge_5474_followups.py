@@ -3,7 +3,8 @@
 """BACKLOG #5474 follow-up items on ``.github/workflows/dependabot-auto-merge.yml``.
 
 Kept apart from ``test_dependabot_automerge_guardrails.py`` so that file's existing tests are not
-rewritten here; the step-running harness is imported from it, not copied. Each test names the
+rewritten here; the step-running harness is imported from it. The curl stub here copies that file's
+journal line, so a change to the journal format is made in both. Each test names the
 ledger item it answers.
 """
 
@@ -37,7 +38,12 @@ from tests import test_dependabot_automerge_guardrails as g
         ("actions/checkout,\n", "false"),
         # A character no name or join carries holds, a tab, a CR and non-ASCII space included.
         ("actions/checkout,\tactions/setup-python", "false"),
+        ("actions/checkout\r", "false"),
         ("actions/x\r::stop-commands::tok", "false"),
+        # glibc classes U+2003 as space, so the old body would strip it there (a review's
+        # reading, not measured on Linux here).
+        ("actions/check\u2003out", "false"),
+        # Not a regression row on the Linux runner, where the old body already denied it.
         ("\u00a0actions/checkout", "false"),
         # Interior whitespace was stripped, rewriting the name into one the row admits.
         ("actions/ checkout", "false"),
@@ -246,7 +252,8 @@ def test_an_actions_pr_outside_the_groups_holds_through_the_step_bodies(
     )
     assert ghsa.rc == 0, g._diagnostic(ghsa)
     age_runs = g._evaluate_expression(
-        str(g._step("age").get("if", "")), {"steps.allowset.outputs.eligible": "true"}
+        str(g._step("age").get("if", "")),
+        {"steps.allowset.outputs.eligible": allow.outputs.get("eligible", "")},
     )
     assert age_runs is True, "the age step would be skipped on an eligible PR"
     age = g._run_step_body(
