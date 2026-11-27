@@ -4,14 +4,15 @@
 // #5411, #8237 items 16, 24, 57 and 102).
 //
 // Item 16: a user-set serviceConfig that reaches the workspace folder by another spelling, a UNC
-// loopback admin share (`\\localhost\C$\...`) or a junction outside the folder, was accepted as
-// written, so no link the repository holds was checked on it. The editor now reads the device and
-// file id of each folder on the path and checks the part below the workspace folder. Item 57: in a
-// window opened from a `.code-workspace` file, that file chooses the workspace folder and holds the
-// workspace settings, so a workspace-set value is refused unless the folder lies inside the folder
-// holding the file. Item 102: the real-path compare in resolveInsideWorkspace folds ASCII case only,
-// so a junction onto a KELVIN SIGN sibling is not inside. Item 24: the connection edits bind
-// `--service-config` with `=`, driven through an entry point the pre-fix code had.
+// loopback admin share (`\\localhost\C$\...`) or a junction outside the folder onto it or a folder
+// below it, was accepted as written, so no link the repository holds was checked on it. The editor
+// now reads each folder on the path, by real path and by device and file id, and checks the part
+// below the workspace folder. Item 57: in a window opened from a `.code-workspace` file, that file
+// chooses the workspace folder and holds the workspace settings, so a path inside that folder is
+// refused unless the folder lies inside the folder holding the file. Item 102: the real-path compare
+// in resolveInsideWorkspace folds ASCII case only, so a junction onto a KELVIN SIGN sibling is not
+// inside. Item 24: the connection edits bind `--service-config` with `=`, driven through an entry
+// point the pre-fix code had.
 import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
@@ -22,10 +23,13 @@ import { securityConfigTarget, type LinkFs } from "../../securityEditorModel";
 import { escapesByLink, resolveInsideWorkspace } from "../../workspaceContainment";
 import { unlinkLinks } from "../unlinkLinks";
 
-// The tests drive securityConfigTarget and its LinkFs only, which the pre-fix module had, so a run
-// against it fails on an assertion rather than on a missing symbol. securityFileId is new, so it is
-// read off the module at run time.
-const model = require("../../securityEditorModel") as { securityFileId?: (p: string) => string };
+// The tests drive securityConfigTarget and its LinkFs, which the pre-fix module had, so a run
+// against it fails on an assertion rather than on a missing symbol. The helpers this branch adds
+// are read off the module at run time.
+const model = require("../../securityEditorModel") as {
+  securityFileId?: (p: string) => string;
+  workspaceFilePath?: (file: { scheme: string; fsPath: string } | undefined) => string | undefined;
+};
 
 const user = { fromWorkspace: false, trusted: true };
 const workspaceScope = { fromWorkspace: true, trusted: true };
@@ -36,32 +40,55 @@ function inWindow<S extends object>(scope: S, workspaceFile: string): S & { read
   return { ...scope, workspaceFile };
 }
 
-/** A file's device and file id as text, as the editor's fileId reads them from fs.statSync. */
+/** A file's device and file id as text, read from fs.statSync: the editor's own securityFileId
+ *  where the module has it, else the same read without its file-id-0 guard. */
 function statId(p: string): string {
+  if (model.securityFileId !== undefined) {
+    return model.securityFileId(p);
+  }
   const st = fs.statSync(p, { bigint: true });
   return `${st.dev}:${st.ino}`;
 }
 
-/** A LinkFs over spelled paths: `ids` maps a path to its file id (any other path does not exist
- *  for fileId, or throws the code its id names when that starts with E), `links` lstat as links,
- *  every other lstat is a plain entry, and realpath returns `realpaths[p]` or the path itself. It
- *  records every fileId call. */
-function idFs(
-  ids: Readonly<Record<string, string>>,
-  links: readonly string[] = [],
-  realpaths: Readonly<Record<string, string>> = {},
+/**
+ * A model file system over spelled paths. A path exists when `ids` or `realpaths` names it, or it is
+ * in `links`. `ids` gives its file id, or the error code fileId throws when the value starts with
+ * E; `realpaths` gives its real path, or the code realpath throws; a path that exists with no
+ * `realpaths` entry is its own real path. `links` lstat as links, and so do the `dangling` ones,
+ * which do not exist. Every fileId call is recorded.
+ */
+function modelFs(
+  opts: {
+    ids?: Readonly<Record<string, string>>;
+    realpaths?: Readonly<Record<string, string>>;
+    links?: readonly string[];
+    dangling?: readonly string[];
+  } = {},
 ): LinkFs & { readonly asked: string[] } {
+  const ids = opts.ids ?? {};
+  const realpaths = opts.realpaths ?? {};
+  const links = opts.links ?? [];
+  const dangling = opts.dangling ?? [];
+  const exists = (p: string): boolean => p in ids || p in realpaths || links.includes(p);
   const asked: string[] = [];
   return {
     asked,
-    lstat: (p: string) => ({ isSymbolicLink: () => links.includes(p) }),
-    realpath: (p: string): string => realpaths[p] ?? p,
-    fileId: (p: string): string => {
-      asked.push(p);
-      const id = ids[p];
-      if (id === undefined) {
+    lstat: (p: string) => {
+      if (!exists(p) && !dangling.includes(p)) {
         throw fail("ENOENT");
       }
+      return { isSymbolicLink: () => links.includes(p) || dangling.includes(p) };
+    },
+    realpath: (p: string): string => {
+      const r = realpaths[p] ?? (exists(p) ? p : "ENOENT");
+      if (/^E[A-Z]+$/.test(r)) {
+        throw fail(r);
+      }
+      return r;
+    },
+    fileId: (p: string): string => {
+      asked.push(p);
+      const id = ids[p] ?? "ENOENT";
       if (/^E[A-Z]+$/.test(id)) {
         throw fail(id);
       }
@@ -75,56 +102,92 @@ const windowsSuite = process.platform === "win32" ? suite : suite.skip;
 windowsSuite("b20008 F: a user-set path that reaches the workspace by another spelling is checked (#8237 item 16)", () => {
   const ws = "C:\\ws";
   const unc = "\\\\localhost\\C$\\ws";
-  // The UNC loopback spelling and the drive spelling are one folder by id, as measured on Windows 11.
-  const ids = { "C:\\": "1:1", "C:\\ws": "1:2", "\\\\localhost\\C$\\": "1:1", [unc]: "1:2", [`${unc}\\cfg`]: "1:3" };
+  // The UNC loopback spelling and the drive spelling are one folder by id, as measured on Windows 11,
+  // and Node's real path keeps the UNC spelling.
+  const ids = {
+    "C:\\": "1:1",
+    "C:\\ws": "1:2",
+    "C:\\ws\\cfg": "1:3",
+    "\\\\localhost\\C$\\": "1:1",
+    [unc]: "1:2",
+    [`${unc}\\cfg`]: "1:3",
+  };
 
   test("a UNC loopback alias that then leaves through a link the repository holds is refused", () => {
-    const got = securityConfigTarget(ws, `${unc}\\cfg\\messagefoundry.toml`, user, idFs(ids, ["C:\\ws\\cfg"]));
+    const got = securityConfigTarget(ws, `${unc}\\cfg\\messagefoundry.toml`, user, modelFs({ ids, links: ["C:\\ws\\cfg"] }));
     assert.ok(!got.ok && got.problem.includes("passes through a link"), JSON.stringify(got));
   });
 
-  test("control: the same alias onto a plain folder is accepted, spelled from the workspace folder", () => {
-    const got = securityConfigTarget(ws, `${unc}\\cfg\\messagefoundry.toml`, user, idFs(ids));
-    assert.deepStrictEqual(got, { ok: true, path: "C:\\ws\\cfg\\messagefoundry.toml" });
+  test("control: the same alias onto a plain folder is accepted, and kept as written, being placed by id alone", () => {
+    const got = securityConfigTarget(ws, `${unc}\\cfg\\messagefoundry.toml`, user, modelFs({ ids }));
+    assert.deepStrictEqual(got, { ok: true, path: `${unc}\\cfg\\messagefoundry.toml` });
   });
 
-  test("the alias gets rule 2's name checks too: a device name below it is refused", () => {
-    const got = securityConfigTarget(ws, `${unc}\\nul`, user, idFs(ids));
+  test("the alias gets rule 2's name checks too: a device name below it, or the folder itself, is refused", () => {
+    const got = securityConfigTarget(ws, `${unc}\\nul`, user, modelFs({ ids }));
     assert.ok(!got.ok && got.problem.includes("device name"), JSON.stringify(got));
-    const itself = securityConfigTarget(ws, unc, user, idFs(ids));
+    const itself = securityConfigTarget(ws, unc, user, modelFs({ ids }));
     assert.ok(!itself.ok && itself.problem.includes("workspace folder itself"), JSON.stringify(itself));
   });
 
-  test("a path whose folders are another folder is accepted as written, the walk stopping where it ends", () => {
-    const fsx = idFs({ ...ids, "D:\\": "2:1", "D:\\elsewhere": "2:5" });
-    const got = securityConfigTarget(ws, "D:\\elsewhere\\new\\messagefoundry.toml", user, fsx);
-    assert.deepStrictEqual(got, { ok: true, path: "D:\\elsewhere\\new\\messagefoundry.toml" });
-    // The walk read the workspace folder, then each folder down to the first that does not exist.
-    assert.deepStrictEqual(fsx.asked, ["C:\\ws", "D:\\", "D:\\elsewhere", "D:\\elsewhere\\new"]);
+  test("a junction outside the folder onto a folder below it is placed by real path, and spelled from the folder", () => {
+    const fsx = (links: string[]) =>
+      modelFs({ ids: { ...ids, "D:\\": "2:1", "C:\\ws\\sub": "1:4", "C:\\ws\\sub\\cfg": "1:5" }, realpaths: { "D:\\alias": "C:\\ws\\sub" }, links });
+    const linked = securityConfigTarget(ws, "D:\\alias\\cfg\\x.toml", user, fsx(["C:\\ws\\sub\\cfg"]));
+    assert.ok(!linked.ok && linked.problem.includes("passes through a link"), JSON.stringify(linked));
+    // THE CONTROL: with no link below, the path is the workspace's own file.
+    assert.deepStrictEqual(securityConfigTarget(ws, "D:\\alias\\cfg\\x.toml", user, fsx([])), {
+      ok: true,
+      path: "C:\\ws\\sub\\cfg\\x.toml",
+    });
   });
 
-  test("a folder on the path that cannot be read, or a workspace whose id cannot, refuses", () => {
-    for (const code of ["EACCES", "EIO", "ENOFILEID"]) {
-      const got = securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, idFs({ ...ids, "D:\\": "2:1", "D:\\elsewhere": code }));
-      assert.ok(!got.ok && got.problem.includes("could not be read"), `${code} ${JSON.stringify(got)}`);
+  test("a path whose folders are another folder is accepted as written, the walk stopping where it ends", () => {
+    const fsx = modelFs({ ids: { ...ids, "D:\\": "2:1", "D:\\elsewhere": "2:5" } });
+    const got = securityConfigTarget(ws, "D:\\elsewhere\\new\\messagefoundry.toml", user, fsx);
+    assert.deepStrictEqual(got, { ok: true, path: "D:\\elsewhere\\new\\messagefoundry.toml" });
+    // The walk read the workspace folder's id, then each existing folder's once.
+    assert.deepStrictEqual(fsx.asked, ["C:\\ws", "D:\\", "D:\\elsewhere"]);
+  });
+
+  test("a dangling link, a folder that cannot be read, or a workspace that cannot, refuses", () => {
+    const base = { ...ids, "D:\\": "2:1" };
+    const dangling = securityConfigTarget(ws, "D:\\dang\\x.toml", user, modelFs({ ids: base, dangling: ["D:\\dang"] }));
+    assert.ok(!dangling.ok && dangling.problem.includes("dangling link"), JSON.stringify(dangling));
+    for (const fsx of [
+      modelFs({ ids: { ...base, "D:\\elsewhere": "EACCES" } }),
+      modelFs({ ids: { ...base, "D:\\elsewhere": "2:5" }, realpaths: { "D:\\elsewhere": "EIO" } }),
+      modelFs({ ids: { "D:\\": "2:1" } }), // the workspace folder itself does not exist
+    ]) {
+      const got = securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, fsx);
+      assert.ok(!got.ok && got.problem.includes("could not be read"), JSON.stringify(got));
     }
-    const noRoot = securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, idFs({ "D:\\": "2:1" }));
-    assert.strictEqual(noRoot.ok, false, JSON.stringify(noRoot));
     // And a caller that passes no fileId refuses, rather than accept a path it cannot place.
     const blind: LinkFs = { lstat: () => ({ isSymbolicLink: () => false }), realpath: (p: string) => p };
     assert.strictEqual(securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, blind).ok, false);
   });
 
+  test("an entry with no file id is placed by real path only, not refused", () => {
+    const noIds = { ...ids, "D:\\": "ENOFILEID", "D:\\elsewhere": "ENOFILEID", "C:\\ws": "ENOFILEID" };
+    assert.deepStrictEqual(securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, modelFs({ ids: noIds })), {
+      ok: true,
+      path: "D:\\elsewhere\\x.toml",
+    });
+    // A junction onto the folder is still found by real path when the workspace keeps no file id.
+    const viaJunction = modelFs({ ids: noIds, realpaths: { "D:\\alias": "C:\\ws" }, links: ["C:\\ws\\cfg"] });
+    assert.strictEqual(securityConfigTarget(ws, "D:\\alias\\cfg\\x.toml", user, viaJunction).ok, false);
+  });
+
   test("a workspace-set alias is still refused by its spelling, before any read", () => {
-    const fsx = idFs(ids);
+    const fsx = modelFs({ ids });
     const got = securityConfigTarget(ws, `${unc}\\cfg\\messagefoundry.toml`, workspaceScope, fsx);
     assert.ok(!got.ok && got.problem.includes("outside the workspace folder"), JSON.stringify(got));
     assert.deepStrictEqual(fsx.asked, []);
   });
 });
 
-suite("b20008 F: securityFileId (#8237 item 16)", () => {
-  test("a file id of 0 throws rather than match another entry; a real id is device and file id", () => {
+suite("b20008 F: securityFileId and workspaceFilePath (#8237 items 16 and 57)", () => {
+  test("a file id of 0 throws ENOFILEID rather than match another entry; a real id is device and file id", () => {
     // The module object itself, which the model's import reads through, not this file's import wrapper.
     const nodeFs = require("node:fs") as { statSync: unknown };
     const real = nodeFs.statSync;
@@ -138,23 +201,41 @@ suite("b20008 F: securityFileId (#8237 item 16)", () => {
     assert.strictEqual(model.securityFileId!(os.tmpdir()), `${st.dev}:${st.ino}`);
     assert.throws(() => model.securityFileId!(path.join(os.tmpdir(), "mf-b20008-does-not-exist")), (e: { code?: unknown }) => e.code === "ENOENT");
   });
+
+  test("workspaceFilePath names a .code-workspace file, and none for an untitled workspace or a folder window", () => {
+    const f = model.workspaceFilePath!;
+    assert.strictEqual(f({ scheme: "file", fsPath: "C:\\repo\\p.code-workspace" }), "C:\\repo\\p.code-workspace");
+    assert.strictEqual(f({ scheme: "untitled", fsPath: "Untitled-1" }), undefined);
+    assert.strictEqual(f(undefined), undefined);
+  });
+
+  test("the editor passes VS Code's workspaceFile through it, and the editor's own fileId", () => {
+    const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "securityEditor.ts"), "utf8");
+    assert.match(src, /workspaceFilePath\(vscode\.workspace\.workspaceFile\)/);
+    assert.match(src, /securityConfigTarget\([^)]*\bworkspaceFile\b/);
+    assert.match(src, /fileId:\s*securityFileId/);
+  });
 });
 
-windowsSuite("b20008 F: the UNC loopback alias on a real folder (#8237 item 16)", () => {
+windowsSuite("b20008 F: aliases of a real workspace folder (#8237 item 16)", () => {
   let base: string;
   let ws: string;
+  let outside: string;
 
   setup(() => {
-    base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mf-b20008-unc-")));
+    base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "mf-b20008-alias-")));
     ws = path.join(base, "ws");
-    fs.mkdirSync(ws);
-    fs.mkdirSync(path.join(base, "outside"));
+    outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(ws, "sub", "plain"), { recursive: true });
+    fs.mkdirSync(outside);
   });
 
   teardown(() => {
     unlinkLinks(base);
     fs.rmSync(base, { recursive: true, force: true });
   });
+
+  const real = (): LinkFs => ({ lstat: fs.lstatSync, realpath: fs.realpathSync.native, fileId: statId });
 
   test("a junction reached through \\\\localhost\\<drive>$ is refused; a plain folder there is not", function () {
     const unc = `\\\\localhost\\${ws[0]}$${ws.slice(2)}`;
@@ -165,19 +246,36 @@ windowsSuite("b20008 F: the UNC loopback alias on a real folder (#8237 item 16)"
     } catch {
       this.skip(); // no admin share on this box (it needs the Server service and an administrator)
     }
-    fs.symlinkSync(path.join(base, "outside"), path.join(ws, "linked"), "junction");
-    fs.mkdirSync(path.join(ws, "plain"));
-    const fsx: LinkFs = { lstat: fs.lstatSync, realpath: fs.realpathSync.native, fileId: statId };
-    const got = securityConfigTarget(ws, `${unc}\\linked\\messagefoundry.toml`, user, fsx);
+    fs.symlinkSync(outside, path.join(ws, "linked"), "junction");
+    const got = securityConfigTarget(ws, `${unc}\\linked\\messagefoundry.toml`, user, real());
     assert.ok(!got.ok && got.problem.includes("passes through a link"), JSON.stringify(got));
-    assert.deepStrictEqual(securityConfigTarget(ws, `${unc}\\plain\\messagefoundry.toml`, user, fsx), {
+    assert.deepStrictEqual(securityConfigTarget(ws, `${unc}\\sub\\plain\\messagefoundry.toml`, user, real()), {
       ok: true,
-      path: path.join(ws, "plain", "messagefoundry.toml"),
+      path: `${unc}\\sub\\plain\\messagefoundry.toml`,
+    });
+  });
+
+  test("a junction outside the folder onto a folder below it, then out through a repository link, is refused", function () {
+    try {
+      fs.symlinkSync(path.join(ws, "sub"), path.join(outside, "alias"), "junction");
+      fs.symlinkSync(outside, path.join(ws, "sub", "linked"), "junction");
+      fs.symlinkSync(path.join(ws, "sub", "not-yet"), path.join(outside, "dangling"), "junction");
+    } catch {
+      this.skip();
+    }
+    const linked = securityConfigTarget(ws, path.join(outside, "alias", "linked", "x.toml"), user, real());
+    assert.ok(!linked.ok && linked.problem.includes("passes through a link"), JSON.stringify(linked));
+    const dangling = securityConfigTarget(ws, path.join(outside, "dangling", "x.toml"), user, real());
+    assert.ok(!dangling.ok && dangling.problem.includes("dangling link"), JSON.stringify(dangling));
+    // THE CONTROL: a plain folder through the same alias is the workspace's own file.
+    assert.deepStrictEqual(securityConfigTarget(ws, path.join(outside, "alias", "plain", "x.toml"), user, real()), {
+      ok: true,
+      path: path.join(ws, "sub", "plain", "x.toml"),
     });
   });
 });
 
-suite("b20008 F: a .code-workspace file cannot choose the folder a workspace value is read against (#8237 item 57)", () => {
+suite("b20008 F: a .code-workspace file cannot choose the folder a path is read against (#8237 item 57)", () => {
   let base: string;
 
   setup(() => {
@@ -191,22 +289,23 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a workspace val
 
   const real: LinkFs = { lstat: fs.lstatSync, realpath: fs.realpathSync.native, fileId: statId };
 
-  test("a workspace folder outside the folder holding the .code-workspace file refuses a workspace value", () => {
+  test("a workspace folder outside the folder holding the .code-workspace file refuses a path inside it", () => {
     const repo = path.join(base, "repo");
     const chosen = path.join(base, "chosen");
     fs.mkdirSync(repo);
     fs.mkdirSync(chosen);
     const workspaceFile = path.join(repo, "project.code-workspace");
-    const got = securityConfigTarget(chosen, "messagefoundry.toml", inWindow(workspaceScope, workspaceFile), real);
-    assert.ok(!got.ok && got.problem.includes(".code-workspace"), JSON.stringify(got));
-    // A user value is the operator's, and is not refused for it.
-    assert.deepStrictEqual(securityConfigTarget(chosen, "messagefoundry.toml", inWindow(user, workspaceFile), real), {
-      ok: true,
-      path: path.join(chosen, "messagefoundry.toml"),
-    });
+    // A workspace value, and the default or a relative user value, all resolve against the chosen folder.
+    for (const scope of [workspaceScope, user]) {
+      const got = securityConfigTarget(chosen, "messagefoundry.toml", inWindow(scope, workspaceFile), real);
+      assert.ok(!got.ok && got.problem.includes(".code-workspace"), JSON.stringify(got));
+    }
+    // An absolute user path outside the chosen folder is the operator's, and is not refused for it.
+    const mine = path.join(base, "mine.toml");
+    assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
   });
 
-  test("control: the folder holding the file, or one inside it, takes the workspace value", () => {
+  test("control: the folder holding the file, or one inside it, takes the value", () => {
     const repo = path.join(base, "repo");
     fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
     const workspaceFile = path.join(repo, "project.code-workspace");
@@ -244,12 +343,24 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a workspace val
     assert.ok(!blind.ok && blind.problem.includes(".code-workspace"), JSON.stringify(blind));
   });
 
-  test("the editor passes VS Code's workspaceFile, and none for an untitled workspace", () => {
-    const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "securityEditor.ts"), "utf8");
-    assert.match(src, /const file = vscode\.workspace\.workspaceFile;/);
-    assert.match(src, /file === undefined \|\| file\.scheme === "untitled" \? undefined : file\.fsPath/);
-    assert.match(src, /securityConfigTarget\(ws, value, \{ fromWorkspace, trusted: vscode\.workspace\.isTrusted, workspaceFile \}/);
-    assert.match(src, /fileId: securityFileId/);
+  (process.platform === "win32" ? test : test.skip)("the name checks still run first, with no file-system call", () => {
+    const none: LinkFs = {
+      lstat: () => {
+        throw new Error("lstat called");
+      },
+      realpath: () => {
+        throw new Error("realpath called");
+      },
+    };
+    const workspaceFile = path.join(base, "elsewhere", "p.code-workspace");
+    for (const [setting, said] of [
+      ["nul", "device name"],
+      ["cfg:x", "colon"],
+      ["cfg.", "dot or a space"],
+    ]) {
+      const got = securityConfigTarget(path.join(base, "chosen"), setting, inWindow(workspaceScope, workspaceFile), none);
+      assert.ok(!got.ok && got.problem.includes(said), `${setting} ${JSON.stringify(got)}`);
+    }
   });
 });
 

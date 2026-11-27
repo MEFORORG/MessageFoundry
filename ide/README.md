@@ -245,11 +245,12 @@ and uses your user value or the default instead, until you trust the workspace (
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. A user-set path
-  that reaches the workspace folder by another spelling, such as a UNC loopback admin share or a
-  junction outside the folder, is found by file id and gets the same checks. In a window opened
-  from a `.code-workspace` file, which chooses the workspace folder, a workspace-set value is
-  refused unless that folder lies inside the folder holding the file. The rules and the open
-  limits are in the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
+  that reaches the workspace folder or a folder below it by another spelling, such as a UNC
+  loopback admin share or a junction outside the folder, is found by real path or file id and gets
+  the same checks. In a window opened from a `.code-workspace` file, which chooses the workspace
+  folder, a path inside that folder, the default one included, is refused unless the folder lies
+  inside the folder holding the file. The rules and the open limits are in the
+  `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
   it is blank (a value that is not used refuses the edit, above), as `--service-config`, whether or not the file exists, so a missing file fails the edit with
