@@ -1766,10 +1766,19 @@ def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
     async def bounded(
         self: RegistryRunner, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
+        fault: Exception | None
         try:
             return await body(self, name, item)
         except Exception as exc:  # noqa: BLE001 -- replaced, never swallowed; see the docstring
-            fault = _reply_step_fault(exc)
+            try:
+                fault = _reply_step_fault(exc)
+            except Exception:  # noqa: BLE001 -- the fixed-text fault below stands in for it
+                # Building the replacement failed. Its error would carry ``exc``, and so the raw
+                # key-service chain, as its context, so it is dropped (the Lander's hold on PR
+                # 3155, the last loop).
+                fault = None
+        if fault is None:
+            raise QueueOpenFault("re-ingress step fault could not be named") from None
         try:
             raise fault
         finally:
