@@ -483,10 +483,15 @@ def test_a_declaration_after_a_close_reopens_the_record(
     after = read_record(repo)
     assert after["lifecycle"] == "open"
     assert datetime.fromisoformat(str(after["lifecycleAt"])) > start
-    # The new episode starts at the close: before it is the last episode's, after it the reopener's.
-    assert datetime.fromisoformat(str(after["episodeStart"])) == close_at
     by_key = {c["key"]: c["attribution"] for c in after["claims"]}
-    assert by_key == {"9401": "worktree-inherited", "9402": "this-episode"}
+    if session is None:
+        # A shared record's close is the boundary: before it is the last occupant's.
+        assert datetime.fromisoformat(str(after["episodeStart"])) == close_at
+        assert by_key == {"9401": "worktree-inherited", "9402": "this-episode"}
+    else:
+        # A named session keeps its episode, and so its own pre-close claims, across the close.
+        assert datetime.fromisoformat(str(after["episodeStart"])) == start
+        assert by_key == {"9401": "this-episode", "9402": "this-episode"}
     # A later hook pass carries the reopened state forward.
     seat(repo, "-Record", session=session)
     carried = read_record(repo)
@@ -503,12 +508,25 @@ def test_a_plain_pass_on_a_closed_record_leaves_it_closed(repo: Path) -> None:
     assert (after["lifecycle"], after["lifecycleAt"]) == ("closed", closed["lifecycleAt"])
 
 
+@pytest.mark.parametrize("session", ["record-facts-probe", None])
 def test_a_reopen_whose_close_stamp_names_no_instant_starts_at_the_declaration(
-    repo: Path,
+    repo: Path, session: str | None
 ) -> None:
-    declare(repo)
-    seat(repo, "-Close")
-    rewrite_record(repo, lifecycleAt="not a stamp")
-    after = declare(repo)
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first", session=session)
+    seat(repo, "-Close", session=session)
+    rewrite_record(repo, "episodeStart", lifecycleAt="not a stamp")
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed", session=session)
+    after = read_record(repo)
     assert after["lifecycle"] == "open"
     assert after["episodeStart"] == after["lifecycleAt"]
+
+
+@pytest.mark.parametrize("handback", [False, True])
+def test_a_pointer_only_declaration_does_not_reopen(repo: Path, handback: bool) -> None:
+    """A handed seat fixing a pointer has not resumed; its successor respawns from HANDED."""
+    declare(repo)
+    seat(repo, "-Close", *(["-Handback"] if handback else []))
+    ended = read_record(repo)
+    seat(repo, "-Declare", "-Notes", "pointer fix only")
+    after = read_record(repo)
+    assert (after["lifecycle"], after["lifecycleAt"]) == (ended["lifecycle"], ended["lifecycleAt"])

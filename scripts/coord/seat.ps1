@@ -1403,12 +1403,17 @@ try {
                     else { $lifecycleAt }
     # A DECLARATION ON AN ENDED RECORD REOPENS IT. Before this only -Close ever moved lifecycle, so a
     # session resumed after its own -Close kept reading closed, and announce-session.ps1 hid it from
-    # every peer while it worked. The new episode starts at the old one's close: everything after
-    # the close is the reopener's, and that is the same boundary the nosid case above already draws.
-    # A close stamp that names no instant cannot be that boundary, so the declaration itself is.
+    # every peer while it worked. Only a declaration of intent (-Seat or -Goal) reopens: one that
+    # only sets a pointer, such as a handed seat fixing its -Handoff path, is not evidence the work
+    # resumed, and reopening it would hide the HANDED state its successor is respawned from.
+    # The episode is the one computed above, so a named session keeps its own pre-close claims and
+    # a nosid record starts at the close. Where that leaves no start, the close is the boundary, and
+    # a close stamp that names no instant cannot be one, so the declaration itself is.
     # -Record never reopens: the Stop hook fires on a closed session's last turn too.
-    if ($Declare -and $priorEnded) {
-        $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
+    if ($Declare -and $priorEnded -and ($Seat -or $Goal)) {
+        if ($null -eq (ConvertTo-StampInstant $episodeStart)) {
+            $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
+        }
         $lifecycle = 'open'
         $lifecycleAt = $now
     }
