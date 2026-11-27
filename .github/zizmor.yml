@@ -109,7 +109,7 @@ rules:
       #
       # NOT suppressed (fixed at the source instead): release.yml's checkouts set persist-credentials:
       # false, because it DOES upload build artifacts. dependabot-lock-resync.yml is NOT listed either:
-      # its checkout persists nothing and hands the App token to the push step alone (BACKLOG #5477).
+      # its checkouts persist nothing and it hands the App token to the push step alone (BACKLOG #5477).
       - benchmark.yml
       - ci.yml
       - security.yml
@@ -117,7 +117,7 @@ rules:
 
   bot-conditions:
     ignore:
-      # zizmor flags `github.triggering_actor == 'dependabot[bot]'` in the resync job's `if:`, because an
+      # zizmor flags `github.triggering_actor == 'dependabot[bot]'` in the preflight job's `if:`, because an
       # actor context reflects the LAST actor on the run, not the PR's author. True — and it is why that
       # expression is the SECOND half of a conjunction and never the control. The control is the FIRST
       # half, `github.event.pull_request.user.login == 'dependabot[bot]'`: the immutable PR author, and
@@ -128,7 +128,7 @@ rules:
       # Skipping is safe by design: DEP-1 lock/export sync is independently enforced by security.yml's
       # `pip-audit` job, step "Check the lockfile is in sync with pyproject (DEP-1)", which
       # `git diff --exit-code`s the re-exports on an unfiltered pull_request trigger and is a REQUIRED
-      # context. The actor half is an operational self-trigger skip: this job's own App-token push fires
+      # context. The actor half is an operational self-trigger skip: the workflow's own App-token push fires
       # a `synchronize` whose triggering actor is mefor-lock-resync[bot], a run that sees no Dependabot
       # secrets. See the SECURITY MODEL block and the numbered note above that `if:`.
       #
@@ -144,7 +144,7 @@ rules:
       # the line count would not re-fire the finding — that is what the test is for. If the line moves,
       # RE-ANCHOR it; do not broaden it to the file. The pin below catches a moved line (see the header).
       # anchor-pin: && github.triggering_actor == 'dependabot[bot]' }}
-      - dependabot-lock-resync.yml:85
+      - dependabot-lock-resync.yml:121
 
   self-repository:
     ignore:
