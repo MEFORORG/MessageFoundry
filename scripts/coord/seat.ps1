@@ -25,7 +25,7 @@
         seat.ps1 -Record                      # the hook path: derive everything, write, exit 0
         seat.ps1 -Declare -Seat builder3 -Goal "..." -Done "..." -OutOfScope "..."
         seat.ps1 -Declare -Handoff <path>     # point at the document a replacement should read
-        seat.ps1 -Close [-Handback]           # lifecycle closed (handed); a later -Declare reopens it
+        seat.ps1 -Close [-Handback]           # lifecycle closed (handed); a later -Declare -Seat or -Goal reopens it
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
         seat.ps1 -ClearHandoff -Box <boxKey> -SessionId <sessionKey>
                                               # clear ANOTHER, dead session's pointer to a deleted file
@@ -1406,12 +1406,12 @@ try {
     # every peer while it worked. Only a declaration of intent (-Seat or -Goal) reopens: one that
     # only sets a pointer, such as a handed seat fixing its -Handoff path, is not evidence the work
     # resumed, and reopening it would hide the HANDED state its successor is respawned from.
-    # The episode is the one computed above, so a named session keeps its own pre-close claims and
-    # a nosid record starts at the close. Where that leaves no start, the close is the boundary, and
-    # a close stamp that names no instant cannot be one, so the declaration itself is.
+    # The episode is the one computed above, so a named session keeps its own pre-close claims, and
+    # one with no recorded start stays unknown rather than calling them inherited. A nosid record
+    # starts at the close; where that stamp names no instant, the declaration itself is the start.
     # -Record never reopens: the Stop hook fires on a closed session's last turn too.
     if ($Declare -and $priorEnded -and ($Seat -or $Goal)) {
-        if ($null -eq (ConvertTo-StampInstant $episodeStart)) {
+        if ($sk.Key -eq 'nosid' -and $null -eq (ConvertTo-StampInstant $episodeStart)) {
             $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
         }
         $lifecycle = 'open'

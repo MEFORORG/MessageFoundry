@@ -509,16 +509,18 @@ def test_a_plain_pass_on_a_closed_record_leaves_it_closed(repo: Path) -> None:
 
 
 @pytest.mark.parametrize("session", ["record-facts-probe", None])
-def test_a_reopen_whose_close_stamp_names_no_instant_starts_at_the_declaration(
-    repo: Path, session: str | None
-) -> None:
+def test_a_reopen_with_no_usable_start_or_close_stamp(repo: Path, session: str | None) -> None:
     seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first", session=session)
     seat(repo, "-Close", session=session)
     rewrite_record(repo, "episodeStart", lifecycleAt="not a stamp")
     seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed", session=session)
     after = read_record(repo)
     assert after["lifecycle"] == "open"
-    assert after["episodeStart"] == after["lifecycleAt"]
+    if session is None:
+        assert after["episodeStart"] == after["lifecycleAt"]
+    else:
+        # A named session's own pre-close claims stay unknown, never inherited.
+        assert after["episodeStart"] is None
 
 
 @pytest.mark.parametrize("handback", [False, True])
