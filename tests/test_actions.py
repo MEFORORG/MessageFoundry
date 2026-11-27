@@ -481,6 +481,36 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
     assert m["PID-5"] == "O\\S\\Brien \\X41\\bc"
 
 
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1"])
+@pytest.mark.parametrize(
+    ("sent", "mode", "expected"),
+    [
+        # BACKLOG #5928 step 1's own case: the hex escape is kept, so this reads as "JOS" plus the
+        # letter the sender's bytes spell, never a re-encoded guess at its upper case.
+        ("jos\\XE9\\", "upper", "JOS\\XE9\\"),
+        # A UTF-8 "E" with an acute accent is two bytes. The decoder reads each byte as its own
+        # character ("\xc3\x89"), so casing that decoded text gives "\xe3\x89", which spells a
+        # different, broken character. Kept as sent, the bytes stay intact.
+        ("JOS\\XC389\\", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "title", "Jos\\XC389\\"),
+    ],
+)
+def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
+    path: str, sent: str, mode: Literal["upper", "lower", "title"], expected: str
+) -> None:
+    # BACKLOG #5928 step 1, proposed not-a-bug. A hex escape carries bytes in the message's
+    # character set, and the decoder maps each byte to one character with no charset, so a
+    # multi-byte character cannot be cased from that decoded text. While the decoder reads no
+    # charset, keeping the escape as sent is what never corrupts the sender's text. NEGATIVE
+    # CONTROL: on 17f42069782^,
+    # five of these six fail: a component path wrote the decoded bytes back as literal characters,
+    # a whole-field lower re-spelt "\X" as "\x", which no decoder maps, and a whole-field title
+    # re-spelt the hex digits. Only the whole-field upper case passed there.
+    m = _with_pid(sent)
+    convert_case(m, path, mode)
+    assert m["PID-5"] == expected
+
+
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
     m = _with_pid("doe", pid4="A\\S\\BC")
     substring_field(m, "PID-4", 2)
@@ -939,9 +969,9 @@ def test_date_diff_field_still_refuses_a_code_beside_a_subcomponent(start: str) 
 
 
 def test_date_diff_field_shares_timezones_time_precisions() -> None:
-    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"). It pins
-    # behaviour already on origin/main, with no negative control: the
-    # helper reads the one tuple timezone.py defines rather than keeping its own copy.
+    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"): the
+    # helper reads the one tuple timezone.py defines rather than keeping its own copy. NEGATIVE
+    # CONTROL: this fails on 3681393c4ac^, where actions.py defined its own copy.
     import messagefoundry.timezone as timezone_mod
 
     assert vars(actions_mod)["_TIME_PRECISIONS"] is timezone_mod._TIME_PRECISIONS
