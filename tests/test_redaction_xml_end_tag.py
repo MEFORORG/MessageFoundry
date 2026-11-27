@@ -128,9 +128,8 @@ _KEPT = {
     "later-line": "<family>Smith</family\nZqxdoe>",
     "segment-id-head": "<family>Smith</family ZqMSH>",
     "end-digit": "<family>Smith</family Zqx 4455",
-    "end-head": "<family>Smith</family Johnson",
-    "end-camel-head": "<family>Smith</family zqxP",
     "end-camel-word": "<family>Smith</family userPwd",
+    "end-glue-head-only": "<family>Smith</family Ms",
 }
 
 
@@ -139,6 +138,58 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
     with _main():
         main = redaction._redact_xml_elements(text)
     assert redaction._redact_xml_elements(text) == main
+
+
+#: ``(text, want)``: a rest that ends the text, masked but for the end of its last word that text
+#: a caller glues after the answer could complete into a word some pass reads with no boundary, or
+#: into a credential label (BACKLOG #5925 closing step 1). Main printed each rest whole.
+_GLUE_HEAD_KEPT = [
+    ("<family>Smith</family Kim", "<family>[redacted]</family Xxm"),  # `m` opens MSH and mfb
+    ("<family>Smith</family Johnson", "<family>[redacted]</family Xxxxxxn"),  # `n`: nonnumeric
+    ("<family>Smith</family zqxP", "<family>[redacted]</family xxxP"),  # `P`: Pwd, Password
+    ("<family>Smith</family Zq shared", "<family>[redacted]</family Xx shared"),  # sharedaccesskey
+    ("<family>Smith</family Li\n", "<family>[redacted]</family Xx\n"),  # item 15
+    ("<family>Smith</family Li\r\n", "<family>[redacted]</family Xx\r\n"),
+    ("a|b|<family>Smith</family Kim", "[redacted] Xxm"),  # through the field-run arm
+    ("a|b|</family Johnson", "[redacted] Xxxxxxn"),
+]
+
+
+@pytest.mark.parametrize(("text", "want"), _GLUE_HEAD_KEPT)
+def test_a_rest_ending_the_text_keeps_only_its_glue_head(text: str, want: str) -> None:
+    with _main():
+        main = redact(text)
+    assert main != want and _is_main_masked(want, main)  # the premise: main printed it
+    assert redact(text) == want
+    assert redact(want) == want
+
+
+@pytest.mark.parametrize(
+    ("a", "raw", "value"),
+    [
+        ("<family>Smith</family zqxP", "assword: s3cr3tvalue99", "s3cr3tvalue99"),
+        ("<family>Smith</family KiM", "SH*^~\\&*A*B\rPID*1**DOEX$JANEX", "DOEX"),
+        ("<family>Smith</family Zqxnon", "numeric port: 'hunterpw@host'", "hunterpw"),
+        ("<family>Smith</family Zq shared", "accesskey=s3cr3tvalue99", "s3cr3tvalue99"),
+    ],
+)
+def test_text_glued_after_a_kept_glue_head_still_completes_its_word(
+    a: str, raw: str, value: str
+) -> None:
+    """THE REASON for the head: text a caller glues after the answer completes the word the head
+    opens, so the pass that reads that word still finds it and the value after it stays hidden,
+    as main's answer hid it."""
+
+    def joined() -> str:
+        return secretscrub.scrub_credentials(redact(redact(a) + raw))
+
+    with _main():
+        assert value not in joined()  # the premise: main's answer hid it
+    assert value not in joined()
+    # THE POSITIVE CONTROL: masking the head too loses the word, and the value prints.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_glue_head_start", len)
+        assert value in joined()
 
 
 @pytest.mark.parametrize(
@@ -169,7 +220,7 @@ def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want:
     "text",
     [
         "a|b|<family>Smith</family ZqMSH>",  # a head of a word read with no boundary
-        "a|b|<family>Smith</family Kim",  # an end-of-text refusal, as in the walk
+        "a|b|<family>Smith</family Zqx 4455",  # an end-of-text refusal, as in the walk
         "a|b|<family>Smith</family userPwd>",  # a camel credential label
         "a|b|<other>Smith</other Zqxdoe>",  # no vocabulary end tag
         "<name>a|b|<b>c</b Zqxdoe></name>",  # a stated residual: the run hides the element
