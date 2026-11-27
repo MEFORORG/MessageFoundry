@@ -250,14 +250,16 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # NOT engine source either, but it meets the criterion above and the claim is
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
-        # security/runtime-closure-core.txt and holds that to two exported locks. The
-        # gating argument is the one that keeps the repo-wide scanners here. Several paths it reads
-        # match neither arm of ci.yml's tooling path gate: security/runtime-closure-*.txt,
-        # security/risky-component-readings.json, security/bundled-code-survey.json and harness/**.py.
-        # And the tooling tier does not run in the merge queue. Listed as tooling this would be dropped by
-        # `-m 'not tooling'` on the engine legs and reached only when the path gate happens to match,
-        # so a PR that edited only those paths could face nothing, which is the one thing
-        # the designation exists to prevent (BACKLOG #1189).
+        # security/runtime-closure-core.txt, holds each runtime-closure file to the exported lock it
+        # copies, and holds the core closure to requirements.lock too: five locks, at least. The
+        # gating argument is the one that keeps the repo-wide scanners here. Several paths it
+        # reads match neither arm of ci.yml's tooling path gate: security/runtime-closure-*.txt,
+        # security/risky-component-readings.json, security/bundled-code-survey.json and
+        # harness/**.py. And the tooling tier does not run in the merge queue. Listed as tooling
+        # this would be dropped by `-m 'not tooling'` on the engine legs and reached only when the
+        # path gate happens to match, so a PR that edited only those paths could face nothing,
+        # which is the one thing the designation exists to prevent (BACKLOG #1189). CORRECTED
+        # 2026-11-26 (BACKLOG #5472): this read "holds that to two exported locks".
         "test_risky_component_designation.py",
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
@@ -375,7 +377,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # toolkit or tests/ diff, and the tooling path gate sees none of them.
         "test_warn_query_credentials_callers.py",
         # NOT engine source, but it meets the criterion above, as
-        # test_risky_component_designation.py above does and for the same reason. It pins
+        # test_risky_component_designation.py above does, and its reason is the queue half of that
+        # one's: the paths it reads now trip the tooling gate, but the tier skips the queue. It pins
         # security.yml's windows-lock-install job to the hashed runtime locks, and its
         # test_every_runtime_lock_exists reads requirements.lock, docker/locks/, security/locks/ and
         # ci/locks/ off disk (BACKLOG #5594). A lock removed, or renamed without the matching
@@ -384,7 +387,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # tooling tier does not run in the merge queue at all, and a change that breaks it from a
         # path the predicate omits would face nothing there. Listed as tooling it would run on no
         # queue run for any change. It spawns no subprocess, so staying on the
-        # engine legs costs them almost nothing.
+        # engine legs costs them almost nothing. CORRECTED 2026-11-26 (BACKLOG #5472): this read
+        # "as test_risky_component_designation.py above does and for the same reason".
         "test_windows_lock_install.py",
         # Imports its receipt and policy helpers from tests/test_dast_auth_sweep.py, an engine-tier
         # test that reads messagefoundry/api/** through the sweep (BACKLOG #5443). A change to
