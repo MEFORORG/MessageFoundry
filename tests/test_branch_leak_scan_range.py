@@ -31,6 +31,7 @@ _REPO = Path(__file__).resolve().parents[1]
 _WORKFLOW = "branch-leak-scan.yml"
 _STEP = "Scan the pushed tree and every pushed commit for forbidden content"
 _STEP2 = "Rescan the commits earlier pushes added"
+_STEP3 = "Name the commit behind each scan hit"
 _SENTINEL = ".github/workflows/branch-leak-scan.yml"
 _ZERO = "0" * 40
 _MARKER = "SYNTHETIC-LEAK-MARKER"
@@ -52,6 +53,7 @@ for root in "$@"; do
     if grep -q '{_MARKER}' "$f"; then echo "HIT ${{f#"$root"/}}"; hit=1; fi
   done < <(find "$root" -path "$root/.git" -prune -o -type f -print0)
 done
+if [ "$hit" = 1 ] && [ -n "${{STUB_ECHO:-}}" ]; then echo "$STUB_ECHO"; fi
 exit $hit
 """
 
@@ -137,6 +139,7 @@ def _run_steps(
     fail_revlist: str | None = None,
     between: Callable[[Path], None] | None = None,
     tokens: str = "synthetic",
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[list[int], str, list[str]]:
     """Run step 1 then step 2, as the job does: step 2 runs whatever step 1 returned.
 
@@ -149,6 +152,7 @@ def _run_steps(
     stub.chmod(0o755)
     log = tmp_path / "scan.log"
     log.write_text("", encoding="utf-8")
+    (tmp_path / "scan.log.env").write_text("", encoding="utf-8")
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir(exist_ok=True)
     env = probe_env(Path(bash), dict(os.environ))
@@ -175,6 +179,7 @@ def _run_steps(
             "PATH": f"{prefix}{os.pathsep}{env.get('PATH', '')}",
         }
     )
+    env.update(extra_env or {})
     if fail_revlist is not None:
         which_git = subprocess.run(
             [bash, "-c", "command -v git"], capture_output=True, text=True, timeout=60, env=env
@@ -261,10 +266,9 @@ def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
     rc, out, calls = _run(bash, repo.path, tmp_path, leaked, removed)
     assert rc == 1, f"rc={rc}; the earlier push's commit was not rescanned\n{out}"
     assert "HIT docs/security/note.md" in out, out
-    assert len(calls) == 3, f"tip, earlier range, then the hit's own commit: {calls}"
+    assert len(calls) == 2, calls
     assert calls[0] == "--path .", f"step 1 adds nothing but the tip: {calls}"
     assert calls[1].startswith(f"--path {_SENTINEL} ") and leaked in calls[1], calls
-    assert f"earlier-push commit {leaked} carries the hit(s) below" in out, out
 
 
 def test_each_step_reports_its_own_range(bash: str, tmp_path: Path) -> None:
@@ -274,7 +278,7 @@ def test_each_step_reports_its_own_range(bash: str, tmp_path: Path) -> None:
     after = _commit(repo.path, "again", {"b.txt": f"{_MARKER}\n"})
     rcs, out, calls = _run_steps(bash, repo.path, tmp_path, removed, after)
     assert rcs == [1, 1], f"rcs={rcs}\n{out}"
-    assert len(calls) == 3 and after in calls[0] and leaked in calls[1], calls
+    assert len(calls) == 2 and after in calls[0] and leaked in calls[1], calls
     assert "HIT b.txt" in out and "HIT docs/security/note.md" in out, out
 
 
@@ -326,7 +330,7 @@ def test_a_force_push_with_a_known_before_rescans_the_dropped_commits(
     after = _commit(repo.path, "rewritten", {"a.txt": "x\n"})
     rc, out, calls = _run(bash, repo.path, tmp_path, old, after)
     assert rc == 1 and "HIT docs/security/note.md" in out, f"rc={rc}\n{out}"
-    assert len(calls) == 3 and after in calls[0] and old in calls[1], calls
+    assert len(calls) == 2 and after in calls[0] and old in calls[1], calls
 
 
 def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) -> None:
@@ -439,12 +443,9 @@ def test_step_two_fails_closed_when_step_one_dies_listing_the_earlier_range(
     assert not any(leaked in c for c in calls), calls
 
 
-@pytest.mark.parametrize("damage", ["truncate", "not-a-sha"])
-def test_step_two_fails_closed_on_a_damaged_earlier_range(
-    damage: str, bash: str, tmp_path: Path
-) -> None:
-    """The marker records the list's length, so a list cut short after step 1 finished is refused,
-    and so is a line that is not a commit id."""
+def test_step_two_fails_closed_on_a_line_that_is_not_a_commit(bash: str, tmp_path: Path) -> None:
+    """A recorded range is a list of commit ids, and a line that is not one is a refusal, never a
+    ref the rescan resolves or skips."""
     repo = _Repo(tmp_path)
     first = _commit(repo.path, "one", {"a.txt": "x\n"})
     before = _commit(repo.path, "two", {"b.txt": "y\n"})
@@ -454,11 +455,11 @@ def test_step_two_fails_closed_on_a_damaged_earlier_range(
         listing = runner_temp / "branch-leak-scan-earlier.txt"
         lines = listing.read_text(encoding="utf-8").splitlines()
         assert lines == [before, first], lines
-        kept = lines[:1] if damage == "truncate" else [lines[0], "HEAD"]
-        listing.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8", newline="\n")
+        listing.write_text(f"{before}\nHEAD\n", encoding="utf-8", newline="\n")
 
-    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, before, after, between=harm)
-    assert rcs == [0, 2], f"rcs={rcs}\n{out}"
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, before, after, between=harm)
+    assert rcs == [0, 2] and len(calls) == 1, f"rcs={rcs}, calls={calls}\n{out}"
+    assert "not a commit id" in out, out
 
 
 def test_both_steps_scan_under_security_yml_s_detector_floor(bash: str, tmp_path: Path) -> None:
@@ -481,28 +482,84 @@ def test_both_steps_scan_under_security_yml_s_detector_floor(bash: str, tmp_path
 
 
 def test_step_two_without_the_token_secret_fails_closed(bash: str, tmp_path: Path) -> None:
+    """Step 2's OWN check: step 1 runs with the secret and records a range, so a step 2 that lost
+    its check would go on to scan it."""
     repo = _Repo(tmp_path)
     first = _commit(repo.path, "one", {"a.txt": "x\n"})
     after = _commit(repo.path, "two", {"b.txt": "y\n"})
-    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, first, after, tokens="")
-    assert rcs == [2, 2] and not calls, f"rcs={rcs}, calls={calls}\n{out}"
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, first, after, steps=(_STEP,))
+    assert rcs == [0], f"rcs={rcs}\n{out}"
+    assert (tmp_path / "runner-temp" / "branch-leak-scan-earlier.txt").is_file()
+    rcs, out, calls = _run_steps(
+        bash, repo.path, tmp_path, first, after, steps=(_STEP2,), tokens=""
+    )
+    assert rcs == [2] and not calls, f"rcs={rcs}, calls={calls}\n{out}"
+    assert "MEFOR_FORBIDDEN_TOKENS is absent" in out, out
+
+
+_ALL = (_STEP, _STEP2, _STEP3)
 
 
 def test_an_earlier_push_hit_names_its_commit(bash: str, tmp_path: Path) -> None:
-    """The scanner names a hit by its path inside a commit root, which on its own drops the commit,
-    so a responder could not tell which public SHA to assess. Only the commit that carries the hit is
+    """The scanner names a content hit by its path inside a commit root, which drops the commit, so
+    a responder could not tell which public SHA to assess. Only the commit that carries the hit is
     named; a clean commit in the same range is not."""
     repo = _Repo(tmp_path)
     clean = _commit(repo.path, "clean", {"a.txt": "x\n"})
     leaked = _commit(repo.path, "leak", {"docs/security/note.md": f"{_MARKER}\n"})
     removed = _commit(repo.path, "remove", {"docs/security/note.md": None})
-    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, removed, removed)
-    assert rcs == [0, 1], f"rcs={rcs}\n{out}"
-    assert f"earlier-push commit {leaked} carries the hit(s) below" in out, out
-    assert f"earlier-push commit {clean}" not in out, out
-    named = out.index(f"earlier-push commit {leaked}")
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, removed, removed, steps=_ALL)
+    assert rcs == [0, 1, 0], f"rcs={rcs}\n{out}"
+    assert f"earlier commit {leaked} carries the hit(s) below" in out, out
+    assert f"commit {clean} carries" not in out, out
+    named = out.index(f"earlier commit {leaked}")
     assert "HIT docs/security/note.md" in out[named:], out
-    assert _MARKER not in out, "a hit report printed the matched content"
+    # The real scanner prints reasons only unless asked for context; no call may ask.
+    assert calls and not any("--show-context" in c for c in calls), calls
+
+
+def test_a_this_push_hit_names_its_commit(bash: str, tmp_path: Path) -> None:
+    repo = _Repo(tmp_path)
+    clean = _commit(repo.path, "clean", {"a.txt": "x\n"})
+    leaked, removed = _leak_then_remove(repo)
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, removed, steps=_ALL)
+    assert rcs == [1, 0, 0], f"rcs={rcs}\n{out}"
+    assert f"this-push commit {leaked} carries the hit(s) below" in out, out
+    assert f"commit {clean} carries" not in out, out
+
+
+def test_a_hit_in_a_checked_out_file_is_blamed_on_no_commit(bash: str, tmp_path: Path) -> None:
+    """Step 2 scans its roots beside the checked-out workflow file, so a hit THERE makes its scan
+    red; attribution must not then name every clean earlier commit as carrying it."""
+    repo = _Repo(tmp_path)
+    clean = _commit(repo.path, "clean", {"a.txt": "x\n"})
+    after = _commit(repo.path, "edit", {_SENTINEL: f"# {_MARKER}\n"})
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, clean, after, steps=_ALL)
+    assert rcs == [1, 1, 0], f"rcs={rcs}\n{out}"
+    assert f"this-push commit {after} carries" in out, out
+    assert f"commit {clean} carries" not in out, out
+
+
+def test_attribution_cannot_start_a_workflow_command(bash: str, tmp_path: Path) -> None:
+    """A pushed path can carry a newline, so a hit line the scanner prints can begin with ``::``.
+    Attribution re-emits that output, and must not hand the runner a command such as
+    ``::stop-commands::``, which would silence every annotation after it. The stub prints the
+    hostile line on a hit, standing in for the scanner echoing such a path."""
+    repo = _Repo(tmp_path)
+    leaked, removed = _leak_then_remove(repo)
+    rcs, out, _ = _run_steps(
+        bash,
+        repo.path,
+        tmp_path,
+        repo.main,
+        removed,
+        steps=_ALL,
+        extra_env={"STUB_ECHO": "::stop-commands::x"},
+    )
+    assert rcs[0] == 1, f"rcs={rcs}\n{out}"
+    named = out.index(f"this-push commit {leaked} carries the hit(s) below")
+    reemitted = out[named:].splitlines()[1:]
+    assert reemitted and not any(line.startswith("::") for line in reemitted), out
 
 
 def test_the_walk_reports_every_refusal_before_it_fails(bash: str, tmp_path: Path) -> None:
@@ -522,12 +579,16 @@ def test_the_walk_reports_every_refusal_before_it_fails(bash: str, tmp_path: Pat
     assert len(calls) == 1, calls
 
 
-def test_an_unsafe_path_is_refused_and_the_walk_goes_on(bash: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("with_leak", [False, True])
+def test_an_unsafe_path_is_refused_and_the_walk_goes_on(
+    with_leak: bool, bash: str, tmp_path: Path
+) -> None:
     """A tree entry named ``.git`` cannot come through the index, but a hand-built tree carries one,
-    and a push delivers it. It is never written out, the step fails 2, and the walk still reaches the
-    content hit in the same push."""
+    and a push delivers it. It is never written out and the step fails 2; the walk still reaches a
+    content hit in the same push, and that confirmed leak outranks the refusal, so the step fails 1."""
     repo = _Repo(tmp_path)
-    _leak_then_remove(repo)
+    if with_leak:
+        _leak_then_remove(repo)
 
     def plumb(*args: str, stdin: str) -> str:
         # Bytes, not text: text mode on Windows writes CRLF, and each name would gain a CR.
@@ -552,6 +613,9 @@ def test_an_unsafe_path_is_refused_and_the_walk_goes_on(bash: str, tmp_path: Pat
     bad = _git(repo.path, "commit-tree", tree, "-p", "HEAD", "-m", "unsafe")
     _git(repo.path, "update-ref", "HEAD", bad)
     rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, bad)
-    assert rcs[0] == 2, f"rcs={rcs}\n{out}"
+    assert rcs[0] == (1 if with_leak else 2), f"rcs={rcs}\n{out}"
     assert f"branch commit {bad} names an unsafe path" in out, out
-    assert "HIT docs/security/note.md" in out, f"the walk stopped at the unsafe path\n{out}"
+    if with_leak:
+        assert "HIT docs/security/note.md" in out, f"the walk stopped at the unsafe path\n{out}"
+    written = tmp_path / "runner-temp" / "branch-leak-scan-commits" / bad / "sub"
+    assert not written.exists(), "the unsafe entry was written out"
