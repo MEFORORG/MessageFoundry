@@ -453,3 +453,103 @@ def test_a_never_declared_record_still_reads_none(repo: Path) -> None:
     rec = read_record(repo)
     assert rec["seatCanonical"] is None
     assert rec["seatRosterVerdict"] == "none"
+
+
+# --- A declaration reopens an ended record --------------------------------------------------------
+
+
+@pytest.mark.parametrize("handback", [False, True])
+@pytest.mark.parametrize("session", ["record-facts-probe", None])
+def test_a_declaration_after_a_close_reopens_the_record(
+    repo: Path, handback: bool, session: str | None
+) -> None:
+    """A resumed session declares again; announce-session.ps1 hides any record not `open`."""
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first episode", session=session)
+    start = episode_start(read_record(repo))
+    seat(repo, "-Close", *(["-Handback"] if handback else []), session=session)
+    close_at = start + timedelta(hours=1)
+    rewrite_record(repo, lifecycleAt=close_at.isoformat())
+    ended = read_record(repo)
+    assert ended["lifecycle"] == ("handed" if handback else "closed")
+    for key, minutes in (("9401", 10), ("9402", 120)):
+        put_json(
+            coord_dir(repo) / "claims" / f"{key}.json",
+            {
+                "worktree": ended["worktree"],
+                "claimed": (start + timedelta(minutes=minutes)).isoformat(),
+            },
+        )
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed", session=session)
+    after = read_record(repo)
+    assert after["lifecycle"] == "open"
+    assert datetime.fromisoformat(str(after["lifecycleAt"])) > start
+    by_key = {c["key"]: c["attribution"] for c in after["claims"]}
+    if session is None:
+        # A shared record's close is the boundary: before it is the last occupant's.
+        assert datetime.fromisoformat(str(after["episodeStart"])) == close_at
+        assert by_key == {"9401": "worktree-inherited", "9402": "this-episode"}
+    else:
+        # A named session keeps its episode, and so its own pre-close claims, across the close.
+        assert datetime.fromisoformat(str(after["episodeStart"])) == start
+        assert by_key == {"9401": "this-episode", "9402": "this-episode"}
+    # A later hook pass carries the reopened state forward.
+    seat(repo, "-Record", session=session)
+    carried = read_record(repo)
+    assert (carried["lifecycle"], carried["episodeStart"]) == ("open", after["episodeStart"])
+
+
+def test_a_plain_pass_on_a_closed_record_leaves_it_closed(repo: Path) -> None:
+    """The Stop hook fires on a closing session's last turn; that pass must not reopen it."""
+    declare(repo)
+    seat(repo, "-Close")
+    closed = read_record(repo)
+    plain_record(repo)
+    after = read_record(repo)
+    assert (after["lifecycle"], after["lifecycleAt"]) == ("closed", closed["lifecycleAt"])
+
+
+@pytest.mark.parametrize("session", ["record-facts-probe", None])
+def test_a_reopen_with_no_usable_start_or_close_stamp(repo: Path, session: str | None) -> None:
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "first", session=session)
+    seat(repo, "-Close", session=session)
+    rewrite_record(repo, "episodeStart", lifecycleAt="not a stamp")
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed", session=session)
+    after = read_record(repo)
+    assert after["lifecycle"] == "open"
+    if session is None:
+        assert after["episodeStart"] == after["lifecycleAt"]
+    else:
+        # A named session's own pre-close claims stay unknown, never inherited.
+        assert after["episodeStart"] == "unknown"
+
+
+@pytest.mark.parametrize("handback", [False, True])
+def test_a_pointer_only_declaration_does_not_reopen(repo: Path, handback: bool) -> None:
+    """A handed seat fixing a pointer has not resumed; its successor respawns from HANDED."""
+    declare(repo)
+    seat(repo, "-Close", *(["-Handback"] if handback else []))
+    ended = read_record(repo)
+    seat(repo, "-Declare", "-Notes", "pointer fix only")
+    after = read_record(repo)
+    assert (after["lifecycle"], after["lifecycleAt"]) == (ended["lifecycle"], ended["lifecycleAt"])
+
+
+def test_a_reopened_unknown_start_stays_unknown_across_later_passes(repo: Path) -> None:
+    """The reopen stamp is not when the episode began, so a hook pass must not adopt it."""
+    rec = declare(repo)
+    start = episode_start(rec)
+    seat(repo, "-Close")
+    # An older writer's ended record: no start field at all.
+    rewrite_record(repo, "episodeStart")
+    # Taken before the reopen, so a start pinned to the reopen would call it inherited.
+    put_json(
+        coord_dir(repo) / "claims" / "9501.json",
+        {"worktree": rec["worktree"], "claimed": (start - timedelta(minutes=1)).isoformat()},
+    )
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed")
+    for _ in range(2):
+        plain_record(repo)
+        after = read_record(repo)
+        assert after["lifecycle"] == "open"
+        assert after["episodeStart"] == "unknown"
+        assert [c["attribution"] for c in after["claims"]] == ["unknown"]

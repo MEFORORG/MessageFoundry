@@ -25,7 +25,7 @@
         seat.ps1 -Record                      # the hook path: derive everything, write, exit 0
         seat.ps1 -Declare -Seat builder3 -Goal "..." -Done "..." -OutOfScope "..."
         seat.ps1 -Declare -Handoff <path>     # point at the document a replacement should read
-        seat.ps1 -Close [-Handback]
+        seat.ps1 -Close [-Handback]           # lifecycle closed (handed); a later -Declare -Seat or -Goal reopens it
         seat.ps1 -BumpEpoch                   # mark an account switch; see POOL EPOCH below
         seat.ps1 -ClearHandoff -Box <boxKey> -SessionId <sessionKey>
                                               # clear ANOTHER, dead session's pointer to a deleted file
@@ -1401,6 +1401,32 @@ try {
                     elseif ($null -ne $priorStart) { $priorStart }
                     elseif ($priorEnded) { $null }
                     else { $lifecycleAt }
+    # A DECLARATION ON AN ENDED RECORD REOPENS IT. Before this only -Close ever moved lifecycle, so a
+    # session resumed after its own -Close kept reading closed, and announce-session.ps1 hid it from
+    # every peer while it worked. Only a declaration of intent (-Seat or -Goal) reopens: one that
+    # only sets a pointer, such as a handed seat fixing its -Handoff path, is not evidence the work
+    # resumed, and reopening it would hide the HANDED state its successor is respawned from.
+    # The episode is the one computed above, so a named session keeps its own pre-close claims, and
+    # one with no recorded start stays unknown rather than calling them inherited. A nosid record
+    # starts at the close; where that stamp names no instant, the declaration itself is the start.
+    # -Record never reopens: the Stop hook fires on a closed session's last turn too.
+    if ($Declare -and $priorEnded -and ($Seat -or $Goal)) {
+        if ($sk.Key -eq 'nosid' -and $null -eq (ConvertTo-StampInstant $episodeStart)) {
+            $episodeStart = if ($null -ne (ConvertTo-StampInstant $lifecycleAt)) { $lifecycleAt } else { $now }
+        } elseif ($null -eq $episodeStart) {
+            # UNKNOWN AS A VALUE, NOT A NULL. The next -Record sees an open record, and an open record
+            # with a null start takes lifecycleAt -- here the reopen, not the episode's start -- so a
+            # null would read this session's pre-close claims as inherited one pass later. That pass
+            # may be an older copy of this script (the hook runs the primary checkout's). Every
+            # version since 77aa7278dae (BACKLOG #5875) carries a non-null start on an open record
+            # unchanged, and Get-Attribution reads a start that names no instant as unknown. An
+            # older writer that reads this record drops the field and attributes claims against
+            # lifecycleAt, here the reopen stamp, and the next pass pins the start to that stamp.
+            $episodeStart = 'unknown'
+        }
+        $lifecycle = 'open'
+        $lifecycleAt = $now
+    }
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now
