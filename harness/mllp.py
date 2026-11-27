@@ -138,7 +138,8 @@ def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
 
 def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator[T]:
     """Yield ``items`` with a :func:`pause_unless_stopped` of ``1 / rate`` seconds between two of
-    them (none for a ``rate`` of 0 or less), and end as soon as ``stop`` is set.
+    them (none for a ``rate`` of 0 or less), and end as soon as it sees ``stop`` set. It looks
+    before and after each draw and throughout each pause, but cannot see into the caller's work.
 
     The pause is a gap after the caller's work on an item, not a schedule, so a slow send makes
     the batch run below ``rate``. It goes before every item but the first, never after the last:

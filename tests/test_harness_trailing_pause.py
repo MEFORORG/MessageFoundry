@@ -5,16 +5,16 @@
 
 Both workers paced a batch by pausing after every item, the last one included, so a batch ended a
 whole pause after its last send or drop: 10 seconds of a busy tab at the tabs' lowest rate, 0.1 a
-second. PR 3118 made
-that pause interruptible; these tests pin that no pause follows the last item, and that a stop
-inside a pause between items still ends the batch at once.
+second. PR 3118 made that pause interruptible; these tests pin that no pause follows the last
+item, and that a stop inside a pause between items still ends the batch at once.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -49,12 +49,15 @@ def paused(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
     inside the pause's sleep loop rather than before it starts."""
     entered = threading.Event()
     real_sleep = time.sleep
+    pause_code = mllp.pause_unless_stopped.__code__
 
     def sleep(seconds: float) -> None:
-        entered.set()
+        # time.sleep is process-wide, so a sleep on any other thread, or on any other path, must
+        # not count: only one made by the pause itself does.
+        if sys._getframe(1).f_code is pause_code:
+            entered.set()
         real_sleep(seconds)
 
-    # The pause is the only caller of time.sleep on these workers' paths.
     monkeypatch.setattr("harness.mllp.time.sleep", sleep)
     return entered
 
@@ -74,11 +77,10 @@ def _send_worker(
     monkeypatch: pytest.MonkeyPatch,
     *,
     rate: float = _SLOW_RATE,
-    items: Iterable[SendItem] | None = None,
+    on_draw: Callable[[int], None] | None = None,
 ) -> SendWorker:
     """A send worker whose sends are recorded in ``sent`` rather than dialled."""
-    batch = _items(n) if items is None else items
-    worker = SendWorker("127.0.0.1", 9, batch, timeout=1.0, rate=rate)
+    worker = SendWorker("127.0.0.1", 9, _items(n, on_draw), timeout=1.0, rate=rate)
 
     def send_one(item: SendItem) -> SendResult:
         sent.append(item.control_id)
@@ -93,10 +95,9 @@ def _drop_worker(
     directory: Path,
     *,
     rate: float = _SLOW_RATE,
-    items: Iterable[SendItem] | None = None,
+    on_draw: Callable[[int], None] | None = None,
 ) -> FileDropWorker:
-    batch = _items(n) if items is None else items
-    return FileDropWorker(str(directory), batch, rate=rate)
+    return FileDropWorker(str(directory), _items(n, on_draw), rate=rate)
 
 
 def _start(worker: SendWorker | FileDropWorker) -> threading.Thread:
@@ -203,7 +204,7 @@ def test_stop_inside_a_pause_between_messages_ends_the_send_batch(
         assert paused.wait(5), "the worker never reached the pause before the second message"
         started = time.monotonic()
         worker.stop()
-        t.join(timeout=3)
+        t.join(timeout=5)
         assert not t.is_alive(), "stop() did not end the pause"
         assert time.monotonic() - started < 3
         assert sent == ["X1"]
@@ -221,7 +222,7 @@ def test_stop_inside_a_pause_between_files_ends_the_drop_batch(
         assert paused.wait(5), "the worker never reached the pause before the second file"
         started = time.monotonic()
         worker.stop()
-        t.join(timeout=3)
+        t.join(timeout=5)
         assert not t.is_alive(), "stop() did not end the pause"
         assert time.monotonic() - started < 3
         assert len(list(tmp_path.glob("*.hl7"))) == 1
@@ -242,7 +243,7 @@ def test_a_stop_while_a_message_is_generated_sends_none_of_it(
         if seq == 2:
             holder[0].stop()
 
-    worker = _send_worker(3, sent, monkeypatch, rate=0.0, items=_items(3, on_draw))
+    worker = _send_worker(3, sent, monkeypatch, rate=0.0, on_draw=on_draw)
     holder.append(worker)
     worker.run()
     assert sent == ["X1"]
@@ -257,7 +258,7 @@ def test_a_stop_while_a_file_is_generated_drops_none_of_it(tmp_path: Path) -> No
         if seq == 2:
             holder[0].stop()
 
-    worker = _drop_worker(3, tmp_path, rate=0.0, items=_items(3, on_draw))
+    worker = _drop_worker(3, tmp_path, rate=0.0, on_draw=on_draw)
     holder.append(worker)
     worker.run()
     assert len(list(tmp_path.glob("*.hl7"))) == 1
