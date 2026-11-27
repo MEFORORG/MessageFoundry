@@ -197,8 +197,10 @@ def test_reset_store_covers_every_table_the_scanned_sql_names() -> None:
     run's rows into this one. This scans the SQL of this module, of the two store methods the
     engine's ``/stats`` answer is built from (``SqlServerStore.stats`` and ``in_pipeline_depth``),
     and of ``SqlServerStore.connection_metrics``, which the poller's ``/connections`` read counts
-    from, and every table a ``FROM`` or ``JOIN`` there names must be reset. SQL elsewhere, such as
-    the ``/status`` read's catalog queries, is not scanned."""
+    from, and every table a ``FROM`` or ``JOIN`` there names must be reset. SQL elsewhere is not
+    scanned. That includes the ``/status`` read's ``db_status``, whose row counts name their table
+    through a variable and include ``message_events`` and ``audit_log``, which the reset leaves; the
+    poller's sample takes only the database size and journal settings from it."""
     import ast
     import inspect
     import re
