@@ -379,9 +379,12 @@ def test_build_report_fails_on_acknowledged_loss() -> None:
     for seq in range(98):
         t.on_ack(seq)
     for seq in range(90):  # 8 acked never delivered
+        # Two lanes, so the lane checks pass and only the loss can fail the run.
         t.on_delivery("d0", seq)
+        t.on_delivery("d1", seq)
     rep = _report(tracker=t)
     assert rep.acked_not_delivered == 8
+    assert [s.name for s in rep.slos if not s.ok] == ["no_acknowledged_loss"]
     assert rep.result_ok is False
     assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
 

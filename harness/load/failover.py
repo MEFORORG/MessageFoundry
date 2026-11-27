@@ -559,10 +559,11 @@ class FailoverReport:
 
     def render_console(self) -> str:
         lines: list[str] = []
-        # The backend is the operator's own --db-backend text, so it is escaped before it reaches
-        # the terminal; the profile name already prints through repr, which escapes control codes.
+        # The profile name and the backend are the operator's own text, so both are escaped before
+        # they reach the terminal: to ASCII, so a cp1252 console can print the line too.
+        name = escape_for_terminal(self.profile, single_line=True)
         backend = escape_for_terminal(self.db_backend or "?", single_line=True)
-        lines.append(f"Failover-load report -- profile {self.profile!r} (backend {backend})")
+        lines.append(f"Failover-load report -- profile '{name}' (backend {backend})")
         lines.append("")
         prom = "n/a" if self.promotion_seconds is None else f"{self.promotion_seconds:.2f}s"
         rec = "TIMEOUT" if self.recovery_seconds is None else f"{self.recovery_seconds:.2f}s"
@@ -883,12 +884,15 @@ def _build_report(
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
-    if tracker.lanes_observed < 2:
+    # Only where something was delivered: with no delivery the cause is intake, which the
+    # messages_acked check and its warning name.
+    if tracker.lanes_observed < 2 and tracker.delivered_count > 0:
         notes.append(
             f"per-lane ordering observed {tracker.lanes_observed} lane(s); the failover graph fans "
-            "out to MEFOR_LOAD_FANOUT destinations, 3 by default, so fewer than two means "
-            "deliveries reached too few of them or the lane key collapsed onto one label, and the "
-            "check fails rather than certify order across the destinations from it"
+            "out to MEFOR_LOAD_FANOUT destinations, so fewer than two means a fan-out set below "
+            "two, deliveries that reached too few destinations, or a lane key that collapsed onto "
+            "one label, and the check fails rather than certify order across the destinations "
+            "from it"
         )
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 
@@ -1133,14 +1137,19 @@ def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
     ``Infinity``.
 
     ``drain_timeout_s`` is a ``[load]`` knob, but this run's drain wait and monitor deadline are
-    computed from it, so it is checked here too: infinity would hang a run whose survivor never
-    drains, and NaN would skip the drain wait outright. The other profile knobs are the profile
-    loader's to check."""
+    computed from it, so it is checked here too: infinity would never end the drain wait of a run
+    whose survivor never drains, and NaN would skip that wait outright.
+
+    This refuses non-finite values only. A finite but huge lease or drain timeout still makes a
+    run that never ends, and a phase's ``duration_s`` or rate is not checked here at all: the
+    profile loader passes NaN and infinity there too, and bounding them is its job, not this
+    module's. The refusal names the knob, never its value."""
     for f in fields(fo):
         value = getattr(fo, f.name)
         if isinstance(value, float) and not math.isfinite(value):
-            raise FailoverError(f"[load.failover] {f.name} must be a finite number, not {value}")
-    # The monitor's lease multiple is the largest the run computes.
+            raise FailoverError(f"[load.failover] {f.name} must be a finite number")
+    # Every lease multiple the run computes: the recovery bound's, which the profile allows up to
+    # 100, and the monitor deadline's.
     for derived in (fo.recovery_ttl_multiple, _MONITOR_LEASE_MULTIPLE):
         if not math.isfinite(derived * fo.leader_lease_ttl_seconds):
             raise FailoverError(
@@ -1148,9 +1157,7 @@ def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
                 "is not a finite number"
             )
     if not math.isfinite(drain_timeout_s):
-        raise FailoverError(
-            f"[load] drain_timeout_s must be a finite number, not {drain_timeout_s}"
-        )
+        raise FailoverError("[load] drain_timeout_s must be a finite number")
     if not math.isfinite(_monitor_deadline(fo, drain_timeout_s)):
         raise FailoverError(
             "[load] drain_timeout_s is too large: the monitor deadline computed from it is not a "

@@ -5,13 +5,14 @@
 ``per_lane_ordering`` no longer passes on fewer than two lanes, a run with no accepted load is a
 named violation, a NaN or infinite ``[load.failover]`` knob or ``drain_timeout_s`` is refused before
 anything starts, and the console escapes the backend name. The dead-row check stays main's absolute
-``final.dead == 0``: the rig makes no read of the PHI-gated ``/dead-letters`` route.
+``final.dead == 0``: the rig makes no read of the engine's PHI-gated dead-letter list route.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -174,7 +175,20 @@ def test_no_accepted_load_is_a_named_violation() -> None:
     rep = _report(acked=0, tracker=_tracker(n=0))
     assert rep.result_ok is False
     assert any(s.name == "messages_acked" and not s.ok for s in rep.slos)
-    assert "(0 violated)" not in rep.render_console()
+    # Nothing was delivered, so the lanes note does not blame the lane key.
+    assert not any("lane(s)" in n for n in rep.notes)
+
+
+def test_zero_acks_alone_is_counted_as_a_violation() -> None:
+    # Deliveries on two in-order lanes with no ACK, so messages_acked is the only check that fails:
+    # before it existed the console printed FAIL with "(0 violated)".
+    t = FailoverTracker()
+    for seq in range(98):
+        t.on_delivery("d0", seq)
+        t.on_delivery("d1", seq)
+    rep = _report(acked=0, tracker=t)
+    assert [s.name for s in rep.slos if not s.ok] == ["messages_acked"]
+    assert "(1 violated)" in rep.render_console()
 
 
 # --- the dead-row check is main's, absolute ------------------------------------------
@@ -186,12 +200,23 @@ def test_any_dead_row_still_fails_the_run() -> None:
     assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
 
 
-def test_the_rig_makes_no_dead_letter_read() -> None:
-    # The PHI-gated /dead-letters route's reads can go unaudited when a node is stopped
-    # ungracefully, so the rig does not page it (CLAUDE.md section 9).
-    source = inspect.getsource(failover)
-    assert "/dead-letters" not in source
-    assert "dead_letters" not in source
+# Built from parts, so this file does not itself spell the route it scans for.
+_ROUTE = "/dead" + "-letters"
+_FIELD = "dead" + "_letters"
+
+
+def _names_dead_letter_route(source: str) -> bool:
+    return _ROUTE in source or _FIELD in source
+
+
+def test_the_failover_module_names_no_dead_letter_route() -> None:
+    # The engine's PHI-gated dead-letter list route's reads can go unaudited when a node is
+    # stopped ungracefully, so this module does not page it (CLAUDE.md section 9). A spelling scan
+    # of this module only: it does not see a path built from parts, or a read made in another
+    # module.
+    planted = f'await self._signed_in_json(client, "{_ROUTE}?limit=500")'
+    assert _names_dead_letter_route(planted)
+    assert not _names_dead_letter_route(inspect.getsource(failover))
 
 
 # --- non-finite knobs are refused before any start ------------------------------------
@@ -259,3 +284,15 @@ def test_the_console_escapes_the_backend_name() -> None:
     text = _report(db_backend="pg\x1b[2J\n").render_console()
     assert "\x1b" not in text
     assert "pg\\x1b[2J" in text
+
+
+def test_the_console_escapes_the_profile_name_to_ascii() -> None:
+    # A printable non-ASCII letter, written as chr() so the source stays ASCII.
+    rep = replace(_report(), profile="fo\x1b[2J" + chr(0xE9))
+    assert not rep.profile.isascii()
+    header = rep.render_console().splitlines()[0]
+    assert header.isascii() and "\x1b" not in header
+    assert header.startswith("Failover-load report -- profile 'fo\\x1b[2J")
+    assert _report().render_console().splitlines()[0] == (
+        "Failover-load report -- profile 'fo-b20006' (backend postgres)"
+    )
