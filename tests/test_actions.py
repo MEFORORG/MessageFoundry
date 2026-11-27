@@ -487,43 +487,60 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
         # BACKLOG #5928 step 1's own case: upper case leaves the hex escape, so the letter it
         # carries keeps the case the sender sent.
         ("jos\\XE9\\", "PID-5.1", "upper", "JOS\\XE9\\"),
-        ("jos\\XE9\\", "PID-5.1.1", "upper", "JOS\\XE9\\"),
-        # On a whole field, lower-case hex digits tell "kept as sent" from casing the wire text.
+        # Lower-case hex digits tell "kept as sent" from upper-casing the wire text, on every path.
         # Literal text after the escape is still cased, and the field keeps its components.
+        ("jos\\Xe9\\", "PID-5.1.1", "upper", "JOS\\Xe9\\"),
         ("jos\\Xe9\\", "PID-5", "upper", "JOS\\Xe9\\"),
         ("jos\\Xe9\\ab^x", "PID-5", "upper", "JOS\\Xe9\\AB^X"),
         # e-acute is two bytes in UTF-8 (C3 A9). The decoder reads each byte as its own
         # character, so casing that text byte by byte would write different bytes ("\xc3"
         # lower-cased is "\xe3"). Kept as sent, the bytes stay intact.
-        ("ren\\XC3A9\\", "PID-5.1", "upper", "REN\\XC3A9\\"),
+        ("ren\\Xc3a9\\", "PID-5.1", "upper", "REN\\Xc3a9\\"),
         ("JOS\\XC389\\", "PID-5", "lower", "jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5.1", "lower", "jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5", "title", "Jos\\XC389\\"),
         ("JOS\\XC389\\", "PID-5.1", "title", "Jos\\XC389\\"),
-        # Title case still reads the per-byte decode to decide whether the next letter starts a
-        # word, and the last byte of a UTF-8 letter decodes to an uncased character, so the "e"
-        # after it is capitalized mid-word. A known defect on main, not fixed here.
-        pytest.param(
-            "ren\\XC3A9\\e",
-            "PID-5.1",
-            "title",
-            "Ren\\XC3A9\\e",
-            marks=pytest.mark.xfail(strict=True, reason="title case reads a per-byte hex decode"),
-        ),
     ],
 )
 def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
     sent: str, path: str, mode: Literal["upper", "lower", "title"], expected: str
 ) -> None:
     # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
-    # A hex escape carries bytes in the message's character set, and the decoder maps each byte
-    # to one character without reading MSH-18, so it cannot tell a Latin-1 letter from part of a
-    # UTF-8 one. While that holds, keeping the escape as sent writes no byte the sender did not
-    # send. A decoder that reads MSH-18 could case the letter instead and change these rows.
+    # What a hex escape's bytes mean is ADR 0205's, *The hex escape's meaning*; the decoder maps
+    # each byte to one character, so it cannot tell a Latin-1 letter from part of a UTF-8 one.
+    # While that holds, keeping the escape as sent writes no byte the sender did not send.
     # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
-    # every passing row here fails.
+    # every row here fails.
     m = _with_pid(sent)
     convert_case(m, path, mode)
+    assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1"])
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        # The last byte of UTF-8 e-acute, A9, decodes on its own to an uncased character, so a
+        # per-byte read capitalized the "e" after it mid-word.
+        ("ren\\XC3A9\\e", "Ren\\XC3A9\\e"),
+        ("REN\\Xc3a9\\E", "Ren\\Xc3a9\\e"),
+        # The mirror: AA, the last byte of the new shekel sign (E2 82 AA), decodes on its own to a
+        # cased character, so a per-byte read kept the next word's first letter lower case.
+        ("a \\XE282AA\\b", "A \\XE282AA\\B"),
+        # Not valid UTF-8, so each byte is its own character: E9 is a Latin-1 e-acute, cased.
+        ("jos\\XE9\\e", "Jos\\XE9\\e"),
+        ("o\\X41\\b", "O\\X41\\b"),
+    ],
+)
+def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
+    sent: str, expected: str, path: str
+) -> None:
+    # BACKLOG #5928: title case decides whether a letter starts a word from the character before
+    # it, and a hex escape's bytes are read as UTF-8 where they form it. NEGATIVE CONTROL: on
+    # d055c0e8590, which read each byte as its own character, the first three rows fail on both
+    # paths.
+    m = _with_pid(sent)
+    convert_case(m, path, "title")
     assert m["PID-5"] == expected
 
 

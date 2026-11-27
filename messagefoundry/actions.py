@@ -143,7 +143,8 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     its own, so a whole-field path keeps its components, repetitions and subcomponents. Only the
     literal text is cased: an escape sequence such as ``\\.br\\`` or ``\\S\\`` is kept as sent, and so
     is the text a hex escape carries, though title case still reads what an escape decodes to when
-    it decides whether the next letter starts a word. A no-op on an absent field; raises
+    it decides whether the next letter starts a word, a hex escape's bytes read as UTF-8 where they
+    form valid UTF-8. A no-op on an absent field; raises
     :class:`ValueError` on an unknown mode (fail loud rather than silently leaving the value), or on
     field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
     # A tuple test, not a dict one, so an unhashable mode from config raises the documented
@@ -920,10 +921,28 @@ def _case_leaf(raw: str, convert: Callable[[str, bool], str], seps: _Seps) -> st
         else:
             cased = convert(decoded, after_cased)
             out.append(unit_raw if cased == decoded else _escape_data(cased, seps))
-        if decoded:
+        state = _case_state_text(unit_raw, decoded, kind)
+        if state:
             # str.title's own test: a following "a" stays lower case only after a cased character.
-            after_cased = (decoded[-1] + "a").title()[-1] == "a"
+            after_cased = (state[-1] + "a").title()[-1] == "a"
     return "".join(out)
+
+
+def _case_state_text(unit_raw: str, decoded: str, kind: str) -> str:
+    """The text whose last character sets title case's state after a unit.
+
+    ``unescape`` decodes a hex escape one byte to one character, so the last byte of a UTF-8
+    letter, such as the ``A9`` of ``\\XC3A9\\`` (e-acute), would read as a character of its own,
+    cased or not by accident. Its bytes are read as UTF-8 where they form valid UTF-8, and per byte
+    otherwise. That reading only decides whether the next letter starts a word: the escape itself
+    is kept as sent, and the value a read returns is unchanged. ADR 0205, *The hex escape's
+    meaning*, says what a hex escape's bytes mean."""
+    if kind == "esc" and unit_raw[1:2] == "X":
+        try:
+            return decoded.encode("latin-1").decode("utf-8")
+        except UnicodeError:
+            pass
+    return decoded
 
 
 def _replace_leaf(raw: str, old: str, new: str, seps: _Seps) -> str:
