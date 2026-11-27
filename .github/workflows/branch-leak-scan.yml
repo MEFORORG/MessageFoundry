@@ -142,8 +142,12 @@ jobs:
           fi
 
           # THE COMMIT RANGES (BACKLOG #5595). Every git call below fails the step on error: a range
-          # that cannot be computed is not a clean range.
-          set -euo pipefail
+          # that cannot be computed is not a clean range. An unexpected failure, a git call, a mkdir or
+          # a redirect, exits 2 through the trap: it is the instrument failing, never a leak verdict
+          # (1) and never a pass. Only a leak already found, a committed token list on the walk or a
+          # scanner hit, keeps it at 1. -E carries the trap into the functions below.
+          set -Eeuo pipefail
+          trap 'code=$?; line=$LINENO; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then echo "::error::the scan failed internally (exit $code near line $line) after it had found the leak reported above." >&2; exit 1; fi; echo "::error::the scan failed internally (exit $code near line $line) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' ERR
           zero=0000000000000000000000000000000000000000
           for sha in "$PUSH_BEFORE" "$PUSH_AFTER"; do
             case "$sha" in
@@ -157,20 +161,33 @@ jobs:
           # reads: a step 1 that dies mid `rev-list` leaves no record, and step 2 fails closed on that.
           earlier_file="$RUNNER_TEMP/branch-leak-scan-earlier.txt"
           rm -f "$earlier_file" "$earlier_file.tmp"
+          # Shows stdin with every `::` and `##[` broken up, looping until none is left, so a line the
+          # scanner echoes from a pushed path cannot start a workflow command such as ::stop-commands::.
+          defang() { sed -e ':a' -e 's/::/: :/' -e 'ta' -e 's/##\[/# #[/' -e 'ta'; }
+          # Runs the scanner on "$@", shows its output through defang, and sets rc to its exit code.
+          scan() {
+            # Created first, so a file that cannot be written fails here, through the trap, rather
+            # than in the redirect below, whose failure `|| rc=$?` would read as the scanner's 1.
+            : > "$RUNNER_TEMP/branch-leak-scan-output.txt"
+            rc=0
+            PYTHONUNBUFFERED=1 python scripts/security/scan_forbidden.py "$@" > "$RUNNER_TEMP/branch-leak-scan-output.txt" 2>&1 || rc=$?
+            defang < "$RUNNER_TEMP/branch-leak-scan-output.txt"
+          }
           if [ "$PUSH_AFTER" = "$zero" ]; then
             : > "$earlier_file.tmp"
             mv "$earlier_file.tmp" "$earlier_file"
             echo "branch deleted: no pushed commits to scan, and the earlier range is not listed (see this workflow's header); scanning the checked-out tree only."
-            python scripts/security/scan_forbidden.py --path .
-            exit 0
+            scan --path .
+            exit "$rc"
           fi
           snap="$RUNNER_TEMP/branch-leak-scan-commits"
           rm -rf "$snap"
           mkdir -p "$snap"
           # Writes each commit in $1 (one id per line) to its own root under $snap, every file that
-          # commit added or changed, and sets roots and files for the scan that follows. A refusal found
-          # on the walk is recorded in walk_rc (2 for an unsafe path, else 1) and the walk goes on, so
-          # one run reports every commit that carries one; the caller fails on walk_rc after its scan.
+          # commit added or changed, and sets roots and files for the scan that follows. What the walk
+          # refuses is recorded in walk_rc and the walk goes on, so one run reports every commit that
+          # carries one; the caller fails on walk_rc after its scan. A committed token list (1) is a
+          # confirmed leak and outranks an unsafe path (2), whichever the walk meets first.
           snapshot() {
             roots=()
             files=0
@@ -198,7 +215,7 @@ jobs:
                   //*|*/../*|*/./*|*/.git/*)
                     # The path is not printed: it is pushed text, and could carry a workflow command.
                     echo "::error::branch commit $sha names an unsafe path; refusing to write it." >&2
-                    walk_rc=2
+                    if [ "$walk_rc" -ne 1 ]; then walk_rc=2; fi
                     continue
                     ;;
                 esac
@@ -207,7 +224,7 @@ jobs:
                 # definition, so its presence is the leak. It is never written out for the scanner.
                 if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
                   echo "::error::branch commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
-                  if [ "$walk_rc" -lt 1 ]; then walk_rc=1; fi
+                  walk_rc=1
                   continue
                 fi
                 case "$path" in
@@ -233,7 +250,7 @@ jobs:
           record_hit_roots() {
             if [ "${#roots[@]}" -gt 0 ]; then printf '%s\n' "${roots[@]}" > "$snap/hit-roots-$1.txt"; fi
           }
-          declare -f snapshot count verdict record_hit_roots > "$RUNNER_TEMP/branch-leak-scan-snapshot.sh"
+          declare -f defang scan snapshot count verdict record_hit_roots > "$RUNNER_TEMP/branch-leak-scan-snapshot.sh"
 
           # STEP 1, THIS PUSH: `before..after` less origin/main, or everything not on origin/main
           # when `before` is zero or not in this clone.
@@ -254,8 +271,7 @@ jobs:
           # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
           # files sit under a directory the scanner skips. It runs even after a refusal on the walk, so
           # the run reports every hit.
-          rc=0
-          python scripts/security/scan_forbidden.py --path . "${roots[@]}" || rc=$?
+          scan --path . "${roots[@]}"
           if [ "$rc" -eq 1 ]; then record_hit_roots this-push; fi
           exit "$(verdict "$rc" "$walk_rc")"
       - name: Rescan the commits earlier pushes added
@@ -274,7 +290,9 @@ jobs:
           fi
           export MEFOR_REQUIRE_TOKENS=1
           export MEFOR_MIN_DETECTORS=names=8,estate=14,site_prefixes=2
-          set -euo pipefail
+          # As in step 1: an unexpected failure is a refusal (2), never a leak verdict or a pass.
+          set -Eeuo pipefail
+          trap 'code=$?; line=$LINENO; if [ "${walk_rc:-0}" -eq 1 ] || [ "${rc:-0}" -eq 1 ]; then echo "::error::the rescan failed internally (exit $code near line $line) after it had found the leak reported above." >&2; exit 1; fi; echo "::error::the rescan failed internally (exit $code near line $line) and did not finish; this is a refusal, not a leak verdict." >&2; exit 2' ERR
           earlier_file="$RUNNER_TEMP/branch-leak-scan-earlier.txt"
           # A missing or unfinished record is not a clean range (BACKLOG #5595). Step 1 renames the
           # list into place only once it is whole, so it is missing when step 1 refused its inputs,
@@ -303,9 +321,10 @@ jobs:
           echo "step 2, earlier pushes: $(count "$earlier") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
           if [ "${#roots[@]}" -eq 0 ]; then exit "$walk_rc"; fi
           # This workflow file is text and is always checked out, since GitHub runs it from the pushed
-          # commit, so a range of binary files alone cannot trip the zero-files refusal.
-          rc=0
-          python scripts/security/scan_forbidden.py --path .github/workflows/branch-leak-scan.yml "${roots[@]}" || rc=$?
+          # commit, so a range of binary files alone cannot trip the zero-files refusal. Step 1 scans it
+          # too, as part of the tip, so a hit in it reds both steps. That double report is kept: step 1
+          # can fail before its scan, and then this is the run's only scan of the file.
+          scan --path .github/workflows/branch-leak-scan.yml "${roots[@]}"
           if [ "$rc" -eq 1 ]; then record_hit_roots earlier; fi
           exit "$(verdict "$rc" "$walk_rc")"
       - name: Name the commit behind each scan hit
@@ -313,7 +332,9 @@ jobs:
         # the commit, so a responder cannot tell which public SHA to assess. After a scan step hit,
         # this rescans each of its commit roots on its own and names each one that hits. It is its own
         # step, after both scans, so a slow attribution can never delay or cancel a scan step's red
-        # conclusion. It reports and never decides: the job is already red when it runs.
+        # conclusion. It reports and never decides: the job is already red when it runs. Its own limit
+        # does not fit inside what the job's 10-minute limit leaves after slow scans, so the job limit
+        # can cancel it; the step after it, which says what a failure means, then does not run.
         if: failure()
         timeout-minutes: 5
         env:
@@ -337,9 +358,12 @@ jobs:
               python scripts/security/scan_forbidden.py --path "$clean" "$root" > "$snap/attribution.txt" 2>&1 || one=$?
               if [ "$one" -eq 1 ]; then
                 echo "::error::$label commit ${root##*/} carries the hit(s) below; each path is inside that commit."
-                # Reasons only, as the scanner prints them, never the matched content. A pushed path
-                # can carry a newline, so a re-emitted line must not start a workflow command.
-                sed 's/::/: :/g' "$snap/attribution.txt"
+                # The scanner's output for this root. Each hit line names a path inside the commit and
+                # a reason, as the scan step's own output already did for the same root. The scanner runs without
+                # --show-context, so a content hit's matched line or value is never printed, but a
+                # name hit's path is itself the matched text. A pushed path can carry a newline, so
+                # each line is broken up as step 1's defang does, and cannot start a workflow command.
+                sed -e ':a' -e 's/::/: :/' -e 'ta' -e 's/##\[/# #[/' -e 'ta' "$snap/attribution.txt"
               elif [ "$one" -ne 0 ]; then
                 echo "::warning::$label commit ${root##*/} could not be rescanned on its own (scanner exit $one)."
               fi
@@ -350,7 +374,8 @@ jobs:
         if: failure()
         run: |
           echo "::warning::Either this branch carries forbidden content, or the scan could not run. Read"
-          echo "::warning::both scan steps' logs: a FORBIDDEN CONTENT report or an ::error:: naming a leak means"
+          echo "::warning::the logs of the two scan steps and of the step that names each hit's commit, which"
+          echo "::warning::ran before this one: a FORBIDDEN CONTENT report or an ::error:: naming a leak means"
           echo "::warning::the content is ALREADY PUBLIC -- the push completed before this ran; this job"
           echo "::warning::detects, it cannot prevent. Any other refusal is the instrument failing, not a leak."
           echo "::warning::Respond: delete the branch, assess what was exposed, and check whether the"

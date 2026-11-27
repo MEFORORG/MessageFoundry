@@ -437,7 +437,10 @@ def test_step_two_fails_closed_when_step_one_dies_listing_the_earlier_range(
     before = _commit(repo.path, "remove", {"docs/security/note.md": None, "a.txt": "x\n"})
     after = _commit(repo.path, "more", {"b.txt": "y\n"})
     rcs, out, calls = _run_steps(bash, repo.path, tmp_path, before, after, fail_revlist=before)
-    assert rcs[0] == 128, f"rcs={rcs}; the shim did not kill step 1\n{out}"
+    # The trap turns the failed listing into a refusal: an internal failure is never a leak (1).
+    assert rcs[0] == 2 and "failed internally" in out, (
+        f"rcs={rcs}; the shim did not kill step 1\n{out}"
+    )
     assert rcs[1] == 2, f"rcs={rcs}; step 2 read a partial earlier range as complete\n{out}"
     assert "did not finish recording it" in out, out
     assert not any(leaked in c for c in calls), calls
@@ -530,7 +533,11 @@ def test_a_this_push_hit_names_its_commit(bash: str, tmp_path: Path) -> None:
 
 def test_a_hit_in_a_checked_out_file_is_blamed_on_no_commit(bash: str, tmp_path: Path) -> None:
     """Step 2 scans its roots beside the checked-out workflow file, so a hit THERE makes its scan
-    red; attribution must not then name every clean earlier commit as carrying it."""
+    red; attribution must not then name every clean earlier commit as carrying it.
+
+    Step 1 scans the same file as part of the tip, so both steps go red: a deliberate double report.
+    Step 2 cannot leave the file out, because step 1 can fail before its scan, and then step 2's is
+    the run's only scan of it."""
     repo = _Repo(tmp_path)
     clean = _commit(repo.path, "clean", {"a.txt": "x\n"})
     after = _commit(repo.path, "edit", {_SENTINEL: f"# {_MARKER}\n"})
@@ -619,3 +626,114 @@ def test_an_unsafe_path_is_refused_and_the_walk_goes_on(
         assert "HIT docs/security/note.md" in out, f"the walk stopped at the unsafe path\n{out}"
     written = tmp_path / "runner-temp" / "branch-leak-scan-commits" / bad / "sub"
     assert not written.exists(), "the unsafe entry was written out"
+
+
+def _plumb(repo: Path, *args: str, stdin: str) -> str:
+    # Bytes, not text: text mode on Windows writes CRLF, and each name would gain a CR.
+    out = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        input=stdin.encode("utf-8"),
+        capture_output=True,
+        check=True,
+        timeout=60,
+    ).stdout
+    return out.decode("utf-8").strip()
+
+
+def _hand_built_commit(repo: Path, parent: str, entries: str) -> str:
+    """A commit on ``parent`` whose tree is ``parent``'s plus ``entries`` (mktree lines), built by
+    plumbing so it can hold a tree the index refuses."""
+    listing = _git(repo, "ls-tree", f"{parent}^{{tree}}")
+    tree = _plumb(repo, "mktree", stdin=f"{listing}\n{entries}")
+    commit = _git(repo, "commit-tree", tree, "-p", parent, "-m", "hand-built")
+    _git(repo, "update-ref", "HEAD", commit)
+    return commit
+
+
+@pytest.mark.parametrize("unsafe_dir", ["a", "z"])
+def test_a_committed_token_list_outranks_an_unsafe_path_in_either_order(
+    unsafe_dir: str, bash: str, tmp_path: Path
+) -> None:
+    """MEASURED on 7a30cf1f1: a walk that met an unsafe path and a committed token list ended at 2,
+    whichever came first, so the step read as a refusal although the token list is a confirmed leak.
+    ``a`` sorts before ``scripts`` and ``z`` after it, so diff-tree meets the two in each order."""
+    repo = _Repo(tmp_path)
+    blob = _plumb(repo.path, "hash-object", "-w", "--stdin", stdin="x\n")
+    inner = _plumb(repo.path, "mktree", stdin=f"100644 blob {blob}\thooks-config\n")
+    dotgit = _plumb(repo.path, "mktree", stdin=f"040000 tree {inner}\t.git\n")
+    tokens = _plumb(repo.path, "mktree", stdin=f"100644 blob {blob}\tscan-tokens.local.txt\n")
+    security = _plumb(repo.path, "mktree", stdin=f"040000 tree {tokens}\tsecurity\n")
+    bad = _hand_built_commit(
+        repo.path,
+        repo.main,
+        f"040000 tree {security}\tscripts\n040000 tree {dotgit}\t{unsafe_dir}\n",
+    )
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, bad)
+    assert f"branch commit {bad} names an unsafe path" in out, out
+    assert f"branch commit {bad} commits scripts/security/scan-tokens.local.txt" in out, out
+    assert rcs[0] == 1, f"rcs={rcs}; a confirmed leak lost to a refusal\n{out}"
+
+
+@pytest.mark.parametrize("in_step", [1, 2])
+def test_an_internal_failure_on_the_walk_is_a_refusal_not_a_leak(
+    in_step: int, bash: str, tmp_path: Path
+) -> None:
+    """MEASURED on 7a30cf1f1: a hand-built tree naming ``d`` as both a file and a directory makes the
+    walk's ``mkdir`` fail under ``set -e``, which exited 1, the code that means a confirmed leak. An
+    internal failure is the instrument failing: it is 2, with a message saying so, and never 0."""
+    repo = _Repo(tmp_path)
+    blob = _plumb(repo.path, "hash-object", "-w", "--stdin", stdin="x\n")
+    inner = _plumb(repo.path, "mktree", stdin=f"100644 blob {blob}\tf\n")
+    bad = _hand_built_commit(
+        repo.path, repo.main, f"100644 blob {blob}\td\n040000 tree {inner}\td\n"
+    )
+    if in_step == 1:
+        before, after = repo.main, bad
+    else:
+        # The bad commit is the earlier push's, so only step 2 walks it.
+        before = bad
+        after = _hand_built_commit(repo.path, bad, f"100644 blob {blob}\tclean.txt\n")
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, before, after)
+    assert rcs[in_step - 1] == 2, f"rcs={rcs}\n{out}"
+    assert "failed internally" in out and "not a leak verdict" in out, out
+
+
+@pytest.mark.parametrize(
+    "hostile", ["::stop-commands::x", ":::stop-commands::x", "##[cmd]x", "###[cmd]x"]
+)
+def test_no_step_echoes_scanner_output_as_a_workflow_command(
+    hostile: str, bash: str, tmp_path: Path
+) -> None:
+    """MEASURED on 7a30cf1f1: steps 1 and 2 printed the scanner's output as it came, so a hit line
+    echoing a pushed path could hand the runner ``::stop-commands::`` or a ``##[`` command, and the
+    attribution step broke up only ``::``. Every step that shows scanner output must break up both.
+    The leak sits in both ranges, so all three steps print the stub's hostile line."""
+    repo = _Repo(tmp_path)
+    _leaked, before = _leak_then_remove(repo)
+    after = _commit(repo.path, "again", {"b.txt": f"{_MARKER}\n"})
+    rcs, out, _ = _run_steps(
+        bash,
+        repo.path,
+        tmp_path,
+        before,
+        after,
+        steps=_ALL,
+        extra_env={"STUB_ECHO": hostile},
+    )
+    assert rcs == [1, 1, 0], f"rcs={rcs}\n{out}"
+    shown = [line for line in out.splitlines() if "stop-commands" in line or "cmd]" in line]
+    assert len(shown) >= 3, f"the stub's line was not shown by every step\n{out}"
+    for line in shown:
+        bare = line.lstrip()
+        assert not bare.startswith(("::", "##[")) and "::" not in bare and "##[" not in bare, line
+
+
+def test_the_failure_notes_name_what_they_print_and_where_to_read() -> None:
+    """The attribution step re-prints each hit's path, and a name hit's path IS the matched text, so
+    its comment may not say it never prints matched content. The closing note runs after the
+    attribution step and must point a responder at it, not only at the two scans."""
+    assert "never the matched content" not in _body(_STEP3)
+    names = [s.get("name") for s in _steps()]
+    note = names[names.index(_STEP3) + 1]
+    body = str(_step(str(note))["run"])
+    assert "names each hit's commit" in body and "both scan steps" not in body, body
