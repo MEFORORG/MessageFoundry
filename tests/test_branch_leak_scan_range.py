@@ -5,7 +5,9 @@
 The scan step's shipped ``run:`` body is EXECUTED under ``bash -e`` inside a throwaway git repository,
 with ``python`` replaced by a stub scanner that reports any file carrying a synthetic marker. The
 regression row is a branch whose first pushed commit adds the marker and whose second removes it: the
-tip tree is clean, so a tip-only scan passes, while the content stays public by SHA.
+tip tree is clean, so a tip-only scan passes, while the content stays public by SHA. A second row
+(BACKLOG #8244 item 63) is a later push whose earlier push's run never finished: the scan walks every
+commit not on main, so it still finds the earlier commit.
 
 The stub stands in for ``scan_forbidden.py`` only, so these rows measure how the step picks and lays
 out what to scan, never the scanner's detectors.
@@ -175,13 +177,42 @@ def test_a_force_push_with_an_unknown_before_falls_back_to_main(bash: str, tmp_p
     assert rc == 1, f"rc={rc}\n{out}"
 
 
-def test_a_later_push_scans_only_its_own_commits(bash: str, tmp_path: Path) -> None:
-    """The commit that removed the file adds nothing, and the earlier commit was its own push's."""
+def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
+    bash: str, tmp_path: Path
+) -> None:
+    """BACKLOG #8244 item 63: the leak was the earlier push's, and that push's run errored, timed out
+    or never started. A ``before..after`` range began after it, so no run ever scanned it."""
     repo = _Repo(tmp_path)
     leaked, removed = _leak_then_remove(repo)
     rc, out, calls = _run(bash, repo.path, tmp_path, leaked, removed)
+    assert rc == 1, f"rc={rc}; the earlier push's commit was not rescanned\n{out}"
+    assert "HIT docs/security/note.md" in out, out
+    assert len(calls) == 1 and leaked in calls[0], calls
+
+
+def test_a_repeated_path_and_content_pair_is_written_once(bash: str, tmp_path: Path) -> None:
+    """The same blob at the same path is the same scan input, so it is copied once per run."""
+    repo = _Repo(tmp_path)
+    _commit(repo.path, "add", {"a.txt": "same\n"})
+    _commit(repo.path, "drop", {"a.txt": None})
+    after = _commit(repo.path, "re-add", {"a.txt": "same\n"})
+    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
     assert rc == 0, f"rc={rc}\n{out}"
-    assert calls == ["--path ."], f"nothing added, so only the tip is scanned: {calls}"
+    assert "1 commit(s) with 1 distinct" in out, out
+
+
+def test_the_same_content_at_two_paths_or_two_contents_at_one_path_are_both_written(
+    bash: str, tmp_path: Path
+) -> None:
+    """The discriminating half of the row above: the key is path AND content, never either alone, so
+    a path detector still sees each path and a changed file is still read at each version."""
+    repo = _Repo(tmp_path)
+    _commit(repo.path, "one", {"a.txt": "same\n", "b.txt": "same\n"})
+    _commit(repo.path, "two", {"a.txt": f"{_MARKER}\n"})
+    after = _commit(repo.path, "three", {"a.txt": "clean again\n"})
+    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
+    assert rc == 1 and "HIT a.txt" in out, f"rc={rc}\n{out}"
+    assert "3 commit(s) with 4 distinct" in out, out
 
 
 def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) -> None:

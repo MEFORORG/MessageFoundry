@@ -48,14 +48,18 @@ name: Branch leak scan
 # just scanned: one ubuntu job, a full-history checkout plus setup-python plus a stdlib-only scanner,
 # no install step and no dependency resolution.
 #
-# WHAT IT SCANS (BACKLOG #5595): the TIP working tree, and then every file each commit in the pushed
-# range added or changed, at that commit. Scanning only the tip missed content added in one pushed
-# commit and removed in a later one: the earlier commit is still public by SHA while the tip is clean.
-# The range is the push's `before..after`, less what `origin/main` already holds, since main's content
-# went through the merge queue's scan. A new branch (a zero `before`) and a force-push whose `before`
-# is not in this clone fall back to everything not on `origin/main`, which is a superset and so safe.
-# A merge commit is diffed against its FIRST parent, so content a conflict resolution introduced is
-# scanned too.
+# WHAT IT SCANS (BACKLOG #5595): the TIP working tree, and then every file each commit on the branch
+# added or changed, at that commit. Scanning only the tip missed content added in one pushed commit
+# and removed in a later one: the earlier commit is still public by SHA while the tip is clean. The
+# commits are EVERY commit reachable from the pushed head and not from `origin/main`, on every push,
+# since main's content went through the merge queue's scan. It is NOT the push's `before..after`
+# (BACKLOG #8244 item 63): that range trusts the run for the earlier push to have finished, and a run
+# that errored, timed out or never started left its commits unscanned, with the next push's range
+# beginning after them. A commit a force-push dropped from the branch is reachable from neither, so it
+# is scanned only if the run for the push that carried it completed. A merge commit is diffed against
+# its FIRST parent, so content a conflict resolution introduced is scanned too. Each distinct file
+# path and content pair is written once per run, so a branch's earlier commits and its merges of
+# main cost one copy each rather than one per commit that repeats them.
 
 on:
   push:
@@ -69,11 +73,11 @@ on:
 
 # NO `concurrency:` BLOCK, so no push's scan is ever cancelled or dropped (BACKLOG #5595). This used
 # to be a per-ref group with cancel-in-progress, on the premise that "the newer push runs the same scan
-# over a superset of the same refs". That premise is FALSE: each run scans the commits ITS push added,
-# and a later push's range starts where the earlier one ended, so the earlier range is not in it. A
-# force-push can also drop the earlier commits from the branch, yet they stay public by SHA. A per-ref
-# group without cancel-in-progress would not fix it either: GitHub keeps one pending run per group and
-# cancels the older pending one. tests/test_branch_leak_scan_range.py refuses the block's return.
+# over a superset of the same refs". That premise is FALSE for a force-push: it can drop the earlier
+# commits from the branch, so the newer run no longer reaches them, yet they stay public by SHA, and
+# the cancelled run was the only one that would have scanned them. A per-ref group without
+# cancel-in-progress would not fix it either: GitHub keeps one pending run per group and cancels the
+# older pending one. tests/test_branch_leak_scan_range.py refuses the block's return.
 
 permissions:
   contents: read
@@ -139,18 +143,19 @@ jobs:
             python scripts/security/scan_forbidden.py --path .
             exit 0
           fi
-          exclude=(--not refs/remotes/origin/main)
-          if [ "$PUSH_BEFORE" != "$zero" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-            exclude+=("$PUSH_BEFORE")
-          else
-            echo "no usable 'before' (new branch, or a force-push whose old head is not here): scanning everything not on origin/main."
-          fi
-          commits="$(git rev-list "$PUSH_AFTER" "${exclude[@]}")"
+          # EVERY commit not on origin/main, never only `before..after` (BACKLOG #8244 item 63): an
+          # earlier push's run may have errored, timed out or never started. `before` is validated
+          # above and never narrows the scan.
+          echo "scanning every commit reachable from the pushed head and not from origin/main."
+          commits="$(git rev-list "$PUSH_AFTER" --not refs/remotes/origin/main)"
           snap="$RUNNER_TEMP/branch-leak-scan-commits"
           rm -rf "$snap"
           mkdir -p "$snap"
           roots=()
           files=0
+          # One copy of each path-and-content pair: the same blob at the same path is the same scan
+          # input, and every push now walks the whole branch, its merges of main included.
+          declare -A seen=()
           while read -r sha; do
             [ -n "$sha" ] || continue
             root="$snap/$sha"
@@ -183,6 +188,9 @@ jobs:
                 echo "::error::pushed commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
                 exit 1
               fi
+              key="$blob $path"
+              if [ -n "${seen[$key]+x}" ]; then continue; fi
+              seen[$key]=1
               case "$path" in
                 */*) mkdir -p "$root/${path%/*}" ;;
                 *) mkdir -p "$root" ;;
@@ -195,7 +203,7 @@ jobs:
               files=$((files + n))
             fi
           done <<< "$commits"
-          echo "pushed range: ${#roots[@]} commit(s) with $files added or changed file(s)."
+          echo "branch range: ${#roots[@]} commit(s) with $files distinct added or changed file(s)."
           # ONE scan of the tip tree and every commit root. Each commit is its own root, so a path
           # detector keyed on `docs/security/` still sees the repository-relative path, and the tip
           # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
