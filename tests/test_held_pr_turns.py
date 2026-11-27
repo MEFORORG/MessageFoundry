@@ -1672,7 +1672,7 @@ CLOSED_ID = "local_Cd34ef56-0000-4000-8000-000000000000"
 
 
 def _closed_body(session: str = CLOSED_ID) -> str:
-    """The wrapup skill's closing post: the marker line, then the author's own words."""
+    """The closing post's shape: the marker line, then the author's own words."""
     return (
         f"<!-- author-session-closed session={session} -->\n"
         "The author session closed; repairs go to the Repair Manager, the merge stays the Lander's."
@@ -1748,7 +1748,7 @@ def test_a_minimized_author_closed_marker_does_not_count(
     assert _turn(rows[415]) == ("LANDER", ["replied", "no-new-commit"])
 
 
-@pytest.mark.parametrize("session", ["", "a" * 65, "local_x.y", "local x", "local_xé"])
+@pytest.mark.parametrize("session", ["", "a" * 65, "local_x.y", "local x", "local_x\u00e9"])
 def test_an_author_closed_marker_with_a_bad_session_id_does_not_count(
     session: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1765,7 +1765,7 @@ def test_an_author_closed_marker_with_a_bad_session_id_does_not_count(
         " " + _closed_body(),
         "> " + _closed_body(),
         _closed_body().replace(" -->\n", " --> trailing\n", 1),
-        _closed_body().replace(" -->\n", " --> \n", 1),
+        _closed_body().replace(" -->\n", " -->\u2028\n", 1),
     ],
 )
 def test_an_author_closed_marker_off_line_one_does_not_count(
@@ -1776,14 +1776,68 @@ def test_an_author_closed_marker_off_line_one_does_not_count(
     assert _turn(rows[425]) == ("LANDER", ["replied", "no-new-commit"])
 
 
-def test_an_author_commit_after_the_marker_means_the_author_is_not_gone(
+def test_a_push_after_the_hold_voids_the_author_closed_marker(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The head no longer starts with the hold's SHA, which is how the script reads a commit."""
-    pushed = _held(430, _closed(), head=_sha(431))
-    pushed["commits"]["nodes"][0]["commit"]["committedDate"] = "2026-10-28T14:00:00Z"
-    rows = _engine_rows(tmp_path, capsys, pushed)
+    """The script reads a commit only as a head that no longer starts with the hold's SHA, so a
+    push after the marker and one between the hold and the marker read alike: both void it."""
+    rows = _engine_rows(tmp_path, capsys, _held(430, _closed(), head=_sha(431)))
     assert _turn(rows[430]) == ("LANDER", ["new-commit", "replied"])
+
+
+def test_anything_after_the_author_closed_marker_voids_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A comment, a review, an ack of another SHA or an edit after the marker says the author is
+    not gone, so the marker is an ordinary reply."""
+    edited_marker = _closed()
+    edited_marker["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    edited_old = _comment("Manager: answered.", "2026-10-28T12:30:00Z")
+    edited_old["lastEditedAt"] = "2026-10-28T14:00:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        _held(450, _closed(), _comment("still here, fixing", "2026-10-28T14:00:00Z")),
+        _held(451, _closed(), reviews=[_review("", "2026-10-28T14:00:00Z")]),
+        _held(452, _closed(), _ack("2026-10-28T14:00:00Z", _sha(9))),
+        _held(453, edited_marker),
+        _held(454, edited_old, _closed()),
+    )
+    for n in (450, 451, 452):
+        assert _turn(rows[n]) == ("LANDER", ["replied", "no-new-commit"])
+    assert _turn(rows[453]) == ("LANDER", ["replied", "edited", "no-new-commit"])
+    assert _turn(rows[454]) == ("LANDER", ["replied", "edited", "no-new-commit"])
+
+
+def test_an_author_closed_marker_beside_other_lander_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Beside an earlier transfer it reads ``repair-rehold`` too; an edit between the hold and the
+    marker keeps it; a cut page replaces it with ``page-cut``."""
+    rehold = _pr(
+        455,
+        comments=[
+            _repair("2026-10-28T11:00:00Z"),
+            _hold("2026-10-28T12:00:00Z", _sha(455)),
+            _closed(),
+        ],
+    )
+    edited_before = _comment("Manager: answered.", "2026-10-28T12:10:00Z")
+    edited_before["lastEditedAt"] = "2026-10-28T12:20:00Z"
+    rows = _engine_rows(
+        tmp_path,
+        capsys,
+        rehold,
+        _held(456, edited_before, _closed()),
+        _cut(_held(457, _closed())),
+    )
+    assert _repair_row(rows[455]) == (
+        "LANDER",
+        ["held", "author-closed", "repair-rehold"],
+        OWNER_ID,
+    )
+    assert _turn(rows[456]) == ("LANDER", ["replied", "edited", "no-new-commit", "author-closed"])
+    assert _turn(rows[457]) == ("LANDER", ["held", "page-cut"])
 
 
 def test_an_author_closed_marker_on_a_hold_not_naming_the_head_does_not_count(

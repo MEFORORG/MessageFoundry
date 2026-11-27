@@ -149,7 +149,8 @@ to a minimized marker at or after the hold still hands the turn back, as any edi
 The PR is REPAIR's turn, its row naming the marker's session as ``repairOwner``, ONLY when ALL of
 these hold:
 
-* every AUTHOR condition above holds, reading every qualifying marker as neither a reply nor a Lander
+* every AUTHOR condition above holds, reading every qualifying marker, and every counting
+  author-session-closed marker (THE AUTHOR-CLOSED CONTRACT), as neither a reply nor a Lander
   event, so REPAIR is never reached from a state that fails an AUTHOR condition (a marker before
   the hold, which would make it ``repair-rehold``, does not stop a fresh one making it REPAIR's);
 * at least one qualifying marker was posted strictly after the hold's second (a same-second marker
@@ -190,8 +191,9 @@ page.
 When either connection's ``pageInfo.hasPreviousPage`` is true, or its ``pageInfo`` cannot say, a row
 that would read AUTHOR or REPAIR reads LANDER instead, ``page-cut`` following its other flags and
 preceding ``in-queue`` or ``auto-armed``. A REPAIR row keeps ``repair`` and ``repairOwner``: an
-author comment or a later hold off the page could have ended the transfer. No other row changes:
-every LANDER row reads as it would on an uncut page.
+author comment or a later hold off the page could have ended the transfer. A LANDER row carrying
+``author-closed`` loses that flag and gains ``page-cut`` in its place (THE AUTHOR-CLOSED
+CONTRACT). No other row changes: every other LANDER row reads as it would on an uncut page.
 
 A marker posted by a GitHub App or bot is not read, as no bot event is (WHAT COUNTS AS AN EVENT).
 
@@ -242,10 +244,16 @@ when ALL of these hold:
   as AUTHOR's turn reads it; a same-second marker is not provably after the hold);
 * the PR's ``headRefOid`` starts with the hold's SHA, which is how "no author commit after the
   marker" is read, and is stricter, since it also catches a push between the hold and the marker;
-* no ack naming the head is at or after the newest such marker's second: an ack after it says
-  the author is still working, so the author is not gone;
-* the PR is not in the merge queue and has no armed auto-merge request (``_row`` drops the flag
-  there, keeping ``in-queue`` or ``auto-armed``).
+* nothing but a qualifying repair-owner marker or another unedited closed marker is at or after
+  the newest such marker's second, by its latest edit: an ack of any SHA, a comment, a review or
+  an edit after it, the marker's own edit included, says the author is not gone;
+* the PR is not in the merge queue and has no armed auto-merge request, and neither comment nor
+  review page was cut (``_row`` drops the flag on such a PR, keeping ``in-queue``, ``auto-armed``
+  or ``page-cut``, and the row otherwise reads as it would with the marker counted).
+
+The script cannot tell which session posted a marker, since every seat posts under one login;
+CLAUDE.md section 5 says only the original author session posts one. The session id is read for
+the shape only, and is not reported.
 
 A counting closed marker is set aside as neither a reply nor a Lander event, as an ack is. The PR
 then reads LANDER, flagged ``author-closed`` after ``held`` (and ``acked`` when an earlier ack
@@ -254,8 +262,10 @@ stands): the hold stands and the Lander may transfer the PR to the Repair Manage
 repair-owner marker or a REPAIR turn: the transfer steps in CLAUDE.md section 5 still run. Where
 the PR is REPAIR's already (a repair-owner marker after the hold), it stays REPAIR's, and the
 closed marker is set aside. On a PR whose reply or edit after the hold already reads LANDER, a
-counting marker adds ``author-closed`` beside those flags. A marker that does not count, an
-invalid shape or a minimized one included, is an ordinary event, so one after the hold is a reply.
+counting marker adds ``author-closed`` beside those flags, as it does beside ``repair-rehold``. A
+marker that does not count in ``classify``, an invalid shape or a minimized one included, is an
+ordinary event, so one after the hold is a reply. A closed marker before the hold does not count:
+a hold posted after the author closed reads AUTHOR until it expires (HOLD_TTL).
 
 A HOLD ON A QUEUED OR ARMED PR IS THE LANDER'S. A PR in the merge queue, or with auto-merge armed,
 merges without its author moving, so a hold on it reads LANDER with ``held`` kept beside the
@@ -454,7 +464,7 @@ def _signed_marker(pattern: re.Pattern[str], body: str) -> re.Match[str] | None:
     lines = body.split("\n", 2)
     if len(lines) < 2 or not _LANDER_SIGNATURE.match(lines[1]):
         return None
-    return pattern.fullmatch(lines[0].rstrip(_TRAILING))
+    return _first_line_marker(pattern, body)
 
 
 def hold_head(body: str) -> str | None:
@@ -693,7 +703,8 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
     """``(turn, flags, repair owner)`` for one PR; the owner is ``None`` without a ``repair`` or
     ``repair-rehold`` flag, and may be ``None`` beside ``repair-rehold`` (``_earlier_transfer``).
 
-    Pure; the module docstring states the rules. ``page-cut``, ``ack-expired`` and ``hold-expired`` are ``_row``'s.
+    Pure; the module docstring states the rules. ``page-cut``, ``ack-expired`` and ``hold-expired``
+    are ``_row``'s, and so is dropping ``author-closed`` on a queued, armed or cut-page PR.
     """
     turn_events = [e for e in events if not e.bot]
     landers = [e for e in turn_events if e.lander]
@@ -711,13 +722,22 @@ def classify(head_oid: str, events: Iterable[Event]) -> tuple[str, list[str], st
     after = [e for e in turn_events if e.latest >= when and not e.lander and not e.cancelled]
     # An ack naming the head says "still my move", not a reply; any other event after it is one.
     acks = [e for e in after if (a := e.acked_at) is not None and head.startswith(a)]
-    # An author's closing hand-over strictly after the hold, on the hold's head, with no ack from
-    # its second on, is neither a reply nor a Lander event (THE AUTHOR-CLOSED CONTRACT).
+    # An author's closing hand-over strictly after the hold, on the hold's head, with nothing but a
+    # transfer from its second on, is neither a reply nor a Lander event (THE AUTHOR-CLOSED
+    # CONTRACT).
     closed = [] if new_commit else [e for e in after if e.when > when and e.closed_by is not None]
-    newest_closed = max((e.when for e in closed), default=None)
-    if newest_closed is not None and any(e.latest >= newest_closed for e in acks):
-        closed = []
-    after = [e for e in after if not any(e is c for c in closed)]
+    if closed:
+        newest_closed = max(e.when for e in closed)
+        # Any other event or edit from the marker's second on shows the author is not gone.
+        if any(
+            e.latest >= newest_closed
+            and e.repair_by is None
+            and (e.closed_by is None or e.edited is not None)
+            for e in turn_events
+        ):
+            closed = []
+    closed_ids = {id(e) for e in closed}
+    after = [e for e in after if id(e) not in closed_ids]
     replied = len(acks) < len(after)
     # Every seat posts under one login, so who edited cannot be told: any edit from the hold's
     # second on, of the hold itself or of an older Lander comment too, hands the turn back.
@@ -810,10 +830,13 @@ def _row(repo: str, pr: dict[str, Any], read: RepoRead, now: datetime) -> dict[s
         # Nobody answered the hold, so after 30 minutes it is the Lander's to repair or transfer.
         turn = LANDER
         flags.append("hold-expired")
-    if would in (AUTHOR, REPAIR) and page_cut(pr):
+    if (would in (AUTHOR, REPAIR) or "author-closed" in flags) and page_cut(pr):
         # A marker before the hold, a reply by editing an old comment, or an author comment or a
-        # later hold that ended a transfer, may be off the page.
+        # later hold that ended a transfer, may be off the page; so may an old comment edited
+        # after an author-closed marker, which would void it.
         turn = LANDER
+        if "author-closed" in flags:
+            flags.remove("author-closed")
         flags.append("page-cut")
     if pr.get("mergeQueueEntry"):
         flags.append("in-queue")
