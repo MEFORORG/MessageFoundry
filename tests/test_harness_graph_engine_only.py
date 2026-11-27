@@ -26,7 +26,7 @@ from harness.load.ids import SHARDCERT_IDS
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
 from tests._ast_sites import named_func, parse_source
-from tests.test_dependency_boundaries import _modules_imported_by
+from tests.test_dependency_boundaries import _is_forbidden, _modules_imported_by
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO_ROOT / "harness" / "config"
@@ -181,16 +181,76 @@ def test_inlined_id_parser_matches_harness_load_ids() -> None:
         assert inlined.parse(SHARDCERT_IDS.format(seq)) == seq
 
 
+def _harness_imports(path: Path, graph: str) -> list[str]:
+    """The ``harness`` modules ``path`` imports, read as a module of ``harness/config/<graph>``.
+
+    It reads import statements only. A string import, such as ``importlib.import_module("harness")``
+    or ``__import__("harness")``, passes this scan and, in a function body, the load test too."""
+    # The loader runs a config module under a top-level name with no parent package, so a relative
+    # import there raises rather than reaching harness. Reading the file as a member of its harness
+    # package over-reports on purpose: such a line is refused here, not passed.
+    tree = parse_source(path.read_text(encoding="utf-8"))
+    imported = _modules_imported_by(tree, f"harness.config.{graph}")
+    return sorted(name for name in imported if _is_forbidden(name, ("harness",)))
+
+
+def _harness_imports_in(directory: Path, graph: str) -> dict[str, list[str]]:
+    """Each ``.py`` file in ``directory`` that imports a ``harness`` module, and what it imports."""
+    found = {path.name: _harness_imports(path, graph) for path in sorted(directory.glob("*.py"))}
+    return {name: hits for name, hits in found.items() if hits}
+
+
 @pytest.mark.parametrize("graph", _GRAPHS)
 def test_the_graph_does_not_import_the_harness_package(graph: str) -> None:
     # Every file in the directory, function bodies too: a Router's or Handler's body does not run in
     # the load test above, and a non-_ module such as connscale's gen_toml.py is loaded as config.
-    modules = sorted((_CONFIG / graph).glob("*.py"))
-    assert {"_shape.py", "graph.py"} <= {path.name for path in modules}
-    found: dict[str, list[str]] = {}
-    for path in modules:
-        # The module's own package, so a relative import resolves to the harness name it reaches.
-        tree = parse_source(path.read_text(encoding="utf-8"))
-        imported = _modules_imported_by(tree, f"harness.config.{graph}")
-        found[path.name] = [name for name in imported if name.split(".")[0] == "harness"]
-    assert not any(found.values()), found
+    assert {"_shape.py", "graph.py"} <= {path.name for path in (_CONFIG / graph).glob("*.py")}
+    assert _harness_imports_in(_CONFIG / graph, graph) == {}
+
+
+# Each planted source, and the harness module the scan must name for it in a module of
+# harness/config/load. Read with the file's bare stem as its package, the relative forms name none.
+_PLANTED_HARNESS_IMPORTS = {
+    "import harness.config.x": "harness.config.x",
+    "import os, harness": "harness",
+    "import Harness": "Harness",
+    "from harness.config.load._shape import y": "harness.config.load._shape",
+    "from . import _shape": "harness.config.load",
+    "from ._shape import y": "harness.config.load._shape",
+    "from .. import estate": "harness.config",
+    "from ..estate._shape import y": "harness.config.estate._shape",
+    "from ... import load": "harness",
+    "def route(message):\n    from ._shape import y\n": "harness.config.load._shape",
+}
+
+
+@pytest.mark.parametrize(("source", "expected"), list(_PLANTED_HARNESS_IMPORTS.items()))
+def test_control_the_scan_flags_a_planted_harness_import(
+    source: str, expected: str, tmp_path: Path
+) -> None:
+    # If this starts passing a planted source, the scan has stopped seeing that form and the test
+    # above proves nothing for it.
+    planted = tmp_path / "graph.py"
+    planted.write_text(source + "\n", encoding="utf-8")
+    assert expected in _harness_imports(planted, "load")
+
+
+def test_control_the_directory_scan_names_the_one_planted_file(tmp_path: Path) -> None:
+    # A real graph's copy with one file added, so the graph test's directory walk is what is read.
+    config = tmp_path / "load"
+    shutil.copytree(_CONFIG / "load", config, ignore=shutil.ignore_patterns("__pycache__"))
+    (config / "planted.py").write_text("from ._shape import y\n", encoding="utf-8")
+    assert _harness_imports_in(config, "load") == {"planted.py": ["harness.config.load._shape"]}
+
+
+def test_control_the_scan_passes_a_module_with_no_harness_import(tmp_path: Path) -> None:
+    # The bare sibling import the graphs use, and names that only begin with "harness".
+    clean = tmp_path / "graph.py"
+    clean.write_text(
+        "import harnessy\n"
+        "from harness_tools import x\n"
+        "from _shape import wire_graph\n"
+        "from messagefoundry import inbound\n",
+        encoding="utf-8",
+    )
+    assert _harness_imports(clean, "load") == []
