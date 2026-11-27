@@ -434,10 +434,13 @@ def test_the_inline_arm_detector_on_planted_lines(line: str, inline: bool) -> No
 
 def test_each_list_is_well_formed() -> None:
     """What ``ci_path_list`` and the step both refuse, plus: every line anchored, no line twice."""
-    for arm in _INLINE_AT_60EB058:
-        lines = ci_path_list(arm)
-        unanchored = [line for line in lines if not line.startswith("^")]
-        assert not unanchored, f"{arm} list lines without `^`: {unanchored}"
+    lists = {arm: ci_path_list(arm) for arm in _INLINE_AT_60EB058}
+    assert len(lists) >= 5, f"read {len(lists)} lists, expected the five pinned arms"
+    unanchored = [
+        (arm, line) for arm, lines in lists.items() for line in lines if not line.startswith("^")
+    ]
+    assert not unanchored, f"list lines without `^`: {unanchored}"
+    for arm, lines in lists.items():
         assert len(set(lines)) == len(lines), f"the {arm} list repeats a line"
 
 
