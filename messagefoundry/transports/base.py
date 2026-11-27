@@ -985,12 +985,13 @@ async def _end_hold(
 def _held_loss_reason(failed: int, reason: str, *, cut_off: bool) -> str:
     """The value-free ``ERROR`` reason for a held frame the hold ends without: fixed text, a count
     and the ``safe_exc`` text of the last fault. Kept short, since the store bounds the column to
-    200 characters and a head note goes in front of it. "may also be RECEIVED" because an attempt
-    whose fault came after its commit, or one a cancel cut off, may have recorded the frame."""
+    200 characters and a head note goes in front of it. "other copies may exist" because an
+    attempt whose fault came after its commit, or one a cancel cut off, may have recorded the frame,
+    and that copy may since have moved to any status, so the text names none."""
     cut = "last attempt cancelled; " if cut_off else ""
     return (
         f"held until the listener stopped; {cut}handler failed {failed} times "
-        f"(may also be RECEIVED): {reason}"
+        f"(other copies may exist): {reason}"
     )
 
 

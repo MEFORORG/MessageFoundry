@@ -10339,7 +10339,10 @@ class RegistryRunner:
             except IngressGuardError as exc:
                 # ``reason`` is decode_body's content-free text: a codec, a position, a cause.
                 log.warning(
-                    "held frame on inbound %s did not decode as text, so it is stored undecoded: %s",
+                    # Logged before the write, which can fail: so "any row written", not "stored".
+                    "held frame on inbound %s did not decode as text, so any row written for it"
+                    " holds its bytes as a latin-1 view or as mfb64:v1: byte carriage, whole or cut"
+                    " to a head: %s",
                     ic.name,
                     exc.reason,
                 )

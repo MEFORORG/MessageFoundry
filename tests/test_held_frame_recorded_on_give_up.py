@@ -172,7 +172,7 @@ async def test_a_frame_whose_write_never_clears_is_recorded_error_once_at_stop(
     body = _doc_hl7().encode("utf-8")
     assert error == (
         f"[held frame: stored only the head of a {len(body):,}-byte body] "
-        "held until the listener stopped; handler failed 3 times (may also be RECEIVED): "
+        "held until the listener stopped; handler failed 3 times (other copies may exist): "
         "OperationalError: [driver message withheld]"
     ), error
     assert "DOE" not in error and "MRN123" not in error, "the reason carries message content"
@@ -278,7 +278,7 @@ async def test_a_cancel_inside_an_attempt_still_records_the_frame(
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     assert (
-        "; last attempt cancelled; handler failed 1 times (may also be RECEIVED)"
+        "; last attempt cancelled; handler failed 1 times (other copies may exist)"
         in (rows[0]["error"])
     )
     assert allowance.try_charge(ic.name, _POLICY.allowance_bytes)
@@ -500,8 +500,9 @@ def test_the_resubmit_refusal_does_not_promise_a_resend_for_a_held_frame() -> No
 
 
 def test_the_resubmit_refusal_names_only_what_this_row_holds() -> None:
-    # Hold finding 8: an attempt whose fault came after its commit may have left a RECEIVED copy, so
-    # the refusal must not say this head is all the engine holds.
+    # Hold finding 8: an attempt whose fault came after its commit may have left a committed copy,
+    # so the refusal must not say this head is all the engine holds. That copy may since have moved
+    # to any status, so the refusal names none.
     allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
     held = allowance.bound_uncharged(
         _doc_hl7().encode("utf-8"), None, "hl7v2", "held", cipher=_KEYLESS
@@ -509,6 +510,11 @@ def test_the_resubmit_refusal_names_only_what_this_row_holds() -> None:
     refusal = head_only_resubmit_refusal("m1", held.metadata)
     assert refusal is not None and "this row holds only the frame's head" in refusal, refusal
     assert "all the engine holds" not in refusal, refusal
+    assert "under any status" in refusal, refusal
+    assert not [s.value for s in MessageStatus if s.value in refusal.lower()], refusal
+    # A held frame was not refused, and a cancelled attempt may have committed a copy too.
+    assert "refused body" not in refusal and "held frame" in refusal, refusal
+    assert "faulted or was cancelled" in refusal, refusal
 
 
 async def test_a_cancel_while_waiting_for_an_mllp_slot_is_recorded_as_a_cancel(
@@ -573,5 +579,6 @@ async def test_a_held_frame_that_does_not_decode_logs_a_warning_without_its_body
         if r.name == "messagefoundry.pipeline.wiring_runner" and r.levelno == logging.WARNING
     ]
     assert any("did not decode as text" in m and _INBOUND in m for m in lines), lines
+    assert any("any row written for it" in m for m in lines), lines
     assert not any("MRN123" in m or "DOE" in m for m in lines), lines
     assert not any("0xff" in m or "\xff" in m or "\xfe" in m for m in lines), lines

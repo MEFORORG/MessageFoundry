@@ -337,7 +337,9 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         return None
     total = _count(record.get("bytes"))
     head = _count(record.get("head_bytes"))
-    body = f"this {total:,}-byte refused body" if total is not None else "this refused body"
+    # A held frame was not refused for what it holds: its store write failed until the stop.
+    noun = "held frame" if record.get(HELD_FRAME_KEY) is True else "refused body"
+    body = f"this {total:,}-byte {noun}" if total is not None else f"this {noun}"
     # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
     kept = f", cut to a {head:,}-byte head bound" if head is not None else ""
     remedy = (
@@ -348,9 +350,11 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         " erased it, a user scoped to that message who may view raw bodies can read it there"
         if "reingress_of_seq" in parsed and isinstance(parsed.get("correlation_id"), str)
         # BACKLOG #1619 item 6: a held frame's sender waits for no reply and never resends it. An
-        # attempt may also have recorded it RECEIVED, so this names only what this row holds.
+        # attempt that committed before it faulted or was cancelled may also have stored it, each
+        # such copy whole or as a head and since moved to any status, so this names no status.
         else "its sender never resends it, and this row holds only the frame's head; an attempt"
-        " that faulted after its commit may have left a whole RECEIVED copy on this inbound"
+        " that committed before it faulted or was cancelled may have left other copies of this"
+        " message on this inbound, whole or as a head, under any status"
         if record.get(HELD_FRAME_KEY) is True
         else "have the sender send its own copy again"
     )
