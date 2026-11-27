@@ -10336,7 +10336,14 @@ class RegistryRunner:
         if not ic.content_type.is_binary:
             try:
                 text = decode_body(raw, ic)  # the same decode, and surrogate refusal, as ingress
-            except IngressGuardError:
+            except IngressGuardError as exc:
+                # The exception's own text is not logged: it can quote the bytes it refused.
+                log.warning(
+                    "held frame on inbound %s did not decode as text (%s), so its ERROR row "
+                    "stores it as received",
+                    ic.name,
+                    type(exc).__name__,
+                )
                 text = None
         bounded = self._refused_body.bound_uncharged(
             raw, text, ic.content_type.value, reason, cipher=self.store.cipher()

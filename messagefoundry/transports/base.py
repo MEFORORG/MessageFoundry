@@ -755,6 +755,7 @@ async def hold_and_retry(
     stopped: Callable[[], bool],
     report: Callable[[str], Awaitable[None]],
     record_loss: HeldFrameRecorder | None = None,
+    slot: Callable[[], contextlib.AbstractAsyncContextManager[object] | None] | None = None,
 ) -> str | None:
     """Retry ``handler`` on a frame it faulted on, for a listener whose sender waits for no reply
     (BACKLOG #5022), and return its reply once one attempt succeeds. ``reason`` is the first fault,
@@ -790,6 +791,11 @@ async def hold_and_retry(
     inside an attempt records it too, and its reason says the cut-off attempt may also have
     recorded it, since a second row is a lesser fault than a frame that may be lost uncounted. It
     is called only once the hold has ended, so the hold itself still has no attempt cap.
+
+    ``slot``, where given, names the context each attempt waits in before it calls ``handler``, such
+    as the MLLP listener's in-flight bound; it returns ``None`` when there is none. A cancel while
+    an attempt waits there did not cut off ``handler``, so it is recorded as a cancel, not as an
+    attempt that may have committed.
     """
     failed = 1  # attempts that ended in a fault
     reported = False
@@ -833,9 +839,11 @@ async def hold_and_retry(
                 )
                 await _pause(delay, stopped)
                 last = stopped()  # a stop during the pause makes this attempt the last
-            in_attempt = True
             try:
-                reply = await handler(frame)
+                gate = slot() if slot is not None else None
+                async with gate if gate is not None else contextlib.nullcontext():
+                    in_attempt = True
+                    reply = await handler(frame)
             except Exception as exc:  # noqa: BLE001 -- any escape is a handler fault; see the docstring
                 in_attempt = False
                 reason = safe_exc(exc)

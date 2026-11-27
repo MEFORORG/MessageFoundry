@@ -3378,10 +3378,11 @@ class MLLPSource(SourceConnector):
                                 # Set until recovered, so a cancel inside the hold is no clean close.
                                 failed = True
                                 try:
-                                    # Each retry runs through _handle_bounded, so it takes an
-                                    # in-flight slot and gives it back before the next pause.
+                                    # Each retry takes an in-flight slot, as _handle_bounded does,
+                                    # and gives it back before the next pause. The hold waits for
+                                    # it itself, so a cancel during that wait is no cut-off attempt.
                                     reply = await hold_and_retry(
-                                        lambda raw: self._handle_bounded(raw, handle, intake),
+                                        lambda raw: deliver(handle, raw, intake),
                                         message,
                                         fault,
                                         transport="MLLP",
@@ -3392,6 +3393,7 @@ class MLLPSource(SourceConnector):
                                             "handler_error", peer_host=peer_host, reason=reason
                                         ),
                                         record_loss=self.record_lost_frame,
+                                        slot=lambda: self._inflight,
                                     )
                                 except HandlerFaultUnrecovered:
                                     handler_dropped = True  # handler_error is recorded; close

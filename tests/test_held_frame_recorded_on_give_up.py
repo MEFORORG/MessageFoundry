@@ -497,3 +497,76 @@ def test_the_resubmit_refusal_does_not_promise_a_resend_for_a_held_frame() -> No
     refusal = head_only_resubmit_refusal("m1", held.metadata)
     assert refusal is not None and "never resends" in refusal
     assert "send its own copy again" not in refusal
+
+
+def test_the_resubmit_refusal_names_only_what_this_row_holds() -> None:
+    # Hold finding 8: an attempt whose fault came after its commit may have left a RECEIVED copy, so
+    # the refusal must not say this head is all the engine holds.
+    allowance = RefusedBodyAllowance(_POLICY, clock=lambda: 0.0)
+    held = allowance.bound_uncharged(
+        _doc_hl7().encode("utf-8"), None, "hl7v2", "held", cipher=_KEYLESS
+    )
+    refusal = head_only_resubmit_refusal("m1", held.metadata)
+    assert refusal is not None and "this row holds only the frame's head" in refusal, refusal
+    assert "all the engine holds" not in refusal, refusal
+
+
+async def test_a_cancel_while_waiting_for_an_mllp_slot_is_recorded_as_a_cancel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Hold finding 10: the retry waits for an in-flight slot that never frees, so the cancel lands
+    # before the handler is called. No attempt was cut off, so neither the row nor the log says so.
+    source = _mllp_source()
+    source._inflight = asyncio.Semaphore(1)
+    recorder = _Recorder()
+    source.record_lost_frame = recorder
+    calls = 0
+    waiting = asyncio.Event()
+
+    async def handler(_raw: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        # Every later attempt meets a bound with no free slot, as under a full listener.
+        source._inflight = asyncio.Semaphore(0)
+        waiting.set()
+        raise RuntimeError("synthetic store outage")
+
+    source._handler = handler
+    with caplog.at_level(logging.WARNING):
+        client = asyncio.create_task(
+            source._on_client(_ThenEof(frame(_doc_hl7())), _Peer())  # type: ignore[arg-type]
+        )
+        await asyncio.wait_for(waiting.wait(), timeout=2.0)
+        for _ in range(20):  # let the hold reach the slot wait
+            await asyncio.sleep(0)
+        client.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(client, timeout=2.0)
+
+    assert calls == 1, "the handler ran again, so the slot wait was not reached"
+    assert len(recorder.calls) == 1
+    reason = recorder.calls[0][1]
+    assert "last attempt cancelled" not in reason, reason
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("is recorded as ERROR message mid-1" in m for m in errors), errors
+    assert any("the listener task was cancelled" in m for m in errors), errors
+    assert not any("cut-off attempt" in m or "inside attempt" in m for m in errors), errors
+
+
+async def test_a_held_frame_that_does_not_decode_logs_a_warning_without_its_body(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Hold finding 11: the decode failure is not swallowed silently, and the line holds no byte of
+    # the frame.
+    runner, ic, _allowance = _runner(store, ConnectorType.TCP)
+    raw = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X|P|2.5\rPID|1||MRN123||DOE\xff\xfe\r"
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner"):
+        mid = await runner._record_lost_frame(ic, raw, "held")
+    assert mid
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.pipeline.wiring_runner" and r.levelno == logging.WARNING
+    ]
+    assert any("did not decode as text" in m and _INBOUND in m for m in lines), lines
+    assert not any("MRN123" in m or "DOE" in m or "\\xff" in m for m in lines), lines
