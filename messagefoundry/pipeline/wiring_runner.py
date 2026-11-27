@@ -13346,19 +13346,18 @@ class RegistryRunner:
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree. A
         # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
         read_fault: QueueOpenFault | None = None
+        # BACKLOG #5727: each dead-letter below runs after the try, so a failed seal in it chains no
+        # raw open error, whose cause can echo a key service's URL or body. The handlers keep only
+        # strings: the error's type name, and the safe_exc text the dead-letter records.
+        tag_failed = False
+        unopenable: tuple[str, str] | None = None
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
         except QueueTagError:
             # BACKLOG #5982: the token's own payload failed its tag after the claim opened it. The
             # store has audited and alerted it; dead-letter it under the error the handoff records
             # for the same failure, not as an undecryptable reply.
-            log.warning(
-                "response worker %r: work-row %s failed its integrity tag; dead-lettering",
-                name,
-                item.id,
-            )
-            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
-            return _ItemOutcome.PROCESSED, None
+            tag_failed = True
         except CipherError as exc:
             # BACKLOG #5727: a key service that gave no verdict says nothing about this reply, and
             # a fault in the engine's own code is not the cell's either. Both take the fault arm,
@@ -13385,21 +13384,32 @@ class RegistryRunner:
                 # service with no verdict on one of the handoff's encrypts leaves it as a
                 # QueueOpenFault too; its invocation ceiling, a plain CipherError, is a deliberate
                 # hard stop.
-                log.warning(
-                    "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
-                    name,
-                    item.id,
-                    type(exc).__name__,
-                )
-                await self.store.dead_letter_now(
-                    item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
-                )
-                return _ItemOutcome.PROCESSED, None
+                unopenable = (type(exc).__name__, safe_exc(exc))
+        if tag_failed:
+            log.warning(
+                "response worker %r: work-row %s failed its integrity tag; dead-lettering",
+                name,
+                item.id,
+            )
+            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
+            return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
             try:
                 raise read_fault
             finally:
                 del read_fault  # the fault's traceback holds this frame: no cycle through a local
+        if unopenable is not None:
+            error_type, error_text = unopenable
+            log.warning(
+                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                name,
+                item.id,
+                error_type,
+            )
+            await self.store.dead_letter_now(
+                item.id, f"undecryptable re-ingress reply: {error_text}"
+            )
+            return _ItemOutcome.PROCESSED, None
         unstorable = _unstorable_reply(body)
         if unstorable is not None:
             # BACKLOG #5616: a reply holding a lone surrogate. The guards' head sniff raised on one in

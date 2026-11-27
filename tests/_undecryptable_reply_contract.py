@@ -39,6 +39,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     CipherError,
     CipherUnavailableError,
+    UnauthenticatedCipherError,
     cell_aad,
     generate_key,
     make_cipher,
@@ -537,6 +538,43 @@ def _dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
     return case
 
 
+def _worker_dead_letter_seal_failure_carries_no_open_error(which: str) -> ContractCase:
+    """BACKLOG #5727: the step's own read of the token, ahead of the handoff. A verdict on the
+    reply, or a tag failure on the token's reference, dead-letters the token, and a dead-letter
+    whose seal then fails must not chain the raw open error, whose cause can echo the key
+    service's URL and body. Armed after the claim, which opens the same reference."""
+
+    async def case(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
+        mid, item = await _claimed_head(store)
+        target = await _cell(fetch, which, mid)
+        step = runner(store)
+        with faulting_cipher(store) as fault:
+            kind = UnauthenticatedCipherError if which == "ref" else CipherError
+            open_error = kind("synthetic verdict")
+            open_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
+            fault.target, fault.open_error = target, open_error
+            fault.seal_error = CipherError("synthetic invocation ceiling")
+            with pytest.raises(CipherError, match="invocation ceiling") as caught:
+                await step._process_response_item(LOOP, item)
+            rendered = logging.Formatter().formatException(
+                (type(caught.value), caught.value, caught.value.__traceback__)
+            )
+            # CONTROL: the formatter renders the chain it is given, so a clean read is not a miss.
+            assert KEY_SERVICE_TEXT in logging.Formatter().formatException(
+                (type(open_error), open_error, None)
+            )
+            assert KEY_SERVICE_TEXT not in rendered and REPLY not in rendered
+            assert caught.value.__context__ is None
+            await _assert_token_live(store, fetch, mid)
+            # CONTROL: the same token re-ingresses once the fault clears.
+            fault.heal()
+            await step._process_response_item(LOOP, item)
+        assert len(await children(fetch)) == 1
+
+    case.__name__ = f"worker_dead_letter_seal_failure_at_{which}_carries_no_open_error"
+    return case
+
+
 #: Retries of the same token under one outage, each of which opens the faulting cell again.
 OUTAGE_RETRIES = 3
 
@@ -649,6 +687,8 @@ HANDOFF_CASES: list[ContractCase] = [
     seal_outage_reaches_no_reply,
     _dead_letter_seal_failure_carries_no_open_error("reply"),
     _dead_letter_seal_failure_carries_no_open_error("metadata"),
+    _worker_dead_letter_seal_failure_carries_no_open_error("reply"),
+    _worker_dead_letter_seal_failure_carries_no_open_error("ref"),
     _outage_open_leaves_the_loop("worker_ref"),
     _outage_open_leaves_the_loop("worker_reply"),
     _outage_open_leaves_the_loop("ref"),
