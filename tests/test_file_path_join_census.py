@@ -420,10 +420,10 @@ SITES: dict[str, Site] = {
     "harness/load/ingress_probe.py::_probe": Site(
         1, INTERNAL, "A fixed name in a temp directory the probe made."
     ),
-    "harness/load/shardcert.py::_set_aside_kept_log": Site(
-        2,
+    "harness/load/shardcert.py::_restart_env": Site(
+        1,
         INTERNAL,
-        "The node id comes from code; the keep directory is the operator's MEFOR_BENCH_KEEP_NODE_LOGS.",
+        "A fixed subdirectory name under the operator's MEFOR_BENCH_KEEP_NODE_LOGS.",
     ),
     "harness/load/shardcert_ladder.py::_rung_log_paths": Site(
         1, INTERNAL, "Shard ids from the profile, under the operator's keep directory."

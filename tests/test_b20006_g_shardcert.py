@@ -158,11 +158,14 @@ def test_ladder_fails_a_rung_the_single_run_bar_refuses(over: dict[str, int]) ->
 
 @pytest.fixture
 def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
-    """The two-box test's offline fakes, two shards of one lane, with every node's lifecycle logged as
-    ``(event, node index)`` in ``rec.events``."""
+    """The two-box test's offline fakes, two engine shards of one lane each, with every node's lifecycle
+    logged as ``(event, node index)`` in ``rec.events``. ``rec.fail_start`` names the engine shards, or
+    the node indexes, whose start raises."""
     monkeypatch.setenv("MEFOR_SHARDCERT_SHARDS", "a,b")
     monkeypatch.delenv("MEFOR_SHARDCERT_LANES_PER_SHARD", raising=False)
     monkeypatch.delenv("MEFOR_SHARDCERT_PERSISTENT", raising=False)
+    # run_shardcert builds the node env from os.environ: an operator's keep directory must not be touched.
+    monkeypatch.delenv("MEFOR_BENCH_KEEP_NODE_LOGS", raising=False)
     rec = _install_fakes(monkeypatch)
     rec.events = []
     rec.fail_start = set()
@@ -177,12 +180,15 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             self.index = len(rec.nodes) - 1
             self.stops = 0
             keep = self.env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
-            self.log = open(Path(keep) / f"{self.node_id}.log", "wb") if keep else None  # noqa: SIM115
+            self.log = None
+            if keep:
+                Path(keep).mkdir(parents=True, exist_ok=True)
+                self.log = open(Path(keep) / f"{self.node_id}.log", "wb")  # noqa: SIM115
 
         async def start(self, *, provision: bool = True) -> None:
             rec.events.append(("start", self.index))
-            if self.shard in rec.fail_start:
-                raise RuntimeError(f"shard {self.shard} failed to start")
+            if self.shard in rec.fail_start or self.index in rec.fail_start:
+                raise RuntimeError(f"node {self.index} failed to start")
             if self.log is not None:
                 self.log.write(f"log of node {self.index}\n".encode())
 
@@ -304,10 +310,9 @@ async def test_colocated_kill_leg_stops_the_killed_node_and_keeps_its_log(
     old = next(n for n in fleet.nodes[:2] if n.shard == rep.killed_shard)
     restart = fleet.nodes[2]
     assert fleet.events.index(("stop", old.index)) < fleet.events.index(("start", restart.index))
-    node_id = f"shard-{rep.killed_shard}"
-    prekill = (tmp_path / f"{node_id}.prekill.log").read_bytes()
-    assert prekill == f"log of node {old.index}\n".encode()
-    assert (tmp_path / f"{node_id}.log").read_bytes() == b"log of node 2\n"
+    log = f"shard-{rep.killed_shard}.log"
+    assert (tmp_path / log).read_bytes() == f"log of node {old.index}\n".encode()
+    assert (tmp_path / "restart" / log).read_bytes() == b"log of node 2\n"
 
 
 async def test_colocated_node_whose_start_raises_is_still_stopped(
@@ -315,8 +320,31 @@ async def test_colocated_node_whose_start_raises_is_still_stopped(
 ) -> None:
     """S27-56: a node opens its log when it is built, so one whose start raised must be torn down too."""
     fleet.fail_start.add("b")
-    with pytest.raises(RuntimeError, match="shard b failed to start"):
+    with pytest.raises(RuntimeError, match="node 1 failed to start"):
         await sc.run_shardcert(**_sizes())
+    assert [n.stops for n in fleet.nodes] == [1, 1]
+
+
+async def test_colocated_restart_whose_start_raises_is_still_stopped(
+    fleet: types.SimpleNamespace,
+) -> None:
+    """S27-56: the restart is registered before it starts, so the teardown stops it when its start raises,
+    and the killed node it replaced was stopped before that."""
+    fleet.fail_start.add(2)
+    with pytest.raises(RuntimeError, match="node 2 failed to start"):
+        await sc.run_shardcert(**_sizes(kill=True, kill_at_fraction=0.3))
+    assert [n.stops for n in fleet.nodes] == [1, 1, 1]
+
+
+async def test_colocated_kill_that_never_fired_under_load_fails_the_run(
+    fleet: types.SimpleNamespace,
+) -> None:
+    """S27-55 (1): a hold that ends before the kill instant (here a hold of 0) certifies no kill leg.
+    The run fails, no engine shard is killed after the load, and nothing restarts over a live one."""
+    with pytest.raises(RuntimeError, match="kill leg never fired"):
+        await sc.run_shardcert(**_sizes(hold_seconds=0.0, kill=True, kill_at_fraction=0.5))
+    assert [ev for ev, _ in fleet.events if ev == "kill"] == []
+    assert len(fleet.nodes) == 2
     assert [n.stops for n in fleet.nodes] == [1, 1]
 
 
@@ -344,8 +372,8 @@ async def test_engine_kill_leg_stops_the_killed_node(
 async def test_engine_kill_timer_is_cancelled_when_the_hold_is(
     fleet: types.SimpleNamespace, tmp_path: Path
 ) -> None:
-    """S27-55 (3). Before the fix a cancelled hold left the SIGKILL timer pending, to fire on a shard of a
-    run that was already torn down."""
+    """S27-55 (3). Before the fix a cancelled hold left the SIGKILL timer pending, to fire on an engine shard of
+    a run that was already torn down."""
     coord = FileDropCoord(tmp_path, run_id="engine-cancel")
     coord.post(DRIVE_START, {"t0": 0.0})
     engine = asyncio.create_task(
@@ -402,7 +430,7 @@ def _summing_poller(*, done: int, dead: int) -> type[Any]:
 async def test_colocated_report_reads_the_store_count_not_the_shard_sum(
     fleet: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S27-57: the report read engine_done and engine_dead as the sum over both shards, twice the store."""
+    """S27-57: the report read engine_done and engine_dead as the sum over both engine shards, twice the store."""
     monkeypatch.setattr(sc, "EnginePoller", _summing_poller(done=400, dead=3))
     rep = await sc.run_shardcert(**_sizes())
     assert (rep.engine_done, rep.engine_dead) == (400, 3)
@@ -427,25 +455,13 @@ async def test_engine_report_reads_the_store_dead_count_not_the_shard_sum(
     assert rep.engine_dead == 3
 
 
-def test_kept_log_is_set_aside_only_under_the_keep_setting(tmp_path: Path) -> None:
-    (tmp_path / "shard-a.log").write_bytes(b"before the kill")
-    sc._set_aside_kept_log("shard-a", {})
-    assert (tmp_path / "shard-a.log").exists()
-    sc._set_aside_kept_log("shard-a", {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path)})
-    assert not (tmp_path / "shard-a.log").exists()
-    assert (tmp_path / "shard-a.prekill.log").read_bytes() == b"before the kill"
-    sc._set_aside_kept_log("shard-missing", {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path)})
-
-
-def test_kept_log_that_cannot_be_moved_does_not_stop_the_kill_leg(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A diagnostic log held open elsewhere (a Windows sharing violation) is logged, not raised."""
-    (tmp_path / "shard-a.log").write_bytes(b"before the kill")
-
-    def refuse(self: Path, target: object) -> Path:
-        raise PermissionError("held open")
-
-    monkeypatch.setattr(Path, "replace", refuse)
-    sc._set_aside_kept_log("shard-a", {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path)})
-    assert "could not keep the pre-kill log of shard-a" in caplog.text
+def test_restart_env_moves_only_the_keep_directory(tmp_path: Path) -> None:
+    env = {"MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path), "MEFOR_STORE_BACKEND": "sqlserver"}
+    assert sc._restart_env(env) == {
+        "MEFOR_BENCH_KEEP_NODE_LOGS": str(tmp_path / "restart"),
+        "MEFOR_STORE_BACKEND": "sqlserver",
+    }
+    assert env["MEFOR_BENCH_KEEP_NODE_LOGS"] == str(tmp_path)  # the fleet's own env is not changed
+    assert sc._restart_env({"MEFOR_STORE_BACKEND": "sqlserver"}) == {
+        "MEFOR_STORE_BACKEND": "sqlserver"
+    }

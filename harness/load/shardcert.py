@@ -1360,8 +1360,8 @@ class StoreResetFailed(RuntimeError):
     """:func:`_reset_store` could not empty a table, so the run would certify against stale rows."""
 
 
-#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (today: a
-#: :class:`StoreResetFailed`), so the drive half stops at once instead of waiting out its whole
+#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (at least a
+#: :class:`StoreResetFailed` and a refused kill leg, :class:`KillLegError`), so the drive half stops at once instead of waiting out its whole
 #: ``shards_ready_timeout`` for a SHARDS_READY that will never come.
 ENGINE_SETUP_FAILED = "engine_setup_failed"
 
@@ -1922,14 +1922,12 @@ async def run_shardcert(
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
-            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold. Fire it now,
-            # as the two-box engine's timer does, so the restart below never starts a second process over a
-            # live engine shard, and the note says the kill came after the load did.
-            nodes[killed].kill()  # type: ignore[index]
-            kill_at = time.monotonic()
-            did_kill = True
-            report_notes.append(
-                f"SIGKILLed engine shard {killed} only at the end of the hold, after the load"
+            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold (a stalled
+            # event loop, or a hold of 0). No kill happened under load, so there is no kill leg to certify:
+            # fail the run rather than kill now and report a recovery from a crash with no load behind it.
+            # The teardown below stops the fleet; the restart is never reached.
+            raise RuntimeError(
+                f"kill leg never fired: the hold ended before the kill instant of engine shard {killed}"
             )
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything
@@ -3210,24 +3208,17 @@ def require_kill_leg(
         )
 
 
-def _set_aside_kept_log(node_id: str, env: Mapping[str, str]) -> None:
-    """Move a killed node's kept log to ``<node_id>.prekill.log`` before its restart opens
-    ``<node_id>.log`` for writing, which would truncate it (BACKLOG #5440, S27-56). Only under
-    ``MEFOR_BENCH_KEEP_NODE_LOGS``, named as :class:`EngineNode` names it; otherwise the log is a temp file
-    the node's own ``stop()`` removed. The log is a diagnostic, so a move that fails is logged and the kill
-    leg goes on; the restart then truncates the log, as every restart did before this."""
-    keep_dir = env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
-    if not keep_dir:
-        return
-    log = Path(keep_dir) / f"{node_id}.log"
-    try:
-        log.replace(log.with_name(f"{node_id}.prekill.log"))
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        _log.warning(
-            "could not keep the pre-kill log of %s, its restart overwrites it: %s", node_id, exc
-        )
+def _restart_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` for a killed engine shard's restart, with any ``MEFOR_BENCH_KEEP_NODE_LOGS`` moved to its
+    ``restart`` subdirectory (BACKLOG #5440, S27-56). :class:`EngineNode` opens ``<keep>/<node_id>.log``
+    for writing when it is built, and the restart has the killed node's id, so in the same directory it
+    emptied the pre-kill log. A separate directory keeps both logs and renames nothing, so a handle the
+    killed tree still holds on Windows cannot get in the way."""
+    restart_env = dict(env)
+    keep_dir = restart_env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
+    if keep_dir:
+        restart_env["MEFOR_BENCH_KEEP_NODE_LOGS"] = str(Path(keep_dir) / "restart")
+    return restart_env
 
 
 async def _restart_killed(
@@ -3243,10 +3234,10 @@ async def _restart_killed(
     BACKLOG #5440 (S27-56): the killed node is stopped first, because ``kill()`` neither reaps the process
     nor closes its log, and overwriting its entry dropped the only reference the caller's teardown had. The
     restart is registered BEFORE it starts, so a start that raises is still stopped by that teardown."""
-    old = nodes[killed]
-    await old.stop()
-    _set_aside_kept_log(old.node_id, env)
-    restart = ShardCertNode(killed, api_port, env=env, config_dir=_CONFIG_DIR, cwd=cwd)
+    await nodes[killed].stop()
+    restart = ShardCertNode(
+        killed, api_port, env=_restart_env(env), config_dir=_CONFIG_DIR, cwd=cwd
+    )
     nodes[killed] = restart
     await restart.start(provision=False)
     return restart
@@ -3649,11 +3640,14 @@ async def run_shardcert_engine(
     try:
         require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list)
     except KillLegError:
-        # Tell a waiting drive half at once, as _reset_store_or_signal does, with a fixed reason.
-        with contextlib.suppress(OSError):
+        # Tell a waiting drive half at once, as _reset_store_or_signal does, with a fixed reason. A coord
+        # write error must not replace the refusal, so it is logged rather than raised.
+        try:
             coord.post(
                 ENGINE_SETUP_FAILED, {"reason": "kill leg refused (see the engine box's stderr)"}
             )
+        except OSError as exc:
+            _log.warning("could not post %s for the refused kill leg: %s", ENGINE_SETUP_FAILED, exc)
         raise
     # The ACCOUNTING pair the DRIVE box must gate on. Under `partitioned` the graph BUILDS H = D = dests
     # (every handler owns a destination) but the router selects ONE, so the fan-out per message is 1 and the
@@ -3937,13 +3931,6 @@ async def run_shardcert_engine(
             kill_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await kill_task
-        elif (
-            kill_task is not None
-            and not kill_task.cancelled()
-            and kill_task.exception() is not None
-        ):
-            # A kill that raised while the hold failed first: the hold's error propagates, so name this one.
-            _log.warning("the kill-leg SIGKILL also failed: %r", kill_task.exception())
         for node in nodes.values():
             with contextlib.suppress(Exception):
                 await node.stop()
