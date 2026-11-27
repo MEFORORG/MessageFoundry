@@ -1685,8 +1685,9 @@ class LoggingAlertSink:
             "it went down -- the ERROR line before this says what its store shows. It serves "
             "nothing until POST /dr/activate, to be run only once you have confirmed the "
             "primary is not serving. POST /dr/release on this start records that it stays "
-            "passive and closes this alert; an alert an earlier start left open is resolved by "
-            "hand, with POST /alerts/{alert_id}/resolve or Resolve in the web console",
+            "passive, which closes the alert where [alerts] keeps alert instances; there, if "
+            "a later start raises none, an alert left open is resolved by hand, with POST "
+            "/alerts/{alert_id}/resolve or Resolve in the web console",
             node,
         )
 

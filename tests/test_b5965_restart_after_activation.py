@@ -316,13 +316,14 @@ async def test_the_stay_passive_line_claims_no_hand_back(
 
 
 def test_the_restart_alert_line_says_how_to_close_it(caplog: pytest.LogCaptureFixture) -> None:
-    # The CRITICAL line names both ways out: this start's release, and a hand resolve for an
-    # alert an earlier start left open.
+    # The CRITICAL line says how the alert closes. This sink keeps no alert instances, so the
+    # line conditions the close and the hand resolve on [alerts] keeping them.
     with caplog.at_level(logging.CRITICAL, logger="messagefoundry.pipeline.alerts"):
         LoggingAlertSink().dr_restarted_passive("dr-box")
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
-    assert "POST /dr/release on this start records that it stays passive and closes" in line
-    assert "earlier start left open is resolved by hand" in line
+    assert "POST /dr/release on this start records that it stays passive" in line
+    assert "closes the alert where [alerts] keeps alert instances" in line
+    assert "if a later start raises none, an alert left open is resolved by hand" in line
     assert "POST /alerts/{alert_id}/resolve" in line and "Resolve in the web console" in line
 
 

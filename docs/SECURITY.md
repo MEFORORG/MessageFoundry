@@ -4285,11 +4285,12 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   open until an operator resolves it by hand, with `POST /alerts/{id}/resolve` or the web
   console's Resolve on the alert, or a later `POST /dr/activate` under the same box label, run
   only once the operator has confirmed the primary is not serving, closes it. The release's
-  response does not reliably tell the two apart, so read the alert list. Both DR routes ask for
-  the same fresh proof as the planned failover above.
+  response does not reliably tell a stay-passive release from one that changed nothing, so read
+  the alert list. The two routes this bullet names, `POST /dr/activate` and `POST /dr/release`,
+  each ask for the same fresh proof as the planned failover above.
   Under `serve` a DR box starts passive and no setting promotes it: `[dr].activate` is a removed
   key (BACKLOG #5965; the `[dr]` `activate` row of [CONFIGURATION.md](CONFIGURATION.md) says why).
-  So this route is the only promotion, and a restart of an activated box needs it again, once
+  So `POST /dr/activate` is the only promotion, and a restart of an activated box needs it again, once
   the operator has confirmed the primary is not serving.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
