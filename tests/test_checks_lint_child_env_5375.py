@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5375: the check gate's advisory lint children start by an absolute program path and
-get no engine secret, measured through the public ``run_checks``.
+"""BACKLOG #5375, through the public ``run_checks``: the check gate's three advisory lint children
+are started from the program the gate's own locator returns, never a bare name a ``PATH`` search
+resolves, mypy as ``python -P -m mypy``, and with no engine secret in their environment.
+
+What this pins, and what it does not: ``_ruff_binary`` is replaced by a fake that returns an
+absolute path, so whether the real locator returns an absolute path is pinned separately, by
+``test_checks.py::test_ruff_binary_is_absolute_when_found``. ``shutil.which`` is replaced by one
+that returns the bare name, so code that locates a tool through it starts a bare name and fails
+here.
 
 This lives in its own file, apart from ``test_checks.py``, so it can be run against the code
 before the fix: that file's module-level ``skipif`` reads ``checks._ruff_binary``, which the
@@ -13,6 +20,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -33,35 +41,63 @@ _SECRETS = {
 }
 
 
+def _lint_tool(cmd: list[str]) -> str | None:
+    """Which lint leg ``cmd`` starts, or ``None`` for a child some other leg starts."""
+    module = cmd[cmd.index("-m") + 1] if "-m" in cmd[:-1] else Path(cmd[0]).name.lower()
+    if module.startswith("mypy"):
+        return "mypy"
+    if module.startswith("ruff"):
+        return "ruff-security" if "--select" in cmd else "ruff"
+    return None
+
+
 def test_run_checks_lint_children_start_by_absolute_path_with_no_engine_secret(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     for name, value in _SECRETS.items():
         monkeypatch.setenv(name, value)
-    calls: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setenv("MYPYPATH", "stubs")
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+    calls: dict[str, list[tuple[list[str], dict[str, str]]]] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append((list(cmd), dict(kwargs["env"])))
+        tool = _lint_tool(list(cmd))
+        assert tool is not None, f"unexpected child: {cmd}"
+        calls.setdefault(tool, []).append((list(cmd), dict(kwargs.get("env") or {})))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    # The tool-locating seams differ before and after the fix, so each is patched with
-    # raising=False: the unfixed code resolves through shutil.which, the fixed code through
-    # _ruff_binary and _tool_installed. Either way every tool is found and started.
+    # The tool-locating seams differ before and after the fix. The fixed code has _tool_command
+    # and must then have both seams it reads, so each is patched strictly there; on the unfixed
+    # code neither exists, and it locates a tool through shutil.which.
+    fixed = hasattr(checks, "_tool_command")
     program = str(tmp_path / "ruff.exe")
-    monkeypatch.setattr(checks, "_ruff_binary", lambda: program, raising=False)
-    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True, raising=False)
-    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: program)
+    monkeypatch.setattr(checks, "_ruff_binary", lambda: program, raising=fixed)
+    monkeypatch.setattr(checks, "_tool_installed", lambda _module: True, raising=fixed)
+    monkeypatch.setattr(shutil, "which", lambda name, *_a, **_k: name)
 
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
 
     by_name = {r.name: r for r in report.results}
     for tool in ("ruff", "mypy", "ruff-security"):
         assert by_name[tool].skipped is False, by_name[tool].detail
-    assert len(calls) >= 3
-    for cmd, env in calls:
-        assert Path(cmd[0]).is_absolute(), cmd
+        assert len(calls.get(tool, [])) == 1, calls
+    assert set(calls) == {"ruff", "mypy", "ruff-security"}
+
+    config = str(SAMPLES_CONFIG)
+    ruff_cmd = calls["ruff"][0][0]
+    assert ruff_cmd == [program, "check", config]
+    security_cmd = calls["ruff-security"][0][0]
+    assert security_cmd[:2] == [program, "check"] and security_cmd[-1] == config
+    mypy_cmd = calls["mypy"][0][0]
+    assert mypy_cmd[0] == sys.executable and Path(mypy_cmd[0]).is_absolute()
+    assert "-P" in mypy_cmd
+    assert mypy_cmd[-4:] == ["-m", "mypy", "--config-file=", config]
+
+    for (cmd, env), *_ in calls.values():
         upper = {name.upper() for name in env}
         assert not any(name.startswith("MEFOR_") for name in upper), cmd
-        assert {"VAULT_TOKEN", "PGPASSWORD", "CI_DEPLOY_TOKEN_B20009"}.isdisjoint(upper), cmd
-        assert "PATH" in upper
+        assert {name.upper() for name in _SECRETS}.isdisjoint(upper), cmd
+        assert env.get("MYPYPATH") == "stubs", cmd  # the tools' own variables still cross
+        assert env.get("PYTHONIOENCODING") == "utf-8", cmd  # pinned over an inherited value
+        assert "PATH" in upper, cmd
