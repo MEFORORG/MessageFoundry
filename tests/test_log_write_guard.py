@@ -1234,6 +1234,57 @@ def test_a_stream_whose_encoding_misnames_its_encoder_gets_ascii_escapes(
     assert "order caf\\u00e9 \\u4e2d \\ud83d\\ude00" in raw.getvalue().decode("cp1252")
 
 
+def test_the_probe_escapes_a_line_the_stream_cannot_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # revalidate() probes through the same write, so a probe notice holding a character the
+    # stream cannot encode (the sink label is any text register() was given) still lands and the
+    # sink is marked healthy. The probe writes under the handler's lock.
+    # NEGATIVE CONTROL: on 49e92d442f4 the probe wrote unescaped and the sink stayed unwritable.
+    raw, stream = _strict_cp1252()
+    monkeypatch.setattr(sys, "stdout", stream)
+    guard = LogWriteGuard()
+    handler = GuardedStreamHandler(stream, guard=guard, sink="stdout-\u4e2d")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    guard.record_unwritable("stdout-\u4e2d", reason="disk gone")
+    held: list[bool] = []
+    real = handler._write_raw
+
+    def spy(line: str) -> None:
+        held.append(handler.lock is not None and handler.lock._is_owned())  # type: ignore[attr-defined]
+        real(line)
+
+    monkeypatch.setattr(handler, "_write_raw", spy)
+
+    assert guard.revalidate() is True
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert "stdout-\\u4e2d" in raw.getvalue().decode("cp1252")
+    assert held and all(held)
+
+
+def test_a_lone_surrogate_on_the_utf8_file_sink_is_written_as_the_log_spells_it(
+    tmp_path: Path,
+) -> None:
+    # The file sink is UTF-8, which refuses a lone surrogate. With no filter in front of the
+    # handler (the configured handlers escape one first), the guard's escape spells it as the log
+    # does, and the sink stays healthy.
+    # NEGATIVE CONTROL: on 53abdb235b8 the re-write after the roll failed the same way and the
+    # sink was recorded unwritable.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    log_path = tmp_path / "app.log"
+    handler = _file_handler(log_path, guard)
+
+    handler.emit(_record("id %s", "a\udcffb"))
+    handler.close()
+
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert "id a\\\\udcffb" in log_path.read_text(encoding="utf-8")
+    assert list(tmp_path.iterdir()) == [log_path]
+
+
 @pytest.mark.parametrize(
     ("encoding", "text", "expected"),
     [
@@ -1243,6 +1294,8 @@ def test_a_stream_whose_encoding_misnames_its_encoder_gets_ascii_escapes(
         pytest.param(
             "no-such-codec", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="unknown"
         ),
+        # A codec that cannot encode an ASCII character: cp864 has no byte for '%'.
+        pytest.param("cp864", "50% done", "50\\u0025 done", id="cp864-ascii"),
         # A codec that is not a text encoding, and a name codecs.lookup refuses, read as ASCII.
         pytest.param("base64", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="base64"),
         pytest.param("a\x00b", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="nul-name"),

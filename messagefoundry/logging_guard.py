@@ -781,28 +781,41 @@ def _escape_only(text: str, *, fallback: str) -> str:
     return _guarded(scrub_control_chars, text, fallback=fallback)
 
 
+def _escape_unencodable(exc: UnicodeError) -> tuple[str, int]:
+    """The codecs error handler behind :func:`_encodable`: each character the codec refused, as
+    the log escapes one (:func:`~messagefoundry.controlchars.json_unicode_escape`, and a lone
+    surrogate as :func:`~messagefoundry.controlchars.escape_lone_surrogates` spells it)."""
+    if not isinstance(exc, UnicodeEncodeError):
+        raise exc
+    refused = exc.object[exc.start : exc.end]
+    return (
+        "".join(
+            escaped
+            if (escaped := escape_lone_surrogates(ch)) != ch
+            else json_unicode_escape(ord(ch))
+            for ch in refused
+        ),
+        exc.end,
+    )
+
+
+_ESCAPE_HANDLER = "messagefoundry.logging_guard.escape"
+codecs.register_error(_ESCAPE_HANDLER, _escape_unencodable)
+
+
 def _encodable(line: str, encoding: object) -> str:
-    """``line`` with each character ``encoding`` cannot encode spelled as a JSON ``\\uXXXX``
-    escape, a surrogate pair for one outside the BMP, and a lone surrogate as the log spells it
-    (:func:`~messagefoundry.controlchars.escape_lone_surrogates`) (BACKLOG #5813). An ``encoding``
-    that is not a known codec name reads as ASCII. Never raises."""
+    """``line`` with each character ``encoding`` cannot encode, ASCII ones included, spelled as a
+    JSON ``\\uXXXX`` escape, a surrogate pair for one outside the BMP, and a lone surrogate as the
+    log spells it (:func:`~messagefoundry.controlchars.escape_lone_surrogates`) (BACKLOG #5813). An
+    ``encoding`` that is not a known text codec, or that cannot encode the escapes themselves,
+    reads as ASCII. Never raises."""
+    codec = encoding if isinstance(encoding, str) else "ascii"
     try:
-        codec = codecs.lookup(encoding).name if isinstance(encoding, str) else "ascii"
-    except (LookupError, ValueError):
-        codec = "ascii"  # an unknown name, or one ``codecs.lookup`` refuses (an embedded NUL)
-    out: list[str] = []
-    for ch in line:
-        if ch.isascii():
-            out.append(ch)
-            continue
-        try:
-            ch.encode(codec)
-        except (UnicodeError, LookupError):  # LookupError: a codec that is not a text encoding
-            escaped = escape_lone_surrogates(ch)
-            out.append(escaped if escaped != ch else json_unicode_escape(ord(ch)))
-        else:
-            out.append(ch)
-    return "".join(out)
+        return line.encode(codec, _ESCAPE_HANDLER).decode(codec)
+    except (LookupError, ValueError, UnicodeError, TypeError):
+        # LookupError: unknown, or not a text encoding; ValueError: a name codecs refuses (an
+        # embedded NUL); UnicodeError: a codec that cannot encode the escapes or decode itself.
+        return line.encode("ascii", _ESCAPE_HANDLER).decode("ascii")
 
 
 #: The stderr format-fault line's entry for a line the sink's stream could not encode, written
@@ -913,7 +926,7 @@ class _GuardedSinkMixin(_SinkBase):
             # two stages below decide. When the formatter
             # cannot format the stand-in either, the sink is recorded unwritable without a roll,
             # because a roll cannot clear a formatter fault.
-            stand_in = self._stand_in_for(record)
+            formatted, stand_in = self._stand_in_for(record)
             stand_in_line: str | None = None
             if stand_in is not None:
                 notice, kind = stand_in
@@ -948,14 +961,13 @@ class _GuardedSinkMixin(_SinkBase):
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
                     failure = sink_exc
-            elif isinstance(failure, UnicodeEncodeError):
+            elif isinstance(failure, UnicodeEncodeError) and formatted is not None:
                 # The record formats, and the stream has no byte for a character in the line (a
-                # strict cp1252 stdout, say). That is the line's fault, not the sink's, so it is
-                # written again, and ``_write_line`` escapes each such character; neither stage
-                # runs. A roll would only re-resolve to the same stream and fail the same way
-                # (BACKLOG #5813).
+                # strict cp1252 stdout, say). That is the line's fault, not the sink's, so the
+                # line already formatted is written again escaped, and neither stage runs. A roll
+                # would only re-resolve to the same stream and fail the same way (BACKLOG #5813).
                 try:
-                    self._write_line(self.format(record) + self.terminator)
+                    self._write_line(formatted + self.terminator, refused=True)
                     return
                 except Exception as sink_exc:
                     failure = sink_exc
@@ -996,9 +1008,12 @@ class _GuardedSinkMixin(_SinkBase):
         finally:
             self._reentry.active = False
 
-    def _stand_in_for(self, record: logging.LogRecord) -> tuple[str, str] | None:
-        """The notice to write in place of ``record`` when it cannot be formatted, with the
-        formatting exception's type name, or ``None`` when it can (BACKLOG #5813). Never raises.
+    def _stand_in_for(
+        self, record: logging.LogRecord
+    ) -> tuple[str, None] | tuple[None, tuple[str, str]]:
+        """``(the formatted record, None)`` when ``record`` formats; otherwise ``(None, (notice,
+        kind))``, the notice to write in its place with the formatting exception's type name
+        (BACKLOG #5813). Never raises.
 
         A record this handler cannot format is the record's fault, not the sink's: the stand-in is
         a notice naming its logger, its level and the exception's type, never its content or the
@@ -1007,7 +1022,7 @@ class _GuardedSinkMixin(_SinkBase):
         ``RedactionFilter`` already replaces a record whose message cannot be rendered, so this is
         reached only by a formatter that fails where the filter did not."""
         try:
-            self.format(record)
+            formatted = self.format(record)
         except Exception as exc:
             # The exception's TYPE only: its message can quote the record's format string or an
             # argument, and this notice goes below every handler filter.
@@ -1019,8 +1034,8 @@ class _GuardedSinkMixin(_SinkBase):
                 f"{self._record_label(record, 'levelname')} could not be formatted ({kind}); it "
                 "was not written"
             )
-            return notice, kind
-        return None
+            return None, (notice, kind)
+        return formatted, None
 
     def _record_label(self, record: logging.LogRecord, attribute: str) -> str:
         """A record's logger or level name, escaped for a notice. Never raises: a caller can delete
@@ -1103,11 +1118,14 @@ class _GuardedSinkMixin(_SinkBase):
         line = self._notice_line(
             f"application log sink {self._sink_label!r} accepted a record again"
         )
-        try:
-            self._write_line(line)
-        except Exception:
-            self._roll()
-            self._write_line(line)
+        # Under the handler's lock, as emit's writes are: revalidate() calls this from another
+        # thread, and the escape in _write_line counts a format fault the lock guards.
+        with self.lock if self.lock is not None else contextlib.nullcontext():
+            try:
+                self._write_line(line)
+            except Exception:
+                self._roll()
+                self._write_line(line)
 
     def _write_notice(self, message: str) -> None:
         """Record the rollover event ON the rolled sink, through the sink's own formatter so a JSON
@@ -1141,22 +1159,28 @@ class _GuardedSinkMixin(_SinkBase):
         Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2."""
         self._write_line(self.format(record) + self.terminator)
 
-    def _write_line(self, line: str) -> None:
+    def _write_line(self, line: str, *, refused: bool = False) -> None:
         """Write and flush an already formatted line; a sink failure propagates.
 
         Every write the guard makes comes here, so a line the stream has no byte for is escaped
         for every one of them, the roll notice and the probe included (BACKLOG #5813). On
-        ``UnicodeEncodeError`` the line is written again with each such character escaped
-        (:func:`_encodable`) for the stream's ``encoding``, and if the stream still refuses it, as
-        one whose ``encoding`` does not name the encoder it uses can, with everything outside
-        ASCII escaped. A successful escaped write is counted for the stderr format-fault line. A
-        failure of the last write propagates."""
+        ``UnicodeEncodeError`` (or with ``refused``, when the caller already saw the stream refuse
+        ``line`` that way, so it is not sent again) the line is written with each such character
+        escaped (:func:`_encodable`) for the stream's ``encoding``, and if the stream still refuses
+        it, as one whose ``encoding`` does not name the encoder it uses can, with everything outside
+        ASCII escaped. A successful escaped write is counted for the stderr format-fault line.
+        Called under the handler's lock, which that count needs. A failure of the last write
+        propagates."""
+        if not refused:
+            try:
+                self._write_raw(line)
+                return
+            except UnicodeEncodeError:
+                pass
+        escaped = _encodable(line, getattr(self.stream, "encoding", None))
         try:
-            self._write_raw(line)
-            return
-        except UnicodeEncodeError:
-            escaped = _encodable(line, getattr(self.stream, "encoding", None))
-        try:
+            if escaped == line:
+                raise UnicodeEncodeError("unknown", line, 0, 0, "the stream refused the line")
             self._write_raw(escaped)
         except UnicodeEncodeError:
             ascii_only = _encodable(line, None)

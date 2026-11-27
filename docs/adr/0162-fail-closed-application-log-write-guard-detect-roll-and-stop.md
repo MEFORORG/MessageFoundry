@@ -473,8 +473,10 @@ unwritable with a reason that names a formatter fault, and the file is not rolle
 stage 2 then decides the stop as for any other stage-2 failure. (Added 2026-11-25.) A line
 holding a character a strict stream has no byte for is written again with each such character
 as a JSON `\uXXXX` escape, a surrogate pair outside the BMP, so a JSON line still parses back
-to the text (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that called the case
-open). That holds for every line the guard writes: a record that formats, the stand-in
+to the text, except a lone surrogate, which is spelled as the log spells one and parses back to
+the six characters naming it (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that
+called the case open). On a text sink an escape reads the same as the six characters typed,
+since a backslash in the text is not doubled, the ambiguity the log's own escape accepts. That holds for every line the guard writes: a record that formats, the stand-in
 notice, the roll notice, the probe, and the re-write after a roll, escaped for the stream the
 roll left. Where the record's own write failed only that way and the escaped line lands,
 neither stage runs, and the escape is counted on the rate-limited stderr format-fault line;
@@ -483,6 +485,13 @@ for any roll. When the sink refuses the escaped line too, the two stages decide,
 write failure. The escape reads the stream's `encoding`; one that is missing, unknown or not a
 text encoding, or a stream that still refuses the escaped line, escapes everything outside
 ASCII. `tests/test_remote_debug_guard.py` pins the escaped line for a strict cp1252 stdout.
+**This changes when the fail-closed stop fires**: on `main` such a line went to stage 2, showed
+`unwritable` on `GET /status`, raised the alert and could ask for the stop. Now the line is
+written, escaped, and the engine keeps processing. The record is still logged, so the
+count-and-log invariant this guard enforces still holds for it; what is lost is the stop and
+the alert for a line that did land. No owner ruling covers this change; it is the row's own
+remedy, and BACKLOG #5813 records it as defect, not as a decision.
+`_GuardedSinkMixin._write_line` is where the escape is made and counted.
 `_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 
