@@ -472,7 +472,7 @@ function Get-OccupancyForHolder([string]$HeldPath) {
 # declared yet, and nothing on this host proves a session gone (#1348 above). So it is a field
 # beside State, never a State of its own, and no branch below reads it to refuse, release or
 # recommend -Force. Any failure to look reads as no evidence at all.
-$script:HolderSeatsDirs = @{}   # repository key -> its seats directory, '' where it did not resolve
+$script:HolderSeatsDirs = @{}   # repository key -> its seats directory, once one resolved
 $script:HolderSeatClose = @{}   # holder path -> the evidence line, $null for none
 
 function Get-HolderSeatClose([string]$HeldPath) {
@@ -487,13 +487,15 @@ function Get-HolderSeatClose([string]$HeldPath) {
         # One resolve per repository, keyed by its git common dir where occupancy.ps1 loaded.
         $repoKey = if (Get-Command Get-OwningGitCommonDir -EA SilentlyContinue) { Get-OwningGitCommonDir $HeldPath } else { $null }
         if (-not $repoKey) { $repoKey = $pathKey }
-        if (-not $script:HolderSeatsDirs.ContainsKey($repoKey)) {
-            $script:HolderSeatsDirs[$repoKey] = ''
-            $r = Resolve-CoordDir -From $HeldPath -Kind 'seats'
-            if (-not $r.Error -and $r.Path) { $script:HolderSeatsDirs[$repoKey] = $r.Path }
-        }
+        # Only a success is cached: a holder whose own git refuses (a stale .git pointer) must not
+        # blank the evidence for every other holder of the same repository.
         $seats = $script:HolderSeatsDirs[$repoKey]
-        if (-not $seats) { return $null }
+        if (-not $seats) {
+            $r = Resolve-CoordDir -From $HeldPath -Kind 'seats'
+            if ($r.Error -or -not $r.Path) { return $null }
+            $seats = $r.Path
+            $script:HolderSeatsDirs[$repoKey] = $seats
+        }
         $ended = Get-CoordSeatEnded -Dir (Join-Path $seats (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $HeldPath)))
         if (-not $ended) { return $null }
         $script:HolderSeatClose[$pathKey] = "holder's seat record self-declared $($ended.Lifecycle) at $($ended.At)"
@@ -504,16 +506,18 @@ function Get-HolderSeatClose([string]$HeldPath) {
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
     $live = Get-HolderPresence $HeldPath $Record
-    # Not for a holder on another PC, whose box this host's key does not name, nor for a vanished
-    # one, which is already provably gone.
-    $closed = if ($live.State -notin 'elsewhere', 'gone') { Get-HolderSeatClose $HeldPath } else { $null }
+    # Not for a holder on another PC, whose box this host's key does not name, for a vanished one,
+    # which is already provably gone, nor for one where a live session is placed, a stronger signal
+    # the record would only seem to contradict.
+    $closed = if ($live.State -notin 'elsewhere', 'gone', 'occupied') { Get-HolderSeatClose $HeldPath } else { $null }
     $live | Add-Member -NotePropertyName SelfClosed -NotePropertyValue $closed -Force
     return $live
 }
 
 function Write-SelfClosedNote($Live, [string]$Indent = '  ') {
     if (-not $Live.SelfClosed) { return }
-    Write-Host "$Indent$($Live.SelfClosed) -- EVIDENCE, not authority to release: a later session in that worktree may not have declared yet."
+    # At least three live cases read this way, so the caveat says "at least".
+    Write-Host "$Indent$($Live.SelfClosed) -- EVIDENCE, not authority to release: that record is the worktree's newest, not necessarily the claimant's, and at least the closer may still be working, another session there may be mid-turn, or a later one may not have declared yet."
 }
 
 function Get-HolderPresence([string]$HeldPath, $Record = $null) {
