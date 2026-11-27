@@ -1447,6 +1447,8 @@ def test_a_trailing_re_read_cut_short_that_refuses_is_the_verdict(
     out = capsys.readouterr().out
     assert "refused::" in out
     assert "the read judged" not in out
+    # The fault is the re-read's, and says so.
+    assert "fault::a re-read was cut short: GraphQL returned an error" in out
 
 
 def test_each_fault_of_a_trailing_list_names_the_read_it_belongs_to(

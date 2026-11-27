@@ -151,8 +151,9 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
-                      head is re-read, and so is a list of that head lacking it while it
-                      refuses nothing; see the paragraph on a head that lags the push event.
+                      head is re-read, and so is a complete read of CLA_HEAD_SHA whose
+                      commits lack it, while it refuses nothing; see the paragraph on a head
+                      that lags the push event.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
@@ -850,8 +851,10 @@ def read_judged_head(
     """Read and judge the pull request, re-reading while the read is not yet of its head.
 
     Returns the read, ``judge``'s verdict on it (called with whether the read is complete), and a
-    fault to report beside that verdict, if any. When it re-reads, and what it reports then, is
-    stated once, in the module docstring's paragraph on a head that lags the push event.
+    fault to report beside that verdict, if any. Where the read kept is returned, the verdict's
+    own fault is moved into that third element (``_report_kept``) and the verdict carries none.
+    When it re-reads, and what it reports then, is stated once, in the module docstring's
+    paragraph on a head that lags the push event.
     """
     delays = iter(HEAD_RETRY_DELAYS)
     # The last judged read of the head that refused nothing, with why it lacks the head.
@@ -863,6 +866,8 @@ def read_judged_head(
             if kept is not None:
                 # A re-read of another head than CLA_HEAD_SHA ends the re-reads.
                 return _report_kept(kept, "a re-read showed another head than CLA_HEAD_SHA")
+            # With no read kept, every read before this one was stale, so each wait spent
+            # was spent on a re-read of another head.
             delay = next(delays, None)
             if delay is None:
                 raise PrecheckFault(
@@ -877,8 +882,11 @@ def read_judged_head(
                 return _report_kept(kept, f"a re-read faulted: {exc}")
             # A page failed after whole pages were kept. Those pages still prove what they prove.
             verdict = judge(exc.partial, False)
-            if kept is None or verdict.refusals:
+            if kept is None:
                 return exc.partial, verdict, str(exc)
+            if verdict.refusals:
+                # A refusal this re-read proves is the verdict; its fault names it as a re-read.
+                return exc.partial, verdict, f"a re-read was cut short: {exc}"
             return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)
