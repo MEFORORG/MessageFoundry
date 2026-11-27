@@ -39,18 +39,24 @@ _MARKER = "SYNTHETIC-LEAK-MARKER"
 #: Reports each scanned file holding the marker, by its path relative to the scan root it came from,
 #: and exits 1 on any hit. Every call's arguments are logged so a row can tell the tip scan from the
 #: range scan, and the detector floor it ran under goes to a second log. A named root that does not
-#: exist exits 2, as the real scanner's unreadable path does.
+#: exist exits 2, as the real scanner's unreadable path does. A hit prints the real scanner's report
+#: header first, and ``$STUB_CRASH`` stands in for an uncaught exception: exit 1 with no report.
 _STUB = f"""#!/usr/bin/env bash
 shift
 echo "$*" >> "$SCAN_LOG"
 echo "${{MEFOR_REQUIRE_TOKENS:-unset}} ${{MEFOR_MIN_DETECTORS:-unset}}" >> "$SCAN_LOG.env"
 [ "$1" = "--path" ] || exit 9
 shift
+if [ -n "${{STUB_CRASH:-}}" ]; then echo "Traceback (most recent call last):" >&2; exit 1; fi
 hit=0
 for root in "$@"; do
   [ -e "$root" ] || {{ echo "missing root $root" >&2; exit 2; }}
   while IFS= read -r -d '' f; do
-    if grep -q '{_MARKER}' "$f"; then echo "HIT ${{f#"$root"/}}"; hit=1; fi
+    if grep -q '{_MARKER}' "$f"; then
+      [ "$hit" = 1 ] || echo "FORBIDDEN CONTENT -- commit blocked (fail closed):"
+      echo "HIT ${{f#"$root"/}}"
+      hit=1
+    fi
   done < <(find "$root" -path "$root/.git" -prune -o -type f -print0)
 done
 if [ "$hit" = 1 ] && [ -n "${{STUB_ECHO:-}}" ]; then echo "$STUB_ECHO"; fi
@@ -140,6 +146,7 @@ def _run_steps(
     between: Callable[[Path], None] | None = None,
     tokens: str = "synthetic",
     extra_env: dict[str, str] | None = None,
+    transform: Callable[[str], str] | None = None,
 ) -> tuple[list[int], str, list[str]]:
     """Run step 1 then step 2, as the job does: step 2 runs whatever step 1 returned.
 
@@ -195,7 +202,8 @@ def _run_steps(
     out = ""
     for i, name in enumerate(steps or (_STEP, _STEP2)):
         script = tmp_path / f"step{i}.sh"
-        script.write_text(_body(name), encoding="utf-8", newline="\n")
+        body = _body(name)
+        script.write_text(transform(body) if transform else body, encoding="utf-8", newline="\n")
         proc = subprocess.run(
             [bash, "-e", script.as_posix()],
             cwd=repo,
@@ -597,28 +605,10 @@ def test_an_unsafe_path_is_refused_and_the_walk_goes_on(
     if with_leak:
         _leak_then_remove(repo)
 
-    def plumb(*args: str, stdin: str) -> str:
-        # Bytes, not text: text mode on Windows writes CRLF, and each name would gain a CR.
-        out = subprocess.run(
-            ["git", "-C", str(repo.path), *args],
-            input=stdin.encode("utf-8"),
-            capture_output=True,
-            check=True,
-            timeout=60,
-        ).stdout
-        return out.decode("utf-8").strip()
-
-    def mktree(entries: str) -> str:
-        return plumb("mktree", stdin=entries)
-
-    blob = plumb("hash-object", "-w", "--stdin", stdin="x\n")
-    inner = mktree(f"100644 blob {blob}\thooks-config\n")
-    dotgit = mktree(f"040000 tree {inner}\t.git\n")
-    head_tree = _git(repo.path, "rev-parse", "HEAD^{tree}")
-    listing = _git(repo.path, "ls-tree", head_tree)
-    tree = mktree(f"{listing}\n040000 tree {dotgit}\tsub\n")
-    bad = _git(repo.path, "commit-tree", tree, "-p", "HEAD", "-m", "unsafe")
-    _git(repo.path, "update-ref", "HEAD", bad)
+    blob = _plumb(repo.path, "hash-object", "-w", "--stdin", stdin="x\n")
+    inner = _plumb(repo.path, "mktree", stdin=f"100644 blob {blob}\thooks-config\n")
+    dotgit = _plumb(repo.path, "mktree", stdin=f"040000 tree {inner}\t.git\n")
+    bad = _hand_built_commit(repo.path, "HEAD", f"040000 tree {dotgit}\tsub\n")
     rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, bad)
     assert rcs[0] == (1 if with_leak else 2), f"rcs={rcs}\n{out}"
     assert f"branch commit {bad} names an unsafe path" in out, out
@@ -722,7 +712,8 @@ def test_no_step_echoes_scanner_output_as_a_workflow_command(
     )
     assert rcs == [1, 1, 0], f"rcs={rcs}\n{out}"
     shown = [line for line in out.splitlines() if "stop-commands" in line or "cmd]" in line]
-    assert len(shown) >= 3, f"the stub's line was not shown by every step\n{out}"
+    # Once each from steps 1 and 2, and once for each of the two commit roots step 3 rescans.
+    assert len(shown) == 4, f"the stub's line was not shown by every step\n{out}"
     for line in shown:
         bare = line.lstrip()
         assert not bare.startswith(("::", "##[")) and "::" not in bare and "##[" not in bare, line
@@ -730,10 +721,73 @@ def test_no_step_echoes_scanner_output_as_a_workflow_command(
 
 def test_the_failure_notes_name_what_they_print_and_where_to_read() -> None:
     """The attribution step re-prints each hit's path, and a name hit's path IS the matched text, so
-    its comment may not say it never prints matched content. The closing note runs after the
-    attribution step and must point a responder at it, not only at the two scans."""
-    assert "never the matched content" not in _body(_STEP3)
+    its comment must say so rather than claim it never prints matched content. The closing note runs
+    after the attribution step and must send a responder to it by its real step name."""
+    workflow = (_REPO / ".github" / "workflows" / _WORKFLOW).read_text(encoding="utf-8")
+    attribution = workflow[workflow.index(f"- name: {_STEP3}") :]
+    attribution = attribution[: attribution.index("      - name: ")]
+    assert "never the matched content" not in attribution
+    assert "name hit's path is itself the matched text" in attribution, attribution
     names = [s.get("name") for s in _steps()]
     note = names[names.index(_STEP3) + 1]
     body = str(_step(str(note))["run"])
-    assert "names each hit's commit" in body and "both scan steps" not in body, body
+    assert f"'{_STEP3}'" in body and "both scan steps" not in body, body
+
+
+@pytest.mark.parametrize("in_step", [1, 2])
+def test_a_scanner_crash_is_a_refusal_not_a_leak(in_step: int, bash: str, tmp_path: Path) -> None:
+    """An uncaught Python exception exits 1, the scanner's leak code, with no FORBIDDEN CONTENT
+    report. MEASURED on 7a30cf1f1: step 1 read that as a confirmed leak. A crash is the instrument
+    failing, so the step refuses (2), and attribution names no commit."""
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    after = _commit(repo.path, "two", {"b.txt": "y\n"})
+    rcs, out, _ = _run_steps(
+        bash,
+        repo.path,
+        tmp_path,
+        first,
+        after,
+        steps=_ALL,
+        extra_env={"STUB_CRASH": "1"},
+    )
+    assert rcs[in_step - 1] == 2, f"rcs={rcs}\n{out}"
+    assert "without a FORBIDDEN CONTENT report" in out, out
+    assert "carries the hit(s)" not in out, out
+
+
+def test_a_path_with_a_control_character_is_refused_unwritten(bash: str, tmp_path: Path) -> None:
+    """bash's own error for a failed write prints the path raw, so a pushed name carrying a newline
+    could start a line the runner reads as a workflow command. Such a path is refused (2) and never
+    written, and no line of the step's output starts the command it carries."""
+    repo = _Repo(tmp_path)
+    blob = _plumb(repo.path, "hash-object", "-w", "--stdin", stdin="x\n")
+    name = "q\n::stop-commands::tok"
+    inner = _plumb(repo.path, "mktree", "-z", stdin=f"100644 blob {blob}\t{name}\0")
+    bad = _hand_built_commit(repo.path, repo.main, f"040000 tree {inner}\tdocs\n")
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, repo.main, bad)
+    assert rcs[0] == 2, f"rcs={rcs}\n{out}"
+    assert f"branch commit {bad} names an unsafe path" in out, out
+    assert not any(line.lstrip().startswith("::stop-commands") for line in out.splitlines()), out
+    root = tmp_path / "runner-temp" / "branch-leak-scan-commits" / bad
+    assert not root.exists() or not any(root.rglob("*")), "the unsafe entry was written out"
+
+
+def test_an_unset_variable_in_a_step_is_a_refusal_not_a_leak(bash: str, tmp_path: Path) -> None:
+    """MUTATION row: under ``set -u`` an unset variable exits 1 and runs no ERR trap, so a future
+    typo would read as a confirmed leak. The EXIT trap maps it to 2. The mutation inserts one such
+    read right after the trap is set."""
+    repo = _Repo(tmp_path)
+    after = _commit(repo.path, "clean", {"a.txt": "x\n"})
+
+    def mutate(body: str) -> str:
+        anchor = "\nzero=0000000000000000000000000000000000000000\n"
+        assert body.count(anchor) == 1, "the mutation anchor moved"
+        return body.replace(anchor, '\n: "$no_such_variable_for_this_test"' + anchor)
+
+    rcs, out, calls = _run_steps(
+        bash, repo.path, tmp_path, repo.main, after, steps=(_STEP,), transform=mutate
+    )
+    assert "no_such_variable_for_this_test" in out, f"the mutation did not fire\n{out}"
+    assert rcs == [2] and not calls, f"rcs={rcs}, calls={calls}\n{out}"
+    assert "failed internally (exit 1)" in out, out
