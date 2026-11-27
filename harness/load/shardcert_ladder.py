@@ -101,7 +101,6 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
-from messagefoundry.pipeline.phase_timing import LANE_EPISODE_TIMING_ENV
 from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
@@ -608,7 +607,12 @@ class EpisodeTiming:
 
     def render(self) -> str:
         if self.is_empty:
-            return f"lane episode (S_lane): (none captured — {LANE_EPISODE_TIMING_ENV} off or no episodes)"
+            # A literal, not phase_timing's constant: harness/ may not import messagefoundry.pipeline
+            # (tests/test_dependency_boundaries.py). A test pins the two equal.
+            return (
+                "lane episode (S_lane): (none captured — MEFOR_PIPELINE_LANE_EPISODE_TIMING off or no "
+                "episodes)"
+            )
         return (
             f"lane episode (S_lane): episodes={self.episodes} windows={self.windows} | "
             f"S_lane mean/max={self.episode_mean_ms:.2f}/{self.episode_max_ms:.2f}ms | "
@@ -2640,7 +2644,8 @@ class ConsolidatedLadderReport:
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
         a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
         was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2. A
-        break on an un-driven, unaborted soak is exit 1 as well (BACKLOG #5862)."""
+        FIFO inversion or duplicate on an un-driven soak, and a FIFO inversion on an aborted one, is exit 1
+        as well (BACKLOG #5862; :attr:`_break_outranks_degradation` says which soak breaks do not outrank)."""
         if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
@@ -2662,14 +2667,20 @@ class ConsolidatedLadderReport:
         is the pool tripwire, or when the break is on a climb rung, whatever the soak's state.
 
         BACKLOG #5862: a soak the RIG under-drove (:attr:`soak_drive_shortfall`) still delivered the copies it
-        sent, so a FIFO inversion or duplicate on them was measured and outranks the shortfall too. Only an
-        ABORTED soak leaves its break unproven: its sinks were torn down mid-delivery, and the redelivery
-        after a teardown can read as a duplicate. The lanes term is not a hard break and does not outrank."""
+        sent, so a FIFO inversion or duplicate on them was measured and outranks the shortfall too; the soak's
+        single-lane term does not, since an under-driven soak can see few lanes. An ABORTED soak's duplicate
+        does not outrank either: its sinks were torn down mid-delivery, and the redelivery after a teardown
+        is counted as a repeat. Its FIFO inversion does: the tracker counts only a NEW seq below a lane's
+        high-water as one, which a redelivery cannot produce."""
         if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
             return False
-        soak_broke = self.soak is not None and self.soak.verdict is RungVerdict.CORRECTNESS_FAIL
-        return self._climb_broken or (
-            not self.soak_aborted and (soak_broke or not self.soak_drive_shortfall)
+        soak = self.soak
+        soak_broke = soak is not None and soak.verdict is RungVerdict.CORRECTNESS_FAIL
+        soak_inverted = soak is not None and soak.lane_inversions > 0
+        return (
+            self._climb_broken
+            or soak_inverted
+            or (not self.soak_aborted and (soak_broke or not self.soak_drive_shortfall))
         )
 
     @property
@@ -3122,8 +3133,9 @@ class ConsolidatedLadderReport:
             # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
             #
             # v11 (BACKLOG #5862) — no new key, one SCORING change: a FIFO inversion or duplicate on a soak
-            # the rig under-drove (`soak_drive_shortfall`) is FAIL / exit 1, not SETUP_DEGRADED / exit 2. A
-            # break on an ABORTED soak still reads SETUP_DEGRADED.
+            # the rig under-drove (`soak_drive_shortfall`), and a FIFO inversion on an ABORTED soak, is
+            # FAIL / exit 1, not SETUP_DEGRADED / exit 2. A duplicate on an aborted soak still reads
+            # SETUP_DEGRADED (a teardown's redelivery counts as one).
             "schema_version": 11,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
@@ -3671,7 +3683,7 @@ async def run_engine_ladder(
                 )
             break
         payload = _engine_rung_payload(report)
-        # Every shard's node log is read here, so off the loop the ladder awaits its coord on.
+        # Every engine shard's node log is read here, so off the loop the ladder awaits its coord on.
         await asyncio.to_thread(
             _attach_rung_timings, payload, _rung_log_paths(keep_dir, report.shards)
         )
