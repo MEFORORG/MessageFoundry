@@ -3319,6 +3319,24 @@ jobs:
           # which is the defect this comment exists to stop hiding.
           # --no-renames: both sides of a rename (BACKLOG #5472)
           changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
+          # Each path arm below reads its list from .github/ci-paths/<arm>.txt, one ERE per line,
+          # anchored as the inline form was (BACKLOG #5472: this file sits at GitHub's size limit).
+          # A list that is missing, empty, or holds a blank or CR line, or a grep that errors, FAILS
+          # the job: grep reads a missing list as "no match" and a blank line as "match everything".
+          paths_match() {
+            local list=".github/ci-paths/$1.txt" rc=0
+            # -U: Git Bash's grep drops a CR before matching without it.
+            if [ ! -s "$list" ] || grep -qxE '' "$list" || grep -qUF $'\r' "$list"; then
+              echo "::error::$list is missing, empty, or holds a blank or CR line"
+              exit 1
+            fi
+            echo "$changed" | grep -qEf "$list" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::grep failed reading $list (exit $rc)"
+              exit 1
+            fi
+            return "$rc"
+          }
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
@@ -3386,7 +3404,7 @@ jobs:
           # must meet them on its own PR rather than first on the nightly after the merge.
           # scripts/ci/db-tls-cert.sh makes the certificate these legs' databases serve and the engine
           # verifies (vault BACKLOG #3533 item 2), so an edit to it alone must pull them.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__init__|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals|security|models)|messagefoundry/auth/(__init__|service|tokens|trust_anchors|anchor_path|audit_visibility|identity|ldap|passwords|permissions|totp)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner|alert_sinks|engine|ingress_guards|refused_body|security_signals)|messagefoundry/connection_(events|names)|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction|integrity|security/__init__|apiclient/__init__|logging_guard|mllpcodec|proctree|remotedebug|serviceenv|startupcode|terminal_text)|messagefoundry_toolkit/(__init__|generators/)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(__init__|models|response|settings|wiring|fingerprint|snapshot|tls_policy)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12|admission|dicom|receipt)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|store_pin_connect_refusal|uploads_shard_quota|embedded_document_pruning|alert_sinks|alert_state|auth_hardening|b2614_revoke_all|b5091_global_session_epoch|config_fingerprint|custom_roles|processed_files_ledger|reload_dir_only_moves_on_apply|security_signals|start_config_change_alert|startup_attestation)|tests/(_[^/]*|conftest)\.py$|harness/(load/|config/|_spreadsheet|bounded_file|frame_cap)|tests/audit_chain_cases\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/(db-tls-cert|retry-native-crash)\.sh|\.github/workflows/ci\.yml)'; then
+          if paths_match serverdb; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3427,7 +3445,7 @@ jobs:
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
           # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
           # run rate is in that file's docstring.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|messagefoundry/_vendor/defusedxml/LICENSE$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
+          if paths_match docker; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -3446,14 +3464,14 @@ jobs:
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
           # BACKLOG #5472: tests/test_ci_packaging_gate.py
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|((README|CHANGELOG)\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore|messagefoundry/_vendor/defusedxml/LICENSE)$|\.github/workflows/(ci|release)\.yml)'; then
+          if paths_match packaging; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
           fi
           # The ide job (VS Code extension build+test) only depends on ide/** (its own npm project)
           # and this workflow; a pure-Python PR can't change its result, so don't run it there.
-          if echo "$changed" | grep -qE '^(ide/|\.github/workflows/ci\.yml)'; then
+          if paths_match ide; then
             echo "ide=true" >> "$GITHUB_OUTPUT"
           else
             echo "ide=false" >> "$GITHUB_OUTPUT"
@@ -3514,7 +3532,7 @@ jobs:
           # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
           # alone must still run this tier.
           # BACKLOG #5472: tests/test_ci_tooling_gate.py
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|(ci|docker|security)/locks/|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.gitleaks\.toml|\.semgrep/|\.codex/|\.pre-commit-config\.yaml|constraints\.lock|requirements\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          if paths_match tooling \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else

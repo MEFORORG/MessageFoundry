@@ -94,16 +94,17 @@ _STEP_MODULE = re.compile(r"-m\s+((?:harness|scripts|tests)(?:\.\w+)+)")
 
 @functools.cache
 def _docker_pattern() -> re.Pattern[str]:
-    """The pull-request arm's ``grep -qE`` pattern for ``docker``.
+    """The pull-request arm's pattern for ``docker``, from ``.github/ci-paths/docker.txt``.
 
     Anchored on the LAST ``docker=true`` emission: the workflow_dispatch arm emits one first, with
-    no grep in front of it. The last ``grep -qE`` before the emission is the arm that decides it.
+    no matcher in front of it. The last ``paths_match`` before the emission is the arm that decides
+    it.
     """
     return re.compile(changes_arm_pattern("docker", "dockerignore"))
 
 
 def gate(changed: list[str]) -> bool:
-    """Mirror of the shell decision: ``echo "$changed" | grep -qE P`` over one path per line."""
+    """Mirror of the shell decision: ``echo "$changed" | grep -qEf LIST`` over one path per line."""
     pattern = _docker_pattern()
     return any(pattern.search(path) for path in changed)
 
@@ -451,10 +452,15 @@ def test_the_arm_reader_follows_a_repointed_workflows_dir(
     here, not in the tooling tier, because an edit to tests/_workflow_contexts.py alone trips no
     tooling arm."""
     real = changes_arm_pattern("docker", "dockerignore")
-    planted = "^(planted/dockerignore)"
-    step = f'grep -qE \'{planted}\'\necho "docker=true" >> "$GITHUB_OUTPUT"\n'
-    (tmp_path / "ci.yml").write_text(step, encoding="utf-8")
-    monkeypatch.setattr(workflow_contexts, "WORKFLOWS", tmp_path)
+    planted = "^planted/dockerignore"
+    workflows = tmp_path / "workflows"
+    workflows.mkdir()
+    step = 'if paths_match docker; then\necho "docker=true" >> "$GITHUB_OUTPUT"\n'
+    (workflows / "ci.yml").write_text(step, encoding="utf-8")
+    # The arm's list, beside the repointed workflows dir as .github/ci-paths/ is (BACKLOG #5472).
+    (tmp_path / "ci-paths").mkdir()
+    (tmp_path / "ci-paths" / "docker.txt").write_bytes(f"{planted}\n".encode())
+    monkeypatch.setattr(workflow_contexts, "WORKFLOWS", workflows)
     assert changes_arm_pattern("docker", "dockerignore") == planted != real
 
 

@@ -51,6 +51,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._ci_paths import arm_list_name, ci_path_list, joined
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
@@ -138,16 +140,21 @@ def test_every_module_gated_suite_is_named_by_a_workflow() -> None:
     )
 
 
+def _serverdb_lines() -> list[str]:
+    """The ``serverdb`` change-detection list: the one ci.yml's ``serverdb`` arm names, read from
+    ``.github/ci-paths/`` (BACKLOG #5472), so a re-pointed arm is followed rather than assumed."""
+    return ci_path_list(arm_list_name(CI_YML.read_text(encoding="utf-8"), "serverdb"))
+
+
 def _serverdb_alternation() -> re.Pattern[str]:
-    """The ``tests/test_(...)`` alternation inside the ``serverdb`` change-detection regex."""
-    for line in CI_YML.read_text(encoding="utf-8").splitlines():
-        if "grep -qE" in line and "tests/test_(" in line:
-            match = re.search(r"tests/test_\(([^)]*)\)", line)
-            if match:
-                return re.compile(rf"^test_({match.group(1)})")
+    """The ``tests/test_(...)`` alternation inside the ``serverdb`` change-detection list."""
+    for line in _serverdb_lines():
+        match = re.fullmatch(r"\^tests/test_\(([^)]*)\)", line)
+        if match:
+            return re.compile(rf"^test_({match.group(1)})")
     pytest.fail(
-        "could not locate the `serverdb` change-detection alternation (a `grep -qE` line "
-        "containing `tests/test_(...)`) in .github/workflows/ci.yml"
+        "could not locate the `serverdb` change-detection alternation (a `^tests/test_(...)` line "
+        "in the list ci.yml's `paths_match serverdb` reads, .github/ci-paths/serverdb.txt)"
     )
 
 
@@ -181,7 +188,7 @@ def test_serverdb_path_gate_admits_every_file_those_legs_run() -> None:
 
     assert not unmatched, (
         f"{len(unmatched)} test file(s) run by a SQL Server / PostgreSQL step are not matched by "
-        "the `serverdb` change-detection alternation in .github/workflows/ci.yml, so editing one "
+        "the `serverdb` change-detection alternation in .github/ci-paths/serverdb.txt, so editing one "
         "does NOT pull the leg that proves it on the PR — it first runs in the merge queue or on "
         "the nightly cron:\n  "
         + "\n  ".join(unmatched)
@@ -196,15 +203,13 @@ def _serverdb_full_pattern() -> re.Pattern[str]:
     because the invariant IT guards is about test files. This one keeps every arm, because BACKLOG
     #1322's invariant is about the SOURCES those suites assert against.
     """
-    for line in CI_YML.read_text(encoding="utf-8").splitlines():
-        if "grep -qE" in line and "tests/test_(" in line:
-            match = re.search(r"grep -qE '(\^\(.*\))'", line)
-            if match:
-                return re.compile(match.group(1))
-    pytest.fail(
-        "could not locate the `serverdb` change-detection regex (a `grep -qE` line containing "
-        "`tests/test_(...)`) in .github/workflows/ci.yml"
-    )
+    lines = _serverdb_lines()
+    if not any(line.startswith("^tests/test_(") for line in lines):
+        pytest.fail(
+            "could not locate the `serverdb` change-detection regex (a list holding a "
+            "`^tests/test_(...)` line) behind ci.yml's `paths_match serverdb`"
+        )
+    return re.compile(joined(lines))
 
 
 def _module_path(module: str) -> str | None:
@@ -419,7 +424,7 @@ def test_serverdb_path_gate_admits_every_tests_helper_those_suites_import() -> N
     missed = sorted(path for path in helpers if not pattern.match(path))
     assert not missed, (
         f"{len(missed)} tests/ file(s) a SQL Server / PostgreSQL suite imports are not matched by "
-        "the `serverdb` regex in .github/workflows/ci.yml, so editing one does NOT pull the leg "
+        "the `serverdb` list in .github/ci-paths/serverdb.txt, so editing one does NOT pull the leg "
         "that runs it on the PR:\n  " + "\n  ".join(missed)
     )
 
@@ -564,7 +569,7 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
 
     assert not unmatched, (
         f"{len(unmatched)} engine source(s) imported by a SQL Server / PostgreSQL suite are not "
-        "matched by the `serverdb` change-detection regex in .github/workflows/ci.yml, so editing "
+        "matched by the `serverdb` change-detection list in .github/ci-paths/serverdb.txt, so editing "
         "one does NOT pull the leg that would catch a regression in it on the PR — the leg first "
         "runs on it in the merge queue or on the nightly cron:\n  "
         + "\n  ".join(unmatched)

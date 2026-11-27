@@ -88,6 +88,7 @@ from messagefoundry.store.privilege import (
     sqlserver_excess,
     view_definition_grant,
 )
+from tests._ci_paths import arm_list_name, ci_path_list
 from tests._live_scratch import (
     SqlServerAdmin,
     bounded,
@@ -1837,17 +1838,17 @@ def test_editing_this_file_pulls_the_server_db_legs_that_prove_it() -> None:
     nightly cron — editing it does not pull the leg. Same invariant
     ``test_serverdb_path_gate_admits_every_file_those_legs_run`` enforces, asserted here because that
     test derives its file set from module-gated suites and never sees this one."""
-    for line in _ci_yml().splitlines():
-        if "grep -qE" in line and "tests/test_(" in line:
-            match = re.search(r"tests/test_\(([^)]*)\)", line)
-            assert match is not None
+    # The list ci.yml's `serverdb` arm reads, in .github/ci-paths/ since BACKLOG #5472.
+    for line in ci_path_list(arm_list_name(_ci_yml(), "serverdb")):
+        match = re.fullmatch(r"\^tests/test_\(([^)]*)\)", line)
+        if match:
             alternation = re.compile(rf"^test_({match.group(1)})")
             assert alternation.match(Path(_THIS_FILE).stem), (
                 f"the `serverdb` alternation does not match {_THIS_FILE}; it reads: "
                 f"tests/test_({match.group(1)})"
             )
             return
-    pytest.fail("could not locate the `serverdb` change-detection alternation in ci.yml")
+    pytest.fail("could not locate the `serverdb` change-detection alternation in its list")
 
 
 # --- live server legs (skipped locally; CI's store legs are the standing coverage) -------------

@@ -45,6 +45,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on a venv witho
     yaml = pytest.importorskip("yaml")
 
 from scripts.ci.required_contexts import parse_contexts_file  # noqa: E402
+from tests._ci_paths import arm_list_name, ci_path_list, joined  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -113,31 +114,28 @@ def step_script(workflow: str, job: str, name_starts: str) -> tuple[int, str]:
 
 
 def changes_arm_pattern(output: str, sanity: str) -> str:
-    """The ``grep -qE`` pattern ``ci.yml``'s ``changes`` job uses to decide ``output`` on a PR.
+    """The pattern ``ci.yml``'s ``changes`` job uses to decide ``output`` on a PR, as one regex.
 
-    Anchored on the LAST ``<output>=true`` emission, because the dispatch and push arms emit one
-    first with no grep in front of them; the last ``grep -qE`` before it is the path arm. ``sanity``
-    is a substring that arm must hold, so a restructure that puts another arm's grep there raises
-    rather than passing against the wrong pattern.
+    The arm is ``paths_match <arm>``, anchored on the LAST ``<output>=true`` emission (see
+    ``tests/_ci_paths.arm_list_name``), and its patterns live in ``.github/ci-paths/<arm>.txt``, one
+    ERE per line (BACKLOG #5472); they come back ``|``-joined, which reads the same paths.
+    ``sanity`` is a substring the pattern must hold, so a restructure that puts another arm's
+    matcher there raises rather than passing against the wrong pattern.
 
-    Read from ``WORKFLOWS`` on each call and memoised on the text, so a test that repoints
-    ``WORKFLOWS`` and calls this directly reads the file it pointed at. A caller that memoises the
+    Read from ``WORKFLOWS`` and its sibling ``ci-paths`` on each call, so a test that repoints
+    ``WORKFLOWS`` and calls this directly reads the files it pointed at. A caller that memoises the
     result itself, as the docker and packaging gate tests do, still answers from its first call.
     """
-    return _changes_arm_pattern((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"), output, sanity)
+    name = arm_list_name((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"), output)
+    lines = ci_path_list(name, WORKFLOWS.parent / "ci-paths")
+    return _changes_arm_pattern(tuple(lines), output, sanity)
 
 
 @functools.cache
-def _changes_arm_pattern(text: str, output: str, sanity: str) -> str:
-    emit = text.rfind(f'echo "{output}=true" >> "$GITHUB_OUTPUT"')
-    assert emit > 0, (
-        f"the {output} arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
-    )
-    matches = list(re.finditer(r"grep -qE '([^']*)'", text[:emit]))
-    assert matches, f"no `grep -qE` found before the {output} emission"
-    pattern = matches[-1].group(1)
+def _changes_arm_pattern(lines: tuple[str, ...], output: str, sanity: str) -> str:
+    pattern = joined(lines)
     assert sanity in pattern, (
-        f"the grep picked up before the {output} emission is not the {output} arm: {pattern}"
+        f"the list picked up before the {output} emission is not the {output} arm: {pattern}"
     )
     return pattern
 

@@ -63,6 +63,7 @@ tests/test_ci_leg_data_class.py
 tests/test_ci_merge_group_gate.py
 tests/test_ci_odbc_installer_pipefail.py
 tests/test_ci_packaging_gate.py
+tests/test_ci_path_lists.py
 tests/test_ci_postgres_windows_leg.py
 tests/test_ci_red_clearer.py
 tests/test_ci_red_reader.py
