@@ -4,8 +4,8 @@
 
 ``executor_queue_depth`` and ``executor_busy`` are per-process gauges: each engine shard runs its own
 default executor. ``EnginePoller._sample_sync`` read the first engine shard that reported one, so a
-saturated executor on any other engine shard read as the first one's figure. Only the per-shard read
-is faked here; the real aggregation runs.
+saturated executor on any other engine shard read as the first one's figure. Only the read of each
+engine shard is faked here; the real aggregation runs.
 """
 
 from __future__ import annotations

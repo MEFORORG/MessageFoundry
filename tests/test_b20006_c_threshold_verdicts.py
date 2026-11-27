@@ -12,16 +12,14 @@ from __future__ import annotations
 
 import pytest
 
-from harness.load.connscale import runner as connscale_runner
 from harness.load.connscale.runner import _reconcile as connscale_reconcile
 from harness.load.connscale.runner import _ReloadAccount
 from harness.load.enginepoll import EngineSample
-from harness.load.estate import runner as estate_runner
 from harness.load.estate.runner import _reconcile as estate_reconcile
 from harness.load.metrics import Counters
 
 _RESET = "the engine restarted mid-run"
-_SUFFIX = "a threshold, not proof of a loss"
+_SUFFIX = "a threshold and not on its own proof of a loss"
 
 
 def _sample(*, read: int, written: int) -> EngineSample:
@@ -169,8 +167,3 @@ def test_a_reload_signature_that_is_not_a_threshold_stays_loss_across_a_reset() 
         reload=reload,
     )
     assert not result.ok and not result.inconclusive, result.detail
-
-
-def test_the_two_rig_copies_say_the_same() -> None:
-    assert connscale_runner._UNJUDGED_THRESHOLD == estate_runner._UNJUDGED_THRESHOLD
-    assert _SUFFIX in connscale_runner._UNJUDGED_THRESHOLD

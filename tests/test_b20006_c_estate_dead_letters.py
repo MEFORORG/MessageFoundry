@@ -97,6 +97,9 @@ def test_errors_the_client_saw_nakked_are_not_judged() -> None:
     c = Counters(sent=100, acked=97, nak=3, sink_received=97)
     result = _judge(c, _sample(read=100, written=97, in_errored=3))
     assert result.ok, result.detail
+    # Not silent: the detail says the errors were seen and why they were not judged.
+    assert "3 message(s) took an ERROR disposition" in result.detail
+    assert "not judged" in result.detail
 
 
 def test_an_unconfirmed_send_may_be_a_nak_the_client_missed() -> None:
@@ -153,14 +156,15 @@ def test_a_stats_reset_that_cancels_a_new_dead_letter_in_out_dead_is_still_a_los
     assert "the store holds 1 more dead outbound row(s)" in result.detail
 
 
-def test_new_dead_rows_in_the_store_are_a_loss_across_a_counter_reset() -> None:
-    # A stats reset or a restart leaves the store's rows as they are, so a rise still proves them.
+def test_the_store_dead_arm_is_not_judged_across_a_counter_reset() -> None:
+    # Like every engine arm it waits for a clean read: the store is shared, so a reset step's rise
+    # is not taken as this step's loss. The step fails INCONCLUSIVE, as it did before.
     c = Counters(sent=36, acked=36, sink_received=36)
     result = _judge(
         c, _sample(read=36, written=36, dead=2), counter_reset="the engine restarted mid-run"
     )
-    assert not result.ok and not result.inconclusive, result.detail
-    assert "the store holds 2 more dead outbound row(s)" in result.detail
+    assert not result.ok and result.inconclusive, result.detail
+    assert "the store holds" not in result.detail
 
 
 def test_the_store_dead_text_is_not_repeated_beside_the_same_outbound_count() -> None:

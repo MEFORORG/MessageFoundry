@@ -2103,10 +2103,13 @@ def _build_record(
     )
 
 
-#: Appended to the stranding-budget and ``no_sends`` text when the engine arms were not judged, where
-#: either makes the step INCONCLUSIVE rather than LOSS (BACKLOG #5574 item 9). The estate copy keeps
-#: the same text, and tests/test_b20006_c_threshold_verdicts.py holds the two to it.
-_UNJUDGED_THRESHOLD = " — a threshold, not proof of a loss, while the engine arms were not judged"
+#: Appended to the stranding-budget and ``no_sends`` text when the engine arms were not judged,
+#: where neither counts as a loss on its own (BACKLOG #5574 item 9). Another arm can still make that
+#: step LOSS, so the text speaks of the clause it ends, not of the verdict. The estate copy imports
+#: it.
+_UNJUDGED_THRESHOLD = (
+    " — with the engine arms not judged, this is a threshold and not on its own proof of a loss"
+)
 
 
 @dataclass(frozen=True)
@@ -2144,7 +2147,8 @@ def _excusal(c: Counters, *, unconfirmed_budget: int, reload_stranded: int = 0) 
     # Over budget, `excused` clamps to 0, apart from the reload-stranded sends. The shortfall check
     # then treats every other send as confirmed. So an over-budget detail can also print
     # "lost K on intake", where K is `population - read`: unconfirmed sends that never reached
-    # intake, plus any real loss. Read the budget clause first; it is the verdict (BACKLOG #1866).
+    # intake, plus any real loss. Read the budget clause first; with the engine arms judged it is the
+    # verdict (BACKLOG #1866), and without them it makes the step INCONCLUSIVE (BACKLOG #5574 item 9).
     # The load copy in report.py no longer fails on the budget.
     budget = max(unconfirmed_budget, 3 * population // 4)
     over_budget = unconfirmed > budget
@@ -2253,9 +2257,10 @@ def _reconcile_judged(
     sent = c.sent
     sink_received = c.sink_received
     # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
-    # and must not skip the arms that read only client counters: those still prove a loss without
-    # the engine (BACKLOG #5574). The stand-ins 0/0/-1 are what a band report carries for "no
-    # reading" (the batch-box aggregate reads the -1).
+    # and must not skip the arms that read only client counters: the reload guards `not_back` and
+    # `no_reply` still prove a loss without the engine, and the stranding budget and `no_sends`
+    # still run, as thresholds that make the step INCONCLUSIVE (BACKLOG #5574 item 9). The stand-ins
+    # 0/0/-1 are what a band report carries for "no reading" (the batch-box aggregate reads the -1).
     metrics_missing = base is None or final is None
     if base is None or final is None:
         read, written, backlog = 0, 0, -1
@@ -2265,10 +2270,10 @@ def _reconcile_judged(
         # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
         backlog = final.backlog
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
-    # the engine deltas may rest on it; the load copy's reasoning is the source of record. The arms
-    # that read only client counters (the stranding budget and the reload guards) still prove a loss
-    # across it, as the load copy keeps its dead-ACK-path signature. A negative delta is not
-    # published.
+    # the engine deltas may rest on it; the load copy's reasoning is the source of record. Of the
+    # arms that read only client counters, the reload guards `not_back` and `no_reply` still prove a
+    # loss across it; the stranding budget and `no_sends` are thresholds there and make the step
+    # INCONCLUSIVE (BACKLOG #5574 item 9). A negative delta is not published.
     engine_judged = counter_reset is None and not metrics_missing
     if not engine_judged:
         read, written = max(0, read), max(0, written)

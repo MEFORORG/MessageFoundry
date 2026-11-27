@@ -1064,8 +1064,11 @@ class EnginePoller:
             # B11: empty-claim counts SUM across shards (each shard runs its own workers). Executor
             # gauges + the pool snapshot are per-process; take the MAX queue depth/busy and the first
             # shard reporting a pool (in practice the connscale harness runs a single engine, so this
-            # is exactly that one engine's reading). The executor pair read the first shard until
-            # BACKLOG #5950 item 1, which hid a saturated executor on any later engine shard.
+            # is exactly that one engine's reading). The executor pair read the first engine shard
+            # until BACKLOG #5950 item 1, which hid a saturated executor on any later engine shard.
+            # Unlike `pool_wait_max_ms` below, this moves no banked key: the MAX was these fields'
+            # stated meaning, and their only reader, connscale/runner.py, polls a single engine.
+            # Each is its own peak, so one sample's two figures can come from different processes.
             empty_claims=sum(s.empty_claims for s in shard_samples),
             empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),

@@ -1512,7 +1512,7 @@ def test_rig_reconciles_a_stranding_flood_fails_inconclusive_across_a_counter_re
     ):
         assert not result.ok and result.inconclusive, result.detail
         assert "systemic no-ACK fault" in result.detail
-        assert "a threshold, not proof of a loss" in result.detail
+        assert "a threshold and not on its own proof of a loss" in result.detail
         assert "restarted mid-run" in result.detail
     control = connscale_reconcile(
         _RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET
@@ -1547,7 +1547,7 @@ def test_rig_reconciles_a_stranding_flood_fails_inconclusive_without_engine_metr
     ):
         assert not result.ok and result.inconclusive, result.detail
         assert "systemic no-ACK fault" in result.detail
-        assert "a threshold, not proof of a loss" in result.detail
+        assert "a threshold and not on its own proof of a loss" in result.detail
         assert "engine metrics unavailable" in result.detail
         assert (result.engine_read, result.engine_written, result.backlog) == (0, 0, -1)
         assert "not drained" not in result.detail
