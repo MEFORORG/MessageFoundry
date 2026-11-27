@@ -112,7 +112,11 @@ export function reset(): void {
 const disposable = (fn: () => void = () => {}): { dispose(): void } => ({ dispose: fn });
 
 /** Any member is a no-op function: the engine log's output channel. */
-const noOps = new Proxy({}, { get: () => () => undefined });
+const noOps = new Proxy(
+  {},
+  // Not `then`: a channel answering it would be a thenable that never settles if anything awaited it.
+  { get: (_t, key) => (key === "then" ? undefined : () => undefined) },
+);
 
 class MarkdownString {
   isTrusted: unknown;
@@ -432,11 +436,14 @@ export async function tearDown(bar: object | undefined, ctx: { dispose(): void }
       await idle(bar);
     }
   } finally {
-    ctx?.dispose();
-    uninstallFakes();
-    reset();
-    if (ws !== undefined) {
-      fs.rmSync(ws, { recursive: true, force: true });
+    try {
+      ctx?.dispose();
+    } finally {
+      uninstallFakes();
+      reset();
+      if (ws !== undefined) {
+        fs.rmSync(ws, { recursive: true, force: true });
+      }
     }
   }
 }

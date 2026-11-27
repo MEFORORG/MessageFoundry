@@ -47,8 +47,9 @@ def test_the_ide_serve_argv_names_the_service_config() -> None:
 
 
 def test_the_ide_default_serve_argv_names_no_service_config() -> None:
-    """``serveDefault`` is serve with ``messagefoundry.serviceConfig`` at its default: the engine
-    reads it as serve with no service-config file, so it falls back to ./messagefoundry.toml."""
+    """``serveDefault`` is serve with ``messagefoundry.serviceConfig`` at its default: the parser
+    reads it as serve with no service-config file. Which file serve then reads by default is the
+    settings loader's to say, and this test does not check it."""
     parser, _ = _build_parser()
     ns = parser.parse_args(_cli_args(FIXTURE["serveDefault"]))
     assert ns.command == "serve"

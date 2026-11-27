@@ -12,6 +12,11 @@
 //   * the first run, an engine minting its certificate only once started: it answers false and starts
 //     the CLI refresh, which registers the new certificate, so the next re-probe carries it with no
 //     reload (the real handler, with `cert inventory` faked).
+// An open limit the first-run pin does not cover: that refresh runs at most once per
+// FAILURE_REFRESH_MIN_MS (60 s, engineTrust.ts). If a verification failure spent it in the minute
+// before Start, as one from another engine on the same port can, the re-probes after Start are refused
+// a refresh, and the anchor is picked up by the first failing probe after that minute, the 15 s poll's
+// included. A delay of at most that minute, not a reload. The suite's setup resets the limit.
 //
 // This drives the real Start and Restart (b20008-b-harness.ts), with every engine request failing as
 // a self-signed certificate does. Behaviour, not source text, apart from one scan of activation's call.
@@ -102,9 +107,13 @@ trustSuite("the probes after Start and Restart reach the trust failure handler a
   });
 
   teardown(async () => {
-    await tearDown(bar, ctx, ws);
-    mods.engineTrust.forgetEngineTrust();
-    bar = ctx = ws = undefined;
+    try {
+      await mods.engineTrust.engineTrustSettled();
+    } finally {
+      await tearDown(bar, ctx, ws);
+      mods.engineTrust.forgetEngineTrust();
+      bar = ctx = ws = undefined;
+    }
   });
 
   const handled = (events: string[]): boolean => events.some((e) => e.startsWith("handler "));
@@ -121,9 +130,16 @@ trustSuite("the probes after Start and Restart reach the trust failure handler a
 
   test("registerEngineTrust installs followCertificateChange as the trust failure handler, and activation calls it", () => {
     assert.strictEqual(installed, mods.engineTrust.followCertificateChange);
-    const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "extension.ts"), "utf8");
-    const activate = src.slice(src.indexOf("export function activate("));
-    assert.match(activate, /\bregisterEngineTrust\(context\);/);
+    const src = fs
+      .readFileSync(path.join(__dirname, "..", "..", "..", "src", "extension.ts"), "utf8")
+      .replace(/\r\n/g, "\n");
+    // activate's body only: from its signature to the first top-level closing brace after it.
+    const start = src.indexOf("export function activate(");
+    assert.ok(start >= 0, "extension.ts has no activate");
+    const end = src.indexOf("\n}\n", start);
+    assert.ok(end > start, "activate has no closing brace at column 0");
+    const activate = src.slice(start, end);
+    assert.match(activate, /\n {2}registerEngineTrust\(context\);/);
   });
 
   test("a probe after Start reaches the handler through withRenewalRetry, and retries", async () => {
@@ -195,18 +211,22 @@ trustSuite("on the first run, the next probe after Start or Restart carries the 
   /** The first re-probe fails with no anchor and starts the CLI refresh; the second carries the anchor. */
   async function assertPickedUp(probes: (() => void)[]): Promise<void> {
     const inventories = (): number => state.execCalls.filter((c) => c.args.includes("inventory")).length;
-    const before = inventories();
+    const rechecks = (): number => state.executed.filter((id) => id === "messagefoundry.engineRecheck").length;
+    const before = { inventories: inventories(), rechecks: rechecks() };
     const failed = state.requests.length;
     await runProbe(bar!, probes, 0, (e) => e.some((x) => x.startsWith("request ")));
-    assert.strictEqual(state.requests[failed].ca, undefined, "the first re-probe had no anchor to carry");
+    const route = state.requests[failed];
+    assert.strictEqual(route.ca, undefined, "the first re-probe had no anchor to carry");
     await mods.engineTrust.engineTrustSettled();
-    assert.strictEqual(inventories(), before + 1, "the failure started one cert inventory refresh");
+    assert.strictEqual(inventories(), before.inventories + 1, "the failure started one cert inventory refresh");
     assert.strictEqual(mods.engineClient.tlsOptions(new URL(LOOPBACK)).ca, PEM, "the refresh anchored the new pair");
-    assert.ok(state.executed.includes("messagefoundry.engineRecheck"), "the refresh asked the bar to re-check");
+    assert.strictEqual(rechecks(), before.rechecks + 1, "the refresh asked the bar to re-check");
     const next = state.requests.length;
-    await runProbe(bar!, probes, 1, (e) => e.some((x) => x.startsWith("request ")));
-    assert.ok(state.requests.length > next, "the second re-probe sent a request");
-    assert.strictEqual(state.requests[next].ca, PEM, "the second re-probe carried the new certificate");
+    await runProbe(bar!, probes, 1, (e) => e.some((x) => x === `request ${route.url}`));
+    // The second re-probe's own request to the same route, not any other request made meanwhile.
+    const carried = state.requests.slice(next).find((r) => r.url === route.url);
+    assert.ok(carried !== undefined, "the second re-probe sent its request");
+    assert.strictEqual(carried.ca, PEM, "the second re-probe carried the new certificate");
   }
 
   test("after Start", async () => {

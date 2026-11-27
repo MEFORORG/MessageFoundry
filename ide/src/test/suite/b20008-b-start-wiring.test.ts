@@ -7,9 +7,10 @@
 //
 // The workspace holds the configured service TOML and nothing else, so the fork guard passes on the
 // configured file in both the fixed and the unfixed code: the unfixed code judged that file too, and
-// then started serve, the probe and provision-admin without it. The first five tests fail on that
-// code (engine 5fdb7bceaa, the parent of PR 2966's merge) on their argv or tooltip, not on a missing
-// symbol; the rest are controls and the default and blank cases.
+// then started serve, the probe and provision-admin without it. On that code (engine 5fdb7bceaa, the
+// parent of PR 2966's merge) the first five tests fail on their argv or tooltip, not on a missing
+// symbol, and so does the blank case, which meets the store-less prompt there. The unrelated-setting
+// control and the setting-at-default case pass on both.
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -35,7 +36,9 @@ const readFixture = <T>(name: string): T => JSON.parse(fs.readFileSync(path.join
 const SERVE = readFixture<{ serviceConfig: string; configDir: string; serve: string[]; serveDefault: string[]; copyLine: string }>(
   "b20008-b-serve-argv.json",
 );
-const ADMIN = readFixture<{ serviceConfig: string; provision: string[]; probe: string[] }>("provision-admin-argv.json");
+const ADMIN = readFixture<{ serviceConfig: string; provision: string[]; probe: string[]; probeDefault: string[] }>(
+  "provision-admin-argv.json",
+);
 
 const startSuite = NODE_SIDE ? suite : suite.skip;
 
@@ -81,7 +84,8 @@ startSuite("the status bar's Start runs every command with the service TOML the 
     state.probeAnswers = [noAdmin(), adminExists()];
     const run = state.commands.get("messagefoundry.startEngine");
     assert.ok(run !== undefined, "the Start command is registered");
-    await captureProbes(() => run());
+    // Three captured: a change to scheduleProbes' delays fails here rather than leaving real timers.
+    assert.strictEqual((await captureProbes(() => run())).length, 3, "serve schedules its three re-probes");
     assert.ok(!state.warnings.some((w) => /no engine store found/i.test(w)), "the fork guard found the service TOML");
     // The probe's first answer took the no-Administrator branch, not the could-not-check one.
     assert.ok(!state.warnings.some((w) => /could not check/i.test(w)), state.warnings.join("\n"));
@@ -164,7 +168,20 @@ startSuite("the status bar's Start runs every command with the service TOML the 
       await start();
       assert.deepStrictEqual(serveTerminal().shellArgs, SERVE.serveDefault);
       const probes = state.execCalls.filter((c) => c.args.includes("provision-admin"));
-      assert.ok(probes.length > 0 && probes.every((p) => !p.args.some((a) => a.startsWith("--service-config"))));
+      assert.strictEqual(probes.length, 2, JSON.stringify(state.execCalls));
+      for (const probe of probes) {
+        assert.deepStrictEqual(probe.args, ADMIN.probeDefault);
+      }
+      // provision-admin's argv with no --service-config: the fixture's, less that one element.
+      const provision = state.terminals.filter((t) => /provision/i.test(t.name));
+      assert.strictEqual(provision.length, 1);
+      const m = mods.engineControlModel;
+      assert.deepStrictEqual(provision[0].creationOptions.shellArgs, [
+        ...m.INTERPRETER_OPTIONS,
+        "-c",
+        m.HOLD_OPEN_SCRIPT,
+        ...ADMIN.provision.filter((a) => !a.startsWith("--service-config=")),
+      ]);
     });
   }
 });
