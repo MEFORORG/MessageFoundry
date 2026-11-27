@@ -13324,6 +13324,25 @@ class RegistryRunner:
                     log, "response build-up check for loopback %r", name, level=logging.WARNING
                 )
 
+    async def _dead_letter_unread_token(self, item_id: str, error: str) -> None:
+        """Dead-letter a response token the step could not read (BACKLOG #5727). A key service
+        that gave no verdict on the dead-letter's own seal says nothing about the token, so it
+        leaves as a :class:`QueueOpenFault`, raised outside the handler with no chain to the raw
+        key-service error, and the fault arm re-pends the token, as the handoff does with a seal
+        (its fix A). Any other cipher error, the invocation ceiling among them, is raised as is."""
+        seal_fault: QueueOpenFault | None = None
+        try:
+            await self.store.dead_letter_now(item_id, error)
+        except CipherError as exc:
+            if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+                raise
+            seal_fault = queue_open_fault(exc)
+        if seal_fault is not None:
+            try:
+                raise seal_fault
+            finally:
+                del seal_fault  # as for read_fault in _process_response_item
+
     @_records_worker_death("response")
     async def _process_response_item(
         self, name: str, item: OutboxItem
@@ -13396,7 +13415,7 @@ class RegistryRunner:
                 name,
                 item.id,
             )
-            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
+            await self._dead_letter_unread_token(item.id, REINGRESS_TOKEN_TAG_FAILED)
             return _ItemOutcome.PROCESSED, None
         if read_fault is not None:
             try:
@@ -13411,7 +13430,7 @@ class RegistryRunner:
                 item.id,
                 error_type,
             )
-            await self.store.dead_letter_now(
+            await self._dead_letter_unread_token(
                 item.id, f"undecryptable re-ingress reply: {error_text}"
             )
             return _ItemOutcome.PROCESSED, None
