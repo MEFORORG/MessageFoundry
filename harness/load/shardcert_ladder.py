@@ -2637,7 +2637,8 @@ class ConsolidatedLadderReport:
         A pool bind that is the ONLY degradation does not outrank a correctness break: the break is exit 1
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
         a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
-        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2."""
+        was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2. A
+        break on an un-driven, unaborted soak is exit 1 as well (BACKLOG #5862)."""
         if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
@@ -2656,10 +2657,20 @@ class ConsolidatedLadderReport:
     def _break_outranks_degradation(self) -> bool:
         """Correctness broke and no CLIMB-side degradation (a climb rendezvous abort, an unconfirmed climb
         store-truth) leaves the break unproven. Then the break is the answer when the only other degradation
-        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state."""
+        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state.
+
+        BACKLOG #5862: a soak the RIG under-drove (:attr:`soak_drive_shortfall`) still delivered the copies it
+        sent, so a FIFO inversion or duplicate on them was measured and outranks the shortfall too. Only an
+        ABORTED soak leaves its break unproven: its sinks were torn down mid-delivery, and the redelivery
+        after a teardown can read as a duplicate. The lanes term is not a hard break and does not outrank."""
         if self.ok or self.climb_aborted or self.store_truth_unconfirmed:
             return False
-        return self._climb_broken or not (self.soak_aborted or self.soak_drive_shortfall)
+        if self._climb_broken:
+            return True
+        if self.soak_aborted:
+            return False
+        soak_broke = self.soak is not None and self.soak.verdict is RungVerdict.CORRECTNESS_FAIL
+        return soak_broke or not self.soak_drive_shortfall
 
     @property
     def result_label(self) -> str:
@@ -3109,7 +3120,11 @@ class ConsolidatedLadderReport:
             # pool tripwire could not fire and a pool-bound run could exit 0); (3) a correctness break whose
             # only companion degradation is a pool bind, or a break on a CLIMB rung whatever the soak's state,
             # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
-            "schema_version": 10,
+            #
+            # v11 (BACKLOG #5862) — no new key, one SCORING change: a FIFO inversion or duplicate on a soak
+            # the rig under-drove (`soak_drive_shortfall`) is FAIL / exit 1, not SETUP_DEGRADED / exit 2. A
+            # break on an ABORTED soak still reads SETUP_DEGRADED.
+            "schema_version": 11,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
