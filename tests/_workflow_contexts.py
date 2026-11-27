@@ -18,6 +18,7 @@ THE MAPPING IS NOT OBVIOUS, which is why it lives in one place:
 
 from __future__ import annotations
 
+import copy
 import functools
 import re
 from pathlib import Path
@@ -66,10 +67,20 @@ def load_workflow(name: str) -> dict[Any, Any]:
 
     Keyed ``Any``, not ``str``: a bare ``on:`` parses to the boolean key ``True`` (see ``on_block``),
     so a ``str``-keyed type would make the one lookup every trigger reader needs a type error.
+
+    Each call returns a FRESH copy of one parse per file content, so a caller may mutate what it
+    gets: ci.yml takes a tenth of a second to parse, and dozens of tests read it.
     """
-    parsed = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+    parsed = copy.deepcopy(_parse((WORKFLOWS / name).read_text(encoding="utf-8")))
     assert isinstance(parsed, dict), f"{name} did not parse to a mapping"
     return parsed
+
+
+@functools.cache
+def _parse(text: str) -> Any:
+    """One YAML parse per distinct text. Keyed on the text, so a file rewritten under the same
+    path, or a repointed ``WORKFLOWS``, is parsed afresh rather than served stale."""
+    return yaml.safe_load(text)
 
 
 def needs_of(job: dict[str, Any]) -> list[str]:
@@ -101,7 +112,6 @@ def step_script(workflow: str, job: str, name_starts: str) -> tuple[int, str]:
     return found[0], "\n".join(line for line in lines if not line.lstrip().startswith("#"))
 
 
-@functools.cache
 def changes_arm_pattern(output: str, sanity: str) -> str:
     """The ``grep -qE`` pattern ``ci.yml``'s ``changes`` job uses to decide ``output`` on a PR.
 
@@ -109,8 +119,15 @@ def changes_arm_pattern(output: str, sanity: str) -> str:
     first with no grep in front of them; the last ``grep -qE`` before it is the path arm. ``sanity``
     is a substring that arm must hold, so a restructure that puts another arm's grep there raises
     rather than passing against the wrong pattern.
+
+    Read from ``WORKFLOWS`` on each call and memoised on the text, so a test that repoints
+    ``WORKFLOWS`` is never served the pattern of the file it pointed away from.
     """
-    text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    return _changes_arm_pattern((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"), output, sanity)
+
+
+@functools.cache
+def _changes_arm_pattern(text: str, output: str, sanity: str) -> str:
     emit = text.rfind(f'echo "{output}=true" >> "$GITHUB_OUTPUT"')
     assert emit > 0, (
         f"the {output} arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
