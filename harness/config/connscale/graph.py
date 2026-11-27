@@ -15,7 +15,7 @@ env), so this ONE graph file serves any N by env alone. The connscale sweep runn
 it writes each step's shape into a generated config directory instead
 (``harness.load.connscale.stepconfig``), because a ``[sandbox].mode = "subprocess"`` worker never
 receives a ``MEFOR_`` variable and would build the default 50 (BACKLOG #3132). Both build the graph
-through :func:`harness.config.connscale._wire.wire_graph`. The trivial route+handler keep
+through :func:`harness.config.connscale._shape.wire_graph`. The trivial route+handler keep
 the measured cost the engine's *per-connection machinery* (workers, wake events, pool, executor hops),
 not transform CPU. Serve it on its own::
 
@@ -28,7 +28,6 @@ Every value here is synthetic and generic — no real partner, site, host, or vo
 
 from __future__ import annotations
 
-from harness.config.connscale._shape import load_connscale_shape
-from harness.config.connscale._wire import wire_graph
+from _shape import load_connscale_shape, wire_graph
 
 wire_graph(load_connscale_shape())

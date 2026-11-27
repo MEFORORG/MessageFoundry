@@ -28,7 +28,7 @@ from tests.test_dependency_boundaries import _modules_imported_by
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG = _REPO_ROOT / "harness" / "config"
-_GRAPHS = ["load", "estate", "shardcert"]
+_GRAPHS = ["load", "estate", "shardcert", "connscale"]
 
 # Only the finder below raises with this text, so a control can tell its refusal from any other
 # missing module.
