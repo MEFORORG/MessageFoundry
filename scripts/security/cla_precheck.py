@@ -151,8 +151,8 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
-                      head, or a list of it lacking it, is re-read; see the paragraph on a
-                      head that lags the push event.
+                      head is re-read, and so is a list of that head lacking it while it
+                      refuses nothing; see the paragraph on a head that lags the push event.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
@@ -184,7 +184,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 EXIT_PASS = 0
@@ -854,23 +854,19 @@ def read_judged_head(
     stated once, in the module docstring's paragraph on a head that lags the push event.
     """
     delays = iter(HEAD_RETRY_DELAYS)
-    # The last judged read of the head that refused nothing, and the faults of the re-reads after it.
+    # The last judged read of the head that refused nothing, with why it lacks the head.
     kept: tuple[PullRequestRead, Verdict, str] | None = None
-    later: list[str] = []
-    stale_reads = 0
     while True:
         try:
             read = fetch_commits(transport, owner, name, number, expected_head)
         except _StaleHead as exc:
             if kept is not None:
-                # GitHub has moved past this head, so a newer run judges it; waiting cannot help.
-                later.append("a re-read showed another head than CLA_HEAD_SHA")
-                break
-            stale_reads += 1
+                # A re-read of another head than CLA_HEAD_SHA ends the re-reads.
+                return _report_kept(kept, "a re-read showed another head than CLA_HEAD_SHA")
             delay = next(delays, None)
             if delay is None:
                 raise PrecheckFault(
-                    f"{exc} after {stale_reads - 1} re-reads; this run is stale"
+                    f"{exc} after {len(HEAD_RETRY_DELAYS)} re-reads; this run is stale"
                 ) from exc
             sleep(delay)
             continue
@@ -878,26 +874,34 @@ def read_judged_head(
             if exc.partial is None:
                 if kept is None:
                     raise
-                later.append(f"a re-read faulted: {exc}")
-                break
+                return _report_kept(kept, f"a re-read faulted: {exc}")
             # A page failed after whole pages were kept. Those pages still prove what they prove.
             verdict = judge(exc.partial, False)
             if kept is None or verdict.refusals:
                 return exc.partial, verdict, str(exc)
-            later.append(f"a re-read was cut short: {exc}")
-            break
+            return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)
         if missing is None or verdict.refusals:
             return read, verdict, missing
-        kept, later = (read, verdict, missing), []
+        kept = (read, verdict, missing)
         delay = next(delays, None)
         if delay is None:
-            break
+            return _report_kept(kept, None)
         sleep(delay)
-    if kept is None:  # every break above follows a judged read
-        raise PrecheckFault("no read of CLA_HEAD_SHA was judged")
-    return kept[0], kept[1], "; then ".join([kept[2], *later])
+
+
+def _report_kept(
+    kept: tuple[PullRequestRead, Verdict, str], later: str | None
+) -> tuple[PullRequestRead, Verdict, str]:
+    """The read kept, its verdict, and one fault naming the read each part belongs to: the kept
+    read's own faults first, its verdict's included, then the fault of the re-read that ended the
+    re-reads, if one did. The verdict's fault moves into that text, so ``run`` does not print it
+    after the re-read's."""
+    read, verdict, missing = kept
+    fault = "; ".join(f for f in (missing, verdict.fault) if f)
+    text = f"the read judged: {fault}" + (f"; then {later}" if later else "")
+    return read, replace(verdict, fault=None), text
 
 
 def _missing_head(read: PullRequestRead, expected_head: str) -> str | None:

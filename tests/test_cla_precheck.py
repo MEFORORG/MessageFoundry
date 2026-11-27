@@ -1430,3 +1430,38 @@ def test_a_signature_fault_is_read_again_on_a_re_read() -> None:
 
     assert run(env, lambda _q, _v: replies.pop(0), signatures, lambda _s: None) == EXIT_REFUSED
     assert replies == [] and answers == []
+
+
+def test_a_trailing_re_read_cut_short_that_refuses_is_the_verdict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A re-read cut short whose whole pages refuse is the verdict: a refusal it proves stands. If
+    the kept read, which refused nothing, were judged instead, the run would warn and pass."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), _page([_commit(2, "Anon")], 2, True), {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    assert "refused::" in out
+    assert "the read judged" not in out
+
+
+def test_each_fault_of_a_trailing_list_names_the_read_it_belongs_to(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The kept read's count fault comes before the re-read's, under the kept read's name, so it
+    does not read as the re-read's."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 2, False), {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "fault::" in line]
+    assert warnings == [
+        "::warning title=CLA pre-check fault::the read judged: the commits this read returned do "
+        "not include CLA_HEAD_SHA; read 1 distinct commits where the pull request has 2; the "
+        "unread commits are not checked; then a re-read faulted: GraphQL returned an error"
+    ]
