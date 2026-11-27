@@ -788,8 +788,8 @@ def _encodable(line: str, encoding: object) -> str:
     that is not a known codec name reads as ASCII. Never raises."""
     try:
         codec = codecs.lookup(encoding).name if isinstance(encoding, str) else "ascii"
-    except LookupError:
-        codec = "ascii"
+    except (LookupError, ValueError):
+        codec = "ascii"  # an unknown name, or one ``codecs.lookup`` refuses (an embedded NUL)
     out: list[str] = []
     for ch in line:
         if ch.isascii():
@@ -797,12 +797,19 @@ def _encodable(line: str, encoding: object) -> str:
             continue
         try:
             ch.encode(codec)
-        except UnicodeError:
+        except (UnicodeError, LookupError):  # LookupError: a codec that is not a text encoding
             escaped = escape_lone_surrogates(ch)
             out.append(escaped if escaped != ch else json_unicode_escape(ord(ch)))
         else:
             out.append(ch)
     return "".join(out)
+
+
+#: The stderr format-fault line's entry for a line the sink's stream could not encode, written
+#: again escaped (BACKLOG #5813). The record formatted; it is counted on that line all the same.
+_ESCAPED_FAULT = (
+    "a line held characters the sink's stream cannot encode; it was written again with them escaped"
+)
 
 
 #: The fallback for a record's logger or level name, or an exception's type name, in the
@@ -936,7 +943,7 @@ class _GuardedSinkMixin(_SinkBase):
                 )
                 self._report_format_faults()
                 try:
-                    self._write_encodable(stand_in_line)
+                    self._write_line(stand_in_line)
                     return
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
@@ -944,10 +951,11 @@ class _GuardedSinkMixin(_SinkBase):
             elif isinstance(failure, UnicodeEncodeError):
                 # The record formats, and the stream has no byte for a character in the line (a
                 # strict cp1252 stdout, say). That is the line's fault, not the sink's, so it is
-                # written again with each such character escaped, and neither stage runs; a roll
-                # would only re-resolve to the same stream and fail the same way (BACKLOG #5813).
+                # written again, and ``_write_line`` escapes each such character; neither stage
+                # runs. A roll would only re-resolve to the same stream and fail the same way
+                # (BACKLOG #5813).
                 try:
-                    self._write_escaped(self.format(record) + self.terminator)
+                    self._write_line(self.format(record) + self.terminator)
                     return
                 except Exception as sink_exc:
                     failure = sink_exc
@@ -973,7 +981,7 @@ class _GuardedSinkMixin(_SinkBase):
                 if stand_in_line is None:
                     self._rewrite(record)
                 else:
-                    self._write_encodable(stand_in_line)
+                    self._write_line(stand_in_line)
             except Exception as roll_exc:
                 # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
@@ -1130,33 +1138,35 @@ class _GuardedSinkMixin(_SinkBase):
     def _emit_direct(self, record: logging.LogRecord) -> None:
         """Format + write + flush WITHOUT going through ``emit`` — an ``emit`` failure would re-enter
         ``handleError`` and be swallowed by the latch, hiding the very Stage 2 we are trying to detect.
-        Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2. A line
-        the stream cannot encode is escaped for it first, as :meth:`_write_encodable` says."""
-        self._write_encodable(self.format(record) + self.terminator)
-
-    def _write_encodable(self, line: str) -> None:
-        """Write ``line``; if the stream has no byte for one of its characters, write it again
-        with each such character escaped (:meth:`_write_escaped`). Any other failure, and a failure
-        of the escaped write, propagates (BACKLOG #5813)."""
-        try:
-            self._write_line(line)
-        except UnicodeEncodeError:
-            self._write_escaped(line)
-
-    def _write_escaped(self, line: str) -> None:
-        """Write ``line`` with each character the stream cannot encode as a JSON ``\\uXXXX``
-        escape, so a JSON sink's line still parses back to the text, and count it as a format fault
-        for the stderr line. The escape reads the stream's ``encoding``; one that is missing or
-        unknown escapes everything outside ASCII. A failure of the write propagates."""
-        self._write_line(_encodable(line, getattr(self.stream, "encoding", None)))
-        self._note_format_fault(
-            "a line held characters the sink's stream cannot encode; they were written as "
-            "\\uXXXX escapes"
-        )
-        self._report_format_faults()
+        Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2."""
+        self._write_line(self.format(record) + self.terminator)
 
     def _write_line(self, line: str) -> None:
-        """Write and flush an already formatted line; a sink failure propagates."""
+        """Write and flush an already formatted line; a sink failure propagates.
+
+        Every write the guard makes comes here, so a line the stream has no byte for is escaped
+        for every one of them, the roll notice and the probe included (BACKLOG #5813). On
+        ``UnicodeEncodeError`` the line is written again with each such character escaped
+        (:func:`_encodable`) for the stream's ``encoding``, and if the stream still refuses it, as
+        one whose ``encoding`` does not name the encoder it uses can, with everything outside
+        ASCII escaped. A successful escaped write is counted for the stderr format-fault line. A
+        failure of the last write propagates."""
+        try:
+            self._write_raw(line)
+            return
+        except UnicodeEncodeError:
+            escaped = _encodable(line, getattr(self.stream, "encoding", None))
+        try:
+            self._write_raw(escaped)
+        except UnicodeEncodeError:
+            ascii_only = _encodable(line, None)
+            if ascii_only == escaped:
+                raise
+            self._write_raw(ascii_only)
+        self._note_format_fault(_ESCAPED_FAULT)
+        self._report_format_faults()
+
+    def _write_raw(self, line: str) -> None:
         self.stream.write(line)
         self.stream.flush()
 

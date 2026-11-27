@@ -474,13 +474,15 @@ stage 2 then decides the stop as for any other stage-2 failure. (Added 2026-11-2
 holding a character a strict stream has no byte for is written again with each such character
 as a JSON `\uXXXX` escape, a surrogate pair outside the BMP, so a JSON line still parses back
 to the text (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that called the case
-open). That holds for a record that formats, for the stand-in notice, and for the re-write
-after a roll, escaped for the stream the roll left. When the sink takes the escaped line,
+open). That holds for every line the guard writes: a record that formats, the stand-in
+notice, the roll notice, the probe, and the re-write after a roll, escaped for the stream the
+roll left. Where the record's own write failed only that way and the escaped line lands,
 neither stage runs, and the escape is counted on the rate-limited stderr format-fault line;
-nothing shows on `GET /status`. When the sink refuses the escaped line too, the two stages
-decide, as for any write failure. The escape reads the stream's `encoding`, and one that is
-missing or unknown escapes everything outside ASCII. `tests/test_remote_debug_guard.py` pins
-the escaped line for a strict cp1252 stdout.
+nothing shows on `GET /status`. Where a roll ran for another failure, stage 1 is recorded as
+for any roll. When the sink refuses the escaped line too, the two stages decide, as for any
+write failure. The escape reads the stream's `encoding`; one that is missing, unknown or not a
+text encoding, or a stream that still refuses the escaped line, escapes everything outside
+ASCII. `tests/test_remote_debug_guard.py` pins the escaped line for a strict cp1252 stdout.
 `_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 

@@ -1103,7 +1103,7 @@ def test_a_line_the_stream_cannot_encode_is_escaped_not_a_sink_failure(
     assert "the next line" in written
     assert "rolled after a write failure" not in written
     err = capsys.readouterr().err
-    assert "cannot encode; they were written as \\uXXXX escapes (x1)" in err
+    assert f"{logging_guard._ESCAPED_FAULT} (x1)" in err
     assert "IS UNWRITABLE" not in err
 
 
@@ -1151,14 +1151,14 @@ def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # CONTROL: the escape is for the line, not a way round a broken sink. A stream that refuses
-    # every write raises UnicodeEncodeError for this line, and then refuses the escaped line too,
-    # so the two stages decide as for any write failure, and the stop is asked for.
+    # every write raises UnicodeEncodeError for this line, as cp1252 would, and then refuses the
+    # escaped line, which cp1252 can encode, for the sink's own reason. So the two stages decide
+    # as for any write failure, and the stop is asked for.
     class _Refuses(io.StringIO):
         encoding = "cp1252"
 
         def write(self, text: str) -> int:
-            if not text.isascii():
-                raise UnicodeEncodeError("charmap", text, 0, 1, "character maps to <undefined>")
+            text.encode("cp1252")  # UnicodeEncodeError for what cp1252 has no byte for
             raise OSError(28, "No space left on device")
 
     stream = _Refuses()
@@ -1173,7 +1173,65 @@ def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
 
     assert [e.stage for e in events] == ["unwritable"]
     assert events[0].stop_requested is True
+    assert "No space left on device" in events[0].reason
     assert [s.state for s in guard.status()] == ["unwritable"]
+
+
+def test_a_roll_notice_whose_reason_the_stream_cannot_encode_is_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sink's write fails for its own reason, whose text holds a character the strict cp1252
+    # stdout the roll lands on has no byte for (a localized OS message, say). The roll notice is
+    # escaped like any other guard write, so stage 1 completes.
+    # NEGATIVE CONTROL: on 49e92d442f4 the notice was written unescaped, so stage 1 failed and the
+    # sink was recorded unwritable, asking for the stop.
+    raw, live = _strict_cp1252()
+    monkeypatch.setattr(sys, "stdout", live)
+
+    class _Broken(io.StringIO):
+        def write(self, text: str) -> int:
+            raise OSError(5, "E/S \u4e2d")
+
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(_Broken(), guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("plain ascii"))
+
+    assert [e.stage for e in events] == ["rolled"]
+    written = raw.getvalue().decode("cp1252")
+    assert "E/S \\u4e2d" in written
+    assert "plain ascii" in written
+
+
+def test_a_stream_whose_encoding_misnames_its_encoder_gets_ascii_escapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wrapper that says utf-8 but writes through a strict cp1252 stream: the escape for utf-8
+    # changes nothing, so the line is written again with everything outside ASCII escaped.
+    # NEGATIVE CONTROL: on 49e92d442f4 the second write failed too and the sink reached stage 2.
+    raw, inner = _strict_cp1252()
+
+    class _Misnamed(io.StringIO):
+        encoding = "utf-8"
+
+        def write(self, text: str) -> int:
+            return inner.write(text)
+
+    stream = _Misnamed()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    assert events == []
+    assert "order caf\\u00e9 \\u4e2d \\ud83d\\ude00" in raw.getvalue().decode("cp1252")
 
 
 @pytest.mark.parametrize(
@@ -1185,6 +1243,9 @@ def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
         pytest.param(
             "no-such-codec", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="unknown"
         ),
+        # A codec that is not a text encoding, and a name codecs.lookup refuses, read as ASCII.
+        pytest.param("base64", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="base64"),
+        pytest.param("a\x00b", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="nul-name"),
         # Spelled as the log spells one, the backslash doubled, so a strict JSON decoder reads it.
         pytest.param("utf-8", "a\udcffb", "a\\\\udcffb", id="lone-surrogate"),
     ],

@@ -57,7 +57,7 @@ from messagefoundry.config.settings import (
     security_loosenings,
 )
 from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.logging_guard import active_guard
+from messagefoundry.logging_guard import _ESCAPED_FAULT, active_guard
 from messagefoundry.logging_setup import LogFile, SyslogForward, configure_logging
 from messagefoundry.pipeline import Engine
 from messagefoundry.remotedebug import (
@@ -605,12 +605,7 @@ def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
     assert sinks.rolled_aside() == []
     assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
     # The name's own escape, not the log guard's, kept the line encodable.
-    assert _GUARD_ESCAPED not in capsys.readouterr().err
-
-
-#: The stderr line the log guard writes when it had to escape a line the stream could not encode
-#: (BACKLOG #5813).
-_GUARD_ESCAPED = r"cannot encode; they were written as \uXXXX escapes"
+    assert _ESCAPED_FAULT not in capsys.readouterr().err
 
 
 def test_without_the_escape_a_name_outside_cp1252_needs_the_guard_to_escape_it(
@@ -634,7 +629,7 @@ def test_without_the_escape_a_name_outside_cp1252_needs_the_guard_to_escape_it(
     sinks = build_sinks()
     monkeypatch.setattr(remotedebug, "_ascii", lambda name: name)
     remotedebug._report(f"pay{chr(0x4E2D)}load.py")
-    assert _GUARD_ESCAPED in capsys.readouterr().err
+    assert _ESCAPED_FAULT in capsys.readouterr().err
     assert r"script file name pay\u4e2dload.py)" in sinks.on_stdout()
     assert REMOTE_SCRIPT_EVENT in sinks.in_file()
     assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
