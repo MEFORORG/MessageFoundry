@@ -572,8 +572,9 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     tag (see :func:`_queue_cell_refusal`), when a keyed store's row (or any ``ref`` row) holds a
     blank ``payload``, or when a ``ref`` row's opened key differs from its ``body_ref`` column. Any
     other key or format problem raises the cipher's own class, and a key service that gave no
-    verdict (:func:`is_transient_open_failure`) the cipher's own error. That includes at least a cell whose marker the
-    cipher cannot read, which then gets no queue-tag audit row and no alert: docs/PHI.md section 1,
+    verdict (:func:`is_transient_open_failure`) the cipher's own error. That includes at least a
+    cell whose marker the cipher cannot read, which then gets no queue-tag audit row and no alert:
+    docs/PHI.md section 1,
     *A database writer is refused only where a seal or a tag covers the row*, states that gap.
     Raises its subclass
     :class:`CorruptQueueCellError`, which is not drift, only when a cipher that names its keys

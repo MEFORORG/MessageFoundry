@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import re
 import socket
 import traceback
 import weakref
@@ -296,8 +297,11 @@ async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
     formatter = logging.Formatter("%(name)s %(levelname)s %(message)s")
     printed = [formatter.format(record) for record in caplog.records]
     # Control: uvicorn did log the refusal's traceback, so the search below can see one.
-    raised = _REFUSALS[kind][0].__name__
-    assert any("Traceback" in p and f"{raised}:" in p for p in printed), printed
+    # Anchored to a line start and the full class path, so ``CipherError`` cannot match a line
+    # naming ``UnauthenticatedCipherError``.
+    refusal = _REFUSALS[kind][0]
+    raised = re.compile(rf"(?m)^{re.escape(f'{refusal.__module__}.{refusal.__qualname__}')}:")
+    assert any("Traceback" in p and raised.search(p) for p in printed), printed
     leaked = [p for p in printed if any(word in p for word in _CIPHER_WORDS)]
     assert leaked == [], leaked
     assert not any("SYNTH-BODY" in p for p in printed)

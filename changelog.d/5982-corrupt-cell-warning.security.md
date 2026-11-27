@@ -9,14 +9,18 @@
   dead-lettered row's `last_error` and `dead` event detail. The refusal is handled as before: a
   claim dead-letters it, auditing and alerting a queue-tag refusal, and a read is refused. A
   claim's dead-letter WARNING names a queue-tag refusal by its class and cause, and any other
-  error by its class alone. Opening the cell no longer holds the refusal in a reference cycle, so
-  other rows' opened bodies in the caller's frames are no longer kept alive by that cycle until
-  the next cyclic collection. What is lost is diagnostic, at least: the key id the cipher's text
+  error by its class alone. What is lost is diagnostic, at least: the key id the cipher's text
   echoed, the marker version or algorithm id an unparseable marker named, the remedy named for a
   retired key that is not supplied, and, under Vault Transit, the Transit key name, the hvac
   error's class and which kind of non-AEAD refusal it was. Known limits, at least: a key service
   that gave no verdict is raised as the cipher gave it, since a claim reads its cause to set the
-  row aside, so its text still reaches the fault a claim logs at ERROR; an unmarked value's
-  refusal keeps its text, which names a column and a remedy and no value; and a store-once row's
-  shared body, which the store opens with its own decrypt after the queue cell has opened, keeps
-  the cipher's text in its refusal. (`BACKLOG #5982`)
+  row aside, so its text still reaches the fault a claim logs at ERROR, and, for a read the API
+  does not handle during a key-service outage, uvicorn's ERROR traceback, since that path
+  re-raises the cipher's error unchanged; an unmarked value's refusal keeps its text, which names
+  a column and a remedy and no value; a store-once row's shared body, which the store opens with
+  its own `_adecrypt` after the queue cell has opened, keeps the cipher's text in its refusal, and
+  a claim that dead-letters the row on that refusal writes that text into its `last_error`; and
+  the SQLite store's `response_body_for_work_row` still holds a refused token's error in its local
+  `refused` and raises it from there (`refused = err`, then `raise refused`), so that error's
+  traceback and the method's frame form a reference cycle until the next cyclic collection.
+  (`BACKLOG #5982`)
