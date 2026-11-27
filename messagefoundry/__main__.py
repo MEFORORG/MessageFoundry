@@ -14244,10 +14244,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         reason = failing[0]
     elif audit.hidden:
-        # A server schema is the build's own, so an expected cell the catalog read did not show
-        # was hidden from this login (at least a missing grant) rather than never created. Its
-        # values were not read, so the store is not audited whole and cannot PASS. The names come
-        # from the inventory, never from a row.
+        # Not audited whole, so never a PASS: `CipherAudit.hidden` says why.
         status, code = "NOT_COVERED", 3
         reason = (
             f"{audit.opened} sealed value(s) in the visible cells decrypted and authenticated, but "

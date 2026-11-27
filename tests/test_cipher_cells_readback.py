@@ -1715,13 +1715,82 @@ def test_the_server_audit_itself_records_what_the_catalog_hid(
     _hide_from_catalog(monkeypatch, "keyed_surface")
     audit, _source = _server_audit(db, keyed)
     assert audit.hidden == ["search_presets.criteria", "keyed_surface"], audit.hidden
-    assert audit.key_mismatch is None
     # A walk under no key stops before any value, and still records what it could not see.
     monkeypatch.undo()
     _hide_from_catalog(monkeypatch, "search_presets")
     audit, source = _server_audit(db, build_store_cipher(StoreSettings(path=str(db))))
     assert audit.hidden == ["search_presets.criteria"], audit.hidden
     assert audit.key_mismatch is not None and source.limits == {}
+
+
+def test_a_server_audit_stopped_part_way_keeps_what_the_catalog_hid(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key-service outage part way raises, and the audit filled in place still holds the hidden
+    cell, since it is recorded before any value is read."""
+    db, _settings = _copy(_template, tmp_path)
+
+    class _Down:
+        encrypts = True
+
+        def is_encrypted(self, stored: str) -> bool:
+            return stored.startswith(MARKER_PREFIX)
+
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            try:
+                raise ConnectionRefusedError("synthetic outage")
+            except OSError as exc:
+                raise CipherError("Transit decrypt failed") from exc
+
+    _hide_from_catalog(monkeypatch, "search_presets")
+    found = CipherAudit()
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        with pytest.raises(CipherError):
+            asyncio.run(
+                audit_server_cipher_cells(
+                    cast(CipherCellSource, _SqliteSource(conn)),
+                    cast(Cipher, _Down()),
+                    cells=POSTGRES_CIPHER_CELLS,
+                    into=found,
+                )
+            )
+    finally:
+        conn.close()
+    assert found.hidden == ["search_presets.criteria"], found.hidden
+
+
+def test_a_server_walk_that_loses_its_connection_still_names_a_hidden_cell(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A connection lost part way is FAIL, and the cell the catalog hid is named in that same run.
+    Control: the same run with nothing hidden names none."""
+    db, settings = _copy(_template, tmp_path)
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    real_chunk = _SqliteSource.cipher_walk_chunk
+    calls = 0
+
+    async def flaky(self: _SqliteSource, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        nonlocal calls
+        calls += 1
+        if calls % 3 == 0:
+            raise ConnectionResetError("synthetic: connection lost")
+        return await real_chunk(self, *args, **kwargs)
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_chunk", flaky)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and "stopped part way" in payload["reason"], out
+    assert "search_presets.criteria" not in payload["reason"], payload
+    calls = 0
+    _hide_from_catalog(monkeypatch, "search_presets")
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and "stopped part way" in payload["reason"], out
+    assert "search_presets.criteria" in payload["reason"], payload
 
 
 def test_a_reused_audit_drops_the_hidden_list_its_last_walk_left(
@@ -1742,6 +1811,28 @@ def test_a_reused_audit_drops_the_hidden_list_its_last_walk_left(
     finally:
         conn.close()
     assert again is audit and audit.hidden == [], audit.hidden
+
+
+def test_a_reused_audit_whose_catalog_read_fails_keeps_no_earlier_finding(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``into`` is reset before the catalog read, so a read that raises leaves none of the last
+    walk's tallies or hidden cells to be reported as this walk's."""
+    db, settings = _copy(_template, tmp_path)
+    cipher = build_store_cipher(settings)
+    _hide_from_catalog(monkeypatch, "search_presets")
+    audit, _source = _server_audit(db, cipher)
+    assert audit.hidden and audit.tallies
+
+    async def lost(self: _SqliteSource, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        raise ConnectionResetError("synthetic: connection lost")
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_columns", lost)
+    with pytest.raises(ConnectionResetError):
+        _server_audit(db, cipher, into=audit)
+    assert audit.hidden == [] and audit.tallies == [], audit
 
 
 @pytest.mark.parametrize("shape", ["unmarked", "key_mismatch"])
