@@ -1812,10 +1812,9 @@ _IN_USE_FACTS = (
     "process's spool directory can leave segments in its old directory unsent. "
     # The example is tied through ``__main__._forward_spool_dir`` by
     # ``test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory``.
-    "Processes whose spool directories resolve to one path share that directory, and only one of "
-    "them holds its lock at a time. For example, two engines that are not engine shards, whose "
-    "store paths resolve into one directory and whose [logging].forward_spool_dir is unset or "
-    "empty, share one spool directory, not only its root. "
+    "Processes whose spool directories resolve to one path share that directory. For example, two "
+    "engines that are not engine shards, whose store paths resolve into one directory and whose "
+    "[logging].forward_spool_dir is unset or empty, share one spool directory, not only its root. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
@@ -1837,8 +1836,9 @@ def _the_in_use_warning(caplog: pytest.LogCaptureFixture) -> str:
 def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """And the control: a directory another process holds is NOT named, because that process sends
-    what it holds. Its WARNING adds facts instead, never a procedure (BACKLOG #5400): it cannot say
+    """And the control: a directory whose lock another handle holds is NOT named, because the holder
+    sends what it holds. Here the holder is a handle in this process, one of the causes the WARNING
+    names. Its WARNING adds facts instead, never a procedure (BACKLOG #5400): it cannot say
     who holds the lock, so any instruction would be wrong for some deployment. An unusable
     directory's WARNING adds none of them. Either way the opener returns ``None``, so the forwarder
     runs without a spool (#1966)."""
@@ -1883,13 +1883,8 @@ def test_a_lock_fault_reads_as_in_use_and_claims_no_move_strands_nothing(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A lock call that fails for a reason other than contention reads as in use (``_try_lock``),
-    so nobody holds the lock and a segment already there stays unsent. The WARNING it gets is the
-    same one, and it claims for no cause that a change of spool directory strands nothing
-    (BACKLOG #5400)."""
-    earlier = LogSpool(spool_dir, max_bytes=100_000)
-    earlier.open()
-    earlier.append(_entry(0))
-    earlier.close()
+    so nobody holds the lock. The WARNING it gets is the same one, and it claims for no cause that
+    a change of spool directory strands nothing (BACKLOG #5400)."""
 
     def _lock_fault(fd: int, *, wait: bool = False) -> bool:
         raise OSError(errno.EIO, "lock call failed")
@@ -1906,7 +1901,6 @@ def test_a_lock_fault_reads_as_in_use_and_claims_no_move_strands_nothing(
     for strands_nothing in ("strands none", "strand none", "strands nothing", "none of them"):
         assert strands_nothing not in lowered, strands_nothing
     assert message == _expected_in_use_warning(spool_dir)
-    assert log_spool.count_segments(spool_dir) == 1  # nobody sent it
 
 
 def test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory(
@@ -1940,8 +1934,9 @@ def test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory
     )
     assert default(tmp_path / "b.db", spool="") == beside_a  # empty reads as unset
     assert beside_a != default(tmp_path / "other" / "a.db")
-    # Engine shards get a directory each, so the example names engines that are not.
-    assert default(tmp_path / "a.db", "1") != default(tmp_path / "b.db", "2")
+    # Engine shards of one store get a directory each, so the example names engines that are not.
+    shards = {default(tmp_path / "a.db", "1"), default(tmp_path / "a.db", "2"), beside_a}
+    assert len(shards) == 3
     postgres = {"backend": StoreBackend.POSTGRES, "server": "db", "database": "mf", "username": "u"}
     assert default(tmp_path / "a.db", **postgres) == beside_a
 

@@ -2156,10 +2156,10 @@ _SPOOL_IN_USE_FACTS = (
     "restarts with a spool it can lock, the forwarder this WARNING belongs to has no on-disk spool "
     "and sends nothing from that directory. A spool directory's segments are sent only by a process "
     "that holds its lock, so a change to a process's spool directory can leave segments in its old "
-    "directory unsent. Processes whose spool directories resolve to one path share that directory, "
-    "and only one of them holds its lock at a time. For example, two engines that are not engine "
-    "shards, whose store paths resolve into one directory and whose [logging].forward_spool_dir "
-    "is unset or empty, share one spool directory, not only its root. "
+    "directory unsent. Processes whose spool directories resolve to one path share that directory. "
+    "For example, two engines that are not engine shards, whose store paths resolve into one "
+    "directory and whose [logging].forward_spool_dir is unset or empty, share one spool directory, "
+    "not only its root. "
     'One directory serves one process (ADR 0200, "One process per directory").'
 )
 
@@ -2167,7 +2167,7 @@ _SPOOL_IN_USE_FACTS = (
 def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
     """The opened on-disk spool for ``forward``, or ``None`` when it has none or cannot use it.
 
-    A spool that cannot be opened (an unwritable directory, or one another process holds) warns and
+    A spool that cannot be opened (an unwritable directory, or one whose lock it cannot take) warns and
     leaves the forwarder spool-less rather than refusing to start: the spool adds durability to a
     best-effort stream, and losing it must not cost the message path its start (BACKLOG #1966)."""
     if not forward.spool_dir:
@@ -2193,7 +2193,9 @@ def _open_forward_spool(forward: SyslogForward) -> LogSpool | None:
             exc,
             _SPOOL_IN_USE_FACTS if exc.in_use else "",
         )
-        if not exc.in_use:  # the process that holds it sends what it holds
+        # Whoever holds the lock sends what it holds. A lock fault also reads as in use, though,
+        # and gets no leftover count here (BACKLOG #8138 item 43).
+        if not exc.in_use:
             _warn_leftover_segments(forward.spool_dir, "the on-disk log spool could not be opened")
         return None
     return spool
