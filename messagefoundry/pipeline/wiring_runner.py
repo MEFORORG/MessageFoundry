@@ -298,6 +298,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    HeldFrameRecorder,
     InboundHandler,
     IntakeAuditSink,
     IntakeGate,
@@ -6390,6 +6391,10 @@ class RegistryRunner:
         source.refuse_unlisted_sender = (
             self._make_unlisted_sender_refusal(ic) if self._sender_allowlist_enabled(ic) else None
         )
+        # BACKLOG #1619 item 6: a no-reply listener's held frame that a stop ends the hold on is
+        # recorded as an ERROR row rather than lost uncounted. Every source gets it; only the
+        # listeners that hold a frame call it.
+        source.record_lost_frame = self._make_lost_frame_recorder(ic)
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).
@@ -10308,6 +10313,39 @@ class RegistryRunner:
             return await self._handle_inbound(ic, raw, intake)
 
         return intake_handler(on_message)
+
+    def _make_lost_frame_recorder(self, ic: InboundConnection) -> HeldFrameRecorder:
+        # BACKLOG #1619 item 6: the source's `record_lost_frame` seam, bound to this inbound.
+        async def record(raw: bytes, reason: str) -> str:
+            return await self._record_lost_frame(ic, raw, reason)
+
+        return record
+
+    async def _record_lost_frame(self, ic: InboundConnection, raw: bytes, reason: str) -> str:
+        """Record a held frame a no-reply listener is losing at stop as ``ERROR``, and return the
+        row's id (BACKLOG #1619 item 6). ``reason`` is the listener's value-free text.
+
+        Unlike :meth:`_record_refused`, this never charges the refused-body allowance: the frame is
+        not refused for what it holds, and a store fault the same body meets on every attempt
+        would otherwise drain the allowance for every refused body on the inbound. A body larger
+        than a head stores only its head, as a refusal past the allowance does, so a body over the
+        detach threshold never lands whole in the message row; its length and keyed digest are
+        recorded either way. The body is stored as received, never decoded or parsed, so the row
+        carries no header fields. A failed write propagates to the listener, which logs it."""
+        bounded = self._refused_body.bound_uncharged(
+            raw, ic.content_type.value, reason, cipher=self.store.cipher()
+        )
+        return await self.store.record_received(
+            channel_id=ic.name,
+            raw=bounded.raw,
+            status=MessageStatus.ERROR,
+            error=bounded.error,
+            control_id=None,
+            message_type=None if ic.content_type is ContentType.HL7V2 else ic.content_type.value,
+            source_type=ic.spec.type.value,
+            summary=None,
+            metadata=bounded.metadata,
+        )
 
     def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
         # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.

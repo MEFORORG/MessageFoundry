@@ -1033,6 +1033,7 @@ class X12Source(SourceConnector):
                                         report=lambda reason: self._emit_event(
                                             "handler_error", peer_host=peer_host, reason=reason
                                         ),
+                                        record_loss=self.record_lost_frame,
                                     )
                                 except HandlerFaultUnrecovered:
                                     break  # handler_error is recorded; close

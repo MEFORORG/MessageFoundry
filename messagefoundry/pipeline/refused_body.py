@@ -200,6 +200,34 @@ class RefusedBodyAllowance:
             stored = _head(wire, text, content_type, head_bytes)
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
+    def bound_uncharged(
+        self, wire: bytes, content_type: str, error: str, *, cipher: Cipher
+    ) -> BoundedRefusal:
+        """Decide what to store for a held frame a no-reply listener is losing (BACKLOG #1619 item
+        6): the whole body when it fits in a head, else its head, and never a charge.
+
+        Such a frame is not refused for anything it holds: the store write failed on every attempt
+        until the listener stopped. A fault the same body meets every time would otherwise drain
+        the allowance for every refused body on that inbound, so this one is never charged. It is
+        stored as a head the allowance is spent on would be, so a body over the detach threshold
+        never lands whole in the message row. The length and keyed digest are recorded as for
+        every refusal, and the note says why only the head was kept."""
+        head_bytes = self.policy.head_bytes
+        carried, stored_bytes = _stored_form(wire, None)
+        if (len(wire) if carried else stored_bytes) <= head_bytes:
+            return self._refusal(
+                wire, store_safe_raw(wire, content_type), error, whole=True, cipher=cipher
+            )
+        note = f"[held frame lost at stop: stored only the head of a {len(wire):,}-byte body] "
+        return self._refusal(
+            wire,
+            _head(wire, None, content_type, head_bytes),
+            error,
+            whole=False,
+            cipher=cipher,
+            note=note,
+        )
+
     def bound_held(
         self, inbound: str, body: str, content_type: str, error: str, *, cipher: Cipher
     ) -> BoundedRefusal:
@@ -231,12 +259,24 @@ class RefusedBodyAllowance:
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
     def _refusal(
-        self, wire: bytes, stored: str, error: str, *, whole: bool, cipher: Cipher
+        self,
+        wire: bytes,
+        stored: str,
+        error: str,
+        *,
+        whole: bool,
+        cipher: Cipher,
+        note: str | None = None,
     ) -> BoundedRefusal:
-        """The :class:`BoundedRefusal` for ``stored``, the view chosen for ``wire``: the allowance
-        note on a head, and the record of the body's length and keyed digest."""
+        """The :class:`BoundedRefusal` for ``stored``, the view chosen for ``wire``: ``note`` (by
+        default the allowance note) on a head, and the record of the body's length and keyed
+        digest."""
         if not whole:
-            note = f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte body] "
+            if note is None:
+                note = (
+                    f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte "
+                    "body] "
+                )
             error = _with_note(note, error)
         record: dict[str, object] = {
             "bytes": len(wire),
