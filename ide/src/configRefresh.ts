@@ -7,6 +7,7 @@
 // Node-side unit-tested (no Extension Host) like graphModel/engineStatusModel.
 
 import * as path from "node:path";
+import { segmentsBelow } from "./pathFold";
 
 /** Quiet period before a coalesced refresh fires. Long enough to absorb a save's watcher echo and a
  *  multi-file checkout; short enough that the tree still feels live after an external edit. */
@@ -81,12 +82,12 @@ export function watchableConfigDir(
     return undefined;
   }
   const abs = path.isAbsolute(configDir) ? configDir : path.join(workspace, configDir);
-  const rel = path.relative(workspace, abs);
-  if (rel === "") {
-    return workspace; // the config dir IS the workspace root
-  }
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+  // Not path.relative: on Windows it folds case with toLowerCase(), so a directory spelled with
+  // U+212A KELVIN SIGN would read as the workspace's "k" one (pathFold.ts, BACKLOG #5832). A
+  // non-ASCII case difference NTFS does fold reads as outside too, which only leaves it unwatched.
+  const below = segmentsBelow(workspace, abs);
+  if (below === undefined) {
     return undefined; // outside the workspace — no watcher, no crash
   }
-  return abs;
+  return below.length === 0 ? workspace : abs; // no segments: the config dir IS the workspace root
 }

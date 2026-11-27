@@ -10,11 +10,14 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
+import { segmentsBelow } from "./pathFold";
 
 /**
  * True when `fileFsPath` is a Python module under the configured config dir of `workspaceFsPath`.
- * Pure (no vscode/fs) so it is unit-testable; containment is tested with path.relative so a sibling
- * sharing a name prefix (".../config-other" vs ".../config") does not false-match.
+ * Pure (no vscode/fs) so it is unit-testable; containment is compared segment by segment, so a
+ * sibling sharing a name prefix (".../config-other" vs ".../config") does not false-match, and on
+ * Windows with only ASCII case folded, not path.relative's toLowerCase(), which reads a directory
+ * spelled with U+212A KELVIN SIGN as the config dir's "k" one (pathFold.ts, BACKLOG #5832).
  */
 export function isConfigFile(
   fileFsPath: string,
@@ -25,8 +28,8 @@ export function isConfigFile(
     return false;
   }
   const dir = path.resolve(workspaceFsPath, configDirRel);
-  const rel = path.relative(dir, fileFsPath);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  const below = segmentsBelow(dir, fileFsPath);
+  return below !== undefined && below.length > 0;
 }
 
 export type ElementKind = "router" | "handler" | "inbound" | "outbound";
