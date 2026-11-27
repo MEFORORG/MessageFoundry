@@ -481,31 +481,35 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
     assert m["PID-5"] == "O\\S\\Brien \\X41\\bc"
 
 
-@pytest.mark.parametrize("path", ["PID-5", "PID-5.1"])
 @pytest.mark.parametrize(
-    ("sent", "mode", "expected"),
+    ("sent", "path", "mode", "expected"),
     [
-        # BACKLOG #5928 step 1's own case: the hex escape is kept, so this reads as "JOS" plus the
-        # letter the sender's bytes spell, never a re-encoded guess at its upper case.
-        ("jos\\XE9\\", "upper", "JOS\\XE9\\"),
-        # A UTF-8 "E" with an acute accent is two bytes. The decoder reads each byte as its own
-        # character ("\xc3\x89"), so casing that decoded text gives "\xe3\x89", which spells a
-        # different, broken character. Kept as sent, the bytes stay intact.
-        ("JOS\\XC389\\", "lower", "jos\\XC389\\"),
-        ("JOS\\XC389\\", "title", "Jos\\XC389\\"),
+        # BACKLOG #5928 step 1's own case: upper case leaves the hex escape, so the letter it
+        # carries keeps the case the sender sent.
+        ("jos\\XE9\\", "PID-5", "upper", "JOS\\XE9\\"),
+        ("jos\\XE9\\", "PID-5.1", "upper", "JOS\\XE9\\"),
+        ("jos\\XE9\\", "PID-5.1.1", "upper", "JOS\\XE9\\"),
+        # Literal text after the escape is still cased, and a whole field keeps its components.
+        ("jos\\XE9\\ab^x", "PID-5", "upper", "JOS\\XE9\\AB^X"),
+        # A UTF-8 letter is two bytes. The decoder reads each byte as its own character, so
+        # casing that text byte by byte would write different bytes ("\xc3" lower-cased is
+        # "\xe3"). Kept as sent, the bytes stay intact in every mode.
+        ("ren\\XC3A9\\", "PID-5", "upper", "REN\\XC3A9\\"),
+        ("JOS\\XC389\\", "PID-5", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5", "title", "Jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "title", "Jos\\XC389\\"),
     ],
 )
 def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
-    path: str, sent: str, mode: Literal["upper", "lower", "title"], expected: str
+    sent: str, path: str, mode: Literal["upper", "lower", "title"], expected: str
 ) -> None:
-    # BACKLOG #5928 step 1, proposed not-a-bug. A hex escape carries bytes in the message's
-    # character set, and the decoder maps each byte to one character with no charset, so a
-    # multi-byte character cannot be cased from that decoded text. While the decoder reads no
-    # charset, keeping the escape as sent is what never corrupts the sender's text. NEGATIVE
-    # CONTROL: on 17f42069782^,
-    # five of these six fail: a component path wrote the decoded bytes back as literal characters,
-    # a whole-field lower re-spelt "\X" as "\x", which no decoder maps, and a whole-field title
-    # re-spelt the hex digits. Only the whole-field upper case passed there.
+    # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
+    # A hex escape carries bytes in the message's character set, and the decoder maps each byte
+    # to one character without reading that set, so it cannot tell a Latin-1 letter from part of
+    # a UTF-8 one. Keeping the escape as sent writes no byte the sender did not send.
+    # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
+    # every component-path case and the whole-field lower and title cases fail.
     m = _with_pid(sent)
     convert_case(m, path, mode)
     assert m["PID-5"] == expected
