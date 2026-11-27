@@ -282,6 +282,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     fault_text,
     no_verdict_fault,
+    unopenable_log_text,
 )
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import (
@@ -1736,10 +1737,13 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
 def _reply_step_fault(exc: Exception) -> Exception:
     """What leaves the re-ingress step in place of ``exc`` (BACKLOG #5727), always fresh, with no
     cause, context or traceback. A :class:`QueueOpenFault` keeps its own text. A key service that
-    gave no verdict becomes a :class:`QueueOpenFault`, and anything else a
-    :class:`_ReplyStepFault`. Each of those two is named by :func:`fault_text`: the type, and a
-    cipher error's own text, which never holds a value, never a driver's text or a chain. Each
-    also lists the file, line and function of every frame ``exc`` passed through, never a local."""
+    gave no verdict becomes a :class:`QueueOpenFault` named by :func:`fault_text`: its type and
+    the cipher's own text, which is not value-free (BACKLOG #5982) and which the claim's
+    :class:`QueueOpenFault` for the same silence keeps too. Anything else becomes a
+    :class:`_ReplyStepFault` named by :func:`unopenable_log_text`: its class, and a queue-tag
+    refusal's cause, never a cipher's text, which can echo stored text such as a ``key_id``.
+    Neither carries a driver's text or a chain. Each also lists the file, line and function of
+    every frame ``exc`` passed through, never a local."""
     if isinstance(exc, QueueOpenFault):
         return QueueOpenFault(*exc.args)
     frames = "".join(
@@ -1748,7 +1752,7 @@ def _reply_step_fault(exc: Exception) -> Exception:
     )
     if no_verdict_fault(exc) is not None:
         return QueueOpenFault(f"{fault_text(exc)}{frames}")
-    return _ReplyStepFault(f"{fault_text(exc)}{frames}")
+    return _ReplyStepFault(f"{unopenable_log_text(exc)}{frames}")
 
 
 def _reply_step_boundary(body: _ItemBody) -> _ItemBody:
@@ -13425,7 +13429,8 @@ class RegistryRunner:
         read_fault: QueueOpenFault | None = None
         # BACKLOG #5727: each dead-letter below runs after the try, so a failed seal in it chains no
         # raw open error, whose cause can echo a key service's URL or body. The handlers keep only
-        # strings: the error's type name, and the safe_exc text the dead-letter records.
+        # strings: the error's type name, and the unopenable_log_text the dead-letter records. A
+        # cipher's own text is not recorded: it can echo stored text, a key_id (BACKLOG #5982).
         tag_failed = False
         unopenable: tuple[str, str] | None = None
         try:
@@ -13461,7 +13466,7 @@ class RegistryRunner:
                 # handoff. A key service with no verdict on one of the handoff's encrypts leaves it
                 # as a QueueOpenFault too; its invocation ceiling, a plain CipherError, is a
                 # deliberate hard stop.
-                unopenable = (type(exc).__name__, safe_exc(exc))
+                unopenable = (type(exc).__name__, unopenable_log_text(exc))
         if tag_failed:
             log.warning(
                 "response worker %r: work-row %s failed its integrity tag; dead-lettering",
@@ -15392,9 +15397,11 @@ class _RedactedFault(Exception):
 
 class _ReplyStepFault(Exception):
     """An error that left the re-ingress step (:func:`_reply_step_boundary`, BACKLOG #5727), named
-    by its type and its frames' file, line and function. A cipher error also keeps its own text,
-    which never holds a value. Not a :class:`_RedactedFault`: that text is not passed through
-    :func:`safe_exc`."""
+    by :func:`~messagefoundry.store.queue_tag.unopenable_log_text` (its class, and a queue-tag
+    refusal's cause) and its frames' file, line and function. It keeps none of the error's own
+    text: a cipher's can echo stored text such as a ``key_id`` (BACKLOG #5982). Not a
+    :class:`_RedactedFault`, whose message is :func:`safe_exc` output; this one's is built from
+    names alone."""
 
 
 def _as_content_fault(exc: Exception | SystemExit) -> Exception:

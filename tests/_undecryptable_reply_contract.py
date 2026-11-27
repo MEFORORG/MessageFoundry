@@ -558,7 +558,7 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
     ``outage`` the seal gets no verdict, a CipherUnavailableError whose own cause carries the key
     service's text: it leaves as a QueueOpenFault with no chain, and the token is retried.
     Without it the seal is a verdict, the invocation ceiling, whose own cause also carries that
-    text: it leaves as a :class:`_ReplyStepFault` named by type and text, with no chain."""
+    text: it leaves as a :class:`_ReplyStepFault` named by its class alone, with no chain."""
 
     async def case(store: Any, fetch: RawFetch, _raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
@@ -577,9 +577,12 @@ def _worker_dead_letter_seal_failure_carries_no_open_error(
             seal_error.__cause__ = ValueError(KEY_SERVICE_TEXT)
             fault.seal_error = seal_error
             raised: type[Exception] = QueueOpenFault if outage else _ReplyStepFault
-            match = "CipherUnavailableError" if outage else "invocation ceiling"
+            # A verdict is named by its class alone, never the cipher's text (BACKLOG #5982).
+            match = "CipherUnavailableError" if outage else "^CipherError\n"
             with pytest.raises(raised, match=match) as caught:
                 await step._process_response_item(LOOP, item)
+            if not outage:
+                assert "invocation ceiling" not in str(caught.value), str(caught.value)
             assert caught.value.__cause__ is None
             # The fault left through the step boundary, which replaced the seal's raw error: its
             # traceback starts there and never reaches the step's own frame.

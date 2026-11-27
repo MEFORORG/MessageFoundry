@@ -161,22 +161,20 @@ class QueueOpenFault(Exception):
 
 def fault_text(exc: BaseException) -> str:
     """``exc`` named by its type, and by its own text only where ``exc`` is a
-    :class:`CipherError`, whose text never holds a value. Any other error, a failed store read or
-    dead-letter write, is named by its type alone: a driver's text can echo a statement, a key or
-    a truncated value."""
+    :class:`CipherError`, whose text is the cipher's own wording and names no row's body. It is
+    not value-free: a cipher's text can echo a field cut from the stored value (``crypto._echo``),
+    and a Transit outage's can name its key with the cause's class or a fixed refusal text
+    (BACKLOG #5982). Any other error, a failed store read or dead-letter write, is named by its
+    type alone: a driver's text can echo a statement, a key or a truncated value. A text that must
+    hold no stored text uses :func:`unopenable_log_text` instead."""
     if isinstance(exc, CipherError):
         return f"{type(exc).__name__}: {exc}"
     return type(exc).__name__
 
 
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:
-    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
-    is a :class:`CipherError`, whose text is the cipher's own wording and names no row's body. It is
-    not value-free: a cipher's text can echo a field cut from the stored value (``crypto._echo``),
-    and a Transit outage's can name its key with the cause's class or a fixed refusal text. Any
-    other error, a failed store read or dead-letter write, is named by its type alone: a driver's
-    text can echo a statement, a key or a truncated value, and the T17 path logs this fault at
-    ERROR."""
+    """:class:`QueueOpenFault` named by :func:`fault_text`, whose docstring says what that text
+    holds; it is not value-free. The T17 path logs this fault at ERROR."""
     return QueueOpenFault(fault_text(exc))
 
 

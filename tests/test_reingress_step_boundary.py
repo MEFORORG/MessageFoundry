@@ -23,6 +23,7 @@ from messagefoundry.store import MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import (
     CipherError,
     CipherUnavailableError,
+    cell_aad,
     generate_key,
     make_cipher,
 )
@@ -132,6 +133,58 @@ async def test_a_failure_to_build_the_replacement_leaves_a_fixed_text_fault(
     assert record.getMessage() == f"re-ingress step fault could not be named ({names})"
     logged = logging.Formatter().format(record)
     assert contract.KEY_SERVICE_TEXT not in logged and REPLY_MARK not in logged, logged
+
+
+#: A key id planted in a stored marker, which the local cipher's refusal echoes (BACKLOG #5982).
+PLANTED_KEY_ID = "SYNTHKEYIDMARK"
+
+
+async def test_a_refusal_echoing_a_planted_key_id_reaches_no_reason_or_fault(
+    store: MessageStore,
+) -> None:
+    """The Lander's hold at 8b8bb0ed026 (main's #5982 retracts "a CipherError's text never holds a
+    value"): a real refusal of a reply cell whose marker names a planted ``key_id``. The step's
+    read dead-letters it, and neither the token's ``last_error`` nor its ``dead`` event may hold
+    the planted text. The same refusal, raised where the step has no handler of its own, leaves
+    the boundary as a fault whose text does not hold it either. CONTROL: the refusal's own text
+    holds it, so a clean read is not a miss."""
+    mid, item = await _head(store)
+    fetch = _fetch(store)
+    [row] = await fetch("SELECT body FROM response WHERE message_id=?", (mid,))
+    parts = str(row["body"]).split(":")
+    assert parts[1] == "v4", parts[:2]  # mfenc:v4:<alg>:<key_id>:<salt>:<base64>
+    parts[3], parts[-1] = PLANTED_KEY_ID, "AA"
+    planted = ":".join(parts)
+    await store._db.execute("UPDATE response SET body=? WHERE message_id=?", (planted, mid))
+    await store._db.commit()
+    with pytest.raises(CipherError) as refused:
+        store._cipher.decrypt(planted, aad=cell_aad("response", "body", mid, "OB_X", 1))
+    assert PLANTED_KEY_ID in str(refused.value)  # CONTROL
+
+    # The step's read: dead-lettered, with no planted text in the reason.
+    step = contract.runner(store)
+    await step._process_response_item(LOOP, item)
+    [token] = await fetch("SELECT id, status, last_error FROM queue WHERE id=?", (item.id,))
+    assert token["status"] == OutboxStatus.DEAD.value
+    reason = store._cipher.decrypt(
+        token["last_error"], aad=cell_aad("queue", "last_error", item.id)
+    )
+    assert "undecryptable" in reason and PLANTED_KEY_ID not in reason, reason
+    details = [str(e["detail"]) for e in await store.events_for(mid) if e["event"] == "dead"]
+    assert details and not [d for d in details if PLANTED_KEY_ID in d], details
+
+    # The boundary: the same refusal raised by a store call the step does not handle.
+    _, other = await _head(store)
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise refused.value
+
+    del step.registry.inbound[LOOP]
+    step.store.mark_failed = _refuse  # type: ignore[method-assign]
+    with pytest.raises(_ReplyStepFault) as caught:
+        await step._process_response_item(LOOP, other)
+    assert PLANTED_KEY_ID not in str(caught.value), str(caught.value)
+    assert str(caught.value).startswith("CipherError"), str(caught.value)
 
 
 @pytest.mark.parametrize("outage", [True, False], ids=["outage", "verdict"])
