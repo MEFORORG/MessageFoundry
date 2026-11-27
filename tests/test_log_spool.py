@@ -397,7 +397,7 @@ def test_a_segment_number_is_never_reused(spool_dir: Path) -> None:
 
 def _simulate_cpython_3149_syslog_init(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``SysLogHandler.__init__`` swallow a ``socket.gaierror`` from ``createSocket``, as
-    CPython 3.14.9 does (see ``_raise_a_swallowed_lookup``), whatever Python runs the test."""
+    CPython 3.14.9 does (see ``_TimeoutSysLogHandler.__init__``), whatever Python runs the test."""
     real_init = logging.handlers.SysLogHandler.__init__
 
     def _init(self: logging.handlers.SysLogHandler, *args: Any, **kwargs: Any) -> None:
@@ -739,60 +739,8 @@ def test_a_construction_that_connects_creates_one_socket(
             assert creates == [handler]
             assert handler.startup_error is None
             assert handler.socket is not None
-            if protocol == "tls":
-                _assert_wrapped_for_the_collector(handler)
-        finally:
-            handler.close()
-
-
-def test_a_runtime_reconnect_error_is_not_kept(monkeypatch: pytest.MonkeyPatch) -> None:
-    """BACKLOG #4063: only construction records a connect error. A reconnect inside ``emit`` that
-    fails must not leave its error on the handler, since its traceback holds the record."""
-    _simulate_cpython_3149_syslog_init(monkeypatch)
-    _collector_lookups(
-        monkeypatch, [_loopback(socket.SOCK_DGRAM, 514), socket.gaierror(socket.EAI_AGAIN, "x")]
-    )
-    handler = _handler(monkeypatch, "udp", 514, defer_connect=True)
-    try:
-        assert handler._connect_error is None and not handler._constructing
-        handler.socket.close()
-        handler.socket = None  # the next send reconnects, and its lookup fails
-        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "INFO", "levelno": 20}))
-        assert handler.send_failed
-        assert handler._connect_error is None
-    finally:
-        handler.close()
-
-
-@pytest.mark.parametrize("protocol", ["tcp", "tls"])
-def test_a_create_socket_that_records_nothing_is_retried_through_our_override(
-    monkeypatch: pytest.MonkeyPatch, protocol: str
-) -> None:
-    """The fallback in ``_raise_a_swallowed_lookup``: when a ``createSocket`` that records nothing
-    replaced ours, the constructor connects again, through the class's own ``createSocket``. For
-    TLS the context's record shows the TLS override ran and wrapped the socket. The retry's lookup
-    answers with a loopback listener, so no name is resolved."""
-    _simulate_cpython_3149_syslog_init(monkeypatch)
-    stdlib_create = logging.handlers.SysLogHandler.createSocket
-    creates: list[object] = []
-
-    def _create_without_recording(self: _TimeoutSysLogHandler) -> None:
-        creates.append(self)
-        stdlib_create(self)
-
-    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _create_without_recording)
-    with socket.create_server(("127.0.0.1", 0)) as server:
-        port = server.getsockname()[1]
-        lookups = _collector_lookups(
-            monkeypatch, [_try_again(), _loopback(socket.SOCK_STREAM, port)]
-        )
-        handler = _handler(monkeypatch, protocol, port, defer_connect=True)
-        try:
-            assert len(lookups) == 2  # the swallowed lookup, then the retry
-            assert creates == [handler, handler]  # both through the class, the retry included
-            assert handler.startup_error is None
-            assert handler.socket is not None
-            assert handler.socket.gettimeout() == logging_setup._FORWARD_TCP_TIMEOUT
+            if protocol != "udp":
+                assert handler.socket.gettimeout() == logging_setup._FORWARD_TCP_TIMEOUT
             if protocol == "tls":
                 _assert_wrapped_for_the_collector(handler)
         finally:
