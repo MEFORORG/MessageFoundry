@@ -1345,12 +1345,14 @@ class EngineClient:
         session's step-up window. Raises :class:`ApiError` (status 403) on a wrong password. Does not
         itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route).
 
-        When the 403 that triggered this reauth named a per-action step-up (``X-Step-Up-Action``, ADR
-        0077), the stashed action rides along as ``purpose`` so the engine mints a grant BOUND to it;
-        a plain session-window step-up posts ``{"password": …}`` unchanged.
+        A ``purpose`` that is not None is posted as the purpose, whatever is stashed. With
+        ``purpose`` None, the action stashed from the per-action refusal (``X-Step-Up-Action``, ADR
+        0077) that the step-up handler is answering rides along instead, if one is stashed, so the
+        engine mints a grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as
+        for a session-window step-up. Either way the stash is cleared, so it binds one reauth at
+        most.
 
-        ``purpose`` names the action explicitly instead, and wins over a stashed action. At least
-        two callers pass it: one that proves BEFORE the call it is about to make, so the refusal
+        At least two callers pass ``purpose``: one that proves BEFORE the call it is about to make, so the refusal
         and the retry never happen (vault BACKLOG #2625: a timed reload must not carry a step-up
         inside its timer), and one answering a refusal this client did not stash, such as a
         worker read through a handler-less polling client, which passes the refused call's
