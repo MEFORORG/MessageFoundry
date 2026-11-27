@@ -11,10 +11,13 @@ three new ones, and a carried-over copy that is replayed and dies again.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import logging
 import math
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 
@@ -285,6 +288,48 @@ def test_the_opening_copies_come_from_the_first_node_that_reads() -> None:
     opening = NodeStats(done=0, dead=1, pending=0, inflight=0, in_pipeline=0)
     got = asyncio.run(failover._opening_dead_copies([down, up], object(), opening))  # type: ignore[list-item,arg-type]
     assert got == frozenset({_A})
+
+
+@pytest.mark.parametrize("leader_index", [0, 1])
+def test_the_opening_read_goes_to_the_node_expected_to_survive(leader_index: int) -> None:
+    # The leader is the node the run expects to SIGKILL, and a killed node loses the PHI-exposure
+    # audit rows it had not yet written, so the opening read tries the other node first.
+    nodes = [_CopyNode(frozenset({_A})), _CopyNode(frozenset({_A}))]
+    leader = nodes[leader_index]
+    order: list[Any] = failover._standby_first(nodes, leader)  # type: ignore[arg-type]
+    assert order[-1] is leader and len(order) == 2
+    opening = NodeStats(done=0, dead=1, pending=0, inflight=0, in_pipeline=0)
+    got = asyncio.run(failover._opening_dead_copies(order, object(), opening))  # type: ignore[arg-type]
+    assert got == frozenset({_A})
+    assert leader.reads == 0
+    assert nodes[1 - leader_index].reads == 1
+
+
+def test_the_opening_read_falls_back_to_the_leader() -> None:
+    standby, leader = _CopyNode(None), _CopyNode(frozenset({_A}))
+    order = failover._standby_first([leader, standby], leader)  # type: ignore[list-item,arg-type]
+    opening = NodeStats(done=0, dead=1, pending=0, inflight=0, in_pipeline=0)
+    got = asyncio.run(failover._opening_dead_copies(order, object(), opening))  # type: ignore[arg-type]
+    assert got == frozenset({_A})
+    assert (standby.reads, leader.reads) == (1, 1)
+
+
+def test_the_run_orders_the_opening_read_by_the_elected_leader() -> None:
+    # Pins the call site: the run passes the nodes through _standby_first with the leader it
+    # elected, so the helper above is the order the run actually uses.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(failover.run_failover_load)))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_opening_dead_copies"
+    ]
+    assert len(calls) == 1
+    first = calls[0].args[0]
+    assert isinstance(first, ast.Call) and isinstance(first.func, ast.Name)
+    assert first.func.id == "_standby_first"
+    assert [a.id for a in first.args if isinstance(a, ast.Name)] == ["nodes", "leader"]
 
 
 # --- S26-62 -----------------------------------------------------------------------

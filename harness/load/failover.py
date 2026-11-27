@@ -807,7 +807,9 @@ async def run_failover_load(
             notes.append(f"elected {leader.node_id} as the initial primary")
             await _await_port("127.0.0.1", ports.inbound_adt, timeout=15.0)
             opening = await _opening_stats(nodes, client)
-            carried = await _opening_dead_copies(nodes, client, opening, notes=notes)
+            carried = await _opening_dead_copies(
+                _standby_first(nodes, leader), client, opening, notes=notes
+            )
 
             dispatcher.start()
             stop = asyncio.Event()
@@ -1246,6 +1248,18 @@ async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> 
         f"could not read the opening /stats baseline in {_OPENING_STATS_ATTEMPTS} attempts; "
         "no load was offered"
     )
+
+
+def _standby_first(nodes: list[EngineNode], leader: EngineNode) -> list[EngineNode]:
+    """``nodes`` with the elected leader last: the order the opening dead-copy read tries them.
+
+    The engine writes a ``/dead-letters`` page's PHI-exposure audit row only when its hour window
+    rolls or at a graceful shutdown, so a node that is SIGKILLed first loses the rows it had not yet
+    written. The leader is the node the run expects to kill, so the opening read goes to the node
+    expected to survive, and to the leader only when that node gives no whole read (BACKLOG #5572).
+    The leader may still be read, and leadership can move before the kill, so this narrows the loss
+    and does not close it."""
+    return [n for n in nodes if n is not leader] + [n for n in nodes if n is leader]
 
 
 async def _opening_dead_copies(
