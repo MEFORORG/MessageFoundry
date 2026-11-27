@@ -237,9 +237,11 @@ function Get-EndedSeatWarning {
     try {
         $ended = Get-CoordSeatEnded -Dir (Join-Path $SeatsDir $Key)
         if (-not $ended) { return $null }
-        # Hedged, because the drain never reads lifecycle: a session that closed and stays open, even
-        # idle, drains the box when it finishes its next turn, and so does another one in that
-        # worktree. The drain runs at SessionStart and Stop, so the consequent names both.
+        # Hedged, because the drain never reads lifecycle: where the drain hook is wired, a session
+        # that closed and stays open, even idle, can drain the box when it finishes its next turn,
+        # and so can another one in that worktree. The drain runs at SessionStart and Stop, so the
+        # consequent names both, and says "may" because at least a root that does not wire the hook
+        # drains at neither.
         return ("WARNING: the newest seat record for $(Get-PrintableField $Label) reads lifecycle " +
             "'$($ended.Lifecycle)' at $($ended.At). This mail may sit unread until a session starts " +
             "in that worktree or one there finishes another turn, or expire unshown at its TTL.")

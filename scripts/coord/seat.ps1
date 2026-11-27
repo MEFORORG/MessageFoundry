@@ -1418,9 +1418,10 @@ try {
             # with a null start takes lifecycleAt -- here the reopen, not the episode's start -- so a
             # null would read this session's pre-close claims as inherited one pass later. That pass
             # may be an older copy of this script (the hook runs the primary checkout's). Every
-            # version since 77aa7278dae (BACKLOG #5875) carries a non-null start unchanged, and
-            # Get-Attribution reads a start that names no instant as unknown. An older writer drops
-            # the field, and the next pass then pins the start to the reopen stamp.
+            # version since 77aa7278dae (BACKLOG #5875) carries a non-null start on an open record
+            # unchanged, and Get-Attribution reads a start that names no instant as unknown. An
+            # older writer that reads this record drops the field and attributes claims against
+            # lifecycleAt, here the reopen stamp, and the next pass pins the start to that stamp.
             $episodeStart = 'unknown'
         }
         $lifecycle = 'open'
