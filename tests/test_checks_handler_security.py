@@ -986,6 +986,137 @@ def test_denylist_member_flags(tmp_path: Path, rule_id: str, name: str, snippet:
     assert f"[{rule_id}]" in result.detail, f"{name}: {result.detail!r}"
 
 
+# BACKLOG #5382, the lint half: file writes the ambient-authority lint used to miss. Every path below
+# is free of the letters w, a, x and +, so none is flagged by reading the PATH as the mode, which is
+# what the old `X.open` slot-0 reading did for codecs.open and io.open.
+FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
+    ("open_mode_variable", 'def f(msg, mode):\n    open("/tmp/in.hl7", mode)\n'),
+    ("open_mode_keyword_variable", 'def f(msg, m):\n    open("/tmp/in.hl7", mode=m)\n'),
+    ("open_mode_splat", 'def f(msg, opts):\n    open("/tmp/in.hl7", **opts)\n'),
+    ("open_args_splat", "def f(msg, args):\n    open(*args)\n"),
+    (
+        "codecs_open_mode_slot",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/tmp/in.hl7", "w")\n',
+    ),
+    ("io_open_mode_slot", 'import io\n\ndef f(msg):\n    io.open("/tmp/in.hl7", "w")\n'),
+    ("gzip_open_mode_slot", 'import gzip\n\ndef f(msg):\n    gzip.open("/tmp/in.hl7", "wt")\n'),
+    ("os_fdopen", 'import os\n\ndef f(msg):\n    os.fdopen(3, "w")\n'),
+    (
+        "builtins_module_alias",
+        'import builtins as b\n\ndef f(msg):\n    b.open("/tmp/in.hl7", "w")\n',
+    ),
+    (
+        "open_import_alias",
+        'from builtins import open as bopen\n\ndef f(msg):\n    bopen("/tmp/in.hl7", "w")\n',
+    ),
+    (
+        "codecs_open_import_alias",
+        'from codecs import open as copen\n\ndef f(msg):\n    copen("/tmp/in.hl7", "w")\n',
+    ),
+    ("open_name_alias", 'opener = open\n\ndef f(msg):\n    opener("/tmp/in.hl7", "w")\n'),
+    (
+        "io_open_name_alias",
+        'import io\n\nopener = io.open\n\ndef f(msg):\n    opener("/tmp/in.hl7", "w")\n',
+    ),
+    ("os_write", "import os\n\ndef f(msg):\n    os.write(3, msg.raw)\n"),
+    ("os_write_import_alias", "from os import write as w\n\ndef f(msg):\n    w(3, msg.raw)\n"),
+    ("os_module_alias_write", "import os as o\n\ndef f(msg):\n    o.write(3, msg.raw)\n"),
+    ("tempfile_named", "import tempfile\n\ndef f(msg):\n    tempfile.NamedTemporaryFile()\n"),
+    ("tempfile_mkstemp", "import tempfile\n\ndef f(msg):\n    tempfile.mkstemp()\n"),
+    (
+        "tempfile_import_alias",
+        "from tempfile import TemporaryFile as T\n\ndef f(msg):\n    T()\n",
+    ),
+    (
+        "shutil_module_alias",
+        'import shutil as sh\n\ndef f(msg):\n    sh.copy("/tmp/i", "/tmp/o")\n',
+    ),
+    (
+        "shutil_from_import",
+        'from shutil import copyfile\n\ndef f(msg):\n    copyfile("/tmp/i", "/tmp/o")\n',
+    ),
+    (
+        "path_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    Path("/tmp/in.hl7").open(mode)\n',
+    ),
+    (
+        "path_name_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    p = Path("/tmp/in.hl7")\n'
+        "    p.open(mode)\n",
+    ),
+    (
+        "path_div_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    (Path("/tmp") / "in.hl7").open(mode)\n',
+    ),
+    ("receiver_open_mode_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "w")\n'),
+    ("receiver_open_mode_slot_one_variable", 'def f(msg, zf, m):\n    zf.open("in.hl7", m)\n'),
+    # Already flagged before #5382; pinned so the widening cannot have lost them.
+    ("open_literal_write", 'def f(msg):\n    open("/tmp/in.hl7", "w")\n'),
+    ("open_keyword_write", 'def f(msg):\n    open("/tmp/in.hl7", mode="ab")\n'),
+    (
+        "path_open_literal_write",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/in.hl7").open("w")\n',
+    ),
+    ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
+    ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
+]
+
+FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
+    ("open_read_default", 'def f(msg):\n    open("/tmp/in.hl7")\n'),
+    ("open_read_literal", 'def f(msg):\n    open("/tmp/in.hl7", "rb")\n'),
+    (
+        "codecs_open_read",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/tmp/in.hl7", "r", "utf-8")\n',
+    ),
+    # The old slot-0 reading flagged this read, because its PATH holds an `a`.
+    (
+        "codecs_open_read_path_with_a",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
+    ("path_open_read", 'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/in.hl7").open()\n'),
+    (
+        "path_open_read_literal",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/i").open("rb")\n',
+    ),
+    ("receiver_open_read", 'def f(msg, zf):\n    zf.open("in.hl7")\n'),
+    ("tempfile_gettempdir", "import tempfile\n\ndef f(msg):\n    return tempfile.gettempdir()\n"),
+    ("os_path_join", 'import os\n\ndef f(msg):\n    return os.path.join("/tmp", "in.hl7")\n'),
+    (
+        "socket_readonly_from_import",
+        "from socket import gethostname\n\ndef f(msg):\n    return gethostname()\n",
+    ),
+    ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "snippet"), FILE_EGRESS_FLAGGED, ids=[c[0] for c in FILE_EGRESS_FLAGGED]
+)
+def test_file_egress_is_flagged(tmp_path: Path, name: str, snippet: str) -> None:
+    result = _run(tmp_path, snippet)
+    assert "[ambient-authority]" in result.detail, f"{name}: {result.detail!r}"
+
+
+@pytest.mark.parametrize(
+    ("name", "snippet"), FILE_EGRESS_CLEAN, ids=[c[0] for c in FILE_EGRESS_CLEAN]
+)
+def test_file_reads_are_not_flagged(tmp_path: Path, name: str, snippet: str) -> None:
+    result = _run(tmp_path, snippet)
+    assert result.skipped, f"{name}: expected no finding, got {result.detail!r}"
+
+
+@pytest.mark.timeout(30)
+def test_alias_lattice_resolves_in_linear_time(tmp_path: Path) -> None:
+    # Each name is bound from the two before it, so there are 2**38 paths from a39 back to os.write.
+    # Walking every path would hang `messagefoundry check`; each name is expanded once instead.
+    lines = ["import os", "a0 = os.write", "a1 = a0"]
+    for i in range(2, 40):
+        lines += [f"a{i} = a{i - 1}", f"a{i} = a{i - 2}"]
+    lines += ["", "def f(msg):", "    a39(3, msg.raw)", ""]
+    result = _run(tmp_path, "\n".join(lines))
+    assert "[ambient-authority]" in result.detail
+
+
 def test_sibling_config_module_import_is_vetted(tmp_path: Path) -> None:
     # `from _sibling import x` where _sibling.py is a config-dir module is first-party, not third-party.
     (tmp_path / "_sibling.py").write_text("VALUE = 1\n", encoding="utf-8")

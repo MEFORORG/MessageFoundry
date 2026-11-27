@@ -181,11 +181,10 @@ rules:
                       regex: ^(_?self|cls|mcs|klass|metacls)\b
           - focus-metavariable: $MSG
     pattern-sinks:
-      # This rule does NOT lean on Control A. The ambient-authority lint flags a builtin `open` whose
-      # 2nd argument is a LITERAL write mode, and an `X.open` whose 1st argument is one -- right for
-      # Path(p).open("w"), wrong for codecs.open/io.open(path, mode), where it reads the path as the
-      # mode. It misses at least a non-literal mode, an aliased open, os.write and tempfile, and
-      # flags shutil only when called by that name.
+      # This rule does NOT lean on Control A, the ambient-authority lint in messagefoundry/checks.py:
+      # that lint flags the opening call, not the data, so it cannot say PHI reached the file, and it
+      # has gaps of its own. What it flags and misses is stated once, in the docstrings of
+      # `_ambient_authority_hit` and `_open_write_hit` there (BACKLOG #5382).
       - pattern: $P.write_text(...)
       - pattern: $P.write_bytes(...)
       - patterns:
