@@ -1240,10 +1240,9 @@ class ShardCertReport:
             #
             # v7 (BACKLOG #5440, S27-57) — `correctness.engine_dead` MEANING CHANGED: it is the store's count,
             # where a v6 value was that count summed over every engine shard (N times it). Zero is zero in both,
-            # so the PASS bar is unchanged. `recovery_seconds`, reported and not gated, still runs from the kill,
-            # but each tick's sleep is now capped at the kill deadline, so the loop asks to wake then rather
-            # than at its next tick; timer granularity or a stalled loop can still wake it later. The span
-            # now includes the wait for the killed process to exit and its node's stop(); see the field.
+            # so the PASS bar is unchanged. `recovery_seconds`, reported and not gated, still runs from the kill;
+            # when the kill fires against its deadline is stated once, at the sleep cap in run_shardcert. The
+            # span now includes the wait for the killed process to exit and its node's stop(); see the field.
             "schema_version": 7,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
@@ -1967,19 +1966,19 @@ async def run_shardcert(
                 next_due = now + interval
             pause = min(next_due - loop.time(), _MAX_TICK_SLEEP)
             if kill and not did_kill:
-                # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill instant, so the loop asks to wake
-                # then. The kill can still come late, at least when timer granularity or a stalled loop wakes
-                # the tick after the instant, or when the instant falls inside a tick's send batch, which runs
-                # after the kill check. While the kill is pending, a tick that wakes past the end of the hold
-                # fails the run below. Otherwise a late kill fires once the loop reaches its next kill check.
-                # That check runs after the hold check and takes its own clock reading, so it can fire past
-                # the end of the hold. Nothing detects such a kill, inside the hold or past its end. The cap
-                # does not mean a message was sent before the kill: a small enough kill fraction still kills
-                # before the first tick sends (`require_kill_leg`).
+                # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill deadline, so the loop asks to wake
+                # no later than then. The kill can still come late, at least when timer granularity or a
+                # stalled loop wakes the tick after the deadline, or when the deadline falls inside a tick's
+                # send batch, which runs after the kill check. While the kill is pending, a tick that wakes
+                # past the end of the hold fails the run below. Otherwise a late kill fires once the loop
+                # reaches its next kill check. That check runs after the hold check and takes its own clock
+                # reading, so it can fire past the end of the hold. Nothing detects such a kill, inside the
+                # hold or past its end. The cap does not mean a message was sent before the kill: a small
+                # enough kill fraction still kills before the first tick sends (`require_kill_leg`).
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
-            # BACKLOG #5440 (S27-55): the loop did not reach its kill check between the kill instant and the
+            # BACKLOG #5440 (S27-55): the loop did not reach its kill check between the kill deadline and the
             # end of the hold, for example when one sleep or one send batch ran past both, or on a positive
             # hold shorter than the loop's own set-up time (`require_kill_leg` refuses only a hold of 0 or
             # less). The kill never fired, so there is no kill leg to certify: fail the run rather than
@@ -1987,7 +1986,7 @@ async def run_shardcert(
             # The teardown below stops the fleet; the restart is never reached.
             raise RuntimeError(
                 f"kill leg never fired: the drive loop did not reach its kill check between the kill "
-                f"instant and the end of the hold, so engine shard {killed} was never killed"
+                f"deadline and the end of the hold, so engine shard {killed} was never killed"
             )
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything
@@ -3256,9 +3255,11 @@ def require_kill_leg(
     half stops.
 
     Checked before the store reset and the fleet launch. A ``kill_shard`` outside ``ids_list`` used to
-    surface as a ``KeyError`` at the kill instant, mid-hold. A ``kill_at_fraction`` of 1 or more never fired
-    on the co-located bench, which then started a second process over the live engine shard, and fired after
-    the hold on the two-box engine. One of 0 kills before the first message is sent. So the fraction must be
+    surface as a ``KeyError`` at the kill instant, mid-hold. A ``kill_at_fraction`` of 1 or more is due at
+    about the end of the hold or later, so on the co-located bench it seldom fired, and a run where it did
+    not fire started a second process over the live engine shard; on the two-box engine it fired after the
+    hold. One of 0 kills at the start of the hold: before the first message is sent on the co-located
+    bench, and once the engine observes DRIVE_START on the two-box engine. So the fraction must be
     strictly between 0 and 1, as a failover profile's ``kill_at_fraction`` must; the comparison refuses NaN
     too. The hold must be a finite number above 0, as :func:`require_drive_shape` requires of a drive: a
     hold of 0 or less has no load to kill under, and a NaN one makes the kill delay NaN. Nothing is checked

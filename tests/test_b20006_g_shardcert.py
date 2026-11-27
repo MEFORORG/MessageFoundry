@@ -264,9 +264,9 @@ def _sizes(**over: Any) -> dict[str, Any]:
 async def test_colocated_kill_leg_that_cannot_kill_under_load_is_refused_before_launch(
     fleet: types.SimpleNamespace, over: dict[str, Any]
 ) -> None:
-    """S27-55 (1) and (2). Before the fix a fraction of 1 never fired the kill, then started a second
-    process over the live engine shard; an unknown one raised KeyError mid-hold after the whole fleet ran.
-    A hold with no load to kill under is refused the same way."""
+    """S27-55 (1) and (2). Before the fix a fraction of 1 seldom fired the kill, and a run where it did not
+    fire started a second process over the live engine shard; an unknown one raised KeyError mid-hold after
+    the whole fleet ran. A hold with no load to kill under is refused the same way."""
     with pytest.raises(ValueError, match=_REFUSED) as refused:
         await sc.run_shardcert(**_sizes(kill=True, **over))
     assert isinstance(refused.value, sc.KillLegError)
@@ -402,10 +402,10 @@ def test_engine_cli_exits_2_on_a_refused_kill_leg(
 async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     fleet: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S27-55 (1), the in-range case: ticks further apart than the hold's remainder. The first tick is
-    before the deadline and the next is past the hold, so before the fix the loop ended unkilled, the
-    restart started over the live engine shard, and the report still named it killed. The tick's sleep is
-    now capped at the kill instant."""
+    """S27-55 (1), the in-range case: ticks further apart than the hold's remainder. Without the cap the
+    first tick comes before the deadline and the next one at the end of the hold, so before the fix the
+    loop ended unkilled, the restart started over the live engine shard, and the report still named it
+    killed. The tick's sleep is now capped at the kill deadline."""
     monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 1.5)
     rep = await sc.run_shardcert(
         **_sizes(aggregate_rate=1.0, hold_seconds=1.0, kill=True, kill_at_fraction=0.1)
@@ -416,14 +416,16 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     assert fleet.nodes[killed[0]].shard == rep.killed_shard
     assert fleet.events.index(("kill", killed[0])) < fleet.events.index(("start", restart.index))
     assert rep.recovery_seconds is not None
-    # Inside the hold: the first message is offered as the hold starts and the kill is due 0.1 s after it,
-    # while a tick that slept to its own next wake (the next message, due at 1 s) would come back only at
-    # the end of the 1 s hold. The 0.9 s between leaves room for a loaded runner.
+    # Near the start of the hold: the kill deadline is 0.1 s after a clock read taken just before the hold
+    # starts, and the first message is offered just after it, while a tick that slept to its own next wake
+    # (the next message, due at 1 s) would come back only at the end of the 1 s hold. `< 1.0` from the
+    # first message leaves room for a loaded runner; it does not by itself prove the kill was inside the
+    # hold.
     assert _kill_offset(fleet) < 1.0
 
 
 def _kill_offset(rec: types.SimpleNamespace) -> float:
-    """Seconds from the first message offered (the start of the hold) to the kill."""
+    """Seconds from the first message offered (just after the hold starts) to the kill."""
     (kill_at,) = rec.kill_times
     return float(kill_at - rec.submit_times[0])
 
@@ -474,8 +476,10 @@ async def test_colocated_restart_whose_start_raises_is_still_stopped(
 async def test_colocated_kill_that_never_fired_under_load_fails_the_run(
     fleet: types.SimpleNamespace,
 ) -> None:
-    """S27-55 (1): a loop that stalls past both the kill instant and the end of the hold certifies no kill
-    leg. The run fails, no engine shard is killed after the load, and nothing restarts over a live one."""
+    """S27-55 (1): a send batch that stalls past both the kill deadline and the end of the hold certifies
+    no kill leg. The run fails, no engine shard is killed, and nothing restarts over a live one. A stall
+    between the hold check and the kill check is not covered: the kill then fires past the end of the hold
+    and the run certifies."""
     fleet.stall_first_submit = 0.3
     with pytest.raises(RuntimeError, match="kill leg never fired"):
         await sc.run_shardcert(**_sizes(hold_seconds=0.1, kill=True, kill_at_fraction=0.5))
