@@ -948,43 +948,17 @@ def is_permanent_connect_error(exc: BaseException) -> bool:
 #: OpenSSL's X509_V_ERR_CERT_NOT_YET_VALID: a clock problem on this host, not a bad certificate.
 _X509_V_ERR_CERT_NOT_YET_VALID = 9
 
-#: ``getaddrinfo`` codes meaning the name has no address: POSIX EAI_NONAME, and EAI_NODATA (-5 on
-#: Linux), a name that exists with no address record; on Windows WSAHOST_NOT_FOUND (11001, which is
-#: also ``socket.EAI_NONAME`` and ``EAI_NODATA`` there) and WSANO_DATA (11004), the same two cases.
-#: EAI_AGAIN is not here. Every code is negative on POSIX, so the two Windows numbers match nothing
-#: there.
+#: ``getaddrinfo`` codes meaning the name does not exist: POSIX EAI_NONAME, and Windows
+#: WSAHOST_NOT_FOUND (11001), which is how a missing name surfaces there. EAI_AGAIN is not here.
+#: Nor are the "no address record" codes, Linux EAI_NODATA (-5) and Windows WSANO_DATA (11004),
+#: although a misconfigured name can return them (BACKLOG #4063): glibc also returns EAI_NODATA
+#: when one of its A and AAAA queries timed out, and Windows returns 11004 on a host whose network
+#: is not up yet, so either can be a boot-time state that waiting fixes. Read as permanent, they
+#: would cost the forwarder for the process life even with a spool behind it (BACKLOG #1966).
+#: Windows reports EAI_NODATA as the same 11001 as EAI_NONAME, so there a no-data name is permanent.
 _EAI_NO_SUCH_NAME = frozenset(
-    code
-    for code in (
-        getattr(socket, "EAI_NONAME", None),
-        getattr(socket, "EAI_NODATA", None),
-        11001,
-        11004,
-    )
-    if code is not None
+    code for code in (getattr(socket, "EAI_NONAME", None), 11001) if code is not None
 )
-
-
-def _raise_a_swallowed_lookup(handler: _TimeoutSysLogHandler) -> None:
-    """Raise, at construction, a lookup error ``SysLogHandler.__init__`` swallowed.
-
-    CPython 3.14.9 catches a ``socket.gaierror`` from ``createSocket`` in ``SysLogHandler.__init__``
-    and leaves ``socket`` None, deferring the lookup to the first send. A name that does not
-    resolve would then read as a forwarder that started. Before 3.14.9 the error raised from
-    ``__init__``, and this restores that.
-
-    :meth:`_TimeoutSysLogHandler.createSocket` records the error it raised, so this re-raises that
-    very error: no second lookup, so a resolver stall is not paid twice, and the permanent or
-    transient reading is of the lookup that failed (BACKLOG #4063). Only when nothing was recorded,
-    because a ``createSocket`` that does not record replaced ours, does it connect again, a second
-    lookup. A stdlib ``createSocket`` that returns has always set ``socket``, so neither branch runs
-    after a construction that connected."""
-    if getattr(handler, "socket", None) is not None:
-        return
-    swallowed, handler._lookup_error = handler._lookup_error, None
-    if swallowed is not None:
-        raise swallowed
-    handler.createSocket()
 
 
 class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
@@ -1020,9 +994,13 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: When :meth:`createSocket` last ran, on the monotonic clock: a UDP socket is rebuilt after a
     #: failed send only once :data:`_UDP_SOCKET_REBUILD_SECONDS` have passed since.
     _socket_built_at: float = 0.0
-    #: The lookup error the last :meth:`createSocket` raised, kept so :func:`_raise_a_swallowed_lookup`
-    #: can raise the one a CPython 3.14.9 constructor swallowed (BACKLOG #4063).
-    _lookup_error: socket.gaierror | None = None
+    #: The connect error :meth:`createSocket` raised during construction, kept so
+    #: :meth:`_raise_a_swallowed_connect_error` can raise one the stdlib constructor swallowed
+    #: (BACKLOG #4063). Recorded only while :attr:`_constructing`, and cleared when construction
+    #: ends, so a runtime reconnect's error, whose traceback holds the record being sent, is
+    #: never kept.
+    _connect_error: OSError | None = None
+    _constructing: bool = False
 
     def __init__(
         self,
@@ -1044,13 +1022,14 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         # that mypy rejects outright. Every construction site here is keyword-only, so this is
         # equivalent at runtime and honest to the checker.
         kwargs["timeout"] = timeout
+        self._constructing = True
         try:
             # SysLogHandler.__init__ calls createSocket() (3.11+). From CPython 3.14.9 it swallows a
-            # lookup error, so _raise_a_swallowed_lookup raises it here; without it a collector
-            # name that does not resolve reads as a forwarder that started. Only 3.14.9 runners
-            # would catch its removal.
+            # lookup error, so _raise_a_swallowed_connect_error raises it here; without it a
+            # collector name that does not resolve reads as a forwarder that started. Real 3.14.9
+            # runners and the simulated-3.14.9 tests in tests/test_log_spool.py catch its removal.
             super().__init__(*args, **kwargs)
-            _raise_a_swallowed_lookup(self)
+            self._raise_a_swallowed_connect_error()
         except OSError as exc:
             # BACKLOG #1966: with a spool behind it, a collector that is down at start must not cost
             # the process its forwarder for good. SysLogHandler.__init__ has set every attribute
@@ -1060,20 +1039,49 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
                 self.close()  # deregisters the half-built handler; its socket is already None
                 raise
             self.startup_error = exc
+        finally:
+            self._constructing = False
+            self._connect_error = None
+
+    def _raise_a_swallowed_connect_error(self) -> None:
+        """Raise, at construction, a connect error ``SysLogHandler.__init__`` swallowed.
+
+        CPython 3.14.9 catches a ``socket.gaierror`` from ``createSocket`` in
+        ``SysLogHandler.__init__`` and leaves ``socket`` None, deferring the lookup to the first
+        send. A name that does not resolve would then read as a forwarder that started. Before
+        3.14.9 the error raised from ``__init__``, and this restores that.
+
+        :meth:`createSocket` records the error it raised, so this re-raises that very error: no
+        second lookup, so a resolver stall is not paid twice, and the permanent or transient
+        reading is of the lookup that failed (BACKLOG #4063). It records any ``OSError``, so a
+        wider swallow in a later release is raised the same way. Only when nothing was recorded
+        does it connect again, so a ``createSocket`` that records nothing, such as a test's
+        replacement, still cannot leave a failed start reading as a started forwarder. A stdlib
+        ``createSocket`` that returns has always set ``socket``, so neither branch runs after a
+        construction that connected."""
+        if getattr(self, "socket", None) is not None:
+            return
+        if self._connect_error is not None:
+            raise self._connect_error
+        self.createSocket()
 
     def createSocket(self) -> None:
         self._socket_built_at = time.monotonic()
-        self._lookup_error = None
         try:
             super().createSocket()
-        except socket.gaierror as exc:
-            self._lookup_error = exc
+        except OSError as exc:
+            self._record_connect_error(exc)
             raise
         # SysLogHandler.socket is set at runtime (not in typeshed); getattr keeps this mypy-clean
         # across typeshed versions without a fragile per-version type: ignore.
         sock = getattr(self, "socket", None)
         if self._sock_timeout is not None and sock is not None:
             sock.settimeout(self._sock_timeout)
+
+    def _record_connect_error(self, exc: OSError) -> None:
+        """Keep ``exc`` for :meth:`_raise_a_swallowed_connect_error`, during construction only."""
+        if self._constructing:
+            self._connect_error = exc
 
     def emit(self, record: logging.LogRecord) -> None:
         """Send ``record`` as ``<PRI>`` plus the formatted line in UTF-8, framed for the transport.
@@ -1317,13 +1325,15 @@ class _TlsSysLogHandler(_TimeoutSysLogHandler):
                 self.socket = self._ssl_context.wrap_socket(
                     sock, server_hostname=self._server_hostname
                 )
-            except BaseException:
+            except BaseException as exc:
                 # A failed handshake must not leave the CONNECTED PLAIN socket in place: a handler
                 # that survives this (defer_connect, BACKLOG #1966) would otherwise send the next
                 # record over it in cleartext. Clear it so the next send reconnects and re-wraps.
                 self.socket = None
                 with contextlib.suppress(OSError):
                     sock.close()
+                if isinstance(exc, OSError):
+                    self._record_connect_error(exc)  # BACKLOG #4063, as the plain connect's
                 raise
 
 
@@ -1424,8 +1434,8 @@ def _build_syslog_handler(
         )
     # A UDP createSocket connects nothing, but it can still raise an OSError, at least for a failed
     # name lookup. Without a spool every such error raises. With one, every such error is deferred
-    # as on the stream arms except a name with no address (_EAI_NO_SUCH_NAME), which still raises
-    # (is_permanent_connect_error).
+    # as on the stream arms except a name that does not exist (EAI_NONAME, or 11001 on Windows),
+    # which still raises (is_permanent_connect_error).
     return _TimeoutSysLogHandler(
         address=(forward.host, forward.port),
         socktype=socket.SOCK_DGRAM,

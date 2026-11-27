@@ -628,22 +628,28 @@ class _RecordingContext:
         return _Wrapped(sock)
 
 
-def _handler(protocol: str, port: int, *, defer_connect: bool) -> _TimeoutSysLogHandler:
-    """A forwarder arm built as :func:`_build_syslog_handler` builds it, with a stand-in TLS
-    context so no handshake runs."""
-    common: dict[str, Any] = {
-        "address": ("siem.example.org", port),
-        "socktype": socket.SOCK_DGRAM if protocol == "udp" else socket.SOCK_STREAM,
-        "timeout": None if protocol == "udp" else 1.0,
-        "defer_connect": defer_connect,
-    }
-    if protocol == "tls":
-        return _TlsSysLogHandler(
-            **common,
-            ssl_context=_RecordingContext(),  # type: ignore[arg-type]
-            server_hostname="collector.example.org",  # not the address host
-        )
-    return _TimeoutSysLogHandler(**common)
+def _handler(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, port: int, *, defer_connect: bool
+) -> _TimeoutSysLogHandler:
+    """The forwarder arm :func:`_build_syslog_handler` builds for ``siem.example.org``, with a
+    stand-in TLS context so no handshake runs."""
+    monkeypatch.setattr(logging_setup, "_build_tls_context", lambda forward: _RecordingContext())
+    handler = _build_syslog_handler(
+        SyslogForward(host="siem.example.org", port=port, protocol=protocol),
+        defer_connect=defer_connect,
+    )
+    assert isinstance(handler, _TimeoutSysLogHandler)
+    return handler
+
+
+def _assert_wrapped_for_the_collector(handler: _TimeoutSysLogHandler) -> None:
+    """The TLS override wrapped the socket for the configured server name, and the handler kept
+    the wrapped socket."""
+    assert isinstance(handler, _TlsSysLogHandler)
+    assert isinstance(handler.socket, _Wrapped)
+    context = handler._ssl_context
+    assert isinstance(context, _RecordingContext)
+    assert context.wrapped == [(handler.socket.sock, "siem.example.org")]
 
 
 @pytest.mark.parametrize("defer", [False, True], ids=["no-spool", "spool"])
@@ -660,7 +666,7 @@ def test_a_swallowed_lookup_error_is_the_one_raised_with_no_second_lookup(
         port = server.getsockname()[1]
         lookups = _collector_lookups(monkeypatch, [_try_again(), _loopback(socktype, port)])
         if defer:
-            handler = _handler(protocol, port, defer_connect=True)
+            handler = _handler(monkeypatch, protocol, port, defer_connect=True)
             try:
                 assert isinstance(handler.startup_error, socket.gaierror)
                 assert handler.startup_error.errno == socket.EAI_AGAIN
@@ -669,7 +675,7 @@ def test_a_swallowed_lookup_error_is_the_one_raised_with_no_second_lookup(
                 handler.close()
         else:
             with pytest.raises(socket.gaierror) as raised:
-                _handler(protocol, port, defer_connect=False)
+                _handler(monkeypatch, protocol, port, defer_connect=False)
             assert raised.value.errno == socket.EAI_AGAIN
     assert len(lookups) == 1
 
@@ -727,16 +733,35 @@ def test_a_construction_that_connects_creates_one_socket(
     with socket.create_server(("127.0.0.1", 0)) as server:
         port = server.getsockname()[1]
         lookups = _collector_lookups(monkeypatch, [_loopback(socktype, port)])
-        handler = _handler(protocol, port, defer_connect=True)
+        handler = _handler(monkeypatch, protocol, port, defer_connect=True)
         try:
             assert len(lookups) == 1
             assert creates == [handler]
             assert handler.startup_error is None
             assert handler.socket is not None
             if protocol == "tls":
-                assert isinstance(handler.socket, _Wrapped)
+                _assert_wrapped_for_the_collector(handler)
         finally:
             handler.close()
+
+
+def test_a_runtime_reconnect_error_is_not_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #4063: only construction records a connect error. A reconnect inside ``emit`` that
+    fails must not leave its error on the handler, since its traceback holds the record."""
+    _simulate_cpython_3149_syslog_init(monkeypatch)
+    _collector_lookups(
+        monkeypatch, [_loopback(socket.SOCK_DGRAM, 514), socket.gaierror(socket.EAI_AGAIN, "x")]
+    )
+    handler = _handler(monkeypatch, "udp", 514, defer_connect=True)
+    try:
+        assert handler._connect_error is None and not handler._constructing
+        handler.socket.close()
+        handler.socket = None  # the next send reconnects, and its lookup fails
+        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "INFO", "levelno": 20}))
+        assert handler.send_failed
+        assert handler._connect_error is None
+    finally:
+        handler.close()
 
 
 @pytest.mark.parametrize("protocol", ["tcp", "tls"])
@@ -745,9 +770,8 @@ def test_a_create_socket_that_records_nothing_is_retried_through_our_override(
 ) -> None:
     """The fallback in ``_raise_a_swallowed_lookup``: when a ``createSocket`` that records nothing
     replaced ours, the constructor connects again, through the class's own ``createSocket``. For
-    TLS the context's record shows the TLS override ran and wrapped the socket for the configured
-    server name, and that the handler kept the wrapped socket. The retry's lookup answers with a
-    loopback listener, so no name is resolved."""
+    TLS the context's record shows the TLS override ran and wrapped the socket. The retry's lookup
+    answers with a loopback listener, so no name is resolved."""
     _simulate_cpython_3149_syslog_init(monkeypatch)
     stdlib_create = logging.handlers.SysLogHandler.createSocket
     creates: list[object] = []
@@ -762,19 +786,15 @@ def test_a_create_socket_that_records_nothing_is_retried_through_our_override(
         lookups = _collector_lookups(
             monkeypatch, [_try_again(), _loopback(socket.SOCK_STREAM, port)]
         )
-        handler = _handler(protocol, port, defer_connect=True)
+        handler = _handler(monkeypatch, protocol, port, defer_connect=True)
         try:
             assert len(lookups) == 2  # the swallowed lookup, then the retry
             assert creates == [handler, handler]  # both through the class, the retry included
             assert handler.startup_error is None
             assert handler.socket is not None
-            assert handler.socket.gettimeout() == 1.0
+            assert handler.socket.gettimeout() == logging_setup._FORWARD_TCP_TIMEOUT
             if protocol == "tls":
-                assert isinstance(handler.socket, _Wrapped)
-                assert isinstance(handler, _TlsSysLogHandler)
-                context = handler._ssl_context
-                assert isinstance(context, _RecordingContext)
-                assert context.wrapped == [(handler.socket.sock, "collector.example.org")]
+                _assert_wrapped_for_the_collector(handler)
         finally:
             handler.close()
 
@@ -818,10 +838,11 @@ def _not_yet_valid() -> ssl.SSLCertVerificationError:
         (socket.gaierror(11001, "host not found"), True),
         # The platform's own EAI_NONAME: -2 on Linux, where a bare 11001 exercises nothing.
         (socket.gaierror(socket.EAI_NONAME, "name or service not known"), True),
-        # BACKLOG #4063: a name with no address record. EAI_NODATA is -5 on Linux and the same
-        # 11001 as EAI_NONAME on Windows, where WSANO_DATA (11004) is the no-data code.
-        (socket.gaierror(getattr(socket, "EAI_NODATA", -5), "no address associated"), True),
-        (socket.gaierror(11004, "valid name, no data record"), True),
+        # BACKLOG #4063: "no address record", Linux EAI_NODATA (-5) and Windows WSANO_DATA
+        # (11004), stays transient, since a resolver not yet up can return either; the reason is
+        # at _EAI_NO_SUCH_NAME. Literals, so each runs on every platform.
+        (socket.gaierror(-5, "no address associated with hostname"), False),
+        (socket.gaierror(11004, "valid name, no data record"), False),
         (socket.gaierror(getattr(socket, "EAI_AGAIN", -3), "temporary failure"), False),
         (ssl.SSLCertVerificationError("certificate verify failed"), True),
         (_not_yet_valid(), False),
