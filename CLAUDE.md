@@ -793,11 +793,12 @@ Manager's watch reached the cloud session 29 seconds after its question.
   repair-Builder paragraph above, named no finding; the rule was set in the Lander's brief written
   under it, and the owner directed the Manager to follow that brief exactly (2026-11-26, in the
   Manager's chat). Register text the owner signs, signed or drafted for signing, is outside the
-  safe-direction exception: that exception does not apply to it, and every other route in the
-  merge bullet of engine CLAUDE.md section 5 applies as written. Decided by the Lander under the
-  owner's delegation of 2026-11-26: asked *"Should the safe-direction carve-out exclude register
-  text the owner signs? Reply A or B"*, the owner answered *"/driver"* (record
-  d20261127T011443730-344f46).
+  safe-direction exception: a finding on it never takes that exception's no-hold route, and every
+  other route in the merge bullet of engine CLAUDE.md section 5 applies as written, including the
+  owner routes in that exception's own list. Decided by the Lander under the owner's delegation of
+  2026-11-26: asked *"Should the safe-direction carve-out exclude register text the owner signs?
+  Reply A or B"*, the owner answered *"/driver"* (records d20261127T011443730-344f46 and
+  d20261127T020909932-9d4da6).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
