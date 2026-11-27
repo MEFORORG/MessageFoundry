@@ -22,7 +22,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -136,6 +136,21 @@ def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
     return True
 
 
+def paced[T](items: Iterable[T], stop: threading.Event, rate: float) -> Iterator[T]:
+    """Yield ``items`` at ``rate`` a second, with a :func:`pause_unless_stopped` between two of
+    them (none for a ``rate`` of 0 or less), and end as soon as ``stop`` is set.
+
+    The pause goes before every item but the first, never after the last: a pause after the
+    last would hold the batch open a whole pause with nothing left to send, 100 seconds at
+    0.01 a second (BACKLOG #5855, #5856). The next item is drawn before the pause, because a lazy
+    ``items`` only tells there is none left once it is asked for one."""
+    delay = 1.0 / rate if rate > 0 else 0.0
+    for index, item in enumerate(items):
+        if stop.is_set() or (index and delay and pause_unless_stopped(stop, delay)):
+            return
+        yield item
+
+
 def _socket_error(code: int) -> OSError:
     """The OSError for a failed dial's ``code``. On Windows the ``winerror`` argument picks the
     subclass a blocking connect raises, such as ``ConnectionRefusedError`` for 10061, and the text
@@ -208,13 +223,8 @@ class SendWorker(QObject):
         # The items may be generated lazily on this thread, so a generator fault ends the batch
         # here; finished is emitted whatever happens, or the tab would wait on it for good.
         try:
-            delay = 1.0 / self._rate if self._rate > 0 else 0.0
-            for item in self._items:
-                if self._stop.is_set():
-                    break
+            for item in paced(self._items, self._stop, self._rate):
                 self.result.emit(self._send_one(item))
-                if delay and pause_unless_stopped(self._stop, delay):
-                    break
         except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
             log.exception("harness send batch ended early")
             self.failure = f"{type(exc).__name__}: {exc}"

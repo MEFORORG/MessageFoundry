@@ -74,7 +74,7 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
     port = server.getsockname()[1]
     panel = send.SendPanel()
     panel._count.setValue(1_000_000)
-    panel._rate.setValue(0.1)  # a ten-second pause after each message
+    panel._rate.setValue(0.1)  # a ten-second pause between two messages
     panel._host.setText("127.0.0.1")
     panel._port.setValue(port)
     conn: socket.socket | None = None
