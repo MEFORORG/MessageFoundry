@@ -28,6 +28,7 @@ from tests.test_shardcert_failclosed_verdicts import (
     _consolidated,
     _drive,
     _result_line,
+    _rung,
     _sustained,
 )
 
@@ -75,9 +76,25 @@ def test_soak_break_under_a_drive_shortfall_is_fail() -> None:
     assert _result_line(rep).startswith("RESULT: FAIL")
 
 
-def test_soak_duplicate_under_a_drive_shortfall_is_fail() -> None:
-    rep = _consolidated([_sustained(0, 20.0)], soak=_underdriven_soak(repeats=1))
-    assert rep.soak_drive_shortfall is True
+def test_soak_inversion_on_an_engine_aborted_soak_is_fail() -> None:
+    """The tracker counts an inversion only for a NEW seq below a lane's high-water, which a teardown's
+    redelivery cannot produce, so an inversion on an aborted soak is still a measured break."""
+    rep = _consolidated([_sustained(0, 20.0)], soak=_engine_aborted_soak(inversions=2))
+    assert rep.soak_aborted is True
+    assert rep.exit_code == 1
+    assert rep.result_label == "FAIL"
+
+
+def test_soak_inversion_behind_an_unconfirmed_climb_rung_is_fail() -> None:
+    """A climb rung whose store-truth never arrived is INCONCLUSIVE, which says nothing about the order the
+    soak's sinks observed: the soak's inversion is still FAIL / exit 1."""
+    unconfirmed = build_rung_outcome(_rung(1, 24.0), _drive(24.0), None, None)
+    assert unconfirmed.verdict is RungVerdict.INCONCLUSIVE
+    soak = build_rung_outcome(
+        _SOAK_RUNG, dataclasses.replace(_drive(20.0), lane_inversions=3), _clean_gate(), None
+    )
+    rep = _consolidated([_sustained(0, 20.0), unconfirmed], soak=soak)
+    assert rep.store_truth_unconfirmed is True
     assert rep.exit_code == 1
     assert rep.result_label == "FAIL"
 
@@ -90,6 +107,32 @@ def test_clean_underdriven_soak_stays_setup_degraded() -> None:
     assert rep.result_label == "SETUP_DEGRADED"
 
 
+def test_soak_duplicate_under_a_drive_shortfall_stays_setup_degraded() -> None:
+    """An overloaded load-gen box can ACK late and provoke a redelivery, which counts as a repeat, so a
+    duplicate on an under-driven soak is not a proven break."""
+    rep = _consolidated([_sustained(0, 20.0)], soak=_underdriven_soak(repeats=1))
+    assert rep.soak_drive_shortfall is True
+    assert rep.exit_code == 2
+    assert rep.result_label == "SETUP_DEGRADED"
+
+
+def test_single_lane_underdriven_soak_stays_setup_degraded() -> None:
+    """The soak's single-lane term is not a hard break: an under-driven soak can see few lanes."""
+    full = _drive(20.0)
+    drive = dataclasses.replace(
+        full,
+        offered=full.offered * 2,
+        deferred_backpressure=0,
+        deferred_schedule=full.offered,
+        lanes_observed=1,
+    )
+    soak = build_rung_outcome(_SOAK_RUNG, drive, _clean_gate(), None)
+    assert soak.verdict is RungVerdict.SUSTAINED
+    rep = _consolidated([_sustained(0, 20.0)], soak=soak)
+    assert rep.ok is False
+    assert rep.exit_code == 2
+
+
 def test_soak_duplicate_on_an_engine_aborted_soak_stays_setup_degraded() -> None:
     """A soak the engine marked aborted had its sinks torn down mid-delivery, so a repeat there can be the
     teardown's redelivery: unproven, and the run stays exit 2."""
@@ -97,26 +140,6 @@ def test_soak_duplicate_on_an_engine_aborted_soak_stays_setup_degraded() -> None
     assert rep.soak_aborted is True
     assert rep.exit_code == 2
     assert rep.result_label == "SETUP_DEGRADED"
-
-
-def test_soak_duplicate_under_a_drive_side_soak_abort_stays_setup_degraded() -> None:
-    rep = _consolidated([_sustained(0, 20.0)], soak=_underdriven_soak(repeats=2), soak_aborted=True)
-    assert rep.exit_code == 2
-
-
-@pytest.mark.parametrize("where", ["engine", "drive"])
-def test_soak_inversion_on_an_aborted_soak_is_fail(where: str) -> None:
-    """The tracker counts an inversion only for a NEW seq below a lane's high-water, which a teardown's
-    redelivery cannot produce, so an inversion on an aborted soak is still a measured break."""
-    if where == "engine":
-        rep = _consolidated([_sustained(0, 20.0)], soak=_engine_aborted_soak(inversions=2))
-    else:
-        rep = _consolidated(
-            [_sustained(0, 20.0)], soak=_underdriven_soak(inversions=2), soak_aborted=True
-        )
-    assert rep.soak_aborted is True
-    assert rep.exit_code == 1
-    assert rep.result_label == "FAIL"
 
 
 # --- BACKLOG #5953 (S27-75): the timing blocks name the lever that fills them, and are read off the loop ---
