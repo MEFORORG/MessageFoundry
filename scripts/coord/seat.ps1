@@ -1394,12 +1394,16 @@ try {
     #   close is the boundary. The cost: a closer's own later nosid pass reads its claims as inherited.
     # - An ended record with no start (an older writer drops the field) has only a close stamp, which
     #   is not when the episode began, so the start is null and attribution says unknown.
-    # - An open record with no start still holds its first stamp in lifecycleAt.
+    # - An open record with no start FIELD (an older writer) still holds its first stamp in
+    #   lifecycleAt. One whose field is present and null was written by this script as unknown --
+    #   a named session reopened from an ended record that had no start -- and lifecycleAt there is
+    #   the reopen, not the episode's start, so it stays unknown.
     $priorEnded = $lifecycle -in 'closed', 'handed'
     $priorStart = Prior 'episodeStart' $null
+    $startRecorded = $prior -and ($prior.PSObject.Properties.Name -contains 'episodeStart')
     $episodeStart = if ($priorEnded -and $sk.Key -eq 'nosid') { $lifecycleAt }
                     elseif ($null -ne $priorStart) { $priorStart }
-                    elseif ($priorEnded) { $null }
+                    elseif ($priorEnded -or $startRecorded) { $null }
                     else { $lifecycleAt }
     # A DECLARATION ON AN ENDED RECORD REOPENS IT. Before this only -Close ever moved lifecycle, so a
     # session resumed after its own -Close kept reading closed, and announce-session.ps1 hid it from

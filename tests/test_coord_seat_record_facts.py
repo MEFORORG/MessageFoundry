@@ -532,3 +532,22 @@ def test_a_pointer_only_declaration_does_not_reopen(repo: Path, handback: bool) 
     seat(repo, "-Declare", "-Notes", "pointer fix only")
     after = read_record(repo)
     assert (after["lifecycle"], after["lifecycleAt"]) == (ended["lifecycle"], ended["lifecycleAt"])
+
+
+def test_a_reopened_unknown_start_stays_unknown_across_later_passes(repo: Path) -> None:
+    """The reopen stamp is not when the episode began, so a hook pass must not adopt it."""
+    rec = declare(repo)
+    start = episode_start(rec)
+    seat(repo, "-Close")
+    # An older writer's ended record: no start field at all.
+    rewrite_record(repo, "episodeStart", lifecycleAt=(start + timedelta(hours=1)).isoformat())
+    put_json(
+        coord_dir(repo) / "claims" / "9501.json",
+        {"worktree": rec["worktree"], "claimed": (start + timedelta(minutes=10)).isoformat()},
+    )
+    seat(repo, "-Declare", "-Seat", "builder", "-Goal", "resumed")
+    plain_record(repo)
+    after = read_record(repo)
+    assert after["lifecycle"] == "open"
+    assert after["episodeStart"] is None
+    assert [c["attribution"] for c in after["claims"]] == ["unknown"]
