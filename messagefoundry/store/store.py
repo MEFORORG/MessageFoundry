@@ -203,6 +203,7 @@ from messagefoundry.store.queue_tag import (
     report_queue_tag_failure,
     reseal_unless_tag_failure,
     set_aside_deadline,
+    unopenable_log_text,
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -16067,7 +16068,9 @@ class MessageStore:
             return queue_open_fault(exc)
         # The text, not the error: a record keeps its args, and the error's traceback holds the
         # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
-        log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], str(exc))
+        log.warning(
+            "dead-lettering undecryptable queue row %s: %s", row["id"], unopenable_log_text(exc)
+        )
         try:
             await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}", _standalone=True)
         except PROGRAMMING_ERRORS:
