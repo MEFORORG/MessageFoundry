@@ -1837,7 +1837,8 @@ async def test_a_stop_that_cannot_wait_out_an_earlier_stop_says_so(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #6526: stop, start, stop. The second stop waits for the first only within its own
-    timeout; when it returns with the first still under way, it says the pass may still run."""
+    timeout; when it returns with the first still under way, it says the pass may still run. It
+    stopped the new loop rather than joining the first stop, so it does not say it joined one."""
     await _delivered(store, now=0.0)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1863,12 +1864,9 @@ async def test_a_stop_that_cannot_wait_out_an_earlier_stop_says_so(
         await asyncio.wait({old_loop}, timeout=10)
         await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
 
-    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert [
-        m
-        for m in messages
-        if "joined a stop already under way" in m and "may still be running" in m
-    ], messages
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [m for m in messages if "joined a stop already under way" in m], messages
+    assert [m for m in messages if "earlier stop" in m and "may still be running" in m], messages
 
 
 async def test_run_once_after_a_cut_stop_waits_for_its_interrupted_row(
@@ -2130,6 +2128,162 @@ async def test_a_sweep_whose_archive_absorbed_the_cancel_starts_no_further_archi
     assert [(d["interrupted"], d["interrupted_phase"]) for d in details] == [
         (True, "processed_archives")
     ]
+
+
+async def test_an_archive_that_absorbed_the_cancel_stops_its_worker_at_the_loops_stop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: an archive whose sweep swallows the cancel leaves the sweep's own cancel flag
+    clear, so the stop callable its worker thread reads between files must carry the loop's stop:
+    the worker stops once stop() has returned instead of deleting on."""
+    loop = asyncio.get_running_loop()
+    in_worker = asyncio.Event()
+    give_up = threading.Event()
+    saw_stop: list[bool] = []
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def absorbs_the_cancel(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        def work() -> int:
+            loop.call_soon_threadsafe(in_worker.set)
+            while not give_up.is_set():
+                if deadline_hit():
+                    saw_stop.append(True)
+                    return 0
+                time.sleep(0.01)
+            saw_stop.append(False)
+            return 0
+
+        worker = asyncio.ensure_future(asyncio.to_thread(work))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            return await worker
+
+    monkeypatch.setattr(src, "prune_processed_archive", absorbs_the_cancel)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (src,),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(in_worker.wait(), 10)
+        await runner.stop(timeout=0.1)
+        await asyncio.wait({loop_task}, timeout=2)
+        assert saw_stop == [True], "the archive's worker swept on after the loop's stop"
+    finally:
+        give_up.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("absorbs", [True, False], ids=["absorbed", "cancelled"])
+async def test_a_sweep_stopped_partway_audits_what_it_deleted(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, absorbs: bool
+) -> None:
+    """BACKLOG #6526: a stop partway through the `.processed` sweep must not drop the count of the
+    archives that finished: the interrupted row states what was deleted."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sources = [
+        FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / n)}))
+        for n in ("a", "b", "c")
+    ]
+
+    async def deletes_three(*_a: object, **_k: object) -> int:
+        return 3
+
+    async def hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if not absorbs:
+                raise
+            await release.wait()
+        return 0
+
+    async def deletes_one(*_a: object, **_k: object) -> int:
+        return 1
+
+    for src, prune in zip(sources, (deletes_three, hangs, deletes_one), strict=True):
+        monkeypatch.setattr(src, "prune_processed_archive", prune)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: tuple(sources),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 3)]
+
+
+async def test_a_pass_stopped_before_the_sweep_deletes_names_no_archive_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: the `.processed` sweep's prelude only reads (it lists the directories it must
+    not reach). A pass stopped there has not started deleting, so it names no running phase, and
+    with nothing else done writes no audit row."""
+    in_prelude = threading.Event()
+    let_go = threading.Event()
+    real_keys = retention_mod._archive_keys
+
+    def slow_keys(*a: Any, **k: Any) -> Any:
+        in_prelude.set()
+        let_go.wait(10)
+        return real_keys(*a, **k)
+
+    swept: list[str] = []
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def records(*_a: object, **_k: object) -> int:
+        swept.append("swept")
+        return 0
+
+    monkeypatch.setattr(retention_mod, "_archive_keys", slow_keys)
+    monkeypatch.setattr(src, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (src,),
+    )
+    pass_task = asyncio.create_task(runner.run_once())
+    try:
+        await asyncio.to_thread(in_prelude.wait, 10)
+        pass_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pass_task
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    finally:
+        let_go.set()
+
+    assert swept == []
+    assert await _retention_audit_details(store) == []
 
 
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:

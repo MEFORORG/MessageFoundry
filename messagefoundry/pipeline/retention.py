@@ -932,7 +932,14 @@ class RetentionRunner:
                 # Within this stop's budget; the earlier stop's outcome is its own callers'.
                 await asyncio.wait({earlier}, timeout=max(0.0, deadline - loop.time()))
                 if not earlier.done():
-                    _log_joined_stop_cut(timeout, cancelled=False)
+                    # This stop took a loop started after the earlier one, so it joined no stop:
+                    # it only could not wait the earlier one out.
+                    log.warning(
+                        "retention: stop() stopped a loop started during an earlier stop, which had "
+                        "not finished after this call's own %gs; that earlier retention pass may "
+                        "still be running and its interrupted audit row may not be written",
+                        timeout,
+                    )
         if task is None:
             return
         if not task.done():
@@ -1349,11 +1356,26 @@ class RetentionRunner:
             # Each source does its own blocking I/O off the loop and under its own credential, re-reading
             # `_archive_halt` per file, so a large directory releases the pass like the compressor
             # does.
+            # The phase is named only over the sweep, not its read-only prelude, and each archive's
+            # count lands as it ends, so a stop partway audits what went (BACKLOG #6526).
             if not _halt() and s.processed_archive_days > 0:
-                with _running("processed_archives"):
-                    processed_archives_deleted = await self._prune_processed_archives(
-                        now - s.processed_archive_days * _SECONDS_PER_DAY, _archive_halt
-                    )
+
+                def _archive_tally(deleted: int) -> None:
+                    nonlocal processed_archives_deleted
+                    processed_archives_deleted = deleted
+
+                _raise_if_stopped()
+                plan = await self._plan_processed_archives()
+                if plan is not None:
+                    with _running("processed_archives"):
+                        processed_archives_deleted = await self._prune_processed_archives(
+                            plan,
+                            now - s.processed_archive_days * _SECONDS_PER_DAY,
+                            _archive_halt,
+                            on_progress=_archive_tally,
+                        )
+                        # A stop the sweep broke on ends the pass inside the phase it cut.
+                        _raise_if_stopped()
                 if archive_saw_demotion:
                     _demoted(seen=True)
 
@@ -1549,10 +1571,12 @@ class RetentionRunner:
             functools.partial(self._compress_app_logs, now), deadline_hit
         )
 
-    async def _prune_processed_archives(
-        self, older_than: float, deadline_hit: Callable[[], bool]
-    ) -> int:
-        """Run each bound archive's sweep, and return how many files went in all (BACKLOG #1188).
+    async def _plan_processed_archives(
+        self,
+    ) -> tuple[list[ProcessedArchive], ArchiveGuard, list[str]] | None:
+        """The `.processed` sweep's read-only prelude: the bound archives, the guard over what they
+        must not reach, and each archive directory's once-only key; None when this pass sweeps
+        nothing (BACKLOG #1188).
 
         Every archive is handed the watch and ``.error`` directories of every inbound in the
         deployment, on every engine shard, and every File outbound's target directory, bound or not,
@@ -1561,16 +1585,14 @@ class RetentionRunner:
         whole sweep is skipped: the guard is only as good as its list. A guarded directory whose
         identity cannot be read is read again by each archive under its own identity, and an archive
         that still cannot read it is not swept (:class:`ArchiveGuard`), nor is one whose opened
-        directory has no readable identity. A directory two connections share is swept once. A
-        fault in one connection is logged and the others still run, because a sweep must never stop
-        the pass: a pass that raised here would skip its later phases, and its audit row would record
-        an interrupted pass."""
+        directory has no readable identity. A fault here is logged and sweeps nothing, because the
+        prelude must never stop the pass."""
         # Everything up to the sweep itself is contained: a fault here, a connector's declared
         # directories raising say, must not escape the pass and end it early.
         try:
             archives = list(self._archive_source()) if self._archive_source is not None else []
             if not any(a.archiving for a in archives):
-                return 0
+                return None
             guarded: list[Path] = [p for a in archives for p in (a.directory, a.error_dir)]
             if self._guard_source is not None:
                 extra = self._guard_source()
@@ -1580,7 +1602,7 @@ class RetentionRunner:
                         "connection's directories could not be resolved from its configuration, so "
                         "the sweep cannot tell what it must not reach"
                     )
-                    return 0
+                    return None
                 guarded.extend(extra)
             guarded.extend(self._engine_dirs)
             guarded.extend(self._engine_trees)
@@ -1593,13 +1615,38 @@ class RetentionRunner:
                 "directories it must not reach could not be listed (%s)",
                 safe_exc(exc),
             )
-            return 0
+            return None
+        return archives, protected, keys
+
+    async def _prune_processed_archives(
+        self,
+        plan: tuple[list[ProcessedArchive], ArchiveGuard, list[str]],
+        older_than: float,
+        deadline_hit: Callable[[], bool],
+        *,
+        on_progress: Callable[[int], None],
+    ) -> int:
+        """Run each archive's sweep over ``plan`` (:meth:`_plan_processed_archives`), and return how
+        many files went in all (BACKLOG #1188). A directory two connections share is swept once. A
+        fault in one connection is logged and the others still run, because a sweep must never stop
+        the pass: a pass that raised here would skip its later phases, and its audit row would record
+        an interrupted pass. ``on_progress`` gets the count so far, on the event loop, as each
+        archive's sweep ends, so a caller cut off partway still knows what was deleted."""
+        archives, protected, keys = plan
+        # Read here, on the event loop, so the per-file stop callable below carries the loop's stop
+        # to the worker thread: an archive whose sweep absorbs the cancel leaves `cancelled` clear,
+        # and its worker must still stop between files once stop() may have returned (BACKLOG #6526).
+        loop_stop = _LOOP_STOP.get()
         # Set when this task is cancelled, so a sweep already running on a worker thread stops at its
         # next file instead of deleting on after the engine has stopped.
         cancelled = threading.Event()
 
         def stop_hit() -> bool:
-            return cancelled.is_set() or deadline_hit()
+            return (
+                cancelled.is_set()
+                or (loop_stop is not None and loop_stop.is_set())
+                or deadline_hit()
+            )
 
         swept: set[str] = set()
         deleted = 0
@@ -1638,6 +1685,7 @@ class RetentionRunner:
             if outcome is not None:
                 swept.add(key)
                 deleted += outcome
+                on_progress(deleted)
         return deleted
 
     # --- per-connection retention overrides (#34, ADR 0027) ------------------

@@ -1395,7 +1395,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > SQLite-only: on the server backends those methods are documented no-ops, and log management / space
 > reclamation (plus the DB-tier `[backup]` snapshot) are DBA operations there. `min_free_disk_mb` is
 > SQLite-only too. The runner skips its free-space probe unless the store is SQLite, and the stock WAL
-> truncate gives the runner a pass to run only on a file-backed SQLite store. CORRECTED 2026-11-26: this
+> truncate gives the runner a pass to run only on a file-backed SQLite store. A `retention_purge`
+> `audit_log` entry records cutoffs + counts, **no** message content. CORRECTED 2026-11-26: this
 > said each pass that does real work writes one `retention_purge` `audit_log` entry.
 > Per-backend table: [PHI.md §8](PHI.md#8-retention--purge).
 
