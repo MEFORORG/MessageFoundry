@@ -3,9 +3,10 @@
   short for a tag, now dead-letters the `Stage.RESPONSE` token with `last_error` "integrity: the
   re-ingress work-row holds a corrupt payload" and a `dead` event saying the same, on SQLite,
   PostgreSQL and SQL Server, and the server backends' fenced-write WARNING names it
-  `ingress_handoff(corrupt-token)`. The re-ingress worker's WARNING for any refused token now
-  quotes the `last_error` it records, in place of the fixed words "failed its integrity tag". Its
-  handling is unchanged: it is still dead-lettered, still audited under
+  `ingress_handoff(corrupt-token)`. The re-ingress worker's WARNING for a token whose payload its
+  reply read refused now quotes the `last_error` it records, in place of the fixed words "failed
+  its integrity tag"; its other dead-letter WARNINGs are unchanged. Its handling is unchanged: it
+  is still dead-lettered, still audited under
   `integrity.queue_tag_failed` with cause `corrupt`, and still alerted under the corrupt-cell
   subject. Known limits, at least: under Vault Transit a corrupt cell is refused with cause
   `unknown`, not as a corrupt cell, and a blank payload is refused with cause `blank`; both keep

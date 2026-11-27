@@ -1194,8 +1194,10 @@ def reingress_token_refusal(error: QueueTagError) -> ReingressTokenRefusal:
     """The labels for a re-ingress token whose own payload ``error`` refused (BACKLOG #5982):
     :data:`REINGRESS_TOKEN_CORRUPT` for a corrupt cell (:attr:`QueueTagError.drift` false), and
     :data:`REINGRESS_TOKEN_TAG_FAILED` for every other refusal, as before. Each backend's handoff
-    and the re-ingress worker read it, so none can label a corrupt cell apart from the others.
-    Only the labels differ: either is dead-lettered, audited and alerted the same way."""
+    reads all three labels, and the re-ingress worker reads :attr:`~ReingressTokenRefusal.last_error`,
+    which its dead-letter also records as the ``dead`` event detail. Either refusal is dead-lettered,
+    audited and alerted; a corrupt cell's audit row names cause ``corrupt`` and its alert takes its
+    own subject, :data:`~messagefoundry.store.queue_tag.QUEUE_CORRUPT_ALERT_TABLE`."""
     if error.drift:
         return ReingressTokenRefusal(
             "ingress_handoff(tag-failed)",
@@ -1209,7 +1211,8 @@ def reingress_token_refusal(error: QueueTagError) -> ReingressTokenRefusal:
     )
 
 
-#: The ``outcome`` the handoff reports that tag failure with (BACKLOG #5982). It says the handoff
+#: The ``outcome`` the handoff reports a token's refused payload with, a failed tag or a corrupt
+#: cell (BACKLOG #5982). It says the handoff
 #: refused the token rather than that the token is dead. Each backend's handoff queues the report
 #: before its dead-letter write, so it is sent even when that write or its commit fails, or is
 #: fenced. The token then stays live, and a later claim refuses and reports it again under the
@@ -17200,8 +17203,7 @@ class MessageStore:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. So is a
         token whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
         #5982), or is corrupt (:data:`REINGRESS_TOKEN_CORRUPT`), which is also alerted, as a claim
-        reports a tag failure. A token
-        whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
+        reports a tag failure. A token whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
         evidence."""

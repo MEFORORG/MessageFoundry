@@ -9859,8 +9859,7 @@ class SqlServerStore(ServerCipherWalk):
         corrupt ref, and the failure is audited once the transaction has closed; so is a work-row
         whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
         #5982), or is corrupt (:data:`REINGRESS_TOKEN_CORRUPT`), which is also alerted. A
-        ``peek_failed``
-        child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
+        ``peek_failed`` child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
         queue_tag_rows: list[tuple[dict[str, Any], QueueTagError]] = []
@@ -9994,7 +9993,9 @@ class SqlServerStore(ServerCipherWalk):
                     ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
                     ref_corrupt = ref_fault is None
                 if ref_refusal is not None:
-                    return await _consume_dead(*ref_refusal)
+                    return await _consume_dead(
+                        ref_refusal.op, ref_refusal.last_error, ref_refusal.event_detail
+                    )
                 if ref_fault is not None:
                     raise ref_fault
                 if ref_corrupt:

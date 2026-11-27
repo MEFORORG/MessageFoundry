@@ -6663,7 +6663,9 @@ class PostgresStore(ServerCipherWalk):
                         # branch.
                         ref_corrupt = ref_fault is None
                     if ref_refusal is not None:
-                        return await _consume_dead(*ref_refusal)
+                        return await _consume_dead(
+                            ref_refusal.op, ref_refusal.last_error, ref_refusal.event_detail
+                        )
                     if ref_fault is not None:
                         raise ref_fault
                     if ref_corrupt:

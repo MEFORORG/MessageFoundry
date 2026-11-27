@@ -65,11 +65,13 @@ class _Hook:
             self.corrupt.append(reason)
 
     def misrouted(self) -> list[tuple[str, str]]:
-        """Each alert raised under the wrong table for what its reason says."""
+        """Each queue alert raised under the wrong one of the two queue tables for what its reason
+        says. An alert under any other table is not a queue alert, and is not judged here."""
         return [
             (table, reason)
             for table, reason in self.alerts
-            if table
+            if table in ("queue", QUEUE_CORRUPT_ALERT_TABLE)
+            and table
             != (QUEUE_CORRUPT_ALERT_TABLE if QUEUE_TAG_CAUSES["corrupt"] in reason else "queue")
         ]
 
