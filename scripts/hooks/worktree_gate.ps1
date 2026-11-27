@@ -6406,7 +6406,7 @@ if ($coordMatch) {
         @{ Name = "overlap-cache"
            # -LiveOnly, because that is the walk collision_gate.ps1 runs and <key>.live.json is the file
            # it reads; a bare -Refresh rewrites only <key>.json, which the gate never reads.
-           What = "the collision gate's peer-overlap input (two cache files per querying worktree: <key>.live.json, which the gate reads, and <key>.json, from a full walk)"
+           What = "the collision gate's peer-overlap input (per querying worktree, <key>.live.json from a -LiveOnly walk, which the gate reads, and <key>.json from a full walk)"
            Fix  = 'pwsh -NoProfile -File scripts\coord\overlap.ps1 -Refresh -LiveOnly' }
         @{ Name = "announce/off"
            What = "the REPO-WIDE announce kill switch"

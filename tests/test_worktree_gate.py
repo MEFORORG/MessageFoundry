@@ -548,9 +548,10 @@ def test_the_overlap_cache_remedy_refreshes_the_file_the_collision_gate_reads(
     remedy = reason.split("Do this instead:", 1)[1].strip().splitlines()[0].split()
     assert "overlap.ps1" in " ".join(remedy) and "-Refresh" in remedy, remedy
     assert ("-LiveOnly" in remedy) == gate_reads_live, (remedy, call.group(0))
-    # The What text names both cache files, and no longer claims one per querying worktree.
+    # The What text names both cache files, and no longer claims one per querying worktree. The
+    # literal `<key>` placeholder, because the denied target itself is echoed into the reason.
     assert "one cache file per querying worktree" not in reason
-    assert ".live.json" in reason
+    assert "<key>.live.json" in reason and "<key>.json" in reason
 
 
 @pytest.mark.parametrize(
