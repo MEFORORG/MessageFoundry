@@ -238,11 +238,14 @@ class ComparisonRow:
 
     @property
     def ok(self) -> bool:
-        """A row passes when the pooled arm exists, held zero-loss, the idle-poll collapse did not
-        fail (a WARN / INCONCLUSIVE collapse does not fail the run — only a genuine NO-collapse where
-        per_lane cleared the floor does), and throughput did not regress *where the comparison is
-        sound*. A baseline that itself breached zero-loss yields no sound throughput comparison, so
-        the row passes on the resilience basis (pooled held) rather than on a phantom-zero delta."""
+        """A row passes when the pooled arm exists, held zero-loss and drained in every trial, no
+        per_lane trial was INCONCLUSIVE, the idle-poll collapse did not fail (a WARN /
+        INCONCLUSIVE collapse does not fail the run — only a genuine NO-collapse where per_lane
+        cleared the floor does), and throughput did not regress *where the comparison is sound*.
+        Throughput is judged against the per_lane trials that held zero-loss; a baseline whose
+        every trial proved a breach yields no sound comparison, so the row passes on the resilience
+        basis (pooled held) rather than on a phantom-zero delta. One INCONCLUSIVE per_lane trial
+        fails the row even beside a proven breach ([LOSS, INCONCLUSIVE] fails, BACKLOG #5574)."""
         if self.pooled_missing or self.candidate_lost:
             return False
         # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
@@ -643,7 +646,8 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             # achieved rate cannot express.
             "per_lane_zero_loss": row.baseline.no_loss_ok,
             "pooled_zero_loss": (None if row.candidate is None else row.candidate.no_loss_ok),
-            # A False above is a proven breach or an INCONCLUSIVE arm; this says which (BACKLOG #5574).
+            # True only when no failing trial proved a loss (BACKLOG #5574). A row with a proven
+            # trial and an INCONCLUSIVE one reads False here and counts in the next key.
             "per_lane_zero_loss_inconclusive": row.baseline.no_loss_inconclusive,
             # Any of these fails the row, even beside a trial that proved a breach.
             "per_lane_inconclusive_trials": row.baseline.inconclusive_trials,
@@ -836,6 +840,56 @@ BATCH_B0_LABEL = "batch=off (B0)"
 BATCH_B1_LABEL = "batch=on (B1)"
 
 
+@dataclass(frozen=True)
+class _AxisWords:
+    """The words the verdict reasons and notes use for one A/B axis (BACKLOG #5430 item 1).
+
+    The batch A/B reuses the fusion verdict path, so these keep a batch report from naming fusion
+    or ADR 0071's escalation for a lever it did not measure."""
+
+    lever: str  # what B1 turns on, e.g. "fusion"
+    b1: str  # B1 in a parenthetical, e.g. "fusion on"
+    b0_baseline: str  # the B0 arm as a baseline, e.g. "fusion-off baseline (a pooled arm)"
+    b0_tag: str  # B0 in a parenthetical, e.g. "fusion-off"
+    null_result: str  # what a null or negative lift means for the lever's ADR
+    b1_missing_cause: str  # why a missing B1 arm is a run gap
+
+
+_FUSE_WORDS = _AxisWords(
+    lever="fusion",
+    b1="fusion on",
+    b0_baseline="fusion-off baseline (a pooled arm)",
+    b0_tag="fusion-off",
+    null_result="null/negative → ADR 0071 escalates to free-threading",
+    b1_missing_cause=(
+        "Fusion fails OPEN to the async path, so a missing B1 arm is a run/setup gap (the whole "
+        "pooled arm refused to start, or the profile omitted it), not a fusion fault."
+    ),
+)
+# ADR 0075: a sub-threshold or null result "banks nothing" and keeps the flag default-OFF; the
+# escalation if it nulls is free-threading (ADR 0053).
+_BATCH_WORDS = _AxisWords(
+    lever="statement batching",
+    b1="batching on",
+    b0_baseline="batching-off baseline",
+    b0_tag="batching-off",
+    null_result=(
+        "null/negative → ADR 0075 banks nothing, the flag stays default-OFF, and the escalation "
+        "is free-threading (ADR 0053)"
+    ),
+    b1_missing_cause=(
+        "A missing B1 arm is a run/setup gap (the whole arm refused to start, or the profile "
+        "omitted it)."
+    ),
+)
+
+
+def _sigma_label(multiple: float) -> str:
+    """``2sigma`` for the default multiple, and the multiple as given otherwise (``2.5sigma``,
+    ``3sigma``), so a label never names a different bar from the one applied (BACKLOG #5430)."""
+    return f"{multiple:g}sigma"
+
+
 def _fuse_thread_hops(r: ConnScaleRecord) -> bool:
     """Default arm discriminator for the fusion A/B: pair B0 vs B1 by the ``fuse_thread_hops`` tag."""
     return r.fuse_thread_hops
@@ -884,6 +938,12 @@ class _FuseArm:
     #: Trials that recorded no traffic, a failed cell's placeholder among them. Their 0.0 rate is no
     #: measurement, so an arm with any is no reference for a lift (BACKLOG #5574).
     unsent_trials: int
+    #: Trials that recorded traffic and drained, yet whose reconcile was INCONCLUSIVE. Among the
+    #: causes are engine counters it could not judge (at least a reset, or an unreadable
+    #: ``/stats``), and the intake rate is read from those same counters. So on B0 such a trial is
+    #: no reference for a lift (BACKLOG #5574 item 5). A drowned trial (no drain time) is not
+    #: counted here: its rate is still a measurement.
+    drained_inconclusive: int
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
     #: The arm did not hold zero-loss and no trial PROVED a loss: every failing trial's reconcile was
@@ -940,6 +1000,14 @@ class _FuseArm:
                 if r.drain_seconds is None and r.no_loss.sent > 0 and r.no_loss.backlog > 0
             ),
             unsent_trials=sum(1 for r in recs if r.no_loss.sent <= 0),
+            drained_inconclusive=sum(
+                1
+                for r in recs
+                if r.drain_seconds is not None
+                and r.no_loss.sent > 0
+                and not r.no_loss.ok
+                and r.no_loss.inconclusive
+            ),
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
             zero_loss_inconclusive=(
@@ -977,10 +1045,10 @@ class FuseComparisonRow:
 
     @property
     def ok(self) -> bool:
-        """A CORRECTNESS gate distinct from the throughput decision: the run fails only when the
-        fusion arm is missing or breached zero-loss. A NO-GO / INCONCLUSIVE throughput verdict is a
-        legitimate measurement outcome (fusion banked nothing → ADR 0071 escalates to free-threading),
-        recorded — never a red build."""
+        """A CORRECTNESS gate distinct from the throughput decision: the row fails when the B1 arm
+        is missing or did not hold zero-loss, a proven breach or an INCONCLUSIVE reconcile alike. A
+        NO-GO / INCONCLUSIVE throughput verdict is a legitimate measurement outcome (the lever
+        banked nothing, and its ADR says what follows), recorded — never a red build."""
         return not self.candidate_missing and not self.candidate_lost
 
 
@@ -1112,8 +1180,9 @@ class FuseModeComparison:
             f"{self.title} -- baseline {self.baseline_label} vs candidate {self.candidate_label}"
         )
         lines.append(
-            f"guards ({self.guards_ref}): lift >= {self.min_lift_pct:.0f}% AND > {self.sigma_multiple:.0f}"
-            f"sigma | in_pipeline flat-or-lower | delivered/offered >= {self.min_delivered_offered:.2f}"
+            f"guards ({self.guards_ref}): lift >= {self.min_lift_pct:.0f}% AND > "
+            f"{_sigma_label(self.sigma_multiple)} | in_pipeline flat-or-lower | delivered/offered "
+            f">= {self.min_delivered_offered:.2f}"
             f" | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)"
         )
         lines.append(_sandbox_line(self.sandbox_arms))
@@ -1144,7 +1213,8 @@ class FuseModeComparison:
             lines.append(
                 f"  achieved_read/s (ceiling) B0={b.mean_read_per_s:>9.2f}  "
                 f"B1={cand.mean_read_per_s:>9.2f}  {_delta(row.lift_pct):>9}  "
-                f"2sigma={_fmt(_two_sigma(row.sigma, self.sigma_multiple)):>9}  "
+                f"{_sigma_label(self.sigma_multiple)}="
+                f"{_fmt(_two_sigma(row.sigma, self.sigma_multiple)):>9}  "
                 f"significant: {_yn(row.significant)}"
             )
             lines.append(
@@ -1202,6 +1272,7 @@ def build_fuse_comparison(
     guards_ref: str = FUSE_GUARDS_REF,
     baseline_label: str = FUSE_B0_LABEL,
     candidate_label: str = FUSE_B1_LABEL,
+    words: _AxisWords = _FUSE_WORDS,
 ) -> FuseModeComparison | None:
     """Build the B0-vs-B1 fusion A/B from a run's records. Returns ``None`` for a single-arm
     ``fuse_modes`` (nothing to compare — the pre-existing single-arm shape). Groups records by
@@ -1213,7 +1284,8 @@ def build_fuse_comparison(
     ``arm_of`` selects the boolean A/B discriminator (default the ``fuse_thread_hops`` tag); the
     statement-batching A/B (ADR 0075) passes ``batch_handoff_statements`` + the batch labels through
     :func:`build_batch_comparison` to reuse this EXACT verdict path (``_FuseArm`` / ``_in_pipeline_ok``
-    / ``_fuse_verdict``) — one comparator, only the discriminator + labels differ."""
+    / ``_fuse_verdict``) — one comparator, only the discriminator, the labels and ``words`` (the
+    lever's name in the reasons and notes) differ."""
     modes = list(fuse_modes)
     if len(modes) < 2 or FUSE_OFF not in modes or FUSE_ON not in modes:
         return None
@@ -1256,7 +1328,7 @@ def build_fuse_comparison(
                     candidate_missing=True,
                     reason=missing_detail.get(
                         (claim_mode, sweep_mode, count),
-                        "B1 (fusion on) arm absent — engine never ran it",
+                        f"B1 ({words.b1}) arm absent — engine never ran it",
                     ),
                 )
             )
@@ -1272,6 +1344,7 @@ def build_fuse_comparison(
             sigma_multiple=sigma_multiple,
             min_delivered_offered=min_delivered_offered,
             in_pipeline_tolerance=in_pipeline_tolerance,
+            words=words,
         )
         rows.append(row)
 
@@ -1283,10 +1356,8 @@ def build_fuse_comparison(
     ]
     if missing:
         notes.append(
-            f"{len(missing)} fusion (B1) arm(s) MISSING: {', '.join(missing)} -- the B0 baseline is "
-            "never silently compared against nothing. Fusion fails OPEN to the async path, so a missing "
-            "B1 arm is a run/setup gap (the whole pooled arm refused to start, or the profile omitted "
-            "it), not a fusion fault."
+            f"{len(missing)} {words.lever} (B1) arm(s) MISSING: {', '.join(missing)} -- the B0 "
+            f"baseline is never silently compared against nothing. {words.b1_missing_cause}"
         )
     # Orphan B1 (fusion-on) arms whose B0 baseline never produced a record: the fusion-off baseline
     # (itself a pooled arm) failed or was omitted at that cell, so the lift is uncomputable. Detect them
@@ -1302,9 +1373,10 @@ def build_fuse_comparison(
                 baseline_missing.append(key)
     if baseline_missing:
         notes.append(
-            f"{len(baseline_missing)} B0 (fusion-off) BASELINE arm(s) MISSING for a present B1 arm: "
+            f"{len(baseline_missing)} B0 ({words.b0_tag}) BASELINE arm(s) MISSING for a present B1 "
+            "arm: "
             + ", ".join(f"[{cm}/{sm}] N={n}" for (cm, sm, n) in baseline_missing)
-            + " -- the fusion-off baseline (a pooled arm) failed or was omitted there, so the lift is "
+            + f" -- the {words.b0_baseline} failed or was omitted there, so the lift is "
             "uncomputable. This FAILS the run (overall NO-GO) so a swallowed baseline can never let a GO "
             "on other counts mask it."
         )
@@ -1375,6 +1447,7 @@ def build_batch_comparison(
         guards_ref=BATCH_GUARDS_REF,
         baseline_label=BATCH_B0_LABEL,
         candidate_label=BATCH_B1_LABEL,
+        words=_BATCH_WORDS,
     )
 
 
@@ -1419,6 +1492,7 @@ def _fuse_row(
     sigma_multiple: float,
     min_delivered_offered: float,
     in_pipeline_tolerance: float,
+    words: _AxisWords,
 ) -> FuseComparisonRow:
     candidate_lost = not cand.zero_loss_ok
     # "flat-or-lower" (ADR 0071 §10 item 8): does B1's higher intake ride a growing backlog (a mirage),
@@ -1457,6 +1531,7 @@ def _fuse_row(
         min_lift_pct=min_lift_pct,
         sigma_multiple=sigma_multiple,
         min_delivered_offered=min_delivered_offered,
+        words=words,
     )
     return FuseComparisonRow(
         claim_mode=claim_mode,
@@ -1488,13 +1563,17 @@ def _fuse_verdict(
     min_lift_pct: float,
     sigma_multiple: float,
     min_delivered_offered: float,
+    words: _AxisWords,
 ) -> tuple[str, str]:
     """Apply the ADR 0071 §6.4(b) guards in priority order. The correctness guards (zero-loss,
     in_pipeline, delivered/offered) gate first — a breach is a NO-GO regardless of the raw intake
-    number. Then the throughput bar: below 10% is a NO-GO (fusion banked nothing); >= 10% but within
-    trial spread is INCONCLUSIVE (need more/cleaner trials); >= 10% and outside 2σ is a GO."""
+    number. Then the throughput bar: below 10% is a NO-GO (the lever banked nothing); >= 10% but
+    within trial spread is INCONCLUSIVE (need more/cleaner trials); >= 10% and outside 2σ is a GO."""
+    sigma_label = _sigma_label(sigma_multiple)
     if candidate_lost and not cand.zero_loss_inconclusive:
-        return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
+        return FUSE_NO_GO, (
+            f"B1 breached zero-loss -- {words.lever} must never drop a message (hard guard)"
+        )
     if not in_pipeline_ok:
         if not cand.drain_completed:
             return FUSE_NO_GO, _undrained_reason(cand)
@@ -1508,19 +1587,26 @@ def _fuse_verdict(
         return FUSE_NO_GO, (
             f"delivered/offered {shown} < {min_delivered_offered:.2f} -- B1 is not keeping up end-to-end"
         )
-    if lift_pct is not None and lift_pct < min_lift_pct:
-        return FUSE_NO_GO, (
-            f"lift {lift_pct:+.1f}% < {min_lift_pct:.0f}% -- fusion banked no worthwhile margin "
-            "(null/negative → ADR 0071 escalates to free-threading)"
-        )
     if candidate_lost:
-        # INCONCLUSIVE, after every guard that can return a definite NO-GO (drain, keeping-up, a
-        # lift under the bar), so that NO-GO still reads as one. Still a hard fail (the row's `ok`
-        # reads `candidate_lost`), but nothing proved a message dropped, so it is not called a
-        # breach (BACKLOG #5574).
+        # INCONCLUSIVE, after the drain and keeping-up guards, which read the drain gauge and the
+        # client and sink counts, so their NO-GO still reads as one. Before the lift bar: a B1 that
+        # drained and kept up yet could not clear zero-loss may have had engine counters the
+        # reconcile could not judge (at least a reset, or an unreadable /stats), and its intake
+        # rate comes from those same counters (a reset's negative delta clamped to 0), so a lift
+        # under the bar is no measurement (BACKLOG #5574 item 8).
+        # Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a message
+        # dropped, so it is not called a breach.
         return FUSE_INCONCLUSIVE, (
-            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
-            "the run fails closed until a clean measurement clears it"
+            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE), so "
+            "its intake rate is no measurement for the lift bar -- the run fails closed until a "
+            "clean measurement clears it"
+        )
+    if lift_pct is not None and lift_pct < min_lift_pct:
+        # B0's unsound trials checked below (a 0.0 placeholder, a reset's clamped rate) drag its
+        # mean down, which overstates the lift, so a lift under the bar stays a NO-GO.
+        return FUSE_NO_GO, (
+            f"lift {lift_pct:+.1f}% < {min_lift_pct:.0f}% -- {words.lever} banked no worthwhile "
+            f"margin ({words.null_result})"
         )
     if base.unsent_trials:
         # A B0 trial that recorded no traffic (a failed cell's 0.0 placeholder) drags B0's mean
@@ -1530,6 +1616,17 @@ def _fuse_verdict(
             f"{base.unsent_trials} B0 trial(s) recorded no traffic (a failed cell's placeholder, "
             "or a step that sent nothing) -- B0's intake and drain are no sound reference for a lift"
         )
+    if base.drained_inconclusive:
+        # A B0 trial that drained yet could not clear zero-loss may have had engine counters the
+        # reconcile could not judge (at least a reset, or an unreadable /stats), and its intake
+        # rate, read from them (a reset's negative delta clamped to 0), can drag B0's mean down
+        # into a lift B1 never made (BACKLOG #5574 item 5). A B0 that drowned (no drain time) is
+        # still a measurement, the drowning-baseline case, and so is one that proved a loss.
+        return FUSE_INCONCLUSIVE, (
+            f"{base.drained_inconclusive} B0 trial(s) drained but could not clear zero-loss (their "
+            "reconcile was INCONCLUSIVE, for example the engine counters reset or could not be "
+            "read; the reconcile detail says why) -- B0's intake is no sound reference for a lift"
+        )
     if lift_pct is None:
         return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"
     if not significant:
@@ -1537,15 +1634,15 @@ def _fuse_verdict(
             return FUSE_INCONCLUSIVE, (
                 f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% but only "
                 f"{min(base.trials, cand.trials)} trial(s) per arm -- need >= 2 to establish the "
-                f"{sigma_multiple:.0f}sigma spread"
+                f"{sigma_label} spread"
             )
-        two_sigma = sigma_multiple * (sigma or 0.0)
+        bar = sigma_multiple * (sigma or 0.0)
         return FUSE_INCONCLUSIVE, (
             f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% but within trial spread (delta <= "
-            f"{sigma_multiple:.0f}sigma={two_sigma:.1f}/s) -- inconclusive, need cleaner trials"
+            f"{sigma_label}={bar:.1f}/s) -- inconclusive, need cleaner trials"
         )
     return FUSE_GO, (
-        f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% and > {sigma_multiple:.0f}sigma, in_pipeline "
+        f"lift {lift_pct:+.1f}% >= {min_lift_pct:.0f}% and > {sigma_label}, in_pipeline "
         f"flat-or-lower, delivered/offered >= {min_delivered_offered:.2f}, zero-loss held"
     )
 
