@@ -547,11 +547,13 @@ class RetentionPass:
     # of `did_work`: each only says how a pass ended.
     interrupted: bool = False
     # When `interrupted`, the phase that was working when the pass ended; None if it ended outside
-    # any phase's work, before the first or between two. A phase that works in steps (the
-    # embedded-document strip's batches, the `.processed` sweep, the app-log sweep and compression)
-    # may have changed part of its set, and a single-transaction purge cancelled while its COMMIT
-    # was in flight may have committed. A strip threshold call that finished before the one that
-    # ended the pass is counted, and the `.processed` sweep's row counts the archives it finished.
+    # any phase's work, before the first or between two. What that running call itself changed is
+    # not in the row's counts, except that the `.processed` sweep's count includes the archives it
+    # finished: a phase that works in steps (the embedded-document strip's batches, the `.processed`
+    # sweep, the app-log sweep and compression) may have changed part of its set, and a
+    # single-transaction purge cancelled while its COMMIT was in flight may have committed. A strip
+    # threshold call that finished before the one that ended the pass is counted. This comment is
+    # the one statement of what an interrupted row counts; `run_once` and docs/PHI.md point here.
     interrupted_phase: str | None = None
     # Leadership was lost during the pass (BACKLOG #6526, S07-45), so the shared-store phases after
     # the one that was running were skipped and left for the new leader.
@@ -1048,7 +1050,9 @@ class RetentionRunner:
         (``stop()``) partway writes its audit row for the phases that finished, marked
         ``interrupted`` (BACKLOG #6526, S07-44). A pass that ends inside a phase that changes its
         set in steps writes the row even with nothing else done, naming that phase in
-        ``interrupted_phase``, unless that phase changes no data
+        ``interrupted_phase``, since the row may not count what that phase changed (the comment on
+        :attr:`RetentionPass.interrupted_phase` says which counts it keeps), unless that phase
+        changes no data
         (``_PHASES_THAT_CHANGE_NO_DATA``), which is logged instead. A purge that runs in one
         transaction and raises an error is taken to have rolled back, so a pass that ends on one
         with nothing else done writes no row (``_SINGLE_TRANSACTION_PHASES``); one cancelled inside
@@ -1112,8 +1116,9 @@ class RetentionRunner:
 
         # The `.processed` archive sweep reads this per file on a worker thread, which runs on after
         # a cancel of the pass, so it only reads: a demotion it sees is latched and logged by
-        # `_demoted` once the sweep returns, and a late one cannot log a loss the interrupted row
-        # does not record. `is_leader()` is a cached attribute read.
+        # `_demoted` on the event loop as the phase ends, whether the sweep returns or raises, and
+        # a late one cannot log a loss the interrupted row does not record. `is_leader()` is a
+        # cached attribute read.
         archive_saw_demotion = False
 
         def _archive_halt() -> bool:
@@ -1421,6 +1426,11 @@ class RetentionRunner:
             if not _halt():
                 with _running("size_check"):
                     size_bytes, over_limit = await self._check_size()
+            # A phase that absorbed the stop's cancel leaves it to the next phase's entry to read,
+            # and a cap or a demotion can halt the pass before any later phase starts, so the stop
+            # is read once more here: such a pass ends interrupted rather than auditing as a
+            # finished one once stop() may have returned.
+            _raise_if_stopped()
         except (Exception, asyncio.CancelledError) as exc:
             await self._audit_interrupted(_tally(interrupted=True), exc)
             raise

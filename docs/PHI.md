@@ -2537,8 +2537,9 @@ a running `VACUUM` is never interrupted. The `retention_purge` `audit_log` entry
 cutoffs, counts and per-connection overrides — no message content, no PHI. Each purge phase commits on
 its own, so the entry of a pass that raises or is stopped partway covers the phases that finished, marked
 `interrupted`, and names the phase it
-ended in as `interrupted_phase`: a phase that works in steps, or a purge cancelled mid-COMMIT, may
-have changed part of its set, and the `.processed` sweep's entry counts the archives it finished. An entry
+ended in as `interrupted_phase`. The entry may not count what that phase changed; the comment on
+`RetentionPass.interrupted_phase` in [pipeline/retention.py](../messagefoundry/pipeline/retention.py)
+says which counts the pass's entry keeps. An entry
 can still be missing at least when the audit write itself fails, for example under the store fault
 that ended the pass (logged at ERROR), when the write is still unfinished 5 seconds after the pass ends,
 or when the engine's stop gives up waiting for it, after at most 5 seconds and less under the service's

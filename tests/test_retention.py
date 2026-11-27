@@ -2177,6 +2177,105 @@ async def test_a_demotion_the_archive_worker_saw_before_the_stop_is_in_the_row(
     assert any("lost cluster leadership" in r.getMessage() for r in caplog.records)
 
 
+async def _stop_the_loop_once_entered(
+    runner: RetentionRunner, entered: asyncio.Event, store: MessageStore
+) -> list[dict[str, Any]]:
+    """Start ``runner``'s loop, stop it once ``entered`` is set, and return the retention audit
+    rows after every audit write has ended."""
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=2)
+        assert loop_task.done()
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    return await _retention_audit_details(store)
+
+
+async def test_a_demotion_the_archive_worker_saw_is_in_the_row_when_the_cancel_leaves_the_sweep(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6526: when the cancel is not absorbed, so `CancelledError` leaves the archive's
+    sweep and no count is reported, a demotion the sweep's worker read before it is still latched
+    on the way out of the phase.
+
+    Mutation: move the `_demoted(seen=True)` latch out of the `finally` and into `_archive_tally`.
+    Red: `leadership_lost` is False, because no archive's count is ever reported."""
+    loop_thread = threading.get_ident()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        def is_leader(self) -> bool:
+            return threading.get_ident() == loop_thread
+
+    entered = asyncio.Event()
+    source = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")})
+    )
+
+    async def cancelled_inside(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        await asyncio.to_thread(deadline_hit)
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable: the wait above only ends on a cancel")
+
+    monkeypatch.setattr(source, "prune_processed_archive", cancelled_inside)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=_WorkerSeesDemotion(),
+        archive_source=lambda: (source,),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        details = await _stop_the_loop_once_entered(runner, entered, store)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 0)]
+    assert details[0]["leadership_lost"] is True
+    assert any("lost cluster leadership" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_pass_a_phase_absorbed_the_stop_in_is_audited_as_interrupted_when_the_cap_halts_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a phase other than the `.processed` sweep can absorb the stop's cancel and
+    return. If the cap then halts the pass, no later phase starts to re-read the stop, so the pass
+    re-reads it before it tallies: it ends on the cancellation and its row is marked interrupted,
+    rather than returning as a finished pass that audits after stop() may have returned."""
+    entered = asyncio.Event()
+    mono = {"t": 0.0}
+    orig_wal = store.wal_checkpoint
+
+    async def absorbs_the_cancel() -> bool:
+        finished = await orig_wal()
+        entered.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        mono["t"] = 100.0  # the phase overruns the 5s cap, so no later phase starts
+        return finished
+
+    monkeypatch.setattr(store, "wal_checkpoint", absorbs_the_cancel)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(max_pass_seconds=5, wal_checkpoint_seconds=1),
+        clock=lambda: 100 * DAY,
+        monotonic=lambda: mono["t"],
+    )
+    details = await _stop_the_loop_once_entered(runner, entered, store)
+    assert [(d["interrupted"], d["interrupted_phase"], d["capped"]) for d in details] == [
+        (True, None, True)
+    ]
+
+
 async def test_a_sweep_whose_archive_absorbed_the_cancel_starts_no_further_archive(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
