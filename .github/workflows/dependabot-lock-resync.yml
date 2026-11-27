@@ -30,15 +30,27 @@ name: Dependabot lock resync
 #    capability is a self-minted, narrowly-scoped (contents:write), ~1h GitHub App token.
 #  - Author gate is the IMMUTABLE github.event.pull_request.user.login == 'dependabot[bot]', not the
 #    spoofable github.actor — a third party injecting commits into a Dependabot PR cannot make it run.
+#  - THREE JOBS, SPLIT BY WHAT THEY HOLD (BACKLOG #5477). `preflight` reads the App id to decide
+#    whether to run at all. `export` runs uv and the repository script on the Dependabot-changed tree
+#    and references NO secret: not the App id, not the App key, not a minted token, so no step of it
+#    is handed one. (Whether the service ever delivers an unreferenced secret to a job's runner is
+#    not measured here.) It hands its output to `push` as an artifact. `push` mints the App token
+#    and pushes, and runs no code from the Dependabot-changed tree: it checks the tree out as data,
+#    copies the artifact's files over a fixed list of paths, and runs only an allowlist of commands
+#    (tests/test_dep1_lock_resync_lockstep.py). Each job is its own GitHub-hosted runner, so nothing
+#    `export` writes to $GITHUB_ENV, $GITHUB_PATH, BASH_ENV, .git/config or its filesystem reaches
+#    `push`. What does cross is untrusted, and at least this: the artifact (its entry names and file
+#    contents, which the copy step checks), the `closure` job output (read only in an `if:`), and
+#    whether `export` succeeded (which gates `push`). The read-only GITHUB_TOKEN is in the export and
+#    push jobs; preflight's carries no permission.
 #  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
-#    sdist) + "uv export" (serializes the existing lock) execute NO package code — so no
-#    attacker-controlled build backend ever runs while the token is on the runner.
-#  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), under
-#    the runner's own python3 with nothing installed. It is standard-library only (import names
-#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads eight files,
-#    writes at most four. The checkout pins the SHA that triggered the run, and a "pull_request" run
-#    takes THIS workflow's definition from that same PR, so anyone able to change the script could
-#    already change the steps around it.
+#    sdist) + "uv export" (serializes the existing lock) execute NO package code.
+#  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), in the
+#    secretless `export` job, under the runner's own python3 with nothing installed. It is standard-
+#    library only (import names checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed
+#    there), reads eight files, writes at most four. The checkout pins the SHA that triggered the run,
+#    and a "pull_request" run takes THIS workflow's definition from that same PR, so anyone able to
+#    change the script could already change the steps around it.
 
 on:
   pull_request:
@@ -56,23 +68,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  resync:
-    name: Re-export lock files and push to the PR branch
+  preflight:
+    name: Check the lock-resync App credentials
     runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      present: ${{ steps.creds.outputs.present }}
     # TWO conditions, both required. This is a conjunction — it only ever NARROWS who can run the job.
+    # The `export` and `push` jobs need this one, so when it skips they skip too.
     #
     #  1. pull_request.user.login — the IMMUTABLE PR author. A third party pushing commits into a
     #     Dependabot PR still cannot make this job run. (Unchanged; see SECURITY MODEL above.)
     #
     #  2. github.triggering_actor — who caused THIS run. Dependabot secrets are exposed only when the
-    #     run is triggered by dependabot[bot]. When this job pushes the resynced locks, that push
+    #     run is triggered by dependabot[bot]. When the push job pushes the resynced locks, that push
     #     fires a `synchronize` event whose triggering actor is the App (mefor-lock-resync[bot]); the
-    #     follow-up run therefore sees NO Dependabot secrets, `create-github-app-token` gets an empty
-    #     client-id, and the job dies — a phantom red on a PR whose resync had already SUCCEEDED
-    #     seconds earlier. Observed on #801:
+    #     follow-up run therefore sees NO Dependabot secrets. Before the job split, this was one job,
+    #     whose `create-github-app-token` then got an empty client-id and died — a phantom red on a PR
+    #     whose resync had already SUCCEEDED seconds earlier. Observed on #801:
     #         00:04:30  triggering_actor=dependabot[bot]        -> success, pushed the resync commit
     #         00:04:48  triggering_actor=mefor-lock-resync[bot] -> failure, "client-id ... is required"
     #     Skipping the self-triggered re-run is correct: the work is already done.
+    #     This clause is evaluated only here. A manual re-run of the export or push job alone reuses
+    #     this job's earlier result, so it is not re-checked for that re-run.
     #
     #     (This line used to end "the secrets are configured correctly ... nothing to add". True of the
     #     PRIVATE repo, and it did NOT survive the cutover: MEFORORG carried only MEFOR_FORBIDDEN_TOKENS,
@@ -83,7 +101,7 @@ jobs:
     if: >-
       ${{ github.event.pull_request.user.login == 'dependabot[bot]'
       && github.triggering_actor == 'dependabot[bot]' }}
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       # Belt and braces. With the triggering_actor gate above, a run that reaches this step IS
       # Dependabot-triggered, so the Dependabot secrets should be visible. If they are not, that is a
@@ -104,41 +122,34 @@ jobs:
             echo "::warning title=lock-resync skipped (misconfiguration)::This run WAS triggered by dependabot[bot], yet LOCK_RESYNC_APP_ID is empty. The App credentials must live under Settings > Secrets and variables > *Dependabot* (not Actions) for a Dependabot-triggered run to read them. Skipping the re-export; DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
           fi
 
-      # MINTED FIRST, BEFORE ANY STEP RUNS ON THE DEPENDABOT-CHANGED TREE. Ordering is all this buys:
-      # the mint runs before any code from that tree could tamper with it. It does NOT keep the App's
-      # long-lived PRIVATE KEY off the runner while that code runs. The key is a secret of this job, so
-      # it is on the runner for the whole job, and create-github-app-token's post step (which revokes
-      # the token) runs at job end with the key in its inputs, after uv and the repository script ran.
-      # The short-lived token it mints is live on the runner from here on too; what BACKLOG #5477 holds
-      # is that only the push step is handed it, and that it is never written to .git/config. The full
-      # fix is a separate job that runs the re-export with no secret at all and hands its output to a
-      # push-only job; that is a follow-up, not built here.
-      - name: Mint a scoped GitHub App token
-        id: app-token
-        if: steps.creds.outputs.present == 'true'
-        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
-        with:
-          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
-          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
-          permission-contents: write
-
+  export:
+    # NO SECRET IN THIS JOB (BACKLOG #5477). It runs uv and a repository script on the Dependabot-
+    # changed tree, so it references no secret and no minted token, and its output leaves only as
+    # the artifact below. tests/test_dep1_lock_resync_lockstep.py holds that.
+    name: Re-export lock files (no secrets)
+    needs: preflight
+    if: >-
+      ${{ needs.preflight.outputs.present == 'true'
+      && github.event.pull_request.user.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      closure: ${{ steps.closure.outcome }}
+    steps:
       - name: Check out the PR head
-        if: steps.creds.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The SHA that triggered this run, not the branch tip. The regenerate step runs a script from
           # this checkout, so a commit pushed to the branch after the trigger must not be what runs. If
-          # the branch has moved, the push below is refused as non-fast-forward (BACKLOG #1812).
+          # the branch has moved, the push job's push is refused as non-fast-forward (BACKLOG #1812).
           ref: ${{ github.event.pull_request.head.sha }}
           # NO CREDENTIAL IN THE CHECKOUT (BACKLOG #5477). The fetch uses the run's read-only token,
-          # and nothing is persisted into .git/config, so uv and the repository script below run on a
-          # Dependabot-changed tree with no write credential in the checkout's git config. The App
-          # token is handed to the push step alone, through that step's environment; it and the App
-          # key are still on the runner for the whole job (see the mint step above).
+          # and nothing is persisted into .git/config.
           persist-credentials: false
 
       - name: Set up uv
-        if: steps.creds.outputs.present == 'true'
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           # PINNED to the uv security.yml's DEP-1 step installs (`uv==` there), because this job must
@@ -147,7 +158,6 @@ jobs:
           version: "0.12.0"
 
       - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
-        if: steps.creds.outputs.present == 'true'
         # uv reads no PIP_* variable, so this is what keeps the check and the exports from building an
         # sdist, as the SECURITY MODEL above requires (vault BACKLOG #4083 finding 5).
         env:
@@ -186,19 +196,115 @@ jobs:
       #
       # It runs after the exports, so it copies the fresh locks. It may FAIL: a per-platform fork in
       # any lock, which needs a human, or a PR head from before the script existed. Either way the
-      # re-exported locks must still be pushed, so a failure here does not skip the commit. The last
-      # step marks THIS run red. That red sits on the pre-push commit; on the new head, the signal is
-      # the closure test failing in the required test legs.
+      # re-exported locks must still be pushed, so a failure here does not fail this job. The push
+      # job's last step reads this step's outcome through the `closure` output and marks THE RUN red.
+      # That red sits on the pre-push commit; on the new head, the signal is the closure test failing
+      # in the required test legs.
       - name: Regenerate the runtime-closure inventories from the core, sqlserver, postgres and harness locks
         id: closure
-        if: steps.creds.outputs.present == 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
           python3 scripts/security/runtime_closure.py
 
+      # The same paths the push job copies, checks with `git diff --quiet` and stages. A file missing
+      # here makes the push job's copy step fail rather than push an incomplete set.
+      - name: Hand the re-exported files to the push job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lock-resync-exports
+          retention-days: 1
+          if-no-files-found: error
+          # A re-run of this job replaces its own earlier upload rather than failing on the name.
+          overwrite: true
+          path: |
+            requirements.lock
+            docker/locks/requirements-core.lock
+            docker/locks/requirements-sqlserver.lock
+            docker/locks/requirements-postgres.lock
+            security/locks/requirements-harness.lock
+            constraints.lock
+            ci/locks/ci-scanners.lock
+            ci/locks/ci-quality.lock
+            ci/locks/release-tools.lock
+            security/runtime-closure-core.txt
+            security/runtime-closure-sqlserver.txt
+            security/runtime-closure-postgres.txt
+            security/runtime-closure-harness.txt
+
+  push:
+    # THE ONLY JOB THAT HOLDS THE APP KEY OR TOKEN (BACKLOG #5477), and it runs no code from the
+    # Dependabot-changed tree: no uv, no interpreter, no repository script, only git over a checkout
+    # read as data and the files the export job handed over. A fresh runner, so nothing the export
+    # job planted in its own environment or git config is here.
+    name: Push the re-exported lock files to the PR branch
+    needs: [preflight, export]
+    if: >-
+      ${{ needs.preflight.outputs.present == 'true'
+      && github.event.pull_request.user.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # MINTED FIRST, before the checkout. No step of this job runs code from the Dependabot-changed
+      # tree, so ordering is belt and braces here; create-github-app-token's post step revokes the
+      # token at job end. The token is handed to the push step alone and written to no .git/config.
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
+          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Check out the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The same SHA the export job re-exported from. If the branch has moved, the push below is
+          # refused as non-fast-forward (BACKLOG #1812).
+          ref: ${{ github.event.pull_request.head.sha }}
+          # NO CREDENTIAL IN THE CHECKOUT (BACKLOG #5477): the run's read-only token fetches, nothing
+          # is persisted into .git/config, and the App token goes to the push command alone.
+          persist-credentials: false
+
+      - name: Fetch the re-exported files from the export job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lock-resync-exports
+          path: ${{ runner.temp }}/lock-resync-exports
+
+      # The artifact was written by a job that ran code from the Dependabot-changed tree, so it is
+      # untrusted data. Only the fixed list below is copied, only as regular files, and only onto
+      # destinations inside this checkout: a destination the tree made a symlink (or put under a
+      # symlinked directory) could otherwise point outside it, at a file git or the shell reads later.
+      # Anything else in the artifact fails the step.
+      - name: Copy the re-exported files into the checkout
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/lock-resync-exports"
+          files='requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt'
+          while IFS= read -r -d '' found; do
+            rel="${found#"${src}"/}"
+            if [[ " ${files} " != *" ${rel} "* ]]; then
+              echo "::error title=lock-resync artifact::unexpected entry in the artifact: ${rel}"
+              exit 1
+            fi
+          done < <(find "${src}" -mindepth 1 ! -type d -print0)
+          root="$(pwd -P)"
+          for rel in ${files}; do
+            if [ ! -f "${src}/${rel}" ] || [ -L "${src}/${rel}" ]; then
+              echo "::error title=lock-resync artifact::${rel} is missing from the artifact or is not a regular file"
+              exit 1
+            fi
+            if [ -L "${rel}" ] || [ "$(realpath -m -- "${rel}")" != "${root}/${rel}" ]; then
+              echo "::error title=lock-resync checkout::${rel} resolves outside the checkout"
+              exit 1
+            fi
+            cp -- "${src}/${rel}" "${rel}"
+          done
+
       - name: Commit and push the resynced locks
-        if: steps.creds.outputs.present == 'true'
         env:
           # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
           # name containing shell metacharacters can never be evaluated as code (template injection).
@@ -207,12 +313,10 @@ jobs:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          # Earlier steps ran uv and a repository script on the Dependabot-changed tree, as the same
-          # user. Hooks and core.fsmonitor are turned off for every git command below, through git's
-          # environment config, which outranks .git/config. That NARROWS what such a step could plant
-          # to run beside the token here; it does not close it: at least a filter driver, gpg.program,
-          # include.path, and GIT_CONFIG_PARAMETERS or BASH_ENV written to $GITHUB_ENV stay open. The
-          # security model above rests on no package or untrusted code running in those steps.
+          # Hooks and core.fsmonitor are turned off for every git command below, through git's
+          # environment config, which outranks .git/config. No step of this job runs code from the
+          # Dependabot-changed tree, so nothing should have written either; this stays as a second
+          # layer over that job split.
           export GIT_CONFIG_COUNT=2
           export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'
           export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
@@ -243,8 +347,11 @@ jobs:
           GIT_CONFIG_VALUE_2="AUTHORIZATION: basic ${auth}" \
             git push origin "HEAD:refs/heads/${HEAD_REF}"
 
+      # The export job's closure step may fail without failing that job, so the locks are still
+      # pushed. Its outcome arrives here as a job output and is read only in this `if:`, never in a
+      # shell, because the export job ran code from the Dependabot-changed tree.
       - name: Fail if the closure inventory could not be regenerated
-        if: steps.closure.outcome == 'failure'
+        if: needs.export.outputs.closure == 'failure'
         run: |
-          echo "::error title=runtime-closure regeneration failed::scripts/security/runtime_closure.py failed; its log is in the step above. Any re-exported locks were still pushed, but the security/runtime-closure-*.txt files were not regenerated, so tests/test_risky_component_designation.py will fail on this PR until someone fixes it."
+          echo "::error title=runtime-closure regeneration failed::scripts/security/runtime_closure.py failed; its log is in the export job. Any re-exported locks were still pushed, but the security/runtime-closure-*.txt files were not regenerated, so tests/test_risky_component_designation.py will fail on this PR until someone fixes it."
           exit 1
