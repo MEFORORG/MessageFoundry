@@ -1968,22 +1968,24 @@ async def run_shardcert(
             pause = min(next_due - loop.time(), _MAX_TICK_SLEEP)
             if kill and not did_kill:
                 # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill instant, so the loop asks to wake
-                # then; timer granularity or a stalled loop can still wake it later. A wake past the end of
-                # the hold fails the run below; a late wake inside the hold kills late, at the next check,
-                # and nothing detects it. It does not mean a message was sent before the kill: a small
-                # enough kill fraction still kills before the first tick sends (`require_kill_leg`).
+                # then. The kill can still come late, at least when timer granularity or a stalled loop wakes
+                # the tick after the instant, or when the instant falls inside a tick's send batch, which runs
+                # after the kill check. Late past the end of the hold fails the run below; late inside the
+                # hold kills at the next check, and nothing detects it. The cap does not mean a message was
+                # sent before the kill: a small enough kill fraction still kills before the first tick sends
+                # (`require_kill_leg`).
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
-            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold, for example
-            # on a stalled event loop, or on a positive hold shorter than the loop's own set-up time
-            # (`require_kill_leg` refuses only a hold of 0 or less). The kill never fired, so there is no
-            # kill leg to certify: fail the run rather than kill now, after the load, and report a recovery
-            # from it.
+            # BACKLOG #5440 (S27-55): the loop did not reach its kill check between the kill instant and the
+            # end of the hold, for example when one sleep or one send batch ran past both, or on a positive
+            # hold shorter than the loop's own set-up time (`require_kill_leg` refuses only a hold of 0 or
+            # less). The kill never fired, so there is no kill leg to certify: fail the run rather than
+            # kill now, after the load, and report a recovery from it.
             # The teardown below stops the fleet; the restart is never reached.
             raise RuntimeError(
-                f"kill leg never fired: the drive loop did not run between the kill instant and the end "
-                f"of the hold, so engine shard {killed} was never killed"
+                f"kill leg never fired: the drive loop did not reach its kill check between the kill "
+                f"instant and the end of the hold, so engine shard {killed} was never killed"
             )
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything
