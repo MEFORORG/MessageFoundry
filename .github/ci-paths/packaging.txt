@@ -1,0 +1,8 @@
+^pyproject\.toml
+^packaging/
+^scripts/release/
+^ci/python-version
+^ci/locks/release-tools\.lock$
+^((README|CHANGELOG)\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore|messagefoundry/_vendor/defusedxml/LICENSE)$
+^\.github/workflows/(ci|release)\.yml
+^\.github/ci-paths/packaging\.txt$

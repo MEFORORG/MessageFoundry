@@ -45,6 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
+from tests._ci_paths import plant_lists  # noqa: E402
+
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _SOURCE_REPO = "MEFORORG/MessageFoundry"
@@ -304,6 +306,9 @@ def _run(bash: str, cwd: Path, script_text: str, event: str) -> tuple[dict[str, 
     """
     script = cwd / "detector.sh"
     script.write_text(script_text, encoding="utf-8", newline="\n")
+    # The control runs on past `git diff` into the path arms, which read .github/ci-paths/ from the
+    # working directory and fail the step when a list is missing (BACKLOG #5472).
+    plant_lists(cwd)
     out_file = cwd / "gh_output"
     out_file.write_text("", encoding="utf-8")
     # The child needs real utilities, not just the interpreter -- `probe_env` appends the

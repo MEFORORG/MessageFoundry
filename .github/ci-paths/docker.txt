@@ -1,0 +1,13 @@
+^docker/
+^\.dockerignore
+^ci/locks/release-tools\.lock
+^pyproject\.toml
+^requirements\.lock
+^(README\.md|LICENSE|NOTICE)$
+^messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$
+^messagefoundry/_vendor/defusedxml/LICENSE$
+^harness/load/rigadmin\.py$
+^scripts/ci/make_syslog_ca_crl\.py$
+^tests/_phi_gate_provisions\.py$
+^\.github/workflows/ci\.yml
+^\.github/ci-paths/docker\.txt$

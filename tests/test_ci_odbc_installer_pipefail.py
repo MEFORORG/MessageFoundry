@@ -339,6 +339,11 @@ def test_changes_job_stays_off_pipefail_on_purpose() -> None:
     untested store changes, and nothing anywhere says so. That is a silent wrong answer, strictly
     worse than the loud misleading message the three installer steps were fixed for.
 
+    CORRECTED 2026-11-27 (BACKLOG #5472): the five path arms, ``serverdb`` among them, now decide
+    through ``paths_match``, which fails the job on any grep status above 1, so under pipefail a
+    SIGPIPE there is a loud failure rather than ``serverdb=false``. The silent flip still holds for
+    the step's other piped greps, at least the manifest arm and the docs-only classifier.
+
     Pinned here because a later sweep reading "these piped steps run without pipefail" as a to-do
     list would add it, and no other check in the tree would object for THIS job.
 

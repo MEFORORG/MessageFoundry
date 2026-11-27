@@ -41,14 +41,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 from tests import _tooling_manifest as tooling_manifest  # noqa: E402
+from tests._ci_paths import CI_PATHS, ci_path_list, plant_lists  # noqa: E402
 from tests._workflow_contexts import changes_arm_pattern  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
 
+@functools.cache
 def _gate_regex() -> str:
-    """Pull the tooling arm's `grep -qE '...'` pattern out of the workflow.
+    """Pull the tooling arm's pattern out of the list the workflow's `paths_match tooling` reads.
 
     Anchored on the `tooling=true` emission and searched backwards, so renaming the surrounding
     comment cannot silently pick up a different arm. If the shape changes, this raises and the file
@@ -56,12 +58,12 @@ def _gate_regex() -> str:
     """
     # `tooling=true` is emitted THREE times: the workflow_dispatch and push early-exits, and the
     # pull_request path arm. Only the last is a path decision, which is why the shared reader
-    # anchors on the LAST emission; anchoring on the first found no preceding `grep -qE` at all.
+    # anchors on the LAST emission; anchoring on the first found no preceding matcher at all.
     return changes_arm_pattern("tooling", "tooling_manifest")
 
 
 def gate(changed: list[str]) -> bool:
-    """Mirror of the shell decision. `grep -qE P` on the path arm, `grep -qxFf` on the manifest arm.
+    """Mirror of the shell decision. `grep -qEf` on the path arm, `grep -qxFf` on the manifest arm.
 
     The manifest arm goes through the one shared parser (BACKLOG #1434). That parser refuses the
     lines found so far that ci.yml's `grep -vE` would read differently; its docstring lists them.
@@ -108,6 +110,12 @@ _CASES = [
     (["tests/tooling_manifest.txt"], True, "edit the partition, re-run the tier it defines"),
     (["tests/conftest.py"], True, "the hook that applies the marker"),
     (["tests/_tooling_manifest.py"], True, "the parser that hook reads the manifest through"),
+    (
+        [".github/ci-paths/serverdb.txt"],
+        True,
+        "a changes-job path list: editing one must run the gate tests that read it (BACKLOG #5472)",
+    ),
+    (["tests/_ci_paths.py"], True, "the one reader of those lists, which this tier's tests share"),
     # The four rows below pin the arm widened on 2026-08-18, and they are the only thing that does.
     # tests/test_lint_scope_parity.py is a manifest entry whose subject is a three-way agreement: the
     # ruff `rev:` pinned in .pre-commit-config.yaml, the `ruff==` constraints.lock installs, and the
@@ -176,6 +184,32 @@ def test_every_manifest_entry_trips_its_own_gate() -> None:
     assert not missed, f"these listed tests do not trip the tooling gate when edited: {missed}"
 
 
+def test_every_path_list_trips_the_tier_on_a_line_of_its_own() -> None:
+    """The changes job's path lists moved out of ci.yml (BACKLOG #5472); an edit to ci.yml ran this
+    tier, so an edit to a list must too. `^\\.github/` already admits them, and the tooling list
+    names `^\\.github/ci-paths/` on its own line as well, so a later narrowing of `\\.github/` cannot
+    drop them silently. Falsified by deleting that line and narrowing `^\\.github/` to
+    `^\\.github/workflows/`: RED. Restored."""
+    lists = sorted(CI_PATHS.glob("*.txt"))
+    assert len(lists) >= 5, f"expected the five path lists, found {[p.name for p in lists]}"
+    missed = [p.name for p in lists if not gate([f".github/ci-paths/{p.name}"])]
+    assert not missed, f"editing these path lists does not run the tooling tier: {missed}"
+    assert r"^\.github/ci-paths/" in ci_path_list("tooling"), (
+        "the tooling list no longer names the path lists on a line of their own"
+    )
+
+
+def test_a_pr_editing_only_a_path_list_runs_the_tier_on_every_leg(tmp_path: Path) -> None:
+    """End to end through the step's own git diff: a `.txt` under `.github/ci-paths/` is CODE (it is
+    not in the docs-only `noncode` set), so it runs the tier, and on the full matrix."""
+    bash = require_bash(tmp_path)
+    base = _pr_repo(tmp_path, [".github/ci-paths/docker.txt"])
+    out = _run_detector(bash, tmp_path, "pull_request", base_sha=base)
+    assert out["tooling"] == "true", out
+    assert out["code"] == "true", out
+    assert any("windows" in leg for leg in _legs(out["tooling_matrix"])), out
+
+
 def test_the_regex_is_read_not_copied() -> None:
     """If the arm is renamed or restructured, `_gate_regex` raises rather than passing on a stale copy."""
     assert "gitignore" in _gate_regex(), (
@@ -218,12 +252,15 @@ def _run_detector(
     """Execute the real step and return the outputs it wrote, parsed."""
     script = cwd / "detector.sh"
     script.write_text(_changes_step_script(), encoding="utf-8", newline="\n")
+    # The pull-request arms read .github/ci-paths/ from the working directory (BACKLOG #5472).
+    plant_lists(cwd)
     out_file = cwd / "gh_output"
     out_file.write_text("", encoding="utf-8")
     # THE CHILD NEEDS REAL UTILITIES, NOT JUST THE INTERPRETER (BACKLOG #1373). The step below runs
     # `git` and `grep`; a PATH without them -- what PowerShell and cmd supply -- fails the child at
-    # 127, and the detector's `if echo ... | grep -qE` then takes its ELSE branch and writes
-    # `tooling=false`. The test reads that as the workflow filter narrowing, so a harness fault
+    # 127, and the detector's `if echo ... | grep -qE` then took its ELSE branch and wrote
+    # `tooling=false` (its path arms' `paths_match` now fails the step on that, BACKLOG #5472; the
+    # manifest arm's `grep -qxFf` still reads it as no match). The test reads that as the workflow filter narrowing, so a harness fault
     # accuses content that was never wrong. `probe_env` appends the interpreter's own directory,
     # where those utilities ship. Same call, same reason, as
     # tests/test_dependabot_automerge_guardrails.py.
