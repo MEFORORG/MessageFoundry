@@ -74,6 +74,7 @@ __all__ = [
     "DEFAULT_ALLOWANCE_BYTES",
     "DEFAULT_HEAD_BYTES",
     "DEFAULT_WINDOW_SECONDS",
+    "HELD_FRAME_KEY",
     "METADATA_KEY",
     "BoundedRefusal",
     "RefusedBodyAllowance",
@@ -86,6 +87,9 @@ log = logging.getLogger(__name__)
 #: The engine-internal metadata key. ``store.metadata.user_metadata`` exposes only the ``user`` bag,
 #: so this never reaches the API's user-metadata field.
 METADATA_KEY = "refused_body"
+
+#: The record key marking a held frame a no-reply listener lost at stop (BACKLOG #1619 item 6).
+HELD_FRAME_KEY = "held_frame"
 
 #: The bytes a latin-1 view writes as two UTF-8 bytes.
 _HIGH_BYTES = bytes(range(0x80, 0x100))
@@ -200,6 +204,39 @@ class RefusedBodyAllowance:
             stored = _head(wire, text, content_type, head_bytes)
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
+    def bound_uncharged(
+        self, wire: bytes, text: str | None, content_type: str, error: str, *, cipher: Cipher
+    ) -> BoundedRefusal:
+        """Decide what to store for a held frame a no-reply listener is losing (BACKLOG #1619 item
+        6): the whole body when it fits in a head, else its head, and never a charge.
+
+        Such a frame is not refused for anything it holds: its handler raised on every attempt
+        until the listener stopped. A fault the same body meets every time would otherwise drain
+        the allowance for every refused body on that inbound, so this one is never charged. A text
+        body is stored whole only when :meth:`bound`'s fit test says its head would be the whole of
+        it, else as its head, so no body larger than a head lands whole in the message row.
+        ``text`` is its decoded form where the caller could decode it, else ``None``. A binary
+        content type is stored as ``mfb64:v1:`` carriage, never as a latin-1 view: whole when the
+        carriage fits in a head, else carriage of its first bytes. The
+        length and keyed digest are recorded as for every refusal, the note says why only the head
+        was kept, and the record marks the row as a held frame, so the edit-and-resubmit refusal
+        does not tell an operator to wait for a resend that never comes."""
+        head_bytes = self.policy.head_bytes
+        if ContentType(content_type).is_binary:
+            whole = len(CARRIAGE_MARKER) + 4 * ((len(wire) + 2) // 3) <= head_bytes
+            kept = wire if whole else wire[: 3 * (max(head_bytes - len(CARRIAGE_MARKER), 0) // 4)]
+            stored = encode_carriage(kept)
+        else:
+            carried, stored_bytes = _stored_form(wire, text)
+            whole = (len(wire) if carried else stored_bytes) <= head_bytes
+            stored = (
+                store_safe_raw(wire, content_type, text=text)
+                if whole
+                else _head(wire, text, content_type, head_bytes)
+            )
+        note = f"[held frame: stored only the head of a {len(wire):,}-byte body] "
+        return self._refusal(wire, stored, error, whole=whole, cipher=cipher, note=note, held=True)
+
     def bound_held(
         self, inbound: str, body: str, content_type: str, error: str, *, cipher: Cipher
     ) -> BoundedRefusal:
@@ -231,18 +268,33 @@ class RefusedBodyAllowance:
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
 
     def _refusal(
-        self, wire: bytes, stored: str, error: str, *, whole: bool, cipher: Cipher
+        self,
+        wire: bytes,
+        stored: str,
+        error: str,
+        *,
+        whole: bool,
+        cipher: Cipher,
+        note: str | None = None,
+        held: bool = False,
     ) -> BoundedRefusal:
-        """The :class:`BoundedRefusal` for ``stored``, the view chosen for ``wire``: the allowance
-        note on a head, and the record of the body's length and keyed digest."""
+        """The :class:`BoundedRefusal` for ``stored``, the view chosen for ``wire``: ``note`` (by
+        default the allowance note) on a head, and the record of the body's length and keyed
+        digest, marked :data:`HELD_FRAME_KEY` for a held frame (:meth:`bound_uncharged`)."""
         if not whole:
-            note = f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte body] "
+            if note is None:
+                note = (
+                    f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte "
+                    "body] "
+                )
             error = _with_note(note, error)
         record: dict[str, object] = {
             "bytes": len(wire),
             "body_hmac": refused_body_digest(cipher, wire),
             "stored": "whole" if whole else "head",
         }
+        if held:
+            record[HELD_FRAME_KEY] = True
         if not whole:
             # The bound this head was cut to, kept because the policy may change before anyone reads
             # it: the edit-and-resubmit refusal names it (:func:`head_only_resubmit_refusal`).
@@ -285,7 +337,10 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         return None
     total = _count(record.get("bytes"))
     head = _count(record.get("head_bytes"))
-    body = f"this {total:,}-byte refused body" if total is not None else "this refused body"
+    # A held frame was not refused for what it holds: its handler raised on every attempt until the
+    # listener stopped.
+    noun = "held frame" if record.get(HELD_FRAME_KEY) is True else "refused body"
+    body = f"this {total:,}-byte {noun}" if total is not None else f"this {noun}"
     # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
     kept = f", cut to a {head:,}-byte head bound" if head is not None else ""
     remedy = (
@@ -295,6 +350,13 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         "its whole reply was captured on its origin message's response; unless retention has"
         " erased it, a user scoped to that message who may view raw bodies can read it there"
         if "reingress_of_seq" in parsed and isinstance(parsed.get("correlation_id"), str)
+        # BACKLOG #1619 item 6: a held frame's sender waits for no reply and never resends it. An
+        # attempt that committed before it faulted or was cancelled may also have stored it, each
+        # such copy whole or as a head and since moved to any status, so this names no status.
+        else "its sender never resends it, and this row holds only the frame's head; an attempt"
+        " that committed before it faulted or was cancelled may have left other copies of this"
+        " message on this inbound, whole or as a head, under any status"
+        if record.get(HELD_FRAME_KEY) is True
         else "have the sender send its own copy again"
     )
     return (
