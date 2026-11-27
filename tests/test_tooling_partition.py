@@ -407,6 +407,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_xdist_auto_worker_cap.py",
         "test_b622_5828_compose_host_ports.py",  # docker/compose.yaml: no tooling=true path
         "test_b622_8298_compose_ha_postgres_start.py",  # docker/compose.yaml: no tooling=true path
+        "test_b20003_ha_store_password_source.py",  # docker/compose.yaml: no tooling=true path
     }
 )
 

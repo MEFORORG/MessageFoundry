@@ -88,17 +88,23 @@ jobs:
           mkdir -m 0700 "$pki"
 
           # Substitution values compose reads from the project .env, and the secrets the containers
-          # read from secrets.env. The password and the store key are drawn for this run and masked
-          # before anything can echo them. The revocation attestation is for a CA that lives for
-          # this one job and is trusted by nothing outside it.
+          # read from secrets.env. The password, a decoy and the store key are drawn for this run
+          # and masked before anything can echo them. The revocation attestation is for a CA that
+          # lives for this one job and is trusted by nothing outside it.
+          # The ha engines must log in with the substituted password postgres reads, never a
+          # secrets.env line (compose.yaml's x-store-password; BACKLOG #5400), so secrets.env holds
+          # a different decoy: an engine that read it would fail at store login and this job would
+          # go red.
           pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          decoy="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
           key="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           echo "::add-mask::$pw"
+          echo "::add-mask::$decoy"
           echo "::add-mask::$key"
           (
             umask 077
             printf 'MEFOR_TLS_REVOCATION_ATTESTED=1\nMEFOR_STORE_PASSWORD=%s\n' "$pw" > docker/.env
-            printf 'MEFOR_STORE_PASSWORD=%s\nMEFOR_STORE_ENCRYPTION_KEY=%s\n' "$pw" "$key" > docker/secrets.env
+            printf 'MEFOR_STORE_PASSWORD=%s\nMEFOR_STORE_ENCRYPTION_KEY=%s\n' "$decoy" "$key" > docker/secrets.env
           )
 
           # The dev-posture override. Compose merges a service's `environment` by key and replaces
