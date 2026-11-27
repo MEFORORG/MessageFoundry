@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,31 @@ _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|X1|P|2.5.1\rEVN|A01|20260101
 # Below the tabs' 0.1 floor, set on the worker directly: 0.01 a second is a 100-second pause, so a
 # batch that waits one out cannot finish inside a test.
 _SLOW_RATE = 0.01
+
+# The workers are QObjects, so the module defines qapp, which puts it under conftest's
+# _no_qt_object_left_in_a_reference_cycle guard.
+pytestmark = pytest.mark.usefixtures("qapp")
+
+
+@pytest.fixture(scope="module")
+def qapp() -> Any:
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def paused(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Set once a worker enters a pause between two items, so a test stops it inside one."""
+    entered = threading.Event()
+    real = mllp.pause_unless_stopped
+
+    def pause(stop: threading.Event, seconds: float) -> bool:
+        entered.set()
+        return real(stop, seconds)
+
+    monkeypatch.setattr(mllp, "pause_unless_stopped", pause)
+    return entered
 
 
 def _items(n: int) -> Iterator[SendItem]:
@@ -61,15 +87,6 @@ def _start(worker: SendWorker | FileDropWorker) -> threading.Thread:
     return t
 
 
-def _until(cond: Callable[[], bool], timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if cond():
-            return True
-        time.sleep(0.01)
-    return cond()
-
-
 def test_paced_pauses_between_items_and_not_after_the_last(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +109,22 @@ def test_paced_yields_nothing_once_stopped() -> None:
     stop = threading.Event()
     stop.set()
     assert list(mllp.paced(iter("abc"), stop, 0.0)) == []
+
+
+def test_a_stop_during_the_callers_work_draws_no_further_item() -> None:
+    # A lazy batch is not asked for an item the batch will never send: the stop is seen before
+    # the next draw, not after it.
+    drawn: list[str] = []
+
+    def lazy() -> Iterator[str]:
+        for name in "abc":
+            drawn.append(name)
+            yield name
+
+    stop = threading.Event()
+    for _item in mllp.paced(lazy(), stop, 1.0):
+        stop.set()  # as Stop pressed while the first item is being sent
+    assert drawn == ["a"]
 
 
 def test_a_slow_send_batch_finishes_right_after_its_last_message(
@@ -126,14 +159,13 @@ def test_a_slow_file_drop_finishes_right_after_its_last_file(tmp_path: Path) -> 
 
 
 def test_stop_inside_a_pause_between_messages_ends_the_send_batch(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, paused: threading.Event
 ) -> None:
     sent: list[str] = []
     worker = _send_worker(3, sent, monkeypatch)
     t = _start(worker)
     try:
-        assert _until(lambda: bool(sent)), "the first message was never sent"
-        time.sleep(0.05)  # into the 100-second pause before the second message
+        assert paused.wait(5), "the worker never reached the pause before the second message"
         started = time.monotonic()
         worker.stop()
         t.join(timeout=3)
@@ -145,12 +177,13 @@ def test_stop_inside_a_pause_between_messages_ends_the_send_batch(
         t.join(timeout=5)
 
 
-def test_stop_inside_a_pause_between_files_ends_the_drop_batch(tmp_path: Path) -> None:
+def test_stop_inside_a_pause_between_files_ends_the_drop_batch(
+    tmp_path: Path, paused: threading.Event
+) -> None:
     worker = _drop_worker(3, tmp_path)
     t = _start(worker)
     try:
-        assert _until(lambda: bool(list(tmp_path.glob("*.hl7")))), "the first file never landed"
-        time.sleep(0.05)  # into the 100-second pause before the second file
+        assert paused.wait(5), "the worker never reached the pause before the second file"
         started = time.monotonic()
         worker.stop()
         t.join(timeout=3)

@@ -82,8 +82,9 @@ def test_send_generates_on_the_worker_and_stops_inside_a_pause(
         started = time.monotonic()
         panel._start()
         assert time.monotonic() - started < 2, "the batch was built before the worker started"
-        # Accept and answer nothing: the worker waits for an ACK, which stop() interrupts, and
-        # then would pause ten seconds before the next message.
+        # Accept and answer nothing: the worker waits for an ACK, which stop() interrupts; the
+        # worker then sees the stop before it draws the next message, so no pause starts. A stop
+        # inside the pause itself is tested in tests/test_harness_trailing_pause.py.
         server.settimeout(10)
         conn, _ = server.accept()
         assert off_gui_generation
