@@ -7,8 +7,9 @@ pre-fix code: a module-level parametrize builds an `EngineAttribution` with the 
 field the fix added, and several of its cases read the new `MultiShardRecord.problems`. So it cannot
 show that it fails on the unfixed code. This file asks the same questions through names that exist
 on both sides of the fix: `MultiShardReport.result_ok`, `exit_code` and `to_json_dict()["result"]`,
-whether `compare_to_baseline` returns any regression, and the `--load` CLI's exit code. Each failing
-case starts from a control that passes on both sides and changes one field.
+the messages `compare_to_baseline` returns, and the `--load` CLI's exit code. Each failing case
+starts from a control that passes on both sides and changes one field, chosen so that the pre-fix
+code reports PASS or no regression for it, rather than flagging it for an unrelated reason.
 
 Synthetic metrics only; no message bodies.
 """
@@ -21,6 +22,7 @@ from typing import Any, cast
 
 import pytest
 
+from harness.load import rigadmin
 from harness.load.connscale.report import NoLoss
 from harness.load.multishard import EngineAttribution, MultiShardRecord, MultiShardReport
 from harness.load.report import compare_to_baseline
@@ -92,7 +94,7 @@ def test_multishard_clean_record_passes() -> None:
         pytest.param({"per_engine": (_engine(0),)}, id="unattributed"),
         pytest.param({"per_engine": ()}, id="no-attribution"),
         pytest.param(
-            {"per_engine": (_engine(0), _engine(1, inbound_rows=0, reads=0))}, id="no-lanes"
+            {"per_engine": (_engine(0), _engine(1, inbound_rows=_C - 1))}, id="lanes-short"
         ),
         pytest.param({"per_engine": (_engine(0), _engine(1, reads=0))}, id="idle-engine"),
         pytest.param(
@@ -114,22 +116,27 @@ def test_multishard_one_bad_step_fails_a_sweep() -> None:
     assert not _ms_report(_ms_record(), _ms_record(drain_seconds=None)).result_ok
 
 
+@pytest.mark.parametrize(
+    "error", [rigadmin.RigSignInRefused, rigadmin.RigSignInRateLimited, rigadmin.RigUnreachable]
+)
 def test_a_refused_attribution_sign_in_fails_the_step_not_the_sweep(
-    monkeypatch: pytest.MonkeyPatch,
+    error: type[rigadmin.RigAdminError], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import harness.load.multishard as multishard
-    from harness.load.rigadmin import RigSignInRateLimited, RigSignInRefused
 
     def _refuse(url: str, *, cacert: object = None) -> object:
-        raise RigSignInRateLimited("429")
+        raise error("refused")
 
     monkeypatch.setattr(multishard, "rig_client", _refuse)
     node = cast(Any, type("Node", (), {"url": "https://n", "cacert": None, "node_id": "ms-e1"})())
     try:
         attributions = multishard._attribute_engines_sync([node], 1)
-    except RigSignInRefused as exc:
+    except rigadmin.RigAdminError as exc:
         pytest.fail(f"a refused sign-in escaped attribution and would end the sweep: {exc!r}")
     assert len(attributions) == 1
+    # Marked failed, not zero-filled: a zero-filled attribution also fails the step, but on its lane
+    # count, which reads as an engine that came up without its lanes.
+    assert getattr(attributions[0], "attribution_failed", None) is True
     assert not _ms_report(_ms_record(per_engine=(_engine(0), attributions[0]))).result_ok
 
 
@@ -207,8 +214,8 @@ def test_malformed_current_report_is_a_regression_not_a_crash(current: object) -
 
 
 def _flags(current: Any, baseline: Any, needle: str, tolerance: Any = 0.1) -> None:
-    # The needle, not just a non-empty list: the pre-fix code flags some of these cases for an
-    # unrelated reason (a boolean rate read as 1.0 msg/s is a throughput drop).
+    # The needle pins the reason the fix gives. Each case is one the pre-fix code returned no
+    # regression for, so a non-empty list alone would also be evidence, but a weaker one.
     regressions = _compare(current, baseline, tolerance)
     assert any(needle in r for r in regressions), regressions
 
@@ -221,7 +228,6 @@ def _flags(current: Any, baseline: Any, needle: str, tolerance: Any = 0.1) -> No
             "steady: phase is in the baseline but missing",
             id="missing-phase",
         ),
-        pytest.param(_with(("phases", 1, "achieved_msg_s"), True), "not a finite", id="bool-rate"),
         pytest.param(
             _with(("phases", 1, "achieved_msg_s"), float("nan")), "not a finite", id="nan-rate"
         ),
@@ -229,9 +235,10 @@ def _flags(current: Any, baseline: Any, needle: str, tolerance: Any = 0.1) -> No
             _with(("phases", 1, "achieved_msg_s"), 10**400), "not a finite", id="huge-int"
         ),
         pytest.param(
-            _with(("phases", 1, "e2e_ms", "p99"), float("inf")), "not a finite", id="inf-p99"
+            _with(("phases", 1, "e2e_ms"), {"count": 500}),
+            "e2e p99: current value",
+            id="missing-p99",
         ),
-        pytest.param(_with(("phases", 1, "e2e_ms"), None), "not a finite", id="missing-p99"),
         pytest.param(
             _with(("phases", 1, "e2e_ms"), {"count": 0, "p99": 0.0}),
             "steady: no e2e samples in the current run",
@@ -251,15 +258,7 @@ def _flags(current: Any, baseline: Any, needle: str, tolerance: Any = 0.1) -> No
         pytest.param(_with(("totals", "sent"), None), "sent: current value", id="missing-sent"),
         pytest.param(_with(("totals", "sent"), -10), "sent: negative count", id="negative-sent"),
         pytest.param(
-            _with(("no_loss",), None), "current no_loss.ok is missing", id="no-loss-missing"
-        ),
-        pytest.param(
             _with(("no_loss", "ok"), "false"), "current no_loss.ok is missing", id="no-loss-string"
-        ),
-        pytest.param(
-            _with(("phases", 1, "achieved_msg_s"), -5.0),
-            "steady: negative throughput",
-            id="negative-rate",
         ),
         pytest.param(
             _with(("phases", 1, "e2e_ms", "p99"), -1.0),
@@ -274,20 +273,20 @@ def _flags(current: Any, baseline: Any, needle: str, tolerance: Any = 0.1) -> No
     ],
 )
 def test_current_run_regression_is_flagged(current: dict[str, Any], needle: str) -> None:
-    baseline = _load_report()
-    if needle == "steady: negative e2e count":
-        # Against a baseline with samples the count would also read as "no e2e samples".
-        baseline = _with(("phases", 1, "e2e_ms"), {"count": 0, "p99": 0.0})
-    _flags(current, baseline, needle)
+    _flags(current, _load_report(), needle)
 
 
 @pytest.mark.parametrize(
     ("baseline", "needle"),
     [
+        pytest.param(_with(("phases", 1, "achieved_msg_s"), True), "not a finite", id="bool-rate"),
         pytest.param(
             _with(("phases", 1, "achieved_msg_s"), float("nan")),
             "baseline value nan is not a finite number",
             id="nan-rate",
+        ),
+        pytest.param(
+            _with(("phases", 1, "e2e_ms", "p99"), float("inf")), "not a finite", id="inf-p99"
         ),
         pytest.param(
             _with(("phases", 1, "achieved_msg_s"), -5.0),
@@ -311,9 +310,29 @@ def test_malformed_baseline_metric_is_flagged(baseline: dict[str, Any], needle: 
     _flags(_load_report(), baseline, needle)
 
 
+@pytest.mark.parametrize(
+    ("report", "needle"),
+    [
+        pytest.param(
+            _with(("phases", 1, "achieved_msg_s"), -5.0),
+            "steady: negative throughput",
+            id="negative-rate",
+        ),
+        pytest.param(_with(("no_loss",), None), "no_loss.ok is missing", id="no-loss-missing"),
+    ],
+)
+def test_the_same_malformed_report_on_both_sides_is_flagged(
+    report: dict[str, Any], needle: str
+) -> None:
+    _flags(report, report, needle)
+
+
 def test_counters_compare_per_message_sent() -> None:
+    # Fewer NAKs than the baseline in raw count (8 < 10) but a higher rate per sent (1.6% > 1.0%):
+    # only a per-sent comparison flags it.
     base = _with(("totals", "nak"), 10)
-    _flags(_with(("totals", "nak"), 12, base), base, "NAKs worsened")
+    current = _with(("totals", "sent"), 500, _with(("totals", "nak"), 8))
+    _flags(current, base, "NAKs worsened")
 
 
 def test_p99_regression_from_a_zero_baseline_is_flagged() -> None:
@@ -329,12 +348,18 @@ def test_a_loss_against_an_inconclusive_baseline_is_flagged() -> None:
     _flags(lost, baseline, "current run lost messages")
 
 
-@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), 1.0, -0.1, False, True])
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), 1.0, -0.1, True])
 def test_a_tolerance_outside_a_fraction_is_refused(tolerance: object) -> None:
-    _flags(_load_report(), _load_report(), "is not a fraction in [0, 1)", tolerance)
+    # A run better than its baseline everywhere, so no threshold the bad tolerance moves can flag
+    # it: the refusal is the only regression left to report.
+    better = {
+        **_load_report(),
+        "phases": [_phase("warmup", rate=100.0, p99=10.0), _phase("steady", rate=200.0, p99=10.0)],
+    }
+    _flags(better, _load_report(), "is not a fraction in [0, 1)", tolerance)
 
 
-@pytest.mark.parametrize("tolerance", [float("nan"), 1.0, -0.1])
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), 1.0, -0.1])
 def test_a_bad_tolerance_refuses_before_the_run(
     tolerance: float, monkeypatch: pytest.MonkeyPatch
 ) -> None:
