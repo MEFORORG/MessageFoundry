@@ -117,14 +117,17 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_USERNAME: "mefor"
   # The store password is the x-store-password anchor at the top, the value postgres reads as
   # POSTGRES_PASSWORD (BACKLOG #5400). environment: beats env_file:, so a MEFOR_STORE_PASSWORD
-  # line in secrets.env does not reach these engines and cannot split the two. A file of that
-  # name in a MEFOR_SECRETS_DIRECTORY would still win over this variable, and fail at store
-  # login if it differs. Postgres reads POSTGRES_PASSWORD only when it first initializes the
-  # mefor-pg volume, so changing the value later splits them until that volume is recreated or
-  # the role's password is changed to match. A deployment that gives the engines their own
-  # row-only role (the DEV-ONLY note below) replaces this alias with that role's password.
+  # line in secrets.env does not reach these engines. At least these can still split the two,
+  # and the engines then fail at store login: a MEFOR_STORE_PASSWORD file in a
+  # MEFOR_SECRETS_DIRECTORY, which wins over this variable; an override file that sets this
+  # key; `docker compose run -e MEFOR_STORE_PASSWORD=...`; and changing the value after
+  # Postgres first initializes the mefor-pg volume, since it reads POSTGRES_PASSWORD only then,
+  # until that volume is recreated or the role's password is changed to match. A deployment
+  # that gives the engines their own row-only role (the DEV-ONLY note below) replaces this
+  # alias with ANOTHER required `${...:?...}` substitution with no default, never a literal
+  # password in this file (BACKLOG #1091).
   MEFOR_STORE_PASSWORD: *store-password
-  MEFOR_STORE_POOL_SIZE: "40"        # default (ADR 0062); >= 2 required under [cluster]
+  MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
   # The store hop is verified TLS at every posture: the engine refuses a store login over
   # encrypt=false or trust_server_certificate=true, and no escape lifts that (vault BACKLOG #3533

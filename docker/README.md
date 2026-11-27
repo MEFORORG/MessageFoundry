@@ -206,7 +206,8 @@ against one case that matters, described under
   every substituted value, at least this one and the Postgres password, in the file substitution
   reads; the `ha` engines read the same `MEFOR_STORE_PASSWORD` substitution the Postgres service
   does, so a `MEFOR_STORE_PASSWORD` line in `secrets.env` feeds only the default `engine`; the
-  `x-ha-engine-env` comment in `compose.yaml` says what can still split them). The
+  `x-ha-engine-env` comment in `compose.yaml` names at least some of what can still split
+  them). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
   `docker compose up` and `docker compose --profile ha up` run that check before they start the
   default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
@@ -252,7 +253,9 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   production. At least the engine's own secret settings other than the store key, and every
   `MEFOR_VALUE_*` value, can instead come from a **secrets directory**, one file per setting,
   mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect` shows as a path
-  only. Which settings it supplies, and which it does not, are listed in
+  only. The store password is the exception on the `ha` profile: the `ha` engines and the
+  `postgres` service always carry it in `environment:`, so `docker inspect` shows it on them
+  whatever secrets source you use. Which settings it supplies, and which it does not, are listed in
   [CONFIGURATION.md](../docs/CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
   `compose.yaml` carries it commented out, with the ownership and modes the engine requires.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
