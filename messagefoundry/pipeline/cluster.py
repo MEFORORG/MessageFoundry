@@ -21,8 +21,8 @@ HA (Workstream A2), a partitioned old leader **self-fences** before a standby ca
 store always gets the :class:`NullCoordinator`.
 
 **Steps 4 + 4b add leader election and leader-gated poll-source intake:** ``is_leader()`` reflects the
-held leadership lease, the engine gates its leader-only WRITE singletons (retention, the lease-reclaim
-sweep) on it, and the runner threads ``is_leader`` as a plain predicate into each source so only the
+held leadership lease, the engine gates its leader-only WRITE work (retention's shared-store phases,
+the lease-reclaim sweep) on it, and the runner threads ``is_leader`` as a plain predicate into each source so only the
 leader polls a **shared external resource** (a directory / DB table / remote dir) — listen sources
 (MLLP/TCP) ignore it and run on every node, but only the leader binds them (the graph runs on the
 leader only). Single-node operation stays byte-identical because :class:`NullCoordinator`'s

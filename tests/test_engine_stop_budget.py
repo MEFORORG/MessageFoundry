@@ -234,8 +234,7 @@ async def test_a_cancel_during_the_retention_wait_still_closes_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #6526: the retention stop passes a cancel of its caller on once its bounded wait
-    ends. On main it swallowed the cancel, so engine.stop() went on to close the store. It must
-    still reach the close, and raise the cancel after it."""
+    ends. engine.stop() must still reach the store's close, and raise the cancel after it."""
     monkeypatch.setattr(retention_module, "_STOP_WAIT_SECONDS", 0.3)
     eng = await _engine(tmp_path)
     runner = RetentionRunner(eng.store, RetentionSettings(messages_days=1))

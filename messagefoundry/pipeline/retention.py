@@ -1516,7 +1516,7 @@ class RetentionRunner:
         writes it as :meth:`run_once` does."""
         pass_cap = _PassCap(self._monotonic, self._settings.max_pass_seconds)
         deleted = compressed = reclaimed = 0
-        running_phase: str | None = "app_log_sweep"
+        running_phase: str | None = None
 
         def _tally(*, interrupted: bool = False) -> RetentionPass:
             return RetentionPass(
@@ -1539,6 +1539,10 @@ class RetentionRunner:
             )
 
         try:
+            # The loop's stop is read on entry to each phase, as the leader's `_running` does: an
+            # await before it (the disk floor, the sweep) may have absorbed the cancel.
+            _raise_if_stopped()
+            running_phase = "app_log_sweep"
             deleted = await self._sweep_app_log_phase(now, pass_cap.hit)
             running_phase = None
             _raise_if_stopped()

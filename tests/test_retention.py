@@ -1246,6 +1246,55 @@ async def test_a_standby_pass_that_fails_after_its_sweep_still_audits_the_sweep(
     assert details[0]["interrupted"] is True and details[0]["standby"] is True
 
 
+async def test_a_standby_pass_that_absorbed_its_cancel_deletes_no_log(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a standby whose disk-floor await swallowed the stop's cancel must not start
+    its app-log sweep once the stop may have returned, as the leader starts no further phase."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = logs / "engine-old.log"
+    old.write_text("x")
+    os.utime(old, (now - 10 * DAY, now - 10 * DAY))
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def absorbs_the_cancel() -> bool:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return False
+
+    monkeypatch.setattr(runner, "_check_disk_floor", absorbs_the_cancel)
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert old.exists()
+    assert await _retention_audit_details(store) == []
+
+
 async def test_a_pass_stopped_while_writing_its_audit_row_still_writes_it(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

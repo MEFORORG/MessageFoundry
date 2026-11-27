@@ -2543,7 +2543,9 @@ says which counts the pass's entry keeps. An entry
 can still be missing at least when the audit write itself fails, for example under the store fault
 that ended the pass (logged at ERROR), when the write is still unfinished 5 seconds after the pass ends,
 or when the engine's stop gives up waiting for it, after at most 5 seconds and less under the service's
-stop budget (both logged at ERROR), or when the process dies first. **A stop the budget cuts can lose
+stop budget (both logged at ERROR), when the process dies first, or by design when a purge that runs in
+one transaction raises, from its COMMIT say, with nothing else done, which is taken to have rolled
+back and writes no entry. **A stop the budget cuts can lose
 the entry.** The owner ruled on 2026-11-22 that the stop budget wins over the work it cuts
 ([SERVICE.md](SERVICE.md)), so when the engine's stop runs out of budget before the retention loop has
 ended, the stop returns with the pass possibly still running when the store closes, and the interrupted

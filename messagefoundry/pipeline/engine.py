@@ -4377,10 +4377,9 @@ class Engine:
                 )
             except asyncio.CancelledError:
                 # BACKLOG #6526: the retention stop passes a cancel of this stop on once its own
-                # bounded wait ends; main's swallowed it, so the stop went on to close the store.
-                # Held, as the intake monitor's below is, and raised once the store has closed. A
-                # cancel that lands in a later step before the guarded teardown still leaves at
-                # once, as on main.
+                # bounded wait ends. It is held, as the intake monitor's below is, so this stop
+                # still closes the store, and raised once the store has closed. A cancel that
+                # lands in a later step before the guarded teardown still leaves at once.
                 retention_cancelled = True
         if self._backup_runner is not None:
             await self._backup_runner.stop()
