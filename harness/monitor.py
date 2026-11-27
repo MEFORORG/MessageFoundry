@@ -426,8 +426,8 @@ class MonitorPanel(QWidget):
             return False
         if self._step_up_open:
             # The open prompt's nested event loop delivered a second step-up, such as a refused
-            # message search arriving while a Purge prompt is up. It is declined; re-running it
-            # once the open prompt closes prompts then. A refusal through the polling client
+            # message search arriving while a Purge prompt is up. It is declined. A refusal
+            # through the polling client
             # arrives here with that refusal's action. Where that is None, as for a session-window
             # refusal, going ahead would post the action the first refusal stashed
             # (X-Step-Up-Action), minting that action's grant from a password typed for this one;
