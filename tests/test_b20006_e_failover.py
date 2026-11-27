@@ -4,14 +4,15 @@
 
 ``per_lane_ordering`` no longer passes on fewer than two lanes, a run with no accepted load is a
 named violation, a NaN or infinite ``[load.failover]`` knob or ``drain_timeout_s`` is refused before
-anything starts, and the console escapes the backend name. The dead-row check stays main's absolute
-``final.dead == 0``: the rig makes no read of the engine's PHI-gated dead-letter list route.
+anything starts, and the console escapes the profile and backend names. The dead-row check is the
+absolute ``final.dead == 0``: the rig makes no read of the engine's PHI-gated dead-letter list route.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -175,8 +176,16 @@ def test_no_accepted_load_is_a_named_violation() -> None:
     rep = _report(acked=0, tracker=_tracker(n=0))
     assert rep.result_ok is False
     assert any(s.name == "messages_acked" and not s.ok for s in rep.slos)
-    # Nothing was delivered, so the lanes note does not blame the lane key.
+    # Nothing was accepted, so the lanes note does not blame the lane key.
     assert not any("lane(s)" in n for n in rep.notes)
+
+
+def test_accepted_load_with_no_delivery_names_the_lane_cause() -> None:
+    t = FailoverTracker()
+    for seq in range(98):
+        t.on_ack(seq)
+    rep = _report(tracker=t)
+    assert any("observed 0 lane(s)" in n for n in rep.notes)
 
 
 def test_zero_acks_alone_is_counted_as_a_violation() -> None:
@@ -191,14 +200,9 @@ def test_zero_acks_alone_is_counted_as_a_violation() -> None:
     assert "(1 violated)" in rep.render_console()
 
 
-# --- the dead-row check is main's, absolute ------------------------------------------
-
-
-def test_any_dead_row_still_fails_the_run() -> None:
-    rep = _report(dead=1)
-    assert rep.result_ok is False
-    assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
-
+# --- no PHI-gated read -------------------------------------------------------------------
+# The absolute dead-row check is test_any_dead_row_at_the_end_fails_the_run, in
+# tests/test_load_failover_unit.py.
 
 # Built from parts, so this file does not itself spell the route it scans for.
 _ROUTE = "/dead" + "-letters"
@@ -241,13 +245,24 @@ def test_a_non_finite_failover_knob_is_refused_before_any_start(
         asyncio.run(failover.run_failover_load(profile, ports=_PORTS, base_env={}))
 
 
-def test_a_lease_whose_recovery_bound_overflows_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        # Every knob is finite and passes the loader; the bounds 2 x 1e308 and 4 x 1e308 are not.
+        {"leader_lease_ttl_seconds": "1e308"},
+        # Only the recovery bound overflows: 100 x 1e307 does, the monitor's 4 x 1e307 does not.
+        {"leader_lease_ttl_seconds": "1e307", "recovery_ttl_multiple": "100.0"},
+    ],
+    ids=["both bounds", "recovery bound only"],
+)
+def test_a_lease_whose_bound_overflows_is_refused(
+    knobs: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Every knob is finite and passes the loader; the bound 2 x 1e308 is not.
-    profile = _profile(leader_lease_ttl_seconds="1e308")
+    profile = _profile(**knobs)
+    monitor_finite = math.isfinite(failover._monitor_deadline(profile.failover, 0.0))
+    assert monitor_finite == (knobs["leader_lease_ttl_seconds"] == "1e307")
     _refuse_start(monkeypatch)
-    with pytest.raises(FailoverError, match="too large"):
+    with pytest.raises(FailoverError, match="leader_lease_ttl_seconds is too large"):
         asyncio.run(failover.run_failover_load(profile, ports=_PORTS, base_env={}))
 
 
@@ -272,8 +287,8 @@ def test_a_non_finite_drain_timeout_is_refused_before_any_start(
         asyncio.run(failover.run_failover_load(profile, ports=_PORTS, base_env={}))
 
 
-def test_the_monitor_deadline_is_unchanged() -> None:
-    # Extracted into a helper; the formula stays 4 lease TTLs + the drain timeout + 30 s.
+def test_the_monitor_deadline_formula() -> None:
+    # Four lease TTLs, plus the drain timeout, plus a 30 s margin.
     assert failover._monitor_deadline(_profile().failover, 10.0) == 4.0 * 6.0 + 10.0 + 30.0
 
 
@@ -292,7 +307,14 @@ def test_the_console_escapes_the_profile_name_to_ascii() -> None:
     assert not rep.profile.isascii()
     header = rep.render_console().splitlines()[0]
     assert header.isascii() and "\x1b" not in header
-    assert header.startswith("Failover-load report -- profile 'fo\\x1b[2J")
+    assert header.startswith("Failover-load report -- profile 'fo")
     assert _report().render_console().splitlines()[0] == (
         "Failover-load report -- profile 'fo-b20006' (backend postgres)"
+    )
+
+
+def test_a_quote_in_the_profile_name_cannot_end_it_early() -> None:
+    rep = replace(_report(), profile="x' (backend sqlserver) '")
+    assert rep.render_console().splitlines()[0] == (
+        "Failover-load report -- profile \"x' (backend sqlserver) '\" (backend postgres)"
     )

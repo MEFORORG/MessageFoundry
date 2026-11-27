@@ -20,6 +20,10 @@ the current primary mid-load**, and measures what a failover actually costs:
   the MLLP connector opens a fresh connection per delivery, so the lane is the destination, not the
   socket) stay monotonic. The single hub at ``pool_size = 1`` makes harness send order == engine
   insertion order, so a new seq arriving below a lane's high-water is a genuine ordering break.
+  Fewer than two lanes fails it, and the ``lanes_observed`` check names that cause;
+* **accepted load**, ``messages_acked``: a run the engine ACKed nothing from proves none of the above.
+
+A NaN or infinite ``[load.failover]`` knob or ``drain_timeout_s`` is refused before anything starts.
 
 This run is also the **first live proof** of the on-promotion in-flight recovery path
 (``reset_stale_inflight`` for SQL Server, the lease-reclaim sweep for Postgres) under a real crash — see
@@ -560,10 +564,11 @@ class FailoverReport:
     def render_console(self) -> str:
         lines: list[str] = []
         # The profile name and the backend are the operator's own text, so both are escaped before
-        # they reach the terminal: to ASCII, so a cp1252 console can print the line too.
-        name = escape_for_terminal(self.profile, single_line=True)
+        # they reach the terminal: to ASCII, so a cp1252 console can print the line too. The name
+        # keeps repr's quoting, so a quote inside it cannot end the quoted name early.
+        name = escape_for_terminal(repr(self.profile), single_line=True)
         backend = escape_for_terminal(self.db_backend or "?", single_line=True)
-        lines.append(f"Failover-load report -- profile '{name}' (backend {backend})")
+        lines.append(f"Failover-load report -- profile {name} (backend {backend})")
         lines.append("")
         prom = "n/a" if self.promotion_seconds is None else f"{self.promotion_seconds:.2f}s"
         rec = "TIMEOUT" if self.recovery_seconds is None else f"{self.recovery_seconds:.2f}s"
@@ -884,9 +889,9 @@ def _build_report(
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
     no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
-    # Only where something was delivered: with no delivery the cause is intake, which the
+    # Only where the engine accepted load: with no ACK the cause is intake, which the
     # messages_acked check and its warning name.
-    if tracker.lanes_observed < 2 and tracker.delivered_count > 0:
+    if tracker.lanes_observed < 2 and c.acked > 0:
         notes.append(
             f"per-lane ordering observed {tracker.lanes_observed} lane(s); the failover graph fans "
             "out to MEFOR_LOAD_FANOUT destinations, so fewer than two means a fan-out set below "
@@ -1160,8 +1165,8 @@ def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
         raise FailoverError("[load] drain_timeout_s must be a finite number")
     if not math.isfinite(_monitor_deadline(fo, drain_timeout_s)):
         raise FailoverError(
-            "[load] drain_timeout_s is too large: the monitor deadline computed from it is not a "
-            "finite number"
+            "[load] drain_timeout_s is too large: the monitor deadline computed from it and "
+            "[load.failover] leader_lease_ttl_seconds is not a finite number"
         )
 
 
