@@ -38,7 +38,7 @@ import json
 import logging
 import math
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -215,42 +215,78 @@ _PORT_MAX = 65535
 
 
 def check_engine_layout(
+    cells: list[BatchCell], *, sink_procs: int, inbound_base: int, api_base: int, sink_base: int
+) -> None:
+    """Refuse an engine-box layout no cell could run, before any engine starts (BACKLOG #5857).
+
+    Raises :class:`ConnScaleError` naming the first fault: a sink-process count below 1, a port
+    block that runs outside 1..65535 (the largest cell's inbound block, the API ports the cells
+    step through, or the agreed sink band), or an API block that overlaps the inbound block. Each
+    of these used to start the cells' engines and fail them later, at a port bind, a health wait,
+    or the driver's band plan, one cell at a time. An empty cell list has no layout to refuse.
+    The claim mode is :func:`iter_batch_cells`'s to refuse, since the cell ids carry it."""
+    if not cells:
+        return
+    if sink_procs < 1:
+        raise ConnScaleError(f"sink_procs must be >= 1, got {sink_procs}")
+    top_count = max(c.count for c in cells)
+    inbound_last = inbound_base + top_count - 1
+    api_last = api_base + len(cells) - 1
+    blocks = (
+        ("inbound", inbound_base, inbound_last),
+        ("API", api_base, api_last),
+        ("sink", sink_base, sink_base + min(sink_procs, top_count) - 1),
+    )
+    for what, first, last in blocks:
+        if first < 1 or last > _PORT_MAX:
+            raise ConnScaleError(f"the {what} ports {first}..{last} run outside 1..{_PORT_MAX}")
+    # Disjoint whole blocks, not only each cell's own pair: a later, larger cell binds the whole
+    # inbound block on the box an earlier cell's API port was just released on.
+    if api_base <= inbound_last and inbound_base <= api_last:
+        raise ConnScaleError(
+            f"the API ports {api_base}..{api_last} overlap the inbound ports "
+            f"{inbound_base}..{inbound_last}"
+        )
+
+
+def _refusal_before_any_cell(
     cells: list[BatchCell],
     *,
-    claim_mode: str,
     sink_procs: int,
     inbound_base: int,
     api_base: int,
     sink_base: int,
-) -> None:
-    """Refuse an engine-box layout no cell could run, before any engine starts (BACKLOG #5857).
-
-    Raises :class:`ConnScaleError` naming the first fault: a claim mode the engine does not read, a
-    sink-process count below 1, a port block that runs outside 1..65535 (a cell's inbound block, the
-    API ports the cells step through, or the agreed sink band), or a cell whose API port falls in
-    its own inbound block. Each of these used to start every cell's engine and fail it later, at a
-    port bind, a health wait, or the driver's band plan, one cell at a time."""
-    if claim_mode not in CLAIM_MODES:
-        raise ConnScaleError(f"claim mode {claim_mode!r} is not one of {sorted(CLAIM_MODES)}")
-    if sink_procs < 1:
-        raise ConnScaleError(f"sink_procs must be >= 1, got {sink_procs}")
-    top_count = max(c.count for c in cells)
-    blocks = (
-        ("inbound", inbound_base, top_count),
-        ("API", api_base, len(cells)),
-        ("sink", sink_base, min(sink_procs, top_count)),
+    environ: Mapping[str, str],
+) -> tuple[str, ConnScaleError] | None:
+    """The first check that refuses the whole matrix, as ``(label, error)``, or None. The sign-in
+    limits are sized to the largest cell's fleet: it grows with the count, so the largest covers
+    every smaller one."""
+    if not cells:
+        return None
+    checks: tuple[tuple[str, Callable[[], None]], ...] = (
+        (
+            "ENGINE LAYOUT REFUSED",
+            lambda: check_engine_layout(
+                cells,
+                sink_procs=sink_procs,
+                inbound_base=inbound_base,
+                api_base=api_base,
+                sink_base=sink_base,
+            ),
+        ),
+        (
+            "SIGN-IN LIMIT REFUSED",
+            lambda: check_operator_sign_in_limits(
+                min(sink_procs, max(c.count for c in cells)), environ
+            ),
+        ),
     )
-    for what, first, span in blocks:
-        last = first + span - 1
-        if first < 1 or last > _PORT_MAX:
-            raise ConnScaleError(f"the {what} ports {first}..{last} run outside 1..{_PORT_MAX}")
-    for step, cell in enumerate(cells):
-        api_port = api_base + step
-        if inbound_base <= api_port < inbound_base + cell.count:
-            raise ConnScaleError(
-                f"cell {cell.cell_id}: API port {api_port} falls in its inbound ports "
-                f"{inbound_base}..{inbound_base + cell.count - 1}"
-            )
+    for label, check in checks:
+        try:
+            check()
+        except ConnScaleError as exc:
+            return label, exc
+    return None
 
 
 # --- the matrix cell ---------------------------------------------------------
@@ -294,7 +330,12 @@ def iter_batch_cells(profile: ConnScaleProfile, *, claim_mode: str) -> list[Batc
 
     A profile with a sandbox arm or a warm-up is REFUSED (BACKLOG #3132): the batch box runs every
     cell at ``[sandbox].mode = off`` with no warm-up, and the shared SLOs would then fail every cell
-    for an axis the box never ran."""
+    for an axis the box never ran.
+
+    A claim mode the engine does not read is refused too (BACKLOG #5857), before any cell id is
+    built from it: a cell id names the coord files both halves write."""
+    if claim_mode not in CLAIM_MODES:
+        raise ConnScaleError(f"claim mode {claim_mode!r} is not one of {sorted(CLAIM_MODES)}")
     if profile.sandbox_modes != (SANDBOX_OFF,) or profile.warmup_timeout_s > 0.0:
         raise ConnScaleError(
             f"the batch box runs no sandbox arm and no warm-up; profile {profile.name!r} names "
@@ -954,24 +995,19 @@ async def run_batch_engine(
     cells = iter_batch_cells(profile, claim_mode=claim_mode)
     report = BatchEngineReport(profile=profile.name, claim_mode=claim_mode)
     # Refuse a layout no cell could run and an operator sign-in limit too small for the largest
-    # cell's fleet, before any engine starts; the cell fleet grows with the count, so the largest
-    # covers every smaller one. Each cell then fails the way an engine that did not start fails, so
-    # the driver box reads an error READY for every cell instead of waiting on one that never comes,
-    # or on a stale one.
-    label = "ENGINE LAYOUT REFUSED"
-    try:
-        if cells:
-            check_engine_layout(
-                cells,
-                claim_mode=claim_mode,
-                sink_procs=sink_procs,
-                inbound_base=inbound,
-                api_base=api_base,
-                sink_base=sink_base,
-            )
-            label = "SIGN-IN LIMIT REFUSED"
-            check_operator_sign_in_limits(min(sink_procs, max(c.count for c in cells)), base_env)
-    except ConnScaleError as exc:
+    # cell's fleet, before any engine starts. Each cell then fails the way an engine that did not
+    # start fails, so the driver box reads an error READY for every cell instead of waiting on one
+    # that never comes, or on a stale one.
+    refusal = _refusal_before_any_cell(
+        cells,
+        sink_procs=sink_procs,
+        inbound_base=inbound,
+        api_base=api_base,
+        sink_base=sink_base,
+        environ=base_env,
+    )
+    if refusal is not None:
+        label, exc = refusal
         report.notes.append(f"{label}, NO CELL RAN: {exc}")
         for step, cell in enumerate(cells):
             error = f"engine not started: {exc}"
@@ -1021,80 +1057,80 @@ async def run_batch_engine(
         for key, value in rig_sign_in_env(procs).items():
             if env_setting(node_env, key) is None:  # any spelling the engine reads stands
                 node_env[key] = value
-        node = EngineNode(
-            f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
-        )
+        # One stop path for every way out of the cell, a cancellation included: an engine this cell
+        # started never outlives it (BACKLOG #5857).
+        node: EngineNode | None = None
         try:
-            # Empty the shared store so THIS cell is apples-to-apples (the pooled/batch handoff never
-            # inherits the prior cell's rows — the carryover confound run_connscale fixes per step).
-            if reset_store and profile.store_backend is not None:
+            try:
+                node = EngineNode(
+                    f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
+                )
+                # Empty the shared store so THIS cell is apples-to-apples (the pooled/batch handoff
+                # never inherits the prior cell's rows — the carryover confound run_connscale fixes
+                # per step).
+                if reset_store and profile.store_backend is not None:
+                    try:
+                        await _reset_server_store(profile.store_backend, node_env)
+                    except Exception as reset_exc:
+                        # Type only: a driver error's text can carry connection details or a stored
+                        # value. The cell still runs, so it can measure on the prior cell's rows.
+                        kind = type(reset_exc).__name__
+                        log.warning("batch cell %s: store reset failed: %s", cell.cell_id, kind)
+                        report.notes.append(
+                            f"CELL {cell.cell_id}: store reset failed ({kind}); the cell continues "
+                            "and may measure on the prior cell's rows"
+                        )
+                await node.start()
+                await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
+                # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0
+                # listener); the DRIVER separately proves off-box reachability from its side.
+                await _await_port("127.0.0.1", inbound, timeout=_PORTS_READY_TIMEOUT)
+                await _await_port(
+                    "127.0.0.1", inbound + cell.count - 1, timeout=_PORTS_READY_TIMEOUT
+                )
+            # An OSError is a failed start too, such as a spawn or a TLS file the process could not
+            # make (BACKLOG #5857): it used to end the walk with the driver box waiting on a READY.
+            except (ConnScaleError, FailoverError, OSError) as exc:
+                reason = _start_fault(exc)
+                info = BatchCellEngineInfo(
+                    cell_id=cell.cell_id,
+                    node_id=f"batch-{cell.cell_id}",
+                    pid=None,
+                    batch_mode=cell.batch_mode,
+                    count=cell.count,
+                    trial=cell.trial,
+                    inbound_base=inbound,
+                    api_port=api_port,
+                    error=f"engine did not start: {reason}",
+                )
+                report.cells.append(info)
+                report.notes.append(f"CELL {cell.cell_id} ENGINE START FAILED: {reason}")
+                # Tell the driver this cell is unusable so it skips + posts DONE (keeps the matrix
+                # in lockstep instead of hanging both boxes on a READY that never comes).
+                cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})
                 try:
-                    await _reset_server_store(profile.store_backend, node_env)
-                except Exception as reset_exc:
-                    # Type only: a driver error's text can carry connection details or a stored
-                    # value. The cell still runs, so it can measure on the prior cell's rows.
-                    kind = type(reset_exc).__name__
-                    log.warning("batch cell %s: store reset failed: %s", cell.cell_id, kind)
+                    await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
+                except Exception as wait_exc:
+                    kind = type(wait_exc).__name__
+                    log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
                     report.notes.append(
-                        f"CELL {cell.cell_id}: store reset failed ({kind}); the cell continues "
-                        "and may measure on the prior cell's rows"
+                        f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after "
+                        "the cell's startup failed; moving to the next cell"
                     )
-            await node.start()
-            await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
-            # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0 listener);
-            # the DRIVER separately proves off-box reachability from its side.
-            await _await_port("127.0.0.1", inbound, timeout=_PORTS_READY_TIMEOUT)
-            await _await_port("127.0.0.1", inbound + cell.count - 1, timeout=_PORTS_READY_TIMEOUT)
-        # An OSError is a failed start too: a spawn or a TLS context the process could not make
-        # (BACKLOG #5857). It used to end the walk with the cell's engine still running.
-        except (ConnScaleError, FailoverError, OSError) as exc:
+                continue
+
+            pid = getattr(node, "pid", None)
             info = BatchCellEngineInfo(
                 cell_id=cell.cell_id,
                 node_id=node.node_id,
-                pid=None,
+                pid=pid,
                 batch_mode=cell.batch_mode,
                 count=cell.count,
                 trial=cell.trial,
                 inbound_base=inbound,
                 api_port=api_port,
-                error=f"engine did not start: {exc}",
             )
             report.cells.append(info)
-            report.notes.append(f"CELL {cell.cell_id} ENGINE START FAILED: {exc}")
-            # Tell the driver this cell is unusable so it skips + posts DONE (keeps the matrix in
-            # lockstep instead of hanging both boxes on a READY that never comes).
-            cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})
-            try:
-                await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
-            except Exception as wait_exc:
-                kind = type(wait_exc).__name__
-                log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
-                report.notes.append(
-                    f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after the "
-                    "cell's startup failed; moving to the next cell"
-                )
-            finally:
-                await _stop_cell_node(node, cell.cell_id, report)
-            continue
-        except BaseException:
-            # Anything else, a cancellation included, ends the walk, and the engine this cell may
-            # already have started goes with it rather than outliving the run (BACKLOG #5857).
-            await _stop_cell_node(node, cell.cell_id, report)
-            raise
-
-        pid = getattr(node, "pid", None)
-        info = BatchCellEngineInfo(
-            cell_id=cell.cell_id,
-            node_id=node.node_id,
-            pid=pid,
-            batch_mode=cell.batch_mode,
-            count=cell.count,
-            trial=cell.trial,
-            inbound_base=inbound,
-            api_port=api_port,
-        )
-        report.cells.append(info)
-        try:
             cell_coord.post(
                 BATCH_CELL_READY,
                 {
@@ -1111,13 +1147,15 @@ async def run_batch_engine(
                     "hold_seconds": profile.hold_seconds,
                     "drain_timeout_s": profile.drain_timeout_s,
                     "aggregate_rate": profile.aggregate_rate_for(cell.sweep_mode, cell.count),
-                    # The engine subprocess identity for the operator's EXTERNAL per-PID CPU capture.
+                    # The engine subprocess identity for the operator's EXTERNAL per-PID CPU
+                    # capture.
                     "engine": {"pid": pid, "node_id": node.node_id, "role": "connscale-engine"},
                 },
             )
             await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
         finally:
-            await _stop_cell_node(node, cell.cell_id, report)
+            if node is not None:
+                await _stop_cell_node(node, cell.cell_id, report)
     return report
 
 
@@ -1140,6 +1178,15 @@ async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineRep
             else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running "
             "(child processes were not checked)"
         )
+
+
+def _start_fault(exc: BaseException) -> str:
+    """Why a cell's engine did not start, for its error, its READY and the notes. An OSError is
+    named by type and its OS reason only: its full text carries the file paths it failed on, and
+    a bare one has no text at all."""
+    if isinstance(exc, OSError):
+        return f"{type(exc).__name__}: {exc.strerror}" if exc.strerror else type(exc).__name__
+    return str(exc)
 
 
 # --- the DRIVER half ---------------------------------------------------------

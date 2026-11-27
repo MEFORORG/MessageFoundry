@@ -16,6 +16,7 @@ children spawned are one-line ``python -c`` scripts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import sys
 import tempfile
@@ -120,7 +121,7 @@ async def test_a_report_on_disk_does_not_excuse_an_exit_it_does_not_record(
 
 
 def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
-    rec = types.SimpleNamespace(started=[], stopped=[])
+    rec = types.SimpleNamespace(built=[], started=[], stopped=[])
 
     class FakeNode:
         alive = False
@@ -130,6 +131,7 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
             self, node_id: str, api_port: int, *, env: Mapping[str, str], config_dir: str, cwd: Any
         ) -> None:
             self.node_id = node_id
+            rec.built.append(node_id)
 
         async def start(self) -> None:
             rec.started.append(self.node_id)
@@ -143,29 +145,44 @@ def _install_engine_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
     monkeypatch.setattr(bb, "EngineNode", FakeNode)
     monkeypatch.setattr(bb, "_await_node_healthy", fine)
     monkeypatch.setattr(bb, "_await_port", fine)
+    rec.node_cls = FakeNode
     return rec
 
 
-async def _engine_alone(**kwargs: Any) -> tuple[Any, list[dict[str, Any]]]:
-    """The engine half beside a stand-in driver that posts DONE for each READY at once."""
-    profile = load_connscale_profile_text(kwargs.pop("profile_text", _BATCH))
-    claim_mode = kwargs.setdefault("claim_mode", "pooled")
+def _raiser(exc: BaseException) -> Any:
+    async def _raise(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    return _raise
+
+
+async def _engine_alone(
+    profile_text: str = _BATCH, **kwargs: Any
+) -> tuple[Any, list[dict[str, Any]]]:
+    """The engine half beside a stand-in driver that posts DONE for each READY at once. The
+    stand-in is cancelled when the engine half raises, so it never outlives the coord directory."""
+    profile = load_connscale_profile_text(profile_text)
     readies: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as tmp:
         coord = FileDropCoord(tmp, run_id="batch_ab")
 
         async def stub_driver() -> None:
-            for cell in bb.iter_batch_cells(profile, claim_mode=claim_mode):
+            for cell in bb.iter_batch_cells(profile, claim_mode="pooled"):
                 cc = coord.for_run(f"batch_ab.{cell.cell_id}")
                 readies.append(
                     await cc.await_message(BATCH_CELL_READY, timeout=10.0, interval=0.02)
                 )
                 cc.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id})
 
-        engine = bb.run_batch_engine(
-            profile=profile, coord=coord, store_env={}, cell_timeout=10.0, **kwargs
-        )
-        report, _ = await asyncio.gather(engine, stub_driver())
+        driver = asyncio.ensure_future(stub_driver())
+        try:
+            report = await bb.run_batch_engine(
+                profile=profile, coord=coord, store_env={}, cell_timeout=10.0, **kwargs
+            )
+            await driver
+        finally:
+            driver.cancel()
+            await asyncio.gather(driver, return_exceptions=True)
     return report, readies
 
 
@@ -173,13 +190,11 @@ async def _engine_alone(**kwargs: Any) -> tuple[Any, list[dict[str, Any]]]:
     ("layout", "said"),
     [
         ({"sink_procs": 0}, "sink_procs must be >= 1, got 0"),
-        ({"claim_mode": "fifo"}, "claim mode 'fifo' is not one of"),
         # The CLI's --inbound-base is not bounded by the profile's own base_port check.
         ({"inbound_base": 65530}, "the inbound ports 65530..65537 run outside 1..65535"),
         ({"api_base": 0}, "the API ports 0..0 run outside 1..65535"),
         ({"sink_base": 65533}, "the sink ports 65533..65538 run outside 1..65535"),
-        # The API port lands inside the cell's own inbound block (2600..2607).
-        ({"api_base": 2603}, "API port 2603 falls in its inbound ports 2600..2607"),
+        ({"api_base": 2603}, "the API ports 2603..2603 overlap the inbound ports 2600..2607"),
     ],
 )
 async def test_a_layout_no_cell_could_run_starts_no_engine(
@@ -188,54 +203,127 @@ async def test_a_layout_no_cell_could_run_starts_no_engine(
     """S26-22: each of these used to start the cell's engine and fail it later, if at all. Now no
     engine starts, and every cell posts an error READY so the driver box skips it."""
     rec = _install_engine_fakes(monkeypatch)
-    kwargs = {"sink_procs": 6, **layout}
-    report, readies = await _engine_alone(**kwargs)
+    report, readies = await _engine_alone(**{"sink_procs": 6, **layout})
 
-    assert rec.started == []
+    assert rec.built == rec.started == []
     assert not report.ok
     assert report.cells and all(c.error and said in c.error for c in report.cells)
     assert readies and all(said in r.get("error", "") for r in readies), readies
     assert any(n.startswith("ENGINE LAYOUT REFUSED, NO CELL RAN") for n in report.notes)
 
 
-async def test_the_layout_check_admits_the_default_layout(monkeypatch: pytest.MonkeyPatch) -> None:
-    # CONTROL: the shipped defaults, and an API block that ends just below the inbound block.
+async def test_an_api_port_inside_a_later_cells_inbound_block_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cell 0 (3 connections) binds 2600..2602 beside API 2605; cell 1 (8) binds 2600..2607, which
+    # holds the API port cell 0 just released.
     rec = _install_engine_fakes(monkeypatch)
-    for kwargs in ({"sink_procs": 6}, {"sink_procs": 6, "api_base": 2599}):
-        report, readies = await _engine_alone(**kwargs)
-        assert report.ok, report.notes
-        assert all("error" not in r for r in readies)
-    assert len(rec.started) == 2
-    # The edges of the port space are admitted too.
+    report, readies = await _engine_alone(
+        _BATCH.replace("counts = [8]", "counts = [3, 8]"), sink_procs=6, api_base=2605
+    )
+    assert rec.started == [] and len(readies) == 2
+    said = "the API ports 2605..2606 overlap the inbound ports 2600..2607"
+    assert all(c.error and said in c.error for c in report.cells)
+
+
+async def test_a_claim_mode_the_engine_does_not_read_builds_no_cell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S26-22: the cell ids name the coord files, so a claim mode is refused before any is built,
+    by both halves, the way a profile with a sandbox arm is."""
+    rec = _install_engine_fakes(monkeypatch)
+    profile = load_connscale_profile_text(_BATCH)
+    with pytest.raises(ConnScaleError, match="claim mode '../fifo' is not one of"):
+        bb.iter_batch_cells(profile, claim_mode="../fifo")
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ConnScaleError, match="claim mode 'fifo' is not one of"):
+            await bb.run_batch_engine(
+                profile=profile,
+                claim_mode="fifo",
+                coord=FileDropCoord(tmp, run_id="batch_ab"),
+                store_env={},
+                cell_timeout=1.0,
+            )
+        assert list(Path(tmp).iterdir()) == []
+    assert rec.built == []
+
+
+def test_the_layout_check_admits_the_edges_of_the_port_space() -> None:
     cells = bb.iter_batch_cells(load_connscale_profile_text(_BATCH), claim_mode="per_lane")
-    bb.check_engine_layout(
-        cells, claim_mode="per_lane", sink_procs=1, inbound_base=1, api_base=65535, sink_base=65535
-    )
-    bb.check_engine_layout(
-        cells, claim_mode="pooled", sink_procs=6, inbound_base=65528, api_base=9, sink_base=1
-    )
+    bb.check_engine_layout(cells, sink_procs=1, inbound_base=1, api_base=65535, sink_base=65535)
+    bb.check_engine_layout(cells, sink_procs=6, inbound_base=65528, api_base=9, sink_base=1)
+    # API blocks that end just below, or start just above, the inbound block 2600..2607.
+    bb.check_engine_layout(cells, sink_procs=6, inbound_base=2600, api_base=2599, sink_base=40000)
+    bb.check_engine_layout(cells, sink_procs=6, inbound_base=2600, api_base=2608, sink_base=40000)
+    bb.check_engine_layout([], sink_procs=0, inbound_base=0, api_base=0, sink_base=0)
+
+
+async def test_the_default_layout_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = _install_engine_fakes(monkeypatch)
+    report, readies = await _engine_alone(sink_procs=6)
+    assert report.ok, report.notes
+    assert len(rec.started) == 1 and rec.stopped == rec.started
+    assert readies and all("error" not in r for r in readies)
 
 
 async def test_an_engine_whose_start_raises_oserror_is_stopped_and_the_cell_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """S26-23: an OSError after the engine started used to end the walk with the engine running,
-    and the driver box waiting on a READY that never came."""
+    and the driver box waiting on a READY that never came. The OS reason is kept; the path the
+    error names is not."""
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(
+        bb, "_await_node_healthy", _raiser(OSError(13, "Permission denied", "C:/nowhere/cert.pem"))
+    )
+    report: Any = None
+    readies: list[dict[str, Any]] = []
+    with contextlib.suppress(OSError):  # main let it escape
+        report, readies = await _engine_alone(sink_procs=6)
+    assert rec.started and rec.stopped == rec.started
+    assert report is not None and not report.ok
+    said = "engine did not start: PermissionError: Permission denied"
+    assert all(c.error == said for c in report.cells), report.cells
+    assert readies and all(r.get("error") == said for r in readies)
+    assert "nowhere" not in repr(report.to_json_dict())
+
+
+async def test_an_engine_that_cannot_be_built_fails_the_cell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # EngineNode mints the run's TLS pair and opens its log file when it is built.
     rec = _install_engine_fakes(monkeypatch)
 
-    async def unready(*_args: object, **_kwargs: object) -> None:
-        raise OSError("the TLS context could not be made")
+    def no_room(*_args: object, **_kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(bb, "_await_node_healthy", unready)
-    report: Any = None
-    try:
-        report, readies = await _engine_alone(sink_procs=6)
-    except OSError:
-        readies = []  # main let it escape
-    assert rec.stopped == rec.started != []
-    assert report is not None and not report.ok
-    assert all(c.error and "the TLS context could not be made" in c.error for c in report.cells)
-    assert readies and all("engine did not start" in r.get("error", "") for r in readies)
+    monkeypatch.setattr(rec.node_cls, "__init__", no_room)
+    report, readies = await _engine_alone(sink_procs=6)
+    said = "engine did not start: OSError: No space left on device"
+    assert [c.error for c in report.cells] == [said]
+    assert [r.get("error") for r in readies] == [said]
+    assert rec.started == rec.stopped == []
+
+
+async def test_a_failed_error_ready_post_still_stops_the_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_engine_fakes(monkeypatch)
+    monkeypatch.setattr(bb, "_await_node_healthy", _raiser(ConnScaleError("not healthy")))
+
+    def share_gone(self: FileDropCoord, name: str, payload: Mapping[str, Any]) -> None:
+        raise OSError("the coord share went away")
+
+    monkeypatch.setattr(FileDropCoord, "post", share_gone)
+    with tempfile.TemporaryDirectory() as tmp, pytest.raises(OSError, match="share went away"):
+        await bb.run_batch_engine(
+            profile=load_connscale_profile_text(_BATCH),
+            coord=FileDropCoord(tmp, run_id="batch_ab"),
+            store_env={},
+            sink_procs=6,
+            cell_timeout=10.0,
+        )
+    assert rec.started and rec.stopped == rec.started
 
 
 async def _walk_is_cancelled() -> None:
@@ -256,11 +344,7 @@ async def test_a_cancelled_start_up_stops_the_cells_engine(
     """S26-23: a cancellation during the health or port wait still ends the walk, and now takes
     the engine the cell started with it."""
     rec = _install_engine_fakes(monkeypatch)
-
-    async def cancelled(*_args: object, **_kwargs: object) -> None:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(bb, seam, cancelled)
+    monkeypatch.setattr(bb, seam, _raiser(asyncio.CancelledError()))
     await _walk_is_cancelled()
     assert rec.started and rec.stopped == rec.started
 
@@ -269,14 +353,7 @@ async def test_a_cancelled_done_wait_after_a_failed_start_stops_the_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rec = _install_engine_fakes(monkeypatch)
-
-    async def unready(*_args: object, **_kwargs: object) -> None:
-        raise ConnScaleError("engine did not become healthy")
-
-    async def cancelled_wait(self: FileDropCoord, name: str, **_kwargs: Any) -> dict[str, Any]:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(bb, "_await_node_healthy", unready)
-    monkeypatch.setattr(FileDropCoord, "await_message", cancelled_wait)
+    monkeypatch.setattr(bb, "_await_node_healthy", _raiser(ConnScaleError("not healthy")))
+    monkeypatch.setattr(FileDropCoord, "await_message", _raiser(asyncio.CancelledError()))
     await _walk_is_cancelled()
     assert rec.started and rec.stopped == rec.started
