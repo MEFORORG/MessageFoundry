@@ -25,6 +25,7 @@ from harness.config.shardcert import _shape as shardcert_shape
 from harness.load.ids import SHARDCERT_IDS
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.childenv import CHILD_INTERPRETER_FLAGS, outside_engine_namespace
+from messagefoundry.config.snapshot import config_py_files
 from tests._ast_sites import named_func, parse_source
 from tests.test_dependency_boundaries import _is_forbidden, _modules_imported_by
 
@@ -186,26 +187,29 @@ def _harness_imports(path: Path, graph: str) -> list[str]:
 
     It reads import statements only. A string import, such as ``importlib.import_module("harness")``
     or ``__import__("harness")``, passes this scan and, in a function body, the load test too."""
-    # The loader runs a config module under a top-level name with no parent package, so a relative
-    # import there raises rather than reaching harness. Reading the file as a member of its harness
-    # package over-reports on purpose: such a line is refused here, not passed.
+    # A graph's _shape.py is also imported as harness.config.<graph>._shape, by the harness runners
+    # and by this file, and there a relative import reaches harness. Under the loader, which gives a
+    # config module no parent package, the same line raises instead. Either way it is refused here.
     tree = parse_source(path.read_text(encoding="utf-8"))
     imported = _modules_imported_by(tree, f"harness.config.{graph}")
     return sorted(name for name in imported if _is_forbidden(name, ("harness",)))
 
 
-def _harness_imports_in(directory: Path, graph: str) -> dict[str, list[str]]:
-    """Each ``.py`` file in ``directory`` that imports a ``harness`` module, and what it imports."""
-    found = {path.name: _harness_imports(path, graph) for path in sorted(directory.glob("*.py"))}
-    return {name: hits for name, hits in found.items() if hits}
+def _scan_graph_dir(directory: Path) -> tuple[list[str], dict[str, list[str]]]:
+    """The files the scan read in ``directory``, by the loader's own file rule, and each of them
+    that imports a ``harness`` module, with what it imports. The graph is the directory's name."""
+    paths = config_py_files(directory)
+    found = {path.name: _harness_imports(path, directory.name) for path in paths}
+    return [path.name for path in paths], {name: hits for name, hits in found.items() if hits}
 
 
 @pytest.mark.parametrize("graph", _GRAPHS)
 def test_the_graph_does_not_import_the_harness_package(graph: str) -> None:
     # Every file in the directory, function bodies too: a Router's or Handler's body does not run in
     # the load test above, and a non-_ module such as connscale's gen_toml.py is loaded as config.
-    assert {"_shape.py", "graph.py"} <= {path.name for path in (_CONFIG / graph).glob("*.py")}
-    assert _harness_imports_in(_CONFIG / graph, graph) == {}
+    read, found = _scan_graph_dir(_CONFIG / graph)
+    assert {"_shape.py", "graph.py"} <= set(read)
+    assert found == {}
 
 
 # Each planted source, and the harness module the scan must name for it in a module of
@@ -213,7 +217,6 @@ def test_the_graph_does_not_import_the_harness_package(graph: str) -> None:
 _PLANTED_HARNESS_IMPORTS = {
     "import harness.config.x": "harness.config.x",
     "import os, harness": "harness",
-    "import Harness": "Harness",
     "from harness.config.load._shape import y": "harness.config.load._shape",
     "from . import _shape": "harness.config.load",
     "from ._shape import y": "harness.config.load._shape",
@@ -221,6 +224,8 @@ _PLANTED_HARNESS_IMPORTS = {
     "from ..estate._shape import y": "harness.config.estate._shape",
     "from ... import load": "harness",
     "def route(message):\n    from ._shape import y\n": "harness.config.load._shape",
+    "try:\n    import harness.load\nexcept ImportError:\n    pass\n": "harness.load",
+    "class Shape:\n    def build(self):\n        from .. import estate\n": "harness.config",
 }
 
 
@@ -235,12 +240,19 @@ def test_control_the_scan_flags_a_planted_harness_import(
     assert expected in _harness_imports(planted, "load")
 
 
-def test_control_the_directory_scan_names_the_one_planted_file(tmp_path: Path) -> None:
-    # A real graph's copy with one file added, so the graph test's directory walk is what is read.
+def test_control_the_directory_scan_names_the_planted_files(tmp_path: Path) -> None:
+    # A real graph's copy with files added, so the graph test's directory walk is what is read: a
+    # module and a _ helper it must name, and a dot-named backup the loader never runs, which it
+    # must not read.
     config = tmp_path / "load"
     shutil.copytree(_CONFIG / "load", config, ignore=shutil.ignore_patterns("__pycache__"))
-    (config / "planted.py").write_text("from ._shape import y\n", encoding="utf-8")
-    assert _harness_imports_in(config, "load") == {"planted.py": ["harness.config.load._shape"]}
+    for name in ("planted.py", "_planted.py", ".planted.py"):
+        (config / name).write_text("from ._shape import y\n", encoding="utf-8")
+    read, found = _scan_graph_dir(config)
+    assert {"_shape.py", "graph.py", "planted.py", "_planted.py"} <= set(read)
+    assert ".planted.py" not in read
+    hit = ["harness.config.load._shape"]
+    assert found == {"planted.py": hit, "_planted.py": hit}
 
 
 def test_control_the_scan_passes_a_module_with_no_harness_import(tmp_path: Path) -> None:
