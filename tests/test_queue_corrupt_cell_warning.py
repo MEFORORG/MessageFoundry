@@ -47,6 +47,7 @@ from messagefoundry.store.queue_tag import (
     queue_row_aad,
     unopenable_log_text,
 )
+from tests._log_absence import assert_capture_sees_tree
 from tests.test_queue_tag import _raising_transit
 
 #: Words only the cipher's own refusal texts hold, never the queue-tag report's.
@@ -251,7 +252,37 @@ def test_a_refusal_frees_the_callers_opened_bodies_without_the_cyclic_collector(
     assert held[0]() is None, "the caller's opened body outlived the refusal"
 
 
+@pytest.fixture
+def uvicorn_logs_reach_caplog(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uvicorn's child loggers log at DEBUG, propagate and are enabled, for one test.
+
+    These loggers are process-wide. An earlier test on the same worker can leave them unable to
+    reach caplog, and the conftest's per-test restore covers only the ``uvicorn`` parent's level
+    and propagation. ``uvicorn.Config(log_level="critical")`` sets at least ``uvicorn.error`` to
+    CRITICAL, which drops the ERROR traceback; tests/test_proactor_accept.py does so on Windows.
+    uvicorn's default log config stops ``uvicorn.access`` propagating. A dictConfig that disables
+    existing loggers would disable them all.
+
+    This runs at setup, before the call phase's capture attaches. That capture also attaches to
+    each logger that does not propagate, so a logger flipped later would deliver records twice."""
+    children = {"uvicorn.error", "uvicorn.access"} | {
+        name
+        for name, node in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(node, logging.Logger) and name.startswith("uvicorn.")
+    }
+    for name in sorted(children):
+        logger = logging.getLogger(name)
+        caplog.set_level(logging.DEBUG, logger=name)  # restored when the test ends
+        monkeypatch.setattr(logger, "propagate", True)
+        monkeypatch.setattr(logger, "disabled", False)
+    # The conftest owns the parent's level and propagation; only its disabled flag is left open.
+    monkeypatch.setattr(logging.getLogger("uvicorn"), "disabled", False)
+
+
 @pytest.mark.parametrize("kind", sorted(_REFUSALS))
+@pytest.mark.usefixtures("uvicorn_logs_reach_caplog")
 async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
     kind: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -260,6 +291,8 @@ async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
     Starlette then re-raises it to uvicorn, which logs its traceback at ERROR. Every record on the
     ROOT logger, at every level, is formatted with its traceback and searched."""
     caplog.set_level(logging.DEBUG)
+    # Control: at least each uvicorn logger that exists now reaches the capture at DEBUG.
+    assert_capture_sees_tree(caplog, "uvicorn", logging.DEBUG)
     cipher = make_cipher(generate_key(), write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
     row = _refused_row(cipher, kind)
@@ -294,6 +327,8 @@ async def test_an_unhandled_read_refusal_logs_no_cipher_text_under_uvicorn(
         await serving
         sock.close()
     assert answer.status_code == 500
+    # Control: so does each one that exists after serving, any uvicorn created meanwhile included.
+    assert_capture_sees_tree(caplog, "uvicorn", logging.DEBUG)
     formatter = logging.Formatter("%(name)s %(levelname)s %(message)s")
     printed = [formatter.format(record) for record in caplog.records]
     # Control: uvicorn did log the refusal's traceback, so the search below can see one.
