@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import log_spool, logging_setup
+from messagefoundry import file_lock, log_spool, logging_setup
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     _SPOOL_IN_USE_FACTS,
@@ -1793,6 +1793,47 @@ def test_a_sent_segment_still_undeletable_at_close_is_reported(
     assert "left 1 spool segment(s)" in caplog.text and "sends them again" in caplog.text
 
 
+# A literal, never the module constant: comparing the constant with itself passes any rewording.
+# Each clause is checked against the code it states, named beside it.
+_IN_USE_FACTS = (
+    # At least the causes ``_try_lock`` returns False for: ``lock_exclusive`` reports contention by
+    # any handle, this process's own included, and ``_try_lock`` reads any other lock fault as
+    # contention.
+    ". This WARNING reads the same for at least these causes: another process holds the lock, this "
+    "process already holds it on another handle, or taking the lock failed. "
+    # ``_open_forward_spool`` runs once per forwarder, at configure time, and returned ``None``, so
+    # this forwarder has no spool object. Another handle in this process may still send, so the
+    # sentence is about the forwarder.
+    "Until this process restarts with a spool it can lock, the forwarder this WARNING belongs to "
+    "has no on-disk spool and sends nothing from that directory. "
+    # Segments are read only through an opened ``LogSpool``, and ``open`` takes the lock first. No
+    # cause gets a claim that a move strands nothing: on a lock fault nobody holds the lock.
+    "A spool directory's segments are sent only by a process that holds its lock, so a change to a "
+    "process's spool directory can leave segments in its old directory unsent. "
+    # The example is tied through ``__main__._forward_spool_dir`` by
+    # ``test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory``.
+    "Processes whose spool directories resolve to one path share that directory, and only one of "
+    "them holds its lock at a time. For example, two engines that are not engine shards, whose "
+    "store paths resolve into one directory and whose [logging].forward_spool_dir is unset or "
+    "empty, share one spool directory, not only its root. "
+    'One directory serves one process (ADR 0200, "One process per directory").'
+)
+
+
+def _expected_in_use_warning(spool_dir: Path) -> str:
+    """The whole in-use WARNING, the ``SpoolUnavailable`` text and the format string included."""
+    return (
+        f"log spool directory {spool_dir} is in use by another process; off-box log forwarding "
+        "runs without an on-disk spool" + _IN_USE_FACTS
+    )
+
+
+def _the_in_use_warning(caplog: pytest.LogCaptureFixture) -> str:
+    [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
+    assert in_use.levelno == logging.WARNING
+    return in_use.getMessage()
+
+
 def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1801,12 +1842,6 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     who holds the lock, so any instruction would be wrong for some deployment. An unusable
     directory's WARNING adds none of them. Either way the opener returns ``None``, so the forwarder
     runs without a spool (#1966)."""
-    from messagefoundry.config.settings import load_settings
-
-    # The names the WARNING gives are the real ones: the variable reaches the setting.
-    named = load_settings(environ={"MEFOR_LOGGING_FORWARD_SPOOL_DIR": "other"}, default_file=False)
-    assert named.logging.forward_spool_dir == "other"
-
     earlier = LogSpool(spool_dir, max_bytes=100_000)
     earlier.open()
     earlier.append(_entry(0))
@@ -1818,69 +1853,13 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     if opened is not None:
         opened.close()
     assert opened is None  # held by `earlier`
-    assert "in use by another process" in caplog.text and "still holds" not in caplog.text
-    [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
-    assert in_use.levelno == logging.WARNING
-    message = in_use.getMessage()
+    assert "still holds" not in caplog.text
+    message = _the_in_use_warning(caplog)
+    # The whole message, so a command in the format string or the SpoolUnavailable text fails too.
+    assert message == _expected_in_use_warning(spool_dir)
+    # The tie that makes the control below mean something: the in-use branch emits the constant.
     _, sep, facts = message.partition("off-box log forwarding runs without an on-disk spool")
-    assert sep, message
-    # A literal, never the module constant: comparing the constant with itself passes any rewording.
-    assert facts == (
-        # At least the causes ``_try_lock`` returns False for: ``lock_exclusive`` reports
-        # contention by any handle, this process's own included, and ``_try_lock`` reads any other
-        # lock fault as contention.
-        ". This WARNING reads the same for at least these causes: another process holds the lock, "
-        "this process already holds it on another handle, or taking the lock failed. "
-        # ``_open_forward_spool`` runs once per forwarder, at configure time, and returned ``None``
-        # here, so this forwarder has no spool object and reads nothing from that directory.
-        # Another handle in this process may still send, so the sentence is about the forwarder.
-        "Until this process restarts with a spool it can lock, the forwarder this WARNING belongs "
-        "to has no on-disk spool and sends nothing from that directory. "
-        # Stranding belongs to the lock holder; a process without the lock sends none, so moving it
-        # strands none.
-        "Only the process holding a spool directory's lock sends that directory's segments. A "
-        "change to that process's spool directory leaves the segments in its old directory unsent "
-        "until a process opens that directory again; a change to the spool directory of a process "
-        "that does not hold the lock strands none of them. "
-        # ``__main__._forward_spool_dir`` and ``_supervisor_forward_spool_dir``: ``engine``,
-        # ``shard-<id>`` or ``supervisor`` under ``_forward_spool_root``, which is ``Path(base)``
-        # for a non-empty setting and otherwise ``log-spool`` in the resolved store path's parent.
-        # The next test ties only the default for an unset setting: ``log-spool`` in the directory
-        # that holds a ``[store].path`` it builds directly, on SQLite and on a database server,
-        # shared by two stores in one directory. At least these facts here are checked by reading
-        # the code, not tied by any test: the subdirectory names and the supervisor's root
-        # (``_forward_spool_dir``, ``_supervisor_forward_spool_dir``), an empty setting read as
-        # unset (``_forward_spool_root`` tests ``if base``), ``--db`` reaching ``[store].path``
-        # (``_serve`` and ``_supervise`` write it into the CLI layer), and a relative setting being
-        # taken against the working directory (``_forward_spool_root`` returns ``Path(base)``
-        # unanchored).
-        "A process spools in the subdirectory engine, shard-<engine shard id> or supervisor of a "
-        "root. The root is [logging].forward_spool_dir (environment variable "
-        "MEFOR_LOGGING_FORWARD_SPOOL_DIR), taken against the working directory when it is a "
-        "relative path. With the setting unset or empty, the root is log-spool in the directory "
-        "that holds the "
-        "resolved store path (--db, or else [store].path, read even when the store is on a "
-        "database server), so two stores in one directory share it. "
-        'One directory serves one process (ADR 0200, "One process per directory").'
-    )
-    # No branch of a procedure: each of these was wrong for some deployment, the last four being
-    # reworded commands a review named.
-    lowered = facts.lower()
-    for imperative in (
-        "stop one",
-        "stop the duplicate",
-        "give this process",
-        "give that one",
-        "restart this one",
-        "each of the others",
-        "Never change",
-        "Leave the process",
-        "Move this process",
-        "Set [logging].forward_spool_dir",
-        "stop the other process",
-        "Kill the process",
-    ):
-        assert imperative.lower() not in lowered, imperative
+    assert sep and facts == _SPOOL_IN_USE_FACTS
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
         raise PermissionError(13, "read-only directory")
@@ -1896,36 +1875,73 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     )
     assert "is not usable" in caplog.text
     # The control: an unusable directory gets none of the in-use facts.
-    assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" not in caplog.text
     assert _SPOOL_IN_USE_FACTS not in caplog.text
+    assert "One directory serves one process" not in caplog.text
 
 
-def test_the_default_spool_directory_follows_the_directory_that_holds_the_store_path(
+def test_a_lock_fault_reads_as_in_use_and_claims_no_move_strands_nothing(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock call that fails for a reason other than contention reads as in use (``_try_lock``),
+    so nobody holds the lock and a segment already there stays unsent. The WARNING it gets is the
+    same one, and it claims for no cause that a change of spool directory strands nothing
+    (BACKLOG #5400)."""
+    earlier = LogSpool(spool_dir, max_bytes=100_000)
+    earlier.open()
+    earlier.append(_entry(0))
+    earlier.close()
+
+    def _lock_fault(fd: int, *, wait: bool = False) -> bool:
+        raise OSError(errno.EIO, "lock call failed")
+
+    monkeypatch.setattr(file_lock, "lock_exclusive", _lock_fault)  # what ``_try_lock`` calls
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+        opened = _open_forward_spool(_forward_to(spool_dir))
+    monkeypatch.undo()
+    if opened is not None:
+        opened.close()
+    assert opened is None
+    message = _the_in_use_warning(caplog)
+    lowered = message.lower()
+    for strands_nothing in ("strands none", "strand none", "strands nothing", "none of them"):
+        assert strands_nothing not in lowered, strands_nothing
+    assert message == _expected_in_use_warning(spool_dir)
+    assert log_spool.count_segments(spool_dir) == 1  # nobody sent it
+
+
+def test_two_engines_with_store_paths_in_one_directory_share_one_spool_directory(
     tmp_path: Path,
 ) -> None:
-    """The in-use WARNING says the default root is ``log-spool`` in the directory that holds the
-    store path, not one keyed by the path itself, and that the path is read even on a
-    database-server backend: two stores in one directory share it (BACKLOG #5400)."""
-    from messagefoundry.__main__ import _forward_spool_dir, _forward_spool_root
-    from messagefoundry.config.settings import ServiceSettings, StoreBackend, StoreSettings
-
-    unset = ServiceSettings()
-    assert not unset.logging.forward_spool_dir
-    root = _forward_spool_root(unset, str(tmp_path / "a.db"))
-    assert (
-        root
-        == _forward_spool_root(unset, str(tmp_path / "b.db"))
-        == tmp_path.resolve() / "log-spool"
+    """The in-use WARNING's example: two engines that are not engine shards, with store paths in
+    one directory and ``[logging].forward_spool_dir`` unset or empty, resolve to one spool
+    directory, not only one root (BACKLOG #5400)."""
+    from messagefoundry.__main__ import _forward_spool_dir
+    from messagefoundry.config.settings import (
+        LoggingSettings,
+        ServiceSettings,
+        StoreBackend,
+        StoreSettings,
     )
 
-    def default(store: Path, **server: Any) -> str:
+    def default(
+        store: Path, shard: str | None = None, spool: str | None = None, **server: Any
+    ) -> str:
         return _forward_spool_dir(
-            ServiceSettings(store=StoreSettings(path=str(store), **server)), None
+            ServiceSettings(
+                store=StoreSettings(path=str(store), **server),
+                logging=LoggingSettings(forward_spool_dir=spool),
+            ),
+            shard,
         )
 
     beside_a = default(tmp_path / "a.db")
-    assert beside_a == default(tmp_path / "b.db")
+    assert (
+        beside_a == default(tmp_path / "b.db") == str(tmp_path.resolve() / "log-spool" / "engine")
+    )
+    assert default(tmp_path / "b.db", spool="") == beside_a  # empty reads as unset
     assert beside_a != default(tmp_path / "other" / "a.db")
+    # Engine shards get a directory each, so the example names engines that are not.
+    assert default(tmp_path / "a.db", "1") != default(tmp_path / "b.db", "2")
     postgres = {"backend": StoreBackend.POSTGRES, "server": "db", "database": "mf", "username": "u"}
     assert default(tmp_path / "a.db", **postgres) == beside_a
 
