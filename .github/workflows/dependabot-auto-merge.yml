@@ -244,10 +244,29 @@ jobs:
 
           eligible=true
           saw_any=false
+          # `read` drops ONE trailing empty field, so `a,` would read as `a` alone. That is an empty
+          # member like `a,,b`, and it denies the same way (BACKLOG #5474).
+          case "$DEP_NAMES" in
+            *,)
+              echo "::notice::the dependency list ends in a comma, so a member has no name — routing the WHOLE PR to manual review."
+              eligible=false
+              ;;
+          esac
           IFS=',' read -ra names <<< "$DEP_NAMES"
           for raw in "${names[@]}"; do
             name="${raw,,}"
-            name="${name//[[:space:]]/}"
+            # Trim the ends only: fetch-metadata joins names with `, `. Whitespace INSIDE a name is
+            # not stripped, because that would rewrite it into another name the row might admit; it
+            # denies the whole PR instead (BACKLOG #5474).
+            name="${name#"${name%%[![:space:]]*}"}"
+            name="${name%"${name##*[![:space:]]}"}"
+            case "$name" in
+              *[[:space:]]*)
+                echo "::notice::'$name' carries whitespace inside the name — routing the WHOLE PR to manual review."
+                eligible=false
+                continue
+                ;;
+            esac
             # An EMPTY token denies the WHOLE PR rather than being skipped (BACKLOG #5474). It can
             # only come from a dependency with no name, and on the version track this step is the
             # only one that reads the names, so a skip would arm a PR carrying an unnamed member.
