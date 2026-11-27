@@ -736,9 +736,12 @@ again. The record's `method` says how each answer was reached.
 
 One version bump does turn the test red on its own: `asyncpg`'s. The `postgres` section's TLS
 reading names the pin it was read on, and the test holds that pin to the closure. So every `asyncpg`
-bump, a Dependabot one included, stays red until someone reads the new `connect_utils.py` again and
-moves the version the section names. That is meant: the no-plaintext-fallback reading rests on
-that file.
+bump, a Dependabot one included, stays red until a person changes the version the section names.
+That forces a decision on each bump. It cannot show that anyone read the new `connect_utils.py`
+again, which is what the no-plaintext-fallback reading rests on, and whoever moves the version owes
+that re-read. It also conflicts with the header of `.github/workflows/dependabot-lock-resync.yml`,
+which says the closure rewrite exists so that a PR moving a `postgres` package is not left red with
+no path to green the bot can reach. For an `asyncpg` bump that path no longer exists, on purpose.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
 unrelated pull request. Keeping the re-read date is a maintainer task. Run
