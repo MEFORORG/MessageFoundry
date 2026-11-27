@@ -861,7 +861,8 @@ def read_judged_head(
 
     Returns the read, ``judge``'s verdict on it (called with whether the read is complete), and a
     fault to report beside that verdict, if any. Where the read kept is returned, the verdict's
-    own fault is moved into that third element (``_report_kept``) and the verdict carries none.
+    own fault is moved into that third element (``_report_kept``) and the verdict carries none;
+    so it is where a re-read cut short is judged, labelled as the re-read's.
     When it re-reads, and what it reports then, is stated once, in the module docstring's
     paragraph on a head that lags the push event.
     """
@@ -910,10 +911,15 @@ def read_judged_head(
                     seen = {str(c.get("oid", "")) for c in exc.partial.commits}
                     past = [t for oid, t in kept[1].unproven if oid not in seen]
                     if past:
-                        text += "; the read kept, past the re-read's cut, showed: " + "; ".join(
-                            past
+                        text += (
+                            "; the earlier read's W7-R11 warnings for commits the re-read does "
+                            "not list: " + "; ".join(past)
                         )
-                return exc.partial, verdict, text
+                # The re-read's own faults are labelled, so they do not read as the earlier
+                # read's; they move into this text, so ``run`` does not print them again.
+                if verdict.fault:
+                    text += "; the re-read showed: " + verdict.fault
+                return exc.partial, replace(verdict, fault=None), text
             return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)

@@ -1535,12 +1535,52 @@ def test_a_re_read_cut_short_holding_the_head_keeps_the_kept_reads_w7_r11_faults
     warnings = [line for line in out.splitlines() if "fault::" in line]
     assert warnings == [
         "::warning title=CLA pre-check fault::the re-read judged was cut short, so any commits "
-        "past it are not checked: GraphQL returned an error; the read kept, past the re-read's "
-        f"cut, showed: commit {2:040x}: GraphQL reported an error inside its committer, and its "
-        "author reads as unlinked or null, which that failure may have caused; not refused"
+        "past it are not checked: GraphQL returned an error; the earlier read's W7-R11 warnings "
+        f"for commits the re-read does not list: commit {2:040x}: GraphQL reported an error "
+        "inside its committer, and its author reads as unlinked or null, which that failure may "
+        "have caused; not refused"
     ]
     assert "do not include CLA_HEAD_SHA" not in out
     assert "distinct commits" not in out
+
+
+def test_a_re_read_cut_short_labels_its_own_faults_after_the_earlier_reads_warnings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Lander hold on engine PR 3355 at 97da6d21: when the earlier read's W7-R11 warnings and the
+    judged re-read's own verdict fault are both reported, the re-read's fault comes after
+    "the re-read showed: ", so it does not read as the earlier read's."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    errored = {"oid": f"{2:040x}", "author": _UNLINKED, "committer": _OCTO}
+    kept_two = {
+        **_page(
+            [_committer_errored(errored, "user"), _commit(3, "Octo", "octo-contributor", 90000001)],
+            4,
+            False,
+        ),
+        "errors": [_node_error(0, "commit", "committer", "user")],
+    }
+    head = _commit(_HEAD, "Octo", "octo-contributor", 90000001)
+    re_read = {
+        **_page([octo, _commit(5, "Octo Contributor"), head], 4, True),
+        "errors": [_node_error(1, "commit", "author", "user")],
+    }
+    replies = [_page([octo], 4, True), kept_two, re_read, {"errors": [{}]}]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    out = capsys.readouterr().out
+    warnings = [line for line in out.splitlines() if "fault::" in line]
+    assert warnings == [
+        "::warning title=CLA pre-check fault::the re-read judged was cut short, so any commits "
+        "past it are not checked: GraphQL returned an error; the earlier read's W7-R11 warnings "
+        f"for commits the re-read does not list: commit {2:040x}: GraphQL reported an error "
+        "inside its committer, and its author reads as unlinked or null, which that failure may "
+        "have caused; not refused; the re-read showed: "
+        f"commit {5:040x}: GraphQL reported an error inside it; not judged"
+    ]
 
 
 def test_a_trailing_re_read_cut_short_that_cannot_show_the_head_reports_the_kept_read(
