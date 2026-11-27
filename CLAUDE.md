@@ -794,30 +794,30 @@ Manager's watch reached the cloud session 29 seconds after its question.
   under it, and the owner directed the Manager to follow that brief exactly (2026-11-26, in the
   Manager's chat). Register row text, signed or drafted for signing, is outside that safe-direction
   exception (decided by the Lander under the owner's delegation of 2026-11-26, record
-  d20261126T225830018-38a483, which gives the question as *"should the safe-direction carve-out
-  exclude register text the owner signs, A or B"* and the answer as *"/driver"*; Manager record
-  d20261126T233936172-bb6cdb is the reading that fits it to the existing rulings). Its companion is
-  korus `roles/LANDER.md` *4a-quinquies*. A falsehood in signed register row text goes to the owner
-  as a void-or-correction question, and under the 2026-11-15 ruling below it holds the merge like
-  any owner finding. Every falsehood in draft register row text, in any direction or none, must be
-  fixed, or disclosed in the signing guide, before the row is put up for signature. What differs is
-  the merge. One false only in the safe direction blocks the signing, not the merge: this is what
-  the Lander's record chose over *"A as first put, holding every merge on it"*. Every other one
-  keeps the route this bullet already gives it: at least one false in the unsafe direction, a false
-  score and a false anchor go to the owner, and the PR waits; ledger ruling R2.4 and the 2026-11-15
-  ruling stand. A present-tense claim of a live exposure keeps its route to the owner wherever it
-  appears, draft register row text included. The fix is ASVS record work, a Manager's (owner ruling
-  2026-09-23). A PR that records an owner signature holds on a falsehood in the row text whose
-  signature it records that was neither fixed nor disclosed in the signing guide. A disclosed
-  falsehood that was signed does not hold that PR; it goes to the owner as a void-or-correction
-  question only if it is later found to be false in a way the disclosure did not state. A dated
-  marker on a register row is not register row text here. It stays under the safe-direction
-  exception, except a false marker that reads an acceptance as void or fired, which goes to the
-  owner; a correct one stays under the exception. A marker that wrongly reads a fired or void
-  acceptance as in force is false in the unsafe direction, so this bullet's route to the owner
-  applies. Voiding or correcting signed register text, and the question a false void-or-fired
-  marker raises, are signing or re-signing the register, which the 2026-10-22 ruling above
-  reserves to the owner in person (*"Still mine in person"*).
+  d20261126T225830018-38a483 as clarified by the Lander's record d20261127T001516596-98fe64 under
+  the same delegation; 38a483 gives the question as *"should the safe-direction carve-out exclude
+  register text the owner signs, A or B"* and the answer as *"/driver"*, and Manager record
+  d20261126T233936172-bb6cdb fits it to the existing rulings). Its companion is korus
+  `roles/LANDER.md` *4a-quinquies*. A falsehood in draft register row text must be fixed, or
+  disclosed in the signing guide, before the row is put up for signature. Only a falsehood false
+  only in the safe direction skips the merge hold and blocks the signing instead; under 38a483 as
+  clarified by 98fe64, that is what the Lander chose over *"A as first put, holding every merge on
+  it"*. Every other one keeps the route this bullet already gives it, so one false in the unsafe
+  direction, a false score or a false anchor goes to the owner and the PR waits, and a prose error
+  with no route to the owner is a filed R2 row; ledger ruling R2.4 stands for the rest. The fix is
+  ASVS record work, a Manager's (owner ruling 2026-09-23). A signature PR, and any PR that first
+  puts a row up for signature, holds on any falsehood in the row text it records or proposes;
+  disclosure in the signing guide does not exempt it. A falsehood found in signed register row text
+  goes to the owner as a void-or-correction question. It holds the PR that introduces, edits or
+  records that text, and is filed for the owner without holding an unrelated PR that only surfaces
+  it. A PR that edits signed register row text is re-signing: it holds, and goes to the owner in
+  person, because the 2026-10-22 ruling above reserves signing and re-signing the register to the
+  owner in person (*"Still mine in person"*). Whether to void or correct signed register row text
+  is a question for the owner. A dated marker on a register row stays under the safe-direction
+  exception, except a finding that a marker falsely reads an acceptance as void, fired or in force,
+  which goes to the owner. The Lander never decides whether an acceptance is void. This changes no
+  other route to the owner, at least the live-exposure route section 0 sets, the score route and
+  the anchor route.
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
