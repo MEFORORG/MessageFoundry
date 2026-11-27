@@ -99,6 +99,61 @@ def test_soak_inversion_behind_an_unconfirmed_climb_rung_is_fail() -> None:
     assert rep.result_label == "FAIL"
 
 
+def _unconfirmed_climb_rung() -> RungOutcome:
+    """A climb rung whose engine store-truth never arrived: INCONCLUSIVE."""
+    rung = build_rung_outcome(_rung(1, 24.0), _drive(24.0), None, None)
+    assert rung.verdict is RungVerdict.INCONCLUSIVE
+    return rung
+
+
+def test_soak_duplicate_on_a_driven_soak_behind_an_unconfirmed_climb_rung_is_fail() -> None:
+    """A soak the rig fully drove and the engine did not abort saw a duplicate at its sinks. Neither cause
+    that makes a soak repeat unproven (a teardown's redelivery, an overloaded sink's late ACK) applies, and
+    another rung's missing store-truth says nothing about this soak's sinks: FAIL / exit 1."""
+    soak = build_rung_outcome(
+        _SOAK_RUNG, dataclasses.replace(_drive(20.0), lane_repeats=2), _clean_gate(), None
+    )
+    assert soak.verdict is RungVerdict.CORRECTNESS_FAIL
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung()], soak=soak)
+    assert rep.store_truth_unconfirmed is True
+    assert not (rep.soak_aborted or rep.soak_drive_shortfall)
+    assert rep.exit_code == 1
+    assert rep.result_label == "FAIL"
+
+
+def test_single_lane_driven_soak_behind_an_unconfirmed_climb_rung_is_fail() -> None:
+    """The single-lane term is waived only for an under-driven soak; a fully driven soak that saw one lane
+    has vacuous FIFO evidence whatever another rung's store-truth says: FAIL / exit 1."""
+    soak = build_rung_outcome(
+        _SOAK_RUNG, dataclasses.replace(_drive(20.0), lanes_observed=1), _clean_gate(), None
+    )
+    assert soak.verdict is RungVerdict.SUSTAINED
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung()], soak=soak)
+    assert rep.store_truth_unconfirmed is True
+    assert rep.exit_code == 1
+    assert rep.result_label == "FAIL"
+
+
+def test_clean_soak_behind_an_unconfirmed_climb_rung_stays_setup_degraded() -> None:
+    """Control: with no break anywhere, the unconfirmed climb rung is still exit 2."""
+    soak = build_rung_outcome(_SOAK_RUNG, _drive(20.0), _clean_gate(), None)
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung()], soak=soak)
+    assert rep.ok is True
+    assert rep.exit_code == 2
+    assert rep.result_label == "SETUP_DEGRADED"
+
+
+def test_climb_break_behind_an_unconfirmed_climb_rung_stays_setup_degraded() -> None:
+    """Unchanged: a CLIMB duplicate next to an unconfirmed climb rung is still exit 2."""
+    dup = build_rung_outcome(
+        _rung(2, 28.0), dataclasses.replace(_drive(28.0), lane_repeats=1), _clean_gate(), None
+    )
+    assert dup.verdict is RungVerdict.CORRECTNESS_FAIL
+    soak = build_rung_outcome(_SOAK_RUNG, _drive(20.0), _clean_gate(), None)
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung(), dup], soak=soak)
+    assert rep.exit_code == 2
+
+
 def test_clean_underdriven_soak_stays_setup_degraded() -> None:
     """Control: with no break the rig shortfall is still a setup degradation."""
     rep = _consolidated([_sustained(0, 20.0)], soak=_underdriven_soak())

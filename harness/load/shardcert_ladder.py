@@ -2645,8 +2645,8 @@ class ConsolidatedLadderReport:
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
         a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
         was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2. A
-        FIFO inversion on the soak is exit 1 whatever the degradation (BACKLOG #5862;
-        :attr:`_break_outranks_degradation` says why a soak duplicate is not)."""
+        FIFO inversion on the soak is exit 1 whatever the degradation, and so is a soak duplicate or
+        single-lane term on a fully driven soak (BACKLOG #5862; :attr:`_break_outranks_degradation`)."""
         if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
@@ -2662,24 +2662,42 @@ class ConsolidatedLadderReport:
         )
 
     @property
-    def _break_outranks_degradation(self) -> bool:
-        """Correctness broke and no CLIMB-side degradation (a climb rendezvous abort, an unconfirmed climb
-        store-truth) leaves the break unproven. Then the break is the answer when the only other degradation
-        is the pool tripwire, or when the break is on a climb rung, whatever the soak's state.
+    def _soak_broken(self) -> bool:
+        """The SOAK broke correctness: :attr:`_climb_broken`'s terms, read on the soak alone."""
+        soak = self.soak
+        return soak is not None and (
+            soak.verdict is RungVerdict.CORRECTNESS_FAIL
+            or (
+                soak.verdict is RungVerdict.SUSTAINED
+                and soak.offered != 0
+                and soak.lanes_observed < 2
+            )
+        )
 
-        BACKLOG #5862: a FIFO inversion on the SOAK outranks every degradation. The sink tracker counts one
-        only for a NEW seq below a lane's high-water, which neither a teardown's redelivery nor a late ACK
-        from a starved sink can produce, and one rung's unconfirmed store-truth says nothing about another
-        rung's sink-observed order. A soak DUPLICATE is not given that rank under a soak abort or a rig
-        shortfall: a torn-down or overloaded sink can provoke an at-least-once redelivery, which the tracker
-        counts as a repeat. Nor is the soak's single-lane term, since an under-driven soak can see few lanes."""
+    @property
+    def _break_outranks_degradation(self) -> bool:
+        """Correctness broke on a rung whose own evidence is proven, so the break is the answer (exit 1 /
+        FAIL) whatever else degraded. A climb rendezvous abort proves nothing about any rung's break.
+
+        * A FIFO inversion on the SOAK always outranks (BACKLOG #5862). The sink tracker counts one only
+          for a NEW seq below a lane's high-water, which neither a teardown's redelivery nor a late ACK from
+          a starved sink can produce.
+        * A soak DUPLICATE or single-lane term outranks only on a soak the engine did not abort and the rig
+          fully drove: a torn-down or overloaded sink can provoke an at-least-once redelivery, which the
+          tracker counts as a repeat, and an under-driven soak can see few lanes. On a fully driven soak an
+          unconfirmed CLIMB rung does not void it, because one rung's missing store-truth says nothing about
+          another rung's sink-observed order.
+        * A CLIMB break outranks a soak degradation and a pool bind, but not an unconfirmed climb
+          store-truth."""
         if self.ok:
             return False
         if self.soak is not None and self.soak.lane_inversions > 0:
             return True
-        if self.climb_aborted or self.store_truth_unconfirmed:
+        if self.climb_aborted:
             return False
-        return self._climb_broken or not (self.soak_aborted or self.soak_drive_shortfall)
+        if self._soak_broken and not (self.soak_aborted or self.soak_drive_shortfall):
+            return True
+        return self._climb_broken and not self.store_truth_unconfirmed
 
     @property
     def result_label(self) -> str:
@@ -3130,10 +3148,12 @@ class ConsolidatedLadderReport:
             # only companion degradation is a pool bind, or a break on a CLIMB rung whatever the soak's state,
             # is FAIL / exit 1, not POOL_BOUND or SETUP_DEGRADED / exit 2.
             #
-            # v11 (BACKLOG #5862) — no new key, one SCORING change: a FIFO inversion on the soak is FAIL /
-            # exit 1 whatever the degradation (a soak abort or rig shortfall, an unconfirmed climb rung, a
-            # pool bind), not SETUP_DEGRADED / exit 2. A soak duplicate under a soak abort or rig shortfall
-            # still reads SETUP_DEGRADED (a redelivery counts as one).
+            # v11 (BACKLOG #5862) — no new key, two SCORING changes, each moving a run from SETUP_DEGRADED /
+            # exit 2 to FAIL / exit 1: (1) a FIFO inversion on the soak, under a soak abort, a rig shortfall
+            # or an unconfirmed climb rung; (2) a soak duplicate or single-lane term on a soak the rig fully
+            # drove and the engine did not abort, under an unconfirmed climb rung. A soak duplicate or
+            # single-lane term under a soak abort or rig shortfall still reads SETUP_DEGRADED (a redelivery
+            # counts as a repeat, and an under-driven soak can see few lanes).
             "schema_version": 11,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
