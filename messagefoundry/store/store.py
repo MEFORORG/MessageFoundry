@@ -19490,9 +19490,7 @@ class MessageStore:
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
-        if (
-            suspended_until_after is not None
-        ):  # vault BACKLOG #3100 item 14: the suspend prime's read
+        if suspended_until_after is not None:  # vault BACKLOG #3100 item 14: the suspend prime
             where.append("suspended_until > ?")
             params.append(suspended_until_after)
         clause = " WHERE " + " AND ".join(where)

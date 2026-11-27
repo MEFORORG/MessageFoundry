@@ -10345,9 +10345,10 @@ class AuthService:
         whose window holds no failure keeps no window, which reads the same as one of answers
         only, since an answer adds nothing to the count.
 
-        **A flapping directory must not page every account.** Whether the lifespan task pages
+        **No pass pages more than a few accounts by name.** Whether the lifespan task pages
         once for those entering (``unreached_rollup``) is decided by
-        :meth:`_record_unreached_accounts`, on the rows it wrote; each account whose row was
+        :meth:`_record_unreached_accounts`, on the rows this pass wrote alone, so accounts that
+        enter a few at a time on successive passes each page by name; each account whose row was
         written has that row, and one whose row was refused gets no row, page or latch on that
         pass.
 

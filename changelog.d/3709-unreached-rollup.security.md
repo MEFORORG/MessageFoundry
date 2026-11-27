@@ -1,6 +1,6 @@
 - **The rolled-up unreachable-account alert no longer reads as a total.** Where the accounts
   entering on one pass whose audit row was written are more than five, they page as one
-  `ad_reconcile_aborted` alert, under one source until vault BACKLOG #3100 item 14. Its text
+  `ad_reconcile_aborted` alert. Its text
   read "N accounts' sessions are not revoked", counting only the accounts entering on that pass,
   so a later rollup that updated the open alert replaced the count with a smaller one while more
   accounts stood. It now names the count as accounts newly unreachable, and counts failures in

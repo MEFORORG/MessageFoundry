@@ -37,6 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -1402,7 +1403,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._occurrences: dict[str, int] = {}
         # Vault BACKLOG #3100 item 14: the rollup keys (_ROLLUP_KEY_PREFIX) whose _last_sent and
         # _occurrences entries are kept, least recently emitted first (_keep_rollup).
-        self._rollup_keys: dict[str, None] = {}
+        self._rollup_keys: OrderedDict[str, None] = OrderedDict()
         # BACKLOG #1741: the state each connection_started cleared, per key, in the order its durable
         # resolve was scheduled, kept until that resolve lands or fails (_resolve_settled).
         self._pending_clears: dict[str, list[_ClearedState]] = {}
@@ -2391,11 +2392,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         entries of the least recent beyond :data:`_ROLLUP_KEYS_KEPT` (vault BACKLOG #3100 item 14;
         :data:`_ROLLUP_KEY_PREFIX` says why). A suspend entry stays: an operator's act, or the
         startup prime's bounded read, adds one, not an emit."""
-        self._rollup_keys.pop(key, None)
         self._rollup_keys[key] = None
+        self._rollup_keys.move_to_end(key)
         while len(self._rollup_keys) > _ROLLUP_KEYS_KEPT:
-            oldest = next(iter(self._rollup_keys))
-            del self._rollup_keys[oldest]
+            oldest, _ = self._rollup_keys.popitem(last=False)
             self._last_sent.pop(oldest, None)
             self._occurrences.pop(oldest, None)
 
