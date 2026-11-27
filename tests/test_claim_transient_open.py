@@ -410,12 +410,20 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
         assert len(warned) == 1
         assert not any("B2" in r.getMessage() for r in caplog.records)
         # Every WARNING the corrupt cell left, the store's dead-letter line included, carries no
-        # exception object and no traceback.
-        corrupt_lines = [r for r in caplog.records if "is corrupt" in r.getMessage()]
+        # exception object and no traceback. The store's line names the error by its class and
+        # cause (BACKLOG #5982), so it is found by that.
+        corrupt_lines = [
+            r
+            for r in caplog.records
+            if "is corrupt" in r.getMessage() or "CorruptQueueCellError" in r.getMessage()
+        ]
         assert len(corrupt_lines) == 2
         for record in corrupt_lines:
             assert not any(isinstance(a, BaseException) for a in record.args or ())
             assert record.exc_info is None
+        # BACKLOG #5982: no WARNING carries the cipher's refusal text.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("malformed ciphertext" in m or "key_id=" in m for m in warnings), warnings
     finally:
         await store.close()
 
@@ -669,6 +677,29 @@ async def test_the_server_classifier_matches_sqlite(backend: str) -> None:
     fake = _FakeServer(TypeError("bug"))  # an engine bug stays loud
     with pytest.raises(TypeError):
         await _classify(backend, _server_store(backend, fake), QueueTagError("t"))
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+async def test_the_server_dead_letter_warning_carries_no_cipher_text(
+    backend: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5982: as on SQLite, a queue-tag refusal's WARNING names its class and cause, never
+    the cipher's text that its message embeds."""
+    from messagefoundry.store.queue_tag import CorruptQueueCellError, QueueTagError  # noqa: PLC0415
+
+    caplog.set_level(logging.WARNING)
+    text = "malformed ciphertext (bad base64, key_id='k1')"
+    for exc in (
+        CorruptQueueCellError(f"the queue row's payload is corrupt ({text})"),
+        QueueTagError(f"integrity: does not open under its own tag ({text})", cause="tag"),
+    ):
+        caplog.clear()
+        fake = _FakeServer(None)
+        assert await _classify(backend, _server_store(backend, fake), exc) is None
+        assert fake.dead_lettered == ["row-1"]
+        warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(f"{type(exc).__name__} (cause {exc.cause})" in m for m in warned), warned
+        assert not any("malformed ciphertext" in m for m in warned), warned
 
 
 def test_the_postgres_unopened_item_carries_the_fault() -> None:

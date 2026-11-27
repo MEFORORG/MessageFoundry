@@ -557,12 +557,17 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
 
 
 def unopenable_log_text(exc: BaseException) -> str:
-    """What a claim's WARNING may say about ``exc``, the error that refused a row's payload: the
-    error's text, except for a corrupt cell (:class:`CorruptQueueCellError`), whose WARNING names
-    only its class (BACKLOG #5982). The corrupt cell's own report, :func:`alert_queue_tag_failure`,
-    says what is wrong with it in :data:`QUEUE_TAG_CAUSES`'s words."""
-    if isinstance(exc, CorruptQueueCellError):
-        return type(exc).__name__
+    """What a WARNING may say about ``exc``, the error that refused a row's payload (BACKLOG #5982).
+
+    **The rule is stated here once.** A :class:`QueueTagError`, drift or a corrupt cell
+    (:class:`CorruptQueueCellError`) and under any cipher, is named by its class and cause only:
+    its text embeds the cipher's refusal, and its report, :func:`alert_queue_tag_failure`, says
+    what is wrong in :data:`QUEUE_TAG_CAUSES`'s words. The cipher's reason is not lost: a claim
+    keeps it in the dead-lettered row's ``last_error``, and a DEBUG record carries it where the
+    log level admits DEBUG, which a production tier refuses. Any other error keeps its text, at
+    least a cell under a key this process does not hold, whose text can echo part of its marker."""
+    if isinstance(exc, QueueTagError):
+        return f"{type(exc).__name__} (cause {exc.cause})"
     return str(exc)
 
 
@@ -635,16 +640,15 @@ def alert_queue_tag_failure(
     so. Names the row by its stage and a short id prefix, never a row value. The reason says what
     ``error.cause`` says, in :data:`QUEUE_TAG_CAUSES`'s words (BACKLOG #5884). A corrupt cell
     (:class:`CorruptQueueCellError`) alerts under its own subject
-    (:data:`QUEUE_CORRUPT_ALERT_TABLE`). Its WARNING, like drift's, carries no text of the cipher's
-    (BACKLOG #5982); the cipher's reason goes to a DEBUG record only. Unlike the tagged-cell path's
-    WARNING, none of these is rate-limited. Never raises."""
+    (:data:`QUEUE_CORRUPT_ALERT_TABLE`). The WARNING carries none of the error's text, by the rule
+    :func:`unopenable_log_text` states. Unlike the tagged-cell path's WARNING, none of these is
+    rate-limited. Never raises."""
     ref = str(row["id"])[:_ROW_REF_LEN]
     reason = f"a {row['stage']} queue row {QUEUE_TAG_CAUSES[error.cause]} and {outcome} (row {ref})"
     _log.warning("%s", reason)
-    if not error.drift:
-        # The text, not the error: a record keeps its args, and the error's traceback holds the
-        # claim frame's locals, which can include other rows' opened bodies.
-        _log.debug("%s: %s", reason, str(error))
+    # The text, not the error: a record keeps its args, and the error's traceback holds the claim
+    # frame's locals, which can include other rows' opened bodies.
+    _log.debug("%s: %s", reason, str(error))
     report = getattr(cipher, "report_tag_failure", None)
     if callable(report):
         report("queue" if error.drift else QUEUE_CORRUPT_ALERT_TABLE, reason)
