@@ -902,9 +902,12 @@ def keyed_repo(repo: Path) -> Path:
 
 def plant_seat(repo: Path, holder: Path, session: str, lifecycle: str, age_s: float = 0) -> None:
     lib = repo / "scripts" / "coord"
+    # Keyed from git's own spelling of the holder, which is what the claim records: a tmp_path
+    # under an 8.3 TEMP can spell the same directory differently.
+    top = git(holder, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
     script = (
         f". '{lib / 'coord-root.ps1'}'; . '{lib / 'mail-key.ps1'}'; "
-        f"ConvertTo-BoxKey -Path (Resolve-BoxPath -Path '{holder}')"
+        f"ConvertTo-BoxKey -Path (Resolve-BoxPath -Path '{top}')"
     )
     key = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -916,7 +919,8 @@ def plant_seat(repo: Path, holder: Path, session: str, lifecycle: str, age_s: fl
     common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
     box = Path(common) / "mefor-coord" / "seats" / key
     box.mkdir(parents=True, exist_ok=True)
-    rec = {"worktree": str(holder), "sessionKey": session, "lifecycle": lifecycle}
+    as_of = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_s))
+    rec = {"worktree": top, "sessionKey": session, "lifecycle": lifecycle, "asOf": as_of}
     if lifecycle != "open":
         rec["lifecycleAt"] = CLOSED_AT
     f = box / f"{session}.json"

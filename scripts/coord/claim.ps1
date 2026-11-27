@@ -472,19 +472,32 @@ function Get-OccupancyForHolder([string]$HeldPath) {
 # declared yet, and nothing on this host proves a session gone (#1348 above). So it is a field
 # beside State, never a State of its own, and no branch below reads it to refuse, release or
 # recommend -Force. Any failure to look reads as no evidence at all.
-$script:HolderSeatsDir = $null   # $null = not resolved yet; '' = could not be resolved.
+$script:HolderSeatsDirs = @{}   # repository key -> its seats directory, '' where it did not resolve
+$script:HolderSeatClose = @{}   # holder path -> the evidence line, $null for none
 
 function Get-HolderSeatClose([string]$HeldPath) {
+    # Memoised per holder path, because -List walks every claim and one worktree holds many.
+    $pathKey = ConvertTo-ExactPathKey $HeldPath
+    if ($script:HolderSeatClose.ContainsKey($pathKey)) { return $script:HolderSeatClose[$pathKey] }
+    $script:HolderSeatClose[$pathKey] = $null
     try {
-        if ($null -eq $script:HolderSeatsDir) {
-            $script:HolderSeatsDir = ''
-            $r = Resolve-CoordDir -From $registryRepo -Kind 'seats'
-            if (-not $r.Error -and $r.Path) { $script:HolderSeatsDir = $r.Path }
+        if (-not (Get-Command ConvertTo-BoxKey -EA SilentlyContinue)) { return $null }
+        # Resolved from the HOLDER, as seat.ps1 resolves it when that session writes, not from the
+        # claim registry's repository: with mefor.claimsRoot set the two can be different clones.
+        # One resolve per repository, keyed by its git common dir where occupancy.ps1 loaded.
+        $repoKey = if (Get-Command Get-OwningGitCommonDir -EA SilentlyContinue) { Get-OwningGitCommonDir $HeldPath } else { $null }
+        if (-not $repoKey) { $repoKey = $pathKey }
+        if (-not $script:HolderSeatsDirs.ContainsKey($repoKey)) {
+            $script:HolderSeatsDirs[$repoKey] = ''
+            $r = Resolve-CoordDir -From $HeldPath -Kind 'seats'
+            if (-not $r.Error -and $r.Path) { $script:HolderSeatsDirs[$repoKey] = $r.Path }
         }
-        if (-not $script:HolderSeatsDir -or -not (Get-Command ConvertTo-BoxKey -EA SilentlyContinue)) { return $null }
-        $ended = Get-CoordSeatEnded -Dir (Join-Path $script:HolderSeatsDir (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $HeldPath)))
+        $seats = $script:HolderSeatsDirs[$repoKey]
+        if (-not $seats) { return $null }
+        $ended = Get-CoordSeatEnded -Dir (Join-Path $seats (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $HeldPath)))
         if (-not $ended) { return $null }
-        return "holder's seat record self-declared $($ended.Lifecycle) at $($ended.At)"
+        $script:HolderSeatClose[$pathKey] = "holder's seat record self-declared $($ended.Lifecycle) at $($ended.At)"
+        return $script:HolderSeatClose[$pathKey]
     }
     catch { return $null }
 }
