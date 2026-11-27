@@ -159,8 +159,13 @@ def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
     negative one drives nothing and then reads the empty run as a verdict. Checked at entry, before any
     coord wait or child spawn, so a bad value is a setup error rather than a stall or a fake rung."""
     for name, value in (("aggregate_rate", aggregate_rate), ("hold_seconds", hold_seconds)):
-        if not (math.isfinite(value) and value > 0):
+        if not _finite_above_zero(value):
             raise DriveShapeError(f"{name} must be a finite number above 0, got {value!r}")
+
+
+def _finite_above_zero(value: float) -> bool:
+    """The drive-shape predicate: a finite number above 0 (NaN, infinities, 0 and negatives fail)."""
+    return math.isfinite(value) and value > 0
 
 
 #: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
@@ -942,6 +947,39 @@ class ShardCertNode(EngineNode):
             *_insecure_bind_args(self._env),
         )
 
+    #: Whether the process was still running when :meth:`kill` was last called. False until then, so a
+    #: node the rig never killed, or one that had already exited, is never read as a crash the rig caused.
+    killed_while_running = False
+
+    def kill(self) -> None:
+        self.killed_while_running = self.alive
+        super().kill()
+
+    async def wait_exited(self, timeout: float) -> bool:
+        """True once this node's root process has exited, waiting at most ``timeout`` seconds. False if
+        it is still running then, or was never started. On Windows the root is the venv launcher where
+        there is one, and ending it ends the interpreter under it (measured in
+        ``tests/test_engine_node_process_tree.py``).
+
+        The kill leg's check that :meth:`kill` took effect (BACKLOG #5440). ``kill()`` reports nothing:
+        ``terminate_job`` ignores a failed ``TerminateJobObject``, and a ``PermissionError`` from the
+        root's own kill is suppressed. So the effect is checked rather than the call trusted; otherwise
+        :meth:`stop` would shut a live process down GRACEFULLY, and the run would certify that graceful
+        stop as crash recovery."""
+        proc = self._proc
+        if proc is None:
+            return False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+
+#: How long :func:`_restart_killed` waits for a SIGKILLed engine shard's process to exit before it calls
+#: the kill failed. Matches :meth:`EngineNode.stop`'s own wait for a terminated process.
+_KILL_EXIT_TIMEOUT = 10.0
+
 
 def _copies_ok(delivering: int, acked_copies_missing: int) -> bool:
     """The per-message copy check both co-located and driver pass bars gate on (BACKLOG #5575, #5640):
@@ -1054,6 +1092,10 @@ class ShardCertReport:
     e2e_second_half_count: int = 0
     ack_p50_ms: float = 0.0  # ACK-on-receipt latency (across every shard lane)
     ack_p99_ms: float = 0.0
+    #: Kill leg only, reported and not gated: from the kill instant to the restarted engine shard's health.
+    #: It includes at least the rest of the hold, the senders' ACK grace (up to 2 s), the wait for the killed
+    #: process to exit, the killed node's ``stop()`` and the restart's start (:func:`_restart_killed`), so
+    #: it bounds the engine's own recovery from above rather than measuring it.
     recovery_seconds: float | None = None
     notes: list[str] = field(default_factory=list)
     # BACKLOG #209 topology: the shape this run SERVED. `dests` is the destination-CONNECTION count
@@ -1190,7 +1232,13 @@ class ShardCertReport:
             # v6 (BACKLOG #5440) — the PASS bar CHANGED: `correctness.dead_total` is new and gated. A v5 PASS
             # checked only the outbound-scoped `engine_dead`, so work dead-lettered at the routed stage could
             # PASS; a v6 PASS also requires no dead row at any stage.
-            "schema_version": 6,
+            #
+            # v7 (BACKLOG #5440, S27-57) — `correctness.engine_dead` MEANING CHANGED: it is the store's count,
+            # where a v6 value was that count summed over every engine shard (N times it). Zero is zero in both,
+            # so the PASS bar is unchanged. `recovery_seconds`, reported and not gated, still runs from the kill,
+            # but the kill now lands at the kill deadline rather than at the first tick past it, and the span
+            # now includes the wait for the killed process to exit and its node's stop(); see the field.
+            "schema_version": 7,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -1356,8 +1404,8 @@ class StoreResetFailed(RuntimeError):
     """:func:`_reset_store` could not empty a table, so the run would certify against stale rows."""
 
 
-#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (today: a
-#: :class:`StoreResetFailed`), so the drive half stops at once instead of waiting out its whole
+#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (at least a
+#: :class:`StoreResetFailed` and a refused kill leg, :class:`KillLegError`), so the drive half stops at once instead of waiting out its whole
 #: ``shards_ready_timeout`` for a SHARDS_READY that will never come.
 ENGINE_SETUP_FAILED = "engine_setup_failed"
 
@@ -1719,6 +1767,7 @@ async def run_shardcert(
         reg = load_config(_CONFIG_DIR)
     ids_list = shard_ids(reg)
     owned = {s: sorted(owned_destination_set(reg, s, ids_list)) for s in ids_list}
+    require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list, hold_seconds)
     n = len(ids_list)
     # Lanes per shard (many-thin-lanes): the built graph has N*lanes inbound rows, so derive it from the
     # registry rather than re-reading the env (keeps the driver and the served graph in lock-step).
@@ -1817,10 +1866,7 @@ async def run_shardcert(
     e2e_first_hist: Histogram | None = None
     e2e_second_hist: Histogram | None = None
     e2e_drain_hist: Histogram | None = None
-    killed = kill_shard if kill else None
-    if kill and killed is None:
-        # Kill the shard that owns the MOST lanes (maximizes recovery coverage).
-        killed = max(ids_list, key=lambda s: len(owned[s]))
+    killed = _choose_killed(kill, kill_shard, ids_list, owned)
     recovery_seconds: float | None = None
 
     try:
@@ -1828,9 +1874,11 @@ async def run_shardcert(
         # at N>=4 simultaneous opens (multishard.py:426 documents the 30s-timeout blowout).
         for i, s in enumerate(ids_list):
             node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
+            # Registered BEFORE it starts (BACKLOG #5440, S27-56): the node opened its log when it was
+            # built, so the teardown below must stop one whose start raised too.
+            nodes[s] = node
             # One store for the fleet: the first shard provisions the rig Administrator.
             await node.start(provision=i == 0)
-            nodes[s] = node
             if not await _await_health(node.url, timeout=60.0):
                 raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
             # Each shard binds `lanes` inbound ports (base + i*lanes + l); wait for every one.
@@ -1911,7 +1959,20 @@ async def run_shardcert(
                 metrics.counters.deferred += behind  # THE RIG could not schedule these at all
                 metrics.counters.deferred_schedule += behind
                 next_due = now + interval
-            await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
+            pause = min(next_due - loop.time(), _MAX_TICK_SLEEP)
+            if kill and not did_kill:
+                # BACKLOG #5440 (S27-55): wake at the kill instant, so a tick never sleeps past it and the
+                # kill always lands inside the hold, under load.
+                pause = min(pause, (kill_deadline or 0) - time.monotonic())
+            await asyncio.sleep(max(0.0, pause))
+        if kill and not did_kill:
+            # BACKLOG #5440 (S27-55): the loop overslept the kill instant AND the end of the hold (a stalled
+            # event loop, or a hold of 0). No kill happened under load, so there is no kill leg to certify:
+            # fail the run rather than kill now and report a recovery from a crash with no load behind it.
+            # The teardown below stops the fleet; the restart is never reached.
+            raise RuntimeError(
+                f"kill leg never fired: the hold ended before the kill instant of engine shard {killed}"
+            )
 
         # HOLD OVER — FREEZE the second half HERE, before anything post-hold can land in it. Everything
         # from this instant on (the 2 s ACK grace, the kill/restart leg, the whole `await_drain` window) is
@@ -1931,13 +1992,10 @@ async def run_shardcert(
 
         # Kill leg: restart the killed shard (supervisor-style) so its startup runs the
         # ownership-scoped reset over ITS lanes; time functional recovery.
-        if kill and killed is not None:
-            idx = ids_list.index(killed)
-            restart = ShardCertNode(
-                killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
+        if did_kill and killed is not None:
+            restart = await _restart_killed(
+                nodes, killed, api_ports[ids_list.index(killed)], env=node_env, cwd=cwd
             )
-            await restart.start(provision=False)
-            nodes[killed] = restart
             if not await _await_health(restart.url, timeout=60.0):
                 raise RuntimeError(f"shard {killed} did not restart\n{_shown_tail(restart)}")
             if kill_at is not None:
@@ -2012,9 +2070,11 @@ async def run_shardcert(
         lane_inversions=tracker.lane_inversions,
         lanes_observed=tracker.lanes_observed,
         lane_repeats=tracker.lane_repeats,
-        engine_done=(final.done if final else 0),
+        # BACKLOG #5440 (S27-57): every engine shard's /stats counts the ONE unified store, so the poller's
+        # sum is N times the store's count; de-dup it as in_pipeline_final below is.
+        engine_done=(_store_view_rounded_up(final.done, max(1, len(ids_list))) if final else 0),
         # -1 = no poller sample, so an unmeasured dead count fails the pass bars rather than reading clean.
-        engine_dead=(final.dead if final else -1),
+        engine_dead=(_store_view_rounded_up(final.dead, max(1, len(ids_list))) if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
         in_pipeline_final=(
@@ -2708,7 +2768,10 @@ class ShardCertLadderReport:
             # record: `lanes_observed`, `engine_dead`, `dead_total` and `correctness_ok` are new. A rung that
             # breaks that bar pins nothing (`pinned_rate` skips it) and stops the climb, so a v4 FAIL may
             # carry fewer records than a v3 one.
-            "schema_version": 4,
+            #
+            # v5 (BACKLOG #5440, S27-57): per-record `engine_dead` is the store's count, where a v4 value was
+            # that count summed over every engine shard. The verdict is unchanged.
+            "schema_version": 5,
             "kind": "shardcert_ladder",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -3159,6 +3222,109 @@ def _escapes(inbound_bind_host: str) -> dict[str, str]:
     }
 
 
+class KillLegError(ValueError):
+    """A kill leg asked for an engine shard the fleet does not have, a hold with no load to kill under,
+    or a kill instant that is not inside the hold (:func:`require_kill_leg`)."""
+
+
+def require_kill_leg(
+    kill: bool,
+    kill_shard: str | None,
+    kill_at_fraction: float,
+    ids_list: Sequence[str],
+    hold_seconds: float,
+) -> None:
+    """Refuse a kill leg whose settings put the kill outside this fleet or outside the hold (BACKLOG #5440,
+    S27-55). It does not prove load was flowing at the kill instant: a positive fraction small enough still
+    kills before the co-located loop's first tick sends, and the two-box engine cannot see when the drive
+    half stops.
+
+    Checked before the store reset and the fleet launch. A ``kill_shard`` outside ``ids_list`` used to
+    surface as a ``KeyError`` at the kill instant, mid-hold. A ``kill_at_fraction`` of 1 or more never fired
+    on the co-located bench, which then started a second process over the live engine shard, and fired after
+    the hold on the two-box engine. One of 0 kills before the first message is sent. So the fraction must be
+    strictly between 0 and 1, as a failover profile's ``kill_at_fraction`` must; the comparison refuses NaN
+    too. The hold must be a finite number above 0, as :func:`require_drive_shape` requires of a drive: a
+    hold of 0 or less has no load to kill under, and a NaN one makes the kill delay NaN. Nothing is checked
+    when ``kill`` is false, as nothing reads the other settings for a kill then."""
+    if not kill:
+        return
+    if not _finite_above_zero(hold_seconds):
+        raise KillLegError(
+            f"hold_seconds must be a finite number above 0 for a kill leg, got {hold_seconds!r}"
+        )
+    if not 0.0 < kill_at_fraction < 1.0:
+        raise KillLegError(
+            f"kill_at_fraction must be strictly between 0 and 1, got {kill_at_fraction!r}"
+        )
+    if not ids_list:
+        raise KillLegError("kill leg: the fleet has no engine shard to kill")
+    if kill_shard is not None and kill_shard not in ids_list:
+        raise KillLegError(
+            f"kill_shard {kill_shard!r} is not an engine shard of this fleet ({', '.join(ids_list)})"
+        )
+
+
+def _restart_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` for a killed engine shard's restart, with any ``MEFOR_BENCH_KEEP_NODE_LOGS`` moved to its
+    ``restart`` subdirectory (BACKLOG #5440, S27-56). :class:`EngineNode` opens ``<keep>/<node_id>.log``
+    for writing when it is built, and the restart has the killed node's id, so in the same directory it
+    emptied the pre-kill log. A separate directory keeps both logs and renames nothing, so a handle the
+    killed tree still holds on Windows cannot get in the way."""
+    restart_env = dict(env)
+    keep_dir = restart_env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
+    if keep_dir:
+        restart_env["MEFOR_BENCH_KEEP_NODE_LOGS"] = str(Path(keep_dir) / "restart")
+    return restart_env
+
+
+async def _restart_killed(
+    nodes: dict[str, ShardCertNode],
+    killed: str,
+    api_port: int,
+    *,
+    env: Mapping[str, str],
+    cwd: Path,
+) -> ShardCertNode:
+    """Replace the SIGKILLed ``nodes[killed]`` with a fresh ``serve --shard`` (supervisor-style).
+
+    BACKLOG #5440 (S27-56): the killed node is stopped first, because ``kill()`` neither reaps the process
+    nor closes its log, and overwriting its entry dropped the only reference the caller's teardown had. The
+    restart is registered BEFORE it starts, so a start that raises is still stopped by that teardown.
+
+    BACKLOG #5440: the kill must be seen to have taken effect before that stop. ``kill()`` can fail
+    silently (:meth:`ShardCertNode.wait_exited`), and ``stop()`` would then end the live process
+    gracefully, so a recovery timed after it would certify a graceful stop as crash recovery. A process
+    still running :data:`_KILL_EXIT_TIMEOUT` seconds on fails the run; it stays in ``nodes``, so the
+    caller's teardown stops it. So does a process that had already exited when it was killed: the rig
+    caused no crash then.
+
+    The caller's ``recovery_seconds`` runs from the kill instant to the restart's health, so it includes
+    this wait for the exit, the old node's ``stop()`` (on a process already gone, the log close and the job
+    teardown) and the restart's start, besides what the caller itself spends before calling this."""
+    old = nodes[killed]
+    if not old.killed_while_running:
+        # It exited on its own before the kill (an engine crash the rig did not cause), so kill() was a
+        # no-op and a recovery timed from it would be credited to a crash the rig never made.
+        raise RuntimeError(
+            f"engine shard {killed} had already exited when the kill leg killed it, so the rig caused no "
+            "crash and no crash recovery can be certified"
+        )
+    if not await old.wait_exited(_KILL_EXIT_TIMEOUT):
+        raise RuntimeError(
+            f"the kill of engine shard {killed} did not take effect: its process was still running when "
+            f"the restart began, and {_KILL_EXIT_TIMEOUT:.0f}s after that, so no crash recovery can be "
+            "certified"
+        )
+    await old.stop()
+    restart = ShardCertNode(
+        killed, api_port, env=_restart_env(env), config_dir=_CONFIG_DIR, cwd=cwd
+    )
+    nodes[killed] = restart
+    await restart.start(provision=False)
+    return restart
+
+
 def _choose_killed(
     kill: bool, kill_shard: str | None, ids_list: list[str], owned: dict[str, list[str]]
 ) -> str | None:
@@ -3186,12 +3352,13 @@ async def _start_shards(
     (the SS schema-init applock convoys at N>=4 simultaneous opens). Each shard binds ``lanes`` inbound
     ports (lane ``l`` of shard ``i`` on ``inbound_base + i*lanes + l``); EVERY one is readiness-gated at
     ``preflight_host``. Populates ``nodes`` as it goes — a partially-started fleet is left in ``nodes`` so
-    the caller's ``finally`` still tears it down."""
+    the caller's ``finally`` still tears it down. Each node is registered BEFORE it starts (BACKLOG #5440,
+    S27-56): it opens its log when it is built, so one whose start raised must be stopped too."""
     for i, s in enumerate(ids_list):
         node = ShardCertNode(s, api_ports[i], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd)
+        nodes[s] = node
         # One store for the fleet: the first shard provisions the rig Administrator.
         await node.start(provision=i == 0)
-        nodes[s] = node
         if not await _await_health(node.url, timeout=60.0):
             raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
         for lane in range(lanes):
@@ -3290,6 +3457,10 @@ class ShardCertEngineReport:
     routed_stranded: int = -1
     outbound_stranded: int = -1
     in_pipeline_final: int = -1
+    #: Kill leg only, reported and not gated: from the kill instant to the restarted engine shard's health.
+    #: It includes at least the rest of the hold, the wait for the killed process to exit, the killed node's
+    #: ``stop()`` and the restart's start (:func:`_restart_killed`), so it bounds the engine's own recovery
+    #: from above rather than measuring it.
     recovery_seconds: float | None = None
     #: D1: the engine-side drain duration (this box's own await_drain elapsed) — the RELIABLE drain the drive
     #: uses for the honest sustainable rate (its own remote drain misses under load). Guaranteed non-None
@@ -3549,9 +3720,24 @@ async def run_shardcert_engine(
     store_env = dict(store_env or {})
     routing = load_routing()
     handlers, delivering = _resolve_shape(dests, handlers, delivering)
+    # A stale failure from an earlier run of this run id must not be read as this one's. Cleared first, so a
+    # drive half started after this run began never reads an earlier run's refusal below as its own.
+    coord.clear_messages(ENGINE_SETUP_FAILED)
     ids_list, owned, n, lanes, band_note = _discover(
         dests, handlers, delivering, routing, strict_bands=strict_bands
     )
+    try:
+        require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list, hold_seconds)
+    except KillLegError:
+        # Tell a waiting drive half at once, as _reset_store_or_signal does, with a fixed reason. A coord
+        # write error must not replace the refusal, so it is logged rather than raised.
+        try:
+            coord.post(
+                ENGINE_SETUP_FAILED, {"reason": "kill leg refused (see the engine box's stderr)"}
+            )
+        except OSError as exc:
+            _log.warning("could not post %s for the refused kill leg: %s", ENGINE_SETUP_FAILED, exc)
+        raise
     # The ACCOUNTING pair the DRIVE box must gate on. Under `partitioned` the graph BUILDS H = D = dests
     # (every handler owns a destination) but the router selects ONE, so the fan-out per message is 1 and the
     # reported pair is (1, 1). Posting the BUILD pair instead would make the drive expect S == A*dests against
@@ -3584,8 +3770,6 @@ async def run_shardcert_engine(
     # record, not left to whatever MEFOR_PIPELINE_CLAIM_MODE happened to be in the parent env.
     node_env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
 
-    # A stale failure from an earlier run of this run id must not be read as this one's.
-    coord.clear_messages(ENGINE_SETUP_FAILED)
     await _reset_store_or_signal(coord, node_env)
 
     killed = _choose_killed(kill, kill_shard, ids_list, owned)
@@ -3601,6 +3785,9 @@ async def run_shardcert_engine(
     in_pipeline_final = -1
     node_pids: dict[str, tuple[str, int | None]] = {}
     in_pipeline_trace: list[list[float]] = []
+    # Out here so the teardown can cancel it: a hold that is cancelled or raises must not leave the timer to
+    # SIGKILL an engine shard after the run is over (BACKLOG #5440, S27-55).
+    kill_task: asyncio.Task[float] | None = None
     try:
         # Bring the fleet up. Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a
         # 0.0.0.0 listener) — the DRIVER separately proves off-box reachability from its side.
@@ -3681,7 +3868,6 @@ async def run_shardcert_engine(
 
         # Arm the LOCAL SIGKILL timer relative to WHEN WE OBSERVED DRIVE_START (no cross-box clock
         # compare). The kill is a local PID op on a timer — WS-C has no remote-kill leg.
-        kill_task: asyncio.Task[float] | None = None
         if kill and killed is not None:
             delay = _kill_delay(kill_at_fraction, hold_seconds)
             kill_task = asyncio.create_task(_kill_after(nodes[killed], delay))
@@ -3718,12 +3904,9 @@ async def run_shardcert_engine(
         # Kill leg: restart the killed shard (supervisor-style) so its startup runs the ownership-scoped
         # reset over ITS lanes; time functional recovery from the kill instant.
         if kill and killed is not None:
-            idx = ids_list.index(killed)
-            restart = ShardCertNode(
-                killed, api_ports[idx], env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
+            restart = await _restart_killed(
+                nodes, killed, api_ports[ids_list.index(killed)], env=node_env, cwd=cwd
             )
-            await restart.start(provision=False)
-            nodes[killed] = restart
             # The restarted shard is a NEW subprocess (new PID) — refresh the correlation map so a
             # post-kill CPU sample attributes to the survivor process, not the reaped pre-kill one.
             node_pids[killed] = (restart.node_id, getattr(restart, "pid", None))
@@ -3755,7 +3938,9 @@ async def run_shardcert_engine(
             with contextlib.suppress(CoordTimeout):
                 await coord.await_message(abort_signal, timeout=_ABORT_MARKER_GRACE)
                 rung_aborted = True
-        engine_dead = final.dead if final else 0
+        # BACKLOG #5440 (S27-57): the poller sums N engine shards' /stats over ONE unified store, so de-dup
+        # the dead count as in_pipeline_final below is.
+        engine_dead = _store_view_rounded_up(final.dead, max(1, len(ids_list))) if final else 0
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
@@ -3829,9 +4014,25 @@ async def run_shardcert_engine(
             )
         await asyncio.sleep(post_drain_grace)
     finally:
+        # Cancelled first, so the timer cannot fire on a node being stopped; awaited only after the stops,
+        # so a cancel of THIS task that arrives during that wait cannot leave the fleet running.
+        pending_kill = kill_task if kill_task is not None and not kill_task.done() else None
+        if pending_kill is not None:
+            pending_kill.cancel()
         for node in nodes.values():
             with contextlib.suppress(Exception):
                 await node.stop()
+        if pending_kill is not None:
+            # Swallow only the timer's own CancelledError (R11): a cancel of THIS task that arrives while it
+            # waits here raises the cancelling() count, and that one propagates.
+            me = asyncio.current_task()
+            cancels = me.cancelling() if me is not None else 0
+            try:
+                await pending_kill
+            except asyncio.CancelledError:
+                if me is not None and me.cancelling() > cancels:
+                    raise
+                _log.info("cancelled the pending kill timer of engine shard %s in teardown", killed)
 
     return ShardCertEngineReport(
         shards=tuple(ids_list),
