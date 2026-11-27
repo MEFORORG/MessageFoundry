@@ -33,7 +33,7 @@ def _rec(
     drain_seconds: float | None = 1.0,
 ) -> ConnScaleRecord:
     """One synthetic record on the ``fuse`` or ``batch`` axis, B1 when ``b1``."""
-    detail = "ok" if no_loss_ok else "engine counters went backwards"
+    detail = "ok" if no_loss_ok else f"lost {sent - sink_received}"
     return ConnScaleRecord(
         sweep_mode=_CELL[1],
         count=_CELL[2],
@@ -83,9 +83,25 @@ def _arm(b1: bool, axis: str, reads: list[float], **kw: object) -> list[ConnScal
     return [_rec(b1=b1, axis=axis, read=r, **kw) for r in reads]  # type: ignore[arg-type]
 
 
+def _inconclusive(recs: list[ConnScaleRecord], detail: str) -> list[ConnScaleRecord]:
+    """The same trials with an INCONCLUSIVE reconcile carrying ``detail``."""
+    return [
+        replace(r, no_loss=replace(r.no_loss, ok=False, inconclusive=True, detail=detail))
+        for r in recs
+    ]
+
+
 def _reset(recs: list[ConnScaleRecord]) -> list[ConnScaleRecord]:
-    """The same trials with an INCONCLUSIVE reconcile, as a counter reset leaves them."""
-    return [replace(r, no_loss=replace(r.no_loss, ok=False, inconclusive=True)) for r in recs]
+    """The same trials as a mid-step counter reset leaves them: INCONCLUSIVE."""
+    return _inconclusive(recs, "engine counters went backwards (read 900 -> 10, written 900 -> 10)")
+
+
+def _drowned(recs: list[ConnScaleRecord]) -> list[ConnScaleRecord]:
+    """The same trials as a timed-out drain leaves them: no drain time, INCONCLUSIVE."""
+    return [
+        replace(r, drain_seconds=None)
+        for r in _inconclusive(recs, "backlog 40 not drained (in_pipeline 40 not done)")
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -99,9 +115,13 @@ def test_batch_lift_reason_names_batching_and_adr_0075_not_fusion() -> None:
     assert cmp is not None
     reason = cmp.rows[0].reason
     assert cmp.rows[0].verdict == FUSE_NO_GO
-    assert "statement batching banked no worthwhile margin" in reason
-    assert "ADR 0075" in reason
+    # ADR 0075's Amendment superseded the single-RTT bar, so a batch lift under it is no null
+    # result, and the reason does not call it one or name a default-OFF the lever no longer has.
+    assert "statement batching did not clear the single-RTT lift bar" in reason
+    assert "ADR 0075's Amendment superseded" in reason
+    assert "banked no worthwhile margin" not in reason and "default-OFF" not in reason
     assert "fusion" not in reason.lower() and "ADR 0071" not in reason
+    assert reason.isascii()
 
 
 def test_fusion_lift_reason_is_unchanged() -> None:
@@ -164,10 +184,26 @@ def test_the_sigma_label_names_the_multiple_applied() -> None:
     assert one is not None
     assert "establish the 2.5sigma spread" in one.rows[0].reason
 
+    # A multiple :g would round still reads as given.
+    odd = build_fuse_comparison(recs, (False, True), sigma_multiple=2.1234567)
+    assert odd is not None
+    assert "> 2.1234567sigma |" in odd.render_table()
+
     # The default multiple still reads "2sigma", as before.
     default = build_fuse_comparison(recs, (False, True))
     assert default is not None
     assert "2sigma=" in default.render_table() and "> 2sigma," in default.rows[0].reason
+    assert "lift >= 10% AND" in default.render_table()
+
+
+def test_the_lift_bar_label_names_the_bar_applied() -> None:
+    # 12.4% under a 12.5% bar read "lift +12.4% < 12%" and "lift >= 12%" under the :.0f label.
+    recs = _arm(False, "fuse", [100.0, 100.1, 99.9]) + _arm(True, "fuse", [112.4, 112.5, 112.3])
+    cmp = build_fuse_comparison(recs, (False, True), min_lift_pct=12.5)
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "< 12.5% --" in cmp.rows[0].reason
+    assert "lift >= 12.5% AND" in cmp.render_table()
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +238,7 @@ def test_an_inconclusive_b1_under_the_lift_bar_is_inconclusive_not_banked_nothin
 def test_an_inconclusive_b1_still_meets_the_definite_no_gos_first() -> None:
     # The drain and keeping-up guards read the drain gauge and the sink, not the engine counters,
     # so an INCONCLUSIVE reconcile does not pre-empt them.
-    undrained = _reset(_arm(True, "fuse", [130.0, 131.0, 129.0], drain_seconds=None))
+    undrained = _drowned(_arm(True, "fuse", [130.0, 131.0, 129.0]))
     cmp = build_fuse_comparison(
         _arm(False, "fuse", [100.0, 101.0, 99.0]) + undrained, (False, True)
     )
@@ -239,9 +275,11 @@ def test_a_drained_inconclusive_b0_trial_is_no_reference_for_a_go() -> None:
 
 
 def test_a_drowned_or_lossy_b0_is_still_a_reference() -> None:
-    # The drowning-baseline case stands: a B0 whose drain timed out read its counters, so a
-    # fully-draining B1 with the lift is a GO. So is a B0 trial that proved a loss.
-    drowned = _reset(_arm(False, "fuse", [100.0, 101.0, 99.0, 100.0], drain_seconds=None))
+    # The drowning-baseline case stands: a B0 whose drain timed out (and whose counters did not
+    # reset) is still a measurement, so a fully-draining B1 with the lift is a GO. So is a B0
+    # trial that proved a loss. The record carries no reset flag, so a drowned or lossy trial
+    # whose counters ALSO reset is read the same way: the known gap `_fuse_verdict` names.
+    drowned = _drowned(_arm(False, "fuse", [100.0, 101.0, 99.0, 100.0]))
     cmp = build_fuse_comparison(
         drowned + _arm(True, "fuse", [120.0, 121.0, 119.0, 120.0]), (False, True)
     )
