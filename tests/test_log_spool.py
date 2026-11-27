@@ -1812,6 +1812,7 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     earlier.append(_entry(0))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
         assert _open_forward_spool(_forward_to(spool_dir)) is None  # held by `earlier`
+    earlier.close()  # before the wording asserts, so a failing one leaves no lock held
     assert "in use by another process" in caplog.text and "still holds" not in caplog.text
     [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
     assert in_use.levelno == logging.WARNING
@@ -1823,8 +1824,9 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert "Another process usually holds the lock, but a fault taking the lock reads" in facts
     # ``_open_forward_spool`` runs once, at configure time, so only a restart retries the lock.
     assert "runs without an on-disk spool until it restarts with a spool it can lock." in facts
-    # The stranding fact, over every way a process's directory can change: the setting, its
-    # variable, and the default ``__main__._forward_spool_dir`` derives.
+    # The stranding fact, and at least these inputs to the directory ``__main__._forward_spool_dir``
+    # derives: the setting and its variable, the working directory under a relative setting (the
+    # root is ``Path(base)``, never anchored), the shard id, and the store path under no setting.
     assert (
         "Only the process holding a spool directory's lock sends that directory's segments."
         in facts
@@ -1837,7 +1839,9 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "[logging].forward_spool_dir (environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR)"
         in facts
     )
-    assert "the store path or the shard id the default directory is derived from." in facts
+    assert "the working directory when that setting is a relative path" in facts
+    assert "and the engine shard id." in facts
+    assert "it also changes with the store path the default directory is derived from." in facts
     assert 'One directory serves one process (ADR 0200, "One process per directory").' in facts
     # No branch of a procedure: each of these was wrong for some deployment.
     lowered = facts.lower()
@@ -1850,11 +1854,9 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "each of the others",
         "Never change",
         "Leave the process",
-        "where it is",
     ):
         assert imperative.lower() not in lowered, imperative
     assert message.endswith(".")
-    earlier.close()
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
         raise PermissionError(13, "read-only directory")

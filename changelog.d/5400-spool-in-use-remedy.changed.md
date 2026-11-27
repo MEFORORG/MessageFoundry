@@ -4,8 +4,9 @@
   it, but a fault taking the lock reads the same way. This process runs without a spool until it
   restarts with a spool it can lock. Only the process holding a spool directory's lock sends that
   directory's segments, so any change to a process's spool directory leaves the segments in its old
-  directory unsent until a process opens that directory again. That includes a change to
-  `[logging].forward_spool_dir` (environment variable `MEFOR_LOGGING_FORWARD_SPOOL_DIR`), and a
-  change to the store path or the shard id the default directory is derived from. One directory
+  directory unsent until a process opens that directory again. The directory changes with at least
+  `[logging].forward_spool_dir` (environment variable `MEFOR_LOGGING_FORWARD_SPOOL_DIR`), the
+  working directory when that setting is a relative path, and the engine shard id; with no setting,
+  it also changes with the store path the default directory is derived from. One directory
   serves one process (ADR 0200, "One process per directory"). The behaviour is unchanged: it is
   still a WARNING and the engine still starts without a spool. (`BACKLOG #5400`)
