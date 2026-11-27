@@ -1481,6 +1481,7 @@ def _run_shardcert_engine(argv: list[str]) -> int:
     from harness.load.coord import FileDropCoord
     from harness.load.shardcert import (
         InboundBandTooNarrow,
+        KillLegError,
         StoreResetFailed,
         run_shardcert_engine,
     )
@@ -1515,7 +1516,9 @@ def _run_shardcert_engine(argv: list[str]) -> int:
                 strict_bands=args.strict_inbound_bands,
             )
         )
-    except (InboundBandTooNarrow, StoreResetFailed) as exc:
+    except (InboundBandTooNarrow, KillLegError, StoreResetFailed) as exc:
+        # KillLegError (BACKLOG #5440): a kill leg that cannot kill an engine shard of this fleet under
+        # load is refused before the store reset, a setup error like the other two.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except StorePoolOverCliff as exc:

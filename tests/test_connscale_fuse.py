@@ -377,15 +377,17 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
         assert "await_drain timed out" in cmp.rows[0].reason
         assert "no strand is asserted" in cmp.rows[0].reason
         assert "rows stranded" not in cmp.rows[0].reason
-    # A lift under the bar is a definite NO-GO too, which the INCONCLUSIVE label must not pre-empt.
+    # A lift under the bar is NOT a definite NO-GO here: the INCONCLUSIVE reconcile could not judge
+    # the engine counters the intake rate is read from (BACKLOG #5574 item 8; more in
+    # tests/test_b20006_b_compare.py). It still fails closed.
     flat = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))
         for r in _trials(True, [102.0, 103.0, 101.0], no_loss_ok=False)
     ]
     cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + flat, (False, True))
     assert cmp is not None
-    assert cmp.rows[0].verdict == FUSE_NO_GO
-    assert "banked no worthwhile margin" in cmp.rows[0].reason
+    assert cmp.rows[0].verdict == FUSE_INCONCLUSIVE
+    assert "banked no worthwhile margin" not in cmp.rows[0].reason
     assert not cmp.ok
 
 
