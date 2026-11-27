@@ -947,8 +947,13 @@ class ShardCertNode(EngineNode):
             *_insecure_bind_args(self._env),
         )
 
-    #: Whether the process was still running when :meth:`kill` was last called. False until then, so a
-    #: node the rig never killed, or one that had already exited, is never read as a crash the rig caused.
+    #: Whether :attr:`alive` read true when :meth:`kill` was last called. False until then, so a node the
+    #: rig never killed, or one whose exit had already been reaped, is never read as a crash the rig
+    #: caused. At least two exceptions. The reap window: ``alive`` is ``returncode is None``, and
+    #: ``returncode`` is set only once asyncio reaps the exit, so a node that had exited but was not yet
+    #: reaped when killed reads as still running here. And on Windows, whose root is the venv launcher
+    #: where there is one, an engine interpreter that had exited under a launcher still running. In both,
+    #: the node's own exit is then taken for a crash the rig caused.
     killed_while_running = False
 
     def kill(self) -> None:
@@ -1961,8 +1966,10 @@ async def run_shardcert(
                 next_due = now + interval
             pause = min(next_due - loop.time(), _MAX_TICK_SLEEP)
             if kill and not did_kill:
-                # BACKLOG #5440 (S27-55): wake at the kill instant, so a tick never sleeps past it and the
-                # kill always lands inside the hold, under load.
+                # BACKLOG #5440 (S27-55): cap each tick's sleep at the kill instant, so the loop asks to wake
+                # then; timer granularity or a stalled loop can still wake it later (handled below). It does
+                # not mean a message was sent before the kill: a small enough kill fraction still kills
+                # before the first tick sends (`require_kill_leg`).
                 pause = min(pause, (kill_deadline or 0) - time.monotonic())
             await asyncio.sleep(max(0.0, pause))
         if kill and not did_kill:
