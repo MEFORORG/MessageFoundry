@@ -781,24 +781,23 @@ Manager's watch reached the cloud session 29 seconds after its question.
   d20261110T205706609-38b347). Only a statement of what a control does, what it stores, exposes or
   retains included, can be false in the safe direction. One that is false only in the safe
   direction, in a record or as a control claim in any text, does not weaken a control. It is filed
-  under ledger ruling R2 below and does not hold the merge. Safe direction means a reader who acts
-  on the text does more than the control needs, never less. The usual cases are text that overstates
-  what is stored, exposed or retained, or understates what a control guarantees, but only where
-  acting on it passes that test: where storing or retaining something is itself the guarantee,
-  overstating it is the unsafe direction, and understating a guarantee that leads a reader to drop
-  or bypass the control is unsafe too. What still goes to the owner includes at least false program
-  output, which changes behaviour, a false score or a false anchor, always, and a present-tense
-  claim of a live exposure, which section 0 forbids. This narrows the owner's 2026-10-12 ruling, and
-  what goes to the owner with it. The owner's instruction of 2026-11-26, quoted in the
-  repair-Builder paragraph above, named no finding; the rule was set in the Lander's brief written
-  under it, and the owner directed the Manager to follow that brief exactly (2026-11-26, in the
-  Manager's chat). Register text the owner signs, signed or drafted for signing, is outside the
-  safe-direction exception: a finding on it never takes that exception's no-hold route, and every
-  other route in the merge bullet of engine CLAUDE.md section 5 applies as written, including the
-  owner routes in that exception's own list. Decided by the Lander under the owner's delegation of
-  2026-11-26: asked *"Should the safe-direction carve-out exclude register text the owner signs?
-  Reply A or B"*, the owner answered *"/driver"* (records d20261127T011443730-344f46 and
-  d20261127T020909932-9d4da6).
+  under ledger ruling R2 below and does not hold the merge. Register text the owner signs, signed or
+  drafted for signing, is outside the safe-direction exception: a finding on it never takes that
+  exception's no-hold route, and every other route in the merge bullet of engine CLAUDE.md section 5
+  applies as written, including the owner routes in that exception's own list. Decided by the Lander
+  under the owner's delegation of 2026-11-26: asked *"Should the safe-direction carve-out exclude
+  register text the owner signs? Reply A or B"*, the owner answered *"/driver"* (record
+  d20261127T025715932-3a52ad). Safe direction means a reader who acts on the text does more than the
+  control needs, never less. The usual cases are text that overstates what is stored, exposed or
+  retained, or understates what a control guarantees, but only where acting on it passes that test:
+  where storing or retaining something is itself the guarantee, overstating it is the unsafe
+  direction, and understating a guarantee that leads a reader to drop or bypass the control is
+  unsafe too. What still goes to the owner includes at least false program output, which changes
+  behaviour, a false score or a false anchor, always, and a present-tense claim of a live exposure,
+  which section 0 forbids. This narrows the owner's 2026-10-12 ruling, and what goes to the owner
+  with it. The owner's instruction of 2026-11-26, quoted in the repair-Builder paragraph above,
+  named no finding; the rule was set in the Lander's brief written under it, and the owner directed
+  the Manager to follow that brief exactly (2026-11-26, in the Manager's chat).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
