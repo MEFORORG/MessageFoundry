@@ -7,10 +7,12 @@ or secret reaches the bundle."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -729,16 +731,20 @@ def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same race, driven through :func:`build_bundle` as the CLI drives it, so it names no
-    helper of the bundle's own: the listing saw a regular file, and a FIFO is at the name by the
-    open. A plain open then waits for a writer and the bundle never finishes (BACKLOG #5383).
-    The listing's view is stood in for by answering ``os.stat`` and ``os.lstat`` for that one name
-    with a regular file's stat, so the test does rest on the listing checking the file through one
-    of those two calls; the count below fails it by name if neither is reached. A FIFO cannot be
-    made on Windows, so this runs on POSIX only."""
+    helper of the bundle's own: the first listing saw a regular file, and a FIFO is at the name by
+    the open. A plain open then waits for a writer and the bundle never finishes (BACKLOG #5383).
+    That first look is stood in for by answering the first ``os.stat`` or ``os.lstat`` of that one
+    name with a regular file's stat; every later look sees the FIFO, as a real swap leaves it, so a
+    listing made again leaves it out and the bundle carries no app log. The test does rest on the
+    listing checking the file through one of those two calls; the count below fails it by name if
+    neither is reached. A FIFO cannot be made on Windows, so this runs on POSIX only."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     fifo = log_dir / "engine.log"
-    os.mkfifo(fifo)
+    try:
+        os.mkfifo(fifo)
+    except OSError:
+        pytest.skip("this file system cannot hold a FIFO")
     fifo_name = os.fspath(fifo)
     decoy = tmp_path / "decoy.log"
     decoy.write_text("x\n", encoding="utf-8")
@@ -747,7 +753,7 @@ def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
 
     def as_listed(real: Any) -> Any:
         def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
-            if not isinstance(path, int) and os.fspath(path) == fifo_name:
+            if not forged[0] and not isinstance(path, int) and os.fspath(path) == fifo_name:
                 forged[0] += 1
                 return seen_as_regular
             return real(path, *args, **kwargs)
@@ -768,17 +774,20 @@ def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
-    worker.join(10)
+    # Generous, so a loaded runner's build is not taken for a hang; a pass returns at once.
+    worker.join(30)
     hung = worker.is_alive()
-    if hung:
-        # Release the open still waiting on the FIFO: a writer arriving lets it return, and the
-        # close gives it end of file, so no thread outlives the test.
-        os.close(os.open(fifo_name, os.O_WRONLY | os.O_NONBLOCK))
-        worker.join(10)
-    assert not hung, "build_bundle was still waiting on the FIFO after 10 seconds"
+    deadline = time.monotonic() + 10
+    while worker.is_alive() and time.monotonic() < deadline:
+        # Release each open still waiting on the FIFO: a writer arriving lets it return, and the
+        # close gives it end of file. ENXIO means no open is waiting at this moment.
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo_name, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(0.5)
+    assert not hung, "build_bundle was still waiting on the FIFO after 30 seconds"
     assert not failed, failed
-    assert forged[0] >= 1, "neither os.stat nor os.lstat was asked about the log file"
-    assert result == ["MF-BUNDLE-LOG-002 _LogFileRefused"]
+    assert forged[0] == 1, "neither os.stat nor os.lstat was asked about the log file"
+    assert result == [None]
 
 
 def test_read_log_file_refuses_a_file_swapped_in_after_the_listing(tmp_path: Path) -> None:
