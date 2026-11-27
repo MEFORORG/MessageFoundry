@@ -7,9 +7,9 @@
 //
 // The workspace holds the configured service TOML and nothing else, so the fork guard passes on the
 // configured file in both the fixed and the unfixed code: the unfixed code judged that file too, and
-// then started serve, the probe and provision-admin without it. Each test below but the last, a
-// control, fails on that code (engine 5fdb7bceaa, the parent of PR 2966's merge) on its argv or its
-// tooltip, not on a missing symbol.
+// then started serve, the probe and provision-admin without it. The first five tests fail on that
+// code (engine 5fdb7bceaa, the parent of PR 2966's merge) on their argv or tooltip, not on a missing
+// symbol; the rest are controls and the default and blank cases.
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -17,21 +17,24 @@ import * as path from "node:path";
 
 import {
   NODE_SIDE,
-  NO_ADMIN,
-  ADMIN_EXISTS,
+  adminExists,
+  captureProbes,
   changeSetting,
   idle,
   installFakes,
   makeContext,
   mods,
+  noAdmin,
   reset,
   state,
-  uninstallFakes,
+  tearDown,
 } from "./b20008-b-harness";
 
 const FIXTURES = path.join(__dirname, "..", "..", "..", "src", "test", "fixtures");
 const readFixture = <T>(name: string): T => JSON.parse(fs.readFileSync(path.join(FIXTURES, name), "utf8")) as T;
-const SERVE = readFixture<{ serviceConfig: string; serve: string[]; copyLine: string }>("b20008-b-serve-argv.json");
+const SERVE = readFixture<{ serviceConfig: string; configDir: string; serve: string[]; serveDefault: string[]; copyLine: string }>(
+  "b20008-b-serve-argv.json",
+);
 const ADMIN = readFixture<{ serviceConfig: string; provision: string[]; probe: string[] }>("provision-admin-argv.json");
 
 const startSuite = NODE_SIDE ? suite : suite.skip;
@@ -39,51 +42,68 @@ const startSuite = NODE_SIDE ? suite : suite.skip;
 startSuite("the status bar's Start runs every command with the service TOML the guard judged (BACKLOG #5566, #5939)", function () {
   // Above the harness's own 3 s waits, so a wait that runs out fails with its own message.
   this.timeout(10_000);
-  let ws: string;
-  let ctx: ReturnType<typeof makeContext>;
-  let bar: object;
+  let ws: string | undefined;
+  let ctx: ReturnType<typeof makeContext> | undefined;
+  let bar: object | undefined;
 
-  setup(async () => {
-    assert.strictEqual(SERVE.serviceConfig, ADMIN.serviceConfig, "the two fixtures name one file");
+  /** A workspace holding `file` only, the settings set as given, and a registered status bar. */
+  async function open(file: string, settings: Record<string, unknown>): Promise<void> {
     reset();
     ws = fs.mkdtempSync(path.join(os.tmpdir(), "mf-b20008-b-"));
-    // The configured TOML is the only engine file here: no default messagefoundry.toml, no *.db.
-    fs.mkdirSync(path.join(ws, path.dirname(SERVE.serviceConfig)), { recursive: true });
-    fs.writeFileSync(path.join(ws, SERVE.serviceConfig), "");
+    fs.mkdirSync(path.join(ws, path.dirname(file)), { recursive: true });
+    fs.writeFileSync(path.join(ws, file), "");
     state.workspace = ws;
-    state.settings.set("serviceConfig", SERVE.serviceConfig);
+    for (const [key, value] of Object.entries(settings)) {
+      state.settings.set(key, value);
+    }
     installFakes();
     ctx = makeContext();
     bar = mods.statusBar.registerEngineStatusBar(ctx.ctx);
     await idle(bar);
+  }
+
+  setup(async () => {
+    assert.strictEqual(SERVE.serviceConfig, ADMIN.serviceConfig, "the two fixtures name one file");
+    // The configured TOML is the only engine file here: no default messagefoundry.toml, no *.db.
+    await open(SERVE.serviceConfig, { serviceConfig: SERVE.serviceConfig, configDir: SERVE.configDir });
   });
 
   teardown(async () => {
-    await idle(bar);
-    ctx.dispose();
-    uninstallFakes();
-    reset();
-    fs.rmSync(ws, { recursive: true, force: true });
+    await tearDown(bar, ctx, ws);
+    bar = ctx = ws = undefined;
   });
 
-  /** Run the registered Start command: no Administrator at first, so it provisions, then serves. */
+  /**
+   * Run the registered Start command: no Administrator at first, so it provisions, then serves. Its
+   * re-probe timers are captured and dropped, so none outlives the test.
+   */
   async function start(): Promise<void> {
-    state.probeAnswers = [NO_ADMIN, ADMIN_EXISTS];
+    state.probeAnswers = [noAdmin(), adminExists()];
     const run = state.commands.get("messagefoundry.startEngine");
     assert.ok(run !== undefined, "the Start command is registered");
-    await run();
-    assert.ok(
-      !state.warnings.some((w) => /no engine store found/i.test(w)),
-      "the fork guard found the configured service TOML",
-    );
+    await captureProbes(() => run());
+    assert.ok(!state.warnings.some((w) => /no engine store found/i.test(w)), "the fork guard found the service TOML");
+    // The probe's first answer took the no-Administrator branch, not the could-not-check one.
+    assert.ok(!state.warnings.some((w) => /could not check/i.test(w)), state.warnings.join("\n"));
+  }
+
+  /** The one serve terminal Start opened. */
+  function serveTerminal(): { shellPath?: string; shellArgs?: string[]; cwd?: string } {
+    const terms = state.terminals.filter((t) => t.name === "MessageFoundry Engine");
+    assert.strictEqual(terms.length, 1, state.terminals.map((t) => t.name).join(", "));
+    return terms[0].creationOptions;
   }
 
   test("the admin probe runs with the --service-config the guard judged, both times", async () => {
     await start();
     const probes = state.execCalls.filter((c) => c.args.includes("provision-admin"));
     assert.strictEqual(probes.length, 2, JSON.stringify(state.execCalls));
+    const serve = serveTerminal();
     for (const probe of probes) {
       assert.deepStrictEqual(probe.args, ADMIN.probe);
+      // The relative --service-config means the file in the workspace, with serve's interpreter.
+      assert.strictEqual(probe.cwd, ws);
+      assert.strictEqual(probe.command, serve.shellPath);
     }
   });
 
@@ -91,19 +111,19 @@ startSuite("the status bar's Start runs every command with the service TOML the 
     await start();
     const terms = state.terminals.filter((t) => /provision/i.test(t.name));
     assert.strictEqual(terms.length, 1, state.terminals.map((t) => t.name).join(", "));
-    const { shellArgs, cwd } = terms[0].creationOptions;
+    const { shellPath, shellArgs, cwd } = terms[0].creationOptions;
     const m = mods.engineControlModel;
     // The held wrapper, then provision-admin's own argv: the whole list.
     assert.deepStrictEqual(shellArgs, [...m.INTERPRETER_OPTIONS, "-c", m.HOLD_OPEN_SCRIPT, ...ADMIN.provision]);
     assert.strictEqual(cwd, ws);
+    assert.strictEqual(shellPath, serveTerminal().shellPath);
   });
 
   test("serve's terminal runs with the --service-config the guard judged", async () => {
     await start();
-    const terms = state.terminals.filter((t) => t.name === "MessageFoundry Engine");
-    assert.strictEqual(terms.length, 1, state.terminals.map((t) => t.name).join(", "));
-    assert.deepStrictEqual(terms[0].creationOptions.shellArgs, SERVE.serve);
-    assert.strictEqual(terms[0].creationOptions.cwd, ws);
+    const serve = serveTerminal();
+    assert.deepStrictEqual(serve.shellArgs, SERVE.serve);
+    assert.strictEqual(serve.cwd, ws);
   });
 
   test("the copied start command names the --service-config Start passes", async () => {
@@ -132,4 +152,19 @@ startSuite("the status bar's Start runs every command with the service TOML the 
     changeSetting("pythonPath");
     assert.strictEqual(state.tooltips.length, count);
   });
+
+  for (const [label, value] of [
+    ["left at its default", undefined],
+    ["blank", "   "],
+  ] as const) {
+    test(`with messagefoundry.serviceConfig ${label}, serve runs with no --service-config`, async () => {
+      // A workspace with only the default file, which serve reads with no flag.
+      await tearDown(bar, ctx, ws);
+      await open("messagefoundry.toml", value === undefined ? { configDir: SERVE.configDir } : { serviceConfig: value, configDir: SERVE.configDir });
+      await start();
+      assert.deepStrictEqual(serveTerminal().shellArgs, SERVE.serveDefault);
+      const probes = state.execCalls.filter((c) => c.args.includes("provision-admin"));
+      assert.ok(probes.length > 0 && probes.every((p) => !p.args.some((a) => a.startsWith("--service-config"))));
+    });
+  }
 });

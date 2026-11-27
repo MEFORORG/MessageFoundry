@@ -67,3 +67,13 @@ def test_control_the_flag_is_what_names_the_file() -> None:
     parser, _ = _build_parser()
     args = [a for a in _cli_args(FIXTURE["serve"]) if not a.startswith("--service-config")]
     assert parser.parse_args(args).service_config is None
+
+
+def test_control_the_config_pair_is_what_names_the_directory() -> None:
+    """The fixture's config directory is not serve's default, so drop the pair and the parser
+    answers something else: the ``ns.config`` checks above read the argv, not a fallback."""
+    parser, _ = _build_parser()
+    args = _cli_args(FIXTURE["serve"])
+    at = args.index("--config")
+    without = args[:at] + args[at + 2 :]
+    assert parser.parse_args(without).config != FIXTURE["configDir"]
