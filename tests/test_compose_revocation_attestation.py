@@ -368,9 +368,9 @@ def test_the_store_password_note_names_the_ha_image_and_points_at_the_substituti
         "SUBSTITUTION",
         "does NOT feed",
         "with or without --profile ha",
-        "never a placeholder",
+        "never reuse",
         "including through depends_on",
-        "the database role's password must equal",
+        "do not copy it into secrets.env",
         "POSTGRES_PASSWORD",
         "docker/README.md, topology (A)",
     ):

@@ -1,10 +1,8 @@
-- **`docker/secrets.env.example` now says the store password also goes where compose
-  substitution reads.** It named only the SQL Server image for `MEFOR_STORE_PASSWORD`. It now
-  names the Postgres image the `ha` engines run, and says that the local `postgres` service reads
-  the same variable by compose substitution, which `secrets.env` does not feed. Whenever a
-  compose command interpolates the file, with or without `--profile ha`, that value must be the
-  real store password and never a placeholder: Postgres takes it as its role's password when it
-  initialises an empty data directory, which any command that starts `postgres` can trigger,
-  including through `depends_on`. The database role's password must equal the value the `ha`
-  engines read from `secrets.env`. It points at that variable's message in `compose.yaml` and at
-  `docker/README.md`. (BACKLOG #5400)
+- **`docker/secrets.env.example` now says how to set the store password compose substitution
+  checks.** It named only the SQL Server image for `MEFOR_STORE_PASSWORD`. It now says that
+  `compose.yaml` checks that variable by substitution on every command that interpolates the
+  file, with or without `--profile ha`, so every user must set it in the shell, the project
+  `.env` or a file passed with `--env-file`; an `env_file:` entry does not feed it. That value is
+  the local `ha` Postgres container's own password, never a reused store password. Under the
+  `ha` profile it also goes in `secrets.env`, where the `ha` engines read it; otherwise it is a
+  random value kept out of `secrets.env`. (BACKLOG #5400)
