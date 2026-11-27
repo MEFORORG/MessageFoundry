@@ -31,6 +31,7 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
     CipherUnavailableError,
+    cell_aad,
     generate_key,
     make_cipher,
 )
@@ -421,7 +422,13 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
         for record in corrupt_lines:
             assert not any(isinstance(a, BaseException) for a in record.args or ())
             assert record.exc_info is None
-        # BACKLOG #5982: no WARNING carries the cipher's refusal text.
+        # BACKLOG #5982: no WARNING carries the cipher's refusal text. Control: the error did hold
+        # it, as the dead-lettered row's last_error shows.
+        ((sealed_error, row_id),) = _side(
+            db, f"SELECT last_error, id FROM queue WHERE rowid={head}", (_DEST,)
+        )
+        last_error = cipher.decrypt(sealed_error, aad=cell_aad("queue", "last_error", row_id))
+        assert "malformed ciphertext" in last_error and "key_id=" in last_error, last_error
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert not any("malformed ciphertext" in m or "key_id=" in m for m in warnings), warnings
     finally:
@@ -699,7 +706,8 @@ async def test_the_server_dead_letter_warning_carries_no_cipher_text(
         assert fake.dead_lettered == ["row-1"]
         warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(f"{type(exc).__name__} (cause {exc.cause})" in m for m in warned), warned
-        assert not any("malformed ciphertext" in m for m in warned), warned
+        assert "malformed ciphertext" in str(exc)  # control: the error holds the text
+        assert not any("malformed ciphertext" in m or "key_id=" in m for m in warned), warned
 
 
 def test_the_postgres_unopened_item_carries_the_fault() -> None:

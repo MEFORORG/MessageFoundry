@@ -4,7 +4,7 @@
 
 A :class:`CorruptQueueCellError` names the cipher's own refusal, for example ``malformed
 ciphertext (bad base64, key_id=...)``. Its report names the row, its stage and the cause in
-:data:`QUEUE_TAG_CAUSES`'s words, and the cipher's reason goes to a DEBUG record. The claims'
+:data:`QUEUE_TAG_CAUSES`'s words, and no record carries the cipher's reason. The claims'
 dead-letter WARNINGs are covered in tests/test_claim_transient_open.py. Synthetic data only.
 """
 
@@ -48,12 +48,8 @@ def _bad_base64(sealed: str) -> str:
     return f"{sealed.rsplit(':', 1)[0]}:AAAAA"
 
 
-def _cipher_texts(records: list[logging.LogRecord], level: int) -> list[str]:
-    return [
-        r.getMessage()
-        for r in records
-        if r.levelno == level and any(word in r.getMessage() for word in _CIPHER_WORDS)
-    ]
+def _cipher_texts(records: list[logging.LogRecord]) -> list[str]:
+    return [r.getMessage() for r in records if any(w in r.getMessage() for w in _CIPHER_WORDS)]
 
 
 def test_a_corrupt_cell_alert_warns_without_the_ciphers_text(
@@ -74,9 +70,7 @@ def test_a_corrupt_cell_alert_warns_without_the_ciphers_text(
 
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warned) == 1 and "is corrupt" in warned[0] and "row-5982-cor" in warned[0], warned
-    assert _cipher_texts(caplog.records, logging.WARNING) == []
-    # The cipher's reason is still logged at DEBUG, where the log level admits it.
-    assert len(_cipher_texts(caplog.records, logging.DEBUG)) == 1, caplog.records
+    assert _cipher_texts(caplog.records) == []  # at any level, DEBUG included
     assert len(seen) == 1 and not any(word in seen[0] for word in _CIPHER_WORDS), seen
 
 

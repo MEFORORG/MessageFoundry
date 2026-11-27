@@ -562,10 +562,13 @@ def unopenable_log_text(exc: BaseException) -> str:
     **The rule is stated here once.** A :class:`QueueTagError`, drift or a corrupt cell
     (:class:`CorruptQueueCellError`) and under any cipher, is named by its class and cause only:
     its text embeds the cipher's refusal, and its report, :func:`alert_queue_tag_failure`, says
-    what is wrong in :data:`QUEUE_TAG_CAUSES`'s words. The cipher's reason is not lost: a claim
-    keeps it in the dead-lettered row's ``last_error``, and a DEBUG record carries it where the
-    log level admits DEBUG, which a production tier refuses. Any other error keeps its text, at
-    least a cell under a key this process does not hold, whose text can echo part of its marker."""
+    what is wrong in :data:`QUEUE_TAG_CAUSES`'s words. The cost is diagnostic: which way a corrupt
+    cell is corrupt (bad base64, too short, not UTF-8) is no longer in any log. A claim whose
+    dead-letter write succeeds keeps the error's text, cut to ``last_error``'s length, in the
+    dead-lettered row's ``last_error``; a read refusal, a re-ingress refusal and a failed
+    dead-letter write keep it nowhere. Any other error keeps its text at WARNING, at least a cell
+    under a key this process does not hold and a marker this build cannot parse, whose text can
+    echo part of the stored value."""
     if isinstance(exc, QueueTagError):
         return f"{type(exc).__name__} (cause {exc.cause})"
     return str(exc)
@@ -646,9 +649,6 @@ def alert_queue_tag_failure(
     ref = str(row["id"])[:_ROW_REF_LEN]
     reason = f"a {row['stage']} queue row {QUEUE_TAG_CAUSES[error.cause]} and {outcome} (row {ref})"
     _log.warning("%s", reason)
-    # The text, not the error: a record keeps its args, and the error's traceback holds the claim
-    # frame's locals, which can include other rows' opened bodies.
-    _log.debug("%s: %s", reason, str(error))
     report = getattr(cipher, "report_tag_failure", None)
     if callable(report):
         report("queue" if error.drift else QUEUE_CORRUPT_ALERT_TABLE, reason)
