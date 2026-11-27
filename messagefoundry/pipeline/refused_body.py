@@ -212,17 +212,18 @@ class RefusedBodyAllowance:
 
         Such a frame is not refused for anything it holds: the store write failed on every attempt
         until the listener stopped. A fault the same body meets every time would otherwise drain
-        the allowance for every refused body on that inbound, so this one is never charged. It is
-        stored as a head the allowance is spent on would be, by the same fit test as :meth:`bound`,
-        so a body over the detach threshold never lands whole in the message row. ``text`` is its
-        decoded form where the caller could decode it, else ``None``. A binary content type is
-        stored as ``mfb64:v1:`` carriage, whole or of its first bytes, never as a latin-1 view. The
+        the allowance for every refused body on that inbound, so this one is never charged. A text
+        body is stored whole only when :meth:`bound`'s fit test says its head would be the whole of
+        it, else as its head, so no body larger than a head lands whole in the message row.
+        ``text`` is its decoded form where the caller could decode it, else ``None``. A binary
+        content type is stored as ``mfb64:v1:`` carriage, never as a latin-1 view: whole when the
+        carriage fits in a head, else carriage of its first bytes. The
         length and keyed digest are recorded as for every refusal, the note says why only the head
         was kept, and the record marks the row as a held frame, so the edit-and-resubmit refusal
         does not tell an operator to wait for a resend that never comes."""
         head_bytes = self.policy.head_bytes
         if ContentType(content_type).is_binary:
-            whole = len(wire) <= head_bytes
+            whole = len(CARRIAGE_MARKER) + 4 * ((len(wire) + 2) // 3) <= head_bytes
             kept = wire if whole else wire[: 3 * (max(head_bytes - len(CARRIAGE_MARKER), 0) // 4)]
             stored = encode_carriage(kept)
         else:
@@ -233,7 +234,7 @@ class RefusedBodyAllowance:
                 if whole
                 else _head(wire, text, content_type, head_bytes)
             )
-        note = f"[held frame lost at stop: stored only the head of a {len(wire):,}-byte body] "
+        note = f"[held frame: stored only the head of a {len(wire):,}-byte body] "
         return self._refusal(wire, stored, error, whole=whole, cipher=cipher, note=note, held=True)
 
     def bound_held(

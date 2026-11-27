@@ -677,8 +677,9 @@ def owes_hl7_reply(ack_mode: AckMode, content_type: ContentType | None) -> bool:
 
 
 class HandlerFaultUnrecovered(Exception):
-    """The frame the inbound handler faulted on is not recorded, and the caller closes the
-    connection. :func:`recover_handler_fault` has already logged it and reported ``handler_error``."""
+    """The inbound handler did not record the frame it faulted on, and the caller closes the
+    connection. :func:`recover_handler_fault` has already logged it and reported ``handler_error``;
+    a held frame may by then be an ``ERROR`` row, through the hold's ``record_loss``."""
 
 
 async def recover_handler_fault(
@@ -935,7 +936,20 @@ async def _end_hold(
             )
             writing = False
     finally:
-        if cut_off:
+        if cut_off and mid is not None:
+            log.error(
+                "%s message from %s is recorded as ERROR message %s, which may duplicate a row "
+                "the cut-off attempt committed: the listener task was cancelled inside attempt %d, "
+                "after %d failed with: %s. No frame behind it on this connection is recorded "
+                "(closing the connection)",
+                transport,
+                peer,
+                mid,
+                failed + 1,
+                failed,
+                reason,
+            )
+        elif cut_off:
             log.error(
                 "%s message from %s may or may not be recorded: the listener task was cancelled "
                 "inside attempt %d, after %d failed with: %s. No frame behind it on this connection "
@@ -946,14 +960,6 @@ async def _end_hold(
                 failed,
                 reason,
             )
-            if mid is not None:
-                log.warning(
-                    "%s message from %s is recorded as ERROR message %s, which may duplicate a "
-                    "row the cut-off attempt committed",
-                    transport,
-                    peer,
-                    mid,
-                )
         elif mid is not None:
             _log_hold_recorded(log, transport, peer, failed, reason, why, mid)
         else:
@@ -970,13 +976,14 @@ async def _end_hold(
 
 def _held_loss_reason(failed: int, reason: str, *, cut_off: bool) -> str:
     """The value-free ``ERROR`` reason for a held frame the hold ends without: fixed text, a count
-    and the ``safe_exc`` text of the last fault."""
-    if cut_off:
-        return (
-            "held until the listener stopped; the last attempt was cancelled and may also have "
-            f"recorded it, after the inbound handler failed {failed} times: {reason}"
-        )
-    return f"held until the listener stopped; the inbound handler failed {failed} times: {reason}"
+    and the ``safe_exc`` text of the last fault. Kept short, since the store bounds the column to
+    200 characters and a head note goes in front of it. "may also be RECEIVED" because an attempt
+    whose fault came after its commit, or one a cancel cut off, may have recorded the frame."""
+    cut = "last attempt cancelled; " if cut_off else ""
+    return (
+        f"held until the listener stopped; {cut}handler failed {failed} times "
+        f"(may also be RECEIVED): {reason}"
+    )
 
 
 async def _record_held_frame(
@@ -999,7 +1006,8 @@ async def _record_held_frame(
     except Exception as exc:  # noqa: BLE001 -- best effort: the caller's loss line records the frame
         if isinstance(exc, TimeoutError) and bound is not None:
             log.warning(
-                "%s ERROR row for the held message from %s not written within %.1fs of the cancel",
+                "%s ERROR row for the held message from %s not written within %.1fs of the "
+                "cancel; a write cut off at its commit may still have committed",
                 transport,
                 peer,
                 bound,

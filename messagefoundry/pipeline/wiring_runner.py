@@ -10328,17 +10328,15 @@ class RegistryRunner:
         Unlike :meth:`_record_refused`, this never charges the refused-body allowance: the frame is
         not refused for what it holds, and a store fault the same body meets on every attempt
         would otherwise drain the allowance for every refused body on the inbound. A body larger
-        than a head stores only its head, as a refusal past the allowance does, so a body over the
-        detach threshold never lands whole in the message row; its length and keyed digest are
-        recorded either way. A text body is stored decoded in the inbound's charset where that
-        decodes it to text the store can write, else as received; it is never parsed, so the row
-        carries no header fields. A failed write propagates to the listener, which logs it."""
+        than a head stores only its head, as a refusal past the allowance does; its length and
+        keyed digest are recorded either way. A text body is stored as :func:`decode_body` decodes
+        it where that succeeds, else as received; it is never parsed, so the row carries no header
+        fields. A failed write propagates to the listener, which logs it."""
         text: str | None = None
         if not ic.content_type.is_binary:
             try:
-                text = raw.decode(ingress_encoding(ic))
-                text.encode("utf-8")  # a lone surrogate (UTF-7) would fail the write itself
-            except (UnicodeError, LookupError):
+                text = decode_body(raw, ic)  # the same decode, and surrogate refusal, as ingress
+            except IngressGuardError:
                 text = None
         bounded = self._refused_body.bound_uncharged(
             raw, text, ic.content_type.value, reason, cipher=self.store.cipher()

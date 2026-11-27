@@ -9,8 +9,7 @@ with an ERROR log line and no message row, against the count-and-log invariant (
 2). The runner-injected ``record_lost_frame`` seam now records it as an ``ERROR`` row with a
 value-free reason. It does not charge the refused-body allowance, since a store fault the same body
 meets every time would drain that allowance for every refused body on the inbound, and a body larger
-than a head stores only its head, so a body over the detach threshold never lands whole in the
-row. A recovered hold is unchanged: ``tests/test_detach_attachment_write_fault.py`` pins it.
+than a head stores only its head, so no such body lands whole in the row. A recovered hold is unchanged: ``tests/test_detach_attachment_write_fault.py`` pins it.
 
 Synthetic HL7 only, never real PHI.
 """
@@ -171,11 +170,11 @@ async def test_a_frame_whose_write_never_clears_is_recorded_error_once_at_stop(
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     error = rows[0]["error"]
     body = _doc_hl7().encode("utf-8")
-    assert error.startswith(
-        f"[held frame lost at stop: stored only the head of a {len(body):,}-byte body] "
-        "held until the listener stopped; the inbound handler failed 3 times: "
+    assert error == (
+        f"[held frame: stored only the head of a {len(body):,}-byte body] "
+        "held until the listener stopped; handler failed 3 times (may also be RECEIVED): "
+        "OperationalError: [driver message withheld]"
     ), error
-    assert "OperationalError" in error
     assert "DOE" not in error and "MRN123" not in error, "the reason carries message content"
     # Larger than a head, so only the head is stored, and the length and digest are recorded.
     assert rows[0]["raw"] == body[: _POLICY.head_bytes].decode("ascii")
@@ -278,7 +277,10 @@ async def test_a_cancel_inside_an_attempt_still_records_the_frame(
     assert client.cancelled()
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
-    assert "may also have recorded it" in rows[0]["error"]
+    assert (
+        "; last attempt cancelled; handler failed 1 times (may also be RECEIVED)"
+        in (rows[0]["error"])
+    )
     assert allowance.try_charge(ic.name, _POLICY.allowance_bytes)
 
 
@@ -343,7 +345,7 @@ async def test_every_holding_listener_hands_the_frame_to_the_recorder(
     with caplog.at_level(logging.ERROR):
         events = await _drive_tcp(source, _ThenEof(wire), _Peer(), handler=_stops_on_second(source))
     assert [f for f, _ in recorder.calls] == [body]
-    assert recorder.calls[0][1].startswith("held until the listener stopped; the inbound handler")
+    assert recorder.calls[0][1].startswith("held until the listener stopped; handler failed")
     assert "handler_error" in _kinds(events)
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(errors) == 1 and "is recorded as ERROR message mid-1" in errors[0], errors
@@ -396,8 +398,12 @@ async def test_a_second_cancel_during_the_write_still_logs_the_loss(
                 record_loss=recorder,
             )
         )
-        while calls < 2:
-            await asyncio.sleep(0)
+
+        async def second_attempt() -> None:
+            while calls < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(second_attempt(), timeout=2.0)
         task.cancel()
         await asyncio.wait_for(recorder.entered.wait(), timeout=2.0)
         task.cancel()
@@ -407,6 +413,51 @@ async def test_a_second_cancel_during_the_write_still_logs_the_loss(
     assert reports, "the report is made before the write"
     assert any("may or may not be recorded" in m for m in messages), messages
     assert any("may or may not be written: the write was cancelled" in m for m in messages)
+
+
+async def test_a_hung_write_after_one_cancel_is_bounded(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # stop() waits for the task it cancelled, so a hung ERROR write must not hold it open.
+    monkeypatch.setattr(base_mod, "_CANCELLED_REPORT_SECONDS", 0.05)
+    recorder = _Recorder(hang=True)
+    calls = 0
+
+    async def handler(_raw: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("synthetic store outage")
+
+    async def report(_reason: str) -> None:
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        task = asyncio.create_task(
+            base_mod.hold_and_retry(
+                handler,
+                b"frame",
+                "RuntimeError: synthetic store outage",
+                transport="TCP",
+                peer="peer",
+                log=logging.getLogger("messagefoundry.transports.tcp"),
+                stopped=lambda: False,
+                report=report,
+                record_loss=recorder,
+            )
+        )
+
+        async def retried() -> None:
+            while calls < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(retried(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+    messages = [r.getMessage() for r in caplog.records]
+    assert recorder.calls, "the write was not attempted"
+    assert any("not written within 0.1s of the cancel" in m for m in messages), messages
+    assert any("is not recorded, nor is any frame behind it" in m for m in messages)
 
 
 def test_a_frame_that_fits_in_a_head_is_stored_whole_and_charges_nothing() -> None:
