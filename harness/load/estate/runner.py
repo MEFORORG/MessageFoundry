@@ -33,6 +33,7 @@ from pathlib import Path
 
 from harness.config.estate._shape import hub_flags, simple_count
 from harness.load.connscale.probe import FdSampler, ProcSample
+from harness.load.connscale.runner import _UNJUDGED_THRESHOLD
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
@@ -493,18 +494,21 @@ def _reconcile(
     nothing delivered, a timed-out drain (``drain_seconds`` None), rows still in some stage, or
     engine counters that reset mid-step (``counter_reset``, from
     :func:`harness.load.report._counter_reset`). Both are required, with no default, so a caller
-    that forgets one cannot pass by omission. This copy adds one shape the load copy lacks: an
-    outbound dead count that fell during the step (BACKLOG #5436).
+    that forgets one cannot pass by omission. This copy adds dead-letter arms the load copy lacks
+    (BACKLOG #5436): outbound dead rows from two sources, messages that took an ERROR disposition
+    at any stage, and a fall in any of those counts during the step.
     """
     sent = c.sent
     sink_received = c.sink_received
     # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
-    # and must not skip the arms that read only client counters: those still prove a loss without
-    # the engine (BACKLOG #5574). The stand-ins 0/0/-1 are what a band report carries for "no
-    # reading" (the batch-box aggregate reads the -1).
+    # and must not skip the arm that reads only client counters: the stranding budget still runs
+    # and names a no-ACK fault, though without the engine it is a threshold and makes the step
+    # INCONCLUSIVE, not LOSS (BACKLOG #5574 item 9). The stand-ins 0/0/-1 are what a band report
+    # carries for "no reading" (the batch-box aggregate reads the -1).
     metrics_missing = base is None or final is None
     if base is None or final is None:
         read, written, backlog, out_dead = 0, 0, -1, 0
+        store_dead, errored = 0, 0
     else:
         read = final.read - base.read
         written = final.written - base.written
@@ -512,10 +516,20 @@ def _reconcile(
         backlog = final.backlog
         # A delta, so dead rows from before this step do not count against it (BACKLOG #5436).
         out_dead = final.out_dead - base.out_dead
+        # The store's own outbound dead rows (`/stats`). A per-outbound stats reset lowers
+        # `out_dead`, which `/connections` offsets by an in-memory baseline, while the rows stay
+        # dead here, so a reset that cancels a new dead-letter in `out_dead` does not cancel it in
+        # this (BACKLOG #5436, #8332 item 5). It is store-wide, so it also counts a row another
+        # process on the same store dead-letters during the step, and the poller sums it per
+        # engine shard (BACKLOG #5950); the estate rig runs one engine, and only its sign is judged.
+        store_dead = final.dead - base.dead
+        # Messages that took an ERROR disposition: a dead-letter at ANY stage, so it sees the
+        # ingress and routed dead-letters the two outbound counts cannot (BACKLOG #5436).
+        errored = final.in_errored - base.in_errored
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The
-    # stranding budget reads only client counters, so it still proves a loss across it. A negative
-    # delta is not published.
+    # stranding budget reads only client counters, so it still runs across it, as a threshold that
+    # fails the step INCONCLUSIVE (BACKLOG #5574 item 9). A negative delta is not published.
     engine_judged = counter_reset is None and not metrics_missing
     if not engine_judged:
         read, written = max(0, read), max(0, written)
@@ -542,10 +556,28 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows, so an ingress
-    # or routed dead-letter is not in it and this check does not see one (BACKLOG #5436).
-    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or out_dead > 0
-    lost = (engine_judged and engine_lost) or over_budget
+    # `errored` also counts every frame the listener refused, and whether a NAK on an otherwise
+    # delivered run is a loss is an open owner question (BACKLOG #5436), so this arm takes out every
+    # send the client saw NAKed or never saw answered (a NAK it missed reads as an unconfirmed send).
+    # What is left took an ERROR disposition after the engine accepted it. That is a lower bound:
+    # a NAK the engine recorded no row for hides one dead-letter here, as does each unconfirmed send.
+    errored_unexplained = errored - c.nak - c.timeouts
+    # A purge or a replay lowers all three dead-letter counts, and one that removes as many dead
+    # rows as the step added leaves `out_dead`, `store_dead` and `errored` unmoved: no `/stats` or
+    # `/connections` field counts dead-letters monotonically, so that offset is not seen (BACKLOG
+    # #5436).
+    engine_lost = (
+        read_short > 0
+        or floor_short > 0
+        or deliver_short > 0
+        or out_dead > 0
+        or store_dead > 0
+        or errored_unexplained > 0
+    )
+    # The stranding budget is a threshold, not proof (BACKLOG #5574 item 9): with the engine
+    # metrics missing or reset it makes the step INCONCLUSIVE rather than LOSS, as in the connscale
+    # copy. It still fails, since `unproven` below names the missing metrics or the reset.
+    lost = engine_judged and (engine_lost or over_budget)
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
@@ -573,6 +605,16 @@ def _reconcile(
             f"the outbound dead count fell by {-out_dead} during the step (for example a replay "
             f"or a stats reset) — new dead-letters cannot be told from the removed rows"
         )
+    if engine_judged and store_dead < 0:
+        unproven.append(
+            f"the store's outbound dead rows fell by {-store_dead} during the step (a replay or "
+            f"a purge) — new dead-letters cannot be told from the removed rows"
+        )
+    if engine_judged and errored < 0:
+        unproven.append(
+            f"the inbound errored count fell by {-errored} during the step (for example a replay "
+            f"or a stats reset) — new errors cannot be told from the removed ones"
+        )
     ok = not lost and drained and not unproven
     parts: list[str] = []
     if engine_judged and read_short > 0:
@@ -590,6 +632,26 @@ def _reconcile(
         )
     if engine_judged and out_dead > 0:
         parts.append(f"{out_dead} outbound row(s) dead-lettered during the step")
+    # Named on its own only where the connections view above does not already say as much.
+    if engine_judged and store_dead > max(out_dead, 0):
+        parts.append(
+            f"the store holds {store_dead} more dead outbound row(s) than at the step start"
+        )
+    if engine_judged and errored_unexplained > 0:
+        parts.append(
+            f"{errored} message(s) took an ERROR disposition during the step, "
+            f"{errored_unexplained} more than the {c.nak} NAKed and {c.timeouts} unconfirmed "
+            f"send(s) can account for — a dead-letter at some stage (ingress, routed or outbound)"
+        )
+    elif engine_judged and errored > 0:
+        # Not judged, but not silent either, as the unconfirmed-send note below is not: the NAKs and
+        # unconfirmed sends may account for these, and a dead-letter beside them is not seen here.
+        parts.append(
+            f"{errored} message(s) took an ERROR disposition during the step, no more than the "
+            f"{c.nak} NAKed and {c.timeouts} unconfirmed send(s) — not judged, since each may be "
+            f"a refused frame whose NAK the client saw or missed, so a dead-letter among them is "
+            f"not seen"
+        )
     if not drained and final is not None:
         parts.append(
             f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
@@ -601,6 +663,7 @@ def _reconcile(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
             f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
+            + ("" if engine_judged else _UNJUDGED_THRESHOLD)
         )
     elif unconfirmed > 0 and not engine_judged:
         # No intake reading to compare them with: a reset clamps `read` and missing metrics zero
