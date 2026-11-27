@@ -597,7 +597,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // `applyOne` unchanged: a coordinate shifted by a raced edit is REFUSED, not mis-spliced.
     // The drain is `drainEdits` with `firstIsPick` (BACKLOG #5943): the pick is sent as posted, and the
     // typed edits drained behind it are carried over the rewrites before them, the pick's included,
-    // except one on the picked field. `drainEdits` releases the slot through releaseEdit (#1759).
+    // except one on the picked field from a page projected from a buffer before the pick. `drainEdits`
+    // releases the slot through releaseEdit (#1759).
     const applyPickedEdit = async (msg: EditMessage): Promise<void> => {
       // Checked here, not left to drainEdits: a busy slot declines a pick rather than queuing it as a
       // typed edit. Nothing awaits between this check and drainEdits claiming the slot.
