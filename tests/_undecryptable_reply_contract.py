@@ -187,7 +187,7 @@ class FaultingCipher:
 
 
 #: How long :class:`BlockingFaultingCipher` holds each open of its target, as a key service that
-#: does not answer holds a Transit call, and the shortest ticker gap counted as a loop stall.
+#: does not answer holds a Transit call, and the shortest ticker gap :func:`loop_stalls` records.
 BLOCK_SECONDS = 0.25
 STALL_SECONDS = 0.2
 
@@ -195,26 +195,40 @@ STALL_SECONDS = 0.2
 class BlockingFaultingCipher(FaultingCipher):
     """A :class:`FaultingCipher` that waits on I/O, as the Transit cipher does: it declares
     ``blocks_on_io``, and each open of ``target`` while ``open_error`` is set sleeps
-    :data:`BLOCK_SECONDS` before it raises. ``blocked_on`` records the thread each such open ran on."""
+    :data:`BLOCK_SECONDS` before it raises. ``blocks`` records each such open as ``(thread, start,
+    end)`` on the monotonic clock."""
 
     blocks_on_io = True
 
     def __init__(self, real: Any) -> None:
         super().__init__(real)
-        self.blocked_on: list[int] = []
+        self.blocks: list[tuple[int, float, float]] = []
 
     def decrypt(self, stored: Any, *args: Any, **kwargs: Any) -> Any:
         if self.open_error is not None and stored == self.target:
-            self.blocked_on.append(threading.get_ident())
+            start = time.monotonic()
             time.sleep(BLOCK_SECONDS)
+            self.blocks.append((threading.get_ident(), start, time.monotonic()))
         return super().decrypt(stored, *args, **kwargs)
+
+    def loop_cost(self, loop_thread: int, gaps: list[tuple[float, float]]) -> tuple[int, int]:
+        """``(opens on the loop thread, opens a loop gap held whole)``. Only a gap spanning a whole
+        block counts, so a pause with some other cause (a GC, a descheduled runner) is not one."""
+        on_loop = sum(1 for ident, _, _ in self.blocks if ident == loop_thread)
+        held = sum(
+            1
+            for _, start, end in self.blocks
+            if any(g0 <= start + 0.005 and end - 0.005 <= g1 for g0, g1 in gaps)
+        )
+        return on_loop, held
 
 
 @contextlib.asynccontextmanager
-async def loop_stalls() -> AsyncIterator[list[float]]:
-    """The gaps of at least :data:`STALL_SECONDS` a ticker on the running loop sees while the block
-    runs. A call that blocks on the loop thread delays the ticker by as long as it blocks."""
-    gaps: list[float] = []
+async def loop_stalls() -> AsyncIterator[list[tuple[float, float]]]:
+    """The ``(start, end)`` of every gap of at least :data:`STALL_SECONDS` that a ticker on the
+    running loop sees while the block runs. A call that blocks the loop thread delays the ticker for
+    as long as it blocks."""
+    gaps: list[tuple[float, float]] = []
     stop = asyncio.Event()
 
     async def tick() -> None:
@@ -223,7 +237,7 @@ async def loop_stalls() -> AsyncIterator[list[float]]:
             await asyncio.sleep(0.01)
             now = time.monotonic()
             if now - last >= STALL_SECONDS:
-                gaps.append(round(now - last, 3))
+                gaps.append((last, now))
             last = now
 
     task = asyncio.ensure_future(tick())
@@ -236,16 +250,23 @@ async def loop_stalls() -> AsyncIterator[list[float]]:
 
 
 @contextlib.contextmanager
-def faulting_cipher(
-    store: Any, kind: type[FaultingCipher] = FaultingCipher
-) -> Iterator[FaultingCipher]:
+def _swapped_cipher[C: FaultingCipher](store: Any, fault: C) -> Iterator[C]:
     real = store._cipher
-    fault = kind(real)
     store._cipher = fault
     try:
         yield fault
     finally:
         store._cipher = real
+
+
+def faulting_cipher(store: Any) -> contextlib.AbstractContextManager[FaultingCipher]:
+    return _swapped_cipher(store, FaultingCipher(store._cipher))
+
+
+def blocking_faulting_cipher(
+    store: Any,
+) -> contextlib.AbstractContextManager[BlockingFaultingCipher]:
+    return _swapped_cipher(store, BlockingFaultingCipher(store._cipher))
 
 
 async def _plant_metadata(cipher: Any, raw: RawSql, mid: str) -> None:
@@ -433,32 +454,30 @@ OUTAGE_RETRIES = 3
 
 def _outage_open_leaves_the_loop(which: str) -> ContractCase:
     """BACKLOG #5727: a key service that gave no verdict re-pends the token, so every retry opens
-    the cell again, where ``main`` dead-lettered the token after one open. Under a cipher that
-    blocks on I/O each of those opens must run off the event loop, or each retry stalls the loop
-    for as long as the key service holds the call. ``worker`` is the step's own read; the others
-    are the handoff's opens."""
+    the cell again. Before #5727 the token was dead-lettered after one open (BACKLOG #4995). Under a
+    cipher that blocks on I/O each of those opens must run off the event loop, or each retry stalls
+    the loop for as long as the key service holds the call. ``worker_ref`` and ``worker_reply`` are
+    the step's own read; the others are the handoff's opens."""
 
     async def case(store: Any, fetch: RawFetch, raw: RawSql) -> None:
         mid, item = await _claimed_head(store)
         if which == "metadata":
             await _plant_metadata(store._cipher, raw, mid)
-        target = await _cell(fetch, "reply" if which == "worker" else which, mid)
+        target = await _cell(fetch, which.removeprefix("worker_"), mid)
         step = runner(store)
         loop_thread = threading.get_ident()
-        with faulting_cipher(store, BlockingFaultingCipher) as fault:
-            assert isinstance(fault, BlockingFaultingCipher)
+        with blocking_faulting_cipher(store) as fault:
             fault.target, fault.open_error = target, CipherUnavailableError("synthetic")
-            async with loop_stalls() as stalls:
+            async with loop_stalls() as gaps:
                 for _ in range(OUTAGE_RETRIES):
                     with pytest.raises(QueueOpenFault):
-                        if which == "worker":
+                        if which.startswith("worker_"):
                             await step._process_response_item(LOOP, item)
                         else:
                             await _handoff(store, item.id, LOOP)
             # CONTROL: every retry reached the blocking open, so a clean meter is not a miss.
-            assert len(fault.blocked_on) == OUTAGE_RETRIES, fault.blocked_on
-            on_loop = sum(1 for ident in fault.blocked_on if ident == loop_thread)
-            assert (on_loop, stalls) == (0, []), (on_loop, stalls)
+            assert len(fault.blocks) == OUTAGE_RETRIES, fault.blocks
+            assert fault.loop_cost(loop_thread, gaps) == (0, 0), (fault.blocks, gaps)
             await _assert_token_live(store, fetch, mid)
             fault.heal()
             await step._process_response_item(LOOP, item)
@@ -538,7 +557,8 @@ HANDOFF_CASES: list[ContractCase] = [
     _fault_reaches_no_reply("ref", reply=REFUSED_REPLY),
     _fault_reaches_no_reply("reply", reply=REFUSED_REPLY),
     _fault_reaches_no_reply("metadata", reply=REFUSED_REPLY),
-    _outage_open_leaves_the_loop("worker"),
+    _outage_open_leaves_the_loop("worker_ref"),
+    _outage_open_leaves_the_loop("worker_reply"),
     _outage_open_leaves_the_loop("ref"),
     _outage_open_leaves_the_loop("reply"),
     _outage_open_leaves_the_loop("metadata"),

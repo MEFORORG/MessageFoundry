@@ -117,31 +117,28 @@ async def test_an_outage_re_pends_the_token_and_the_lane_resumes_in_order(
 async def test_an_outage_stalls_the_loop_on_no_retry_of_the_running_worker(
     store: MessageStore,
 ) -> None:
-    """BACKLOG #5727: the running worker retries a token through a key-service outage, where
-    ``main`` dead-lettered it after one read. Under a cipher that blocks on I/O, as Transit does,
-    no retry's read may block the event loop: on the branch before this fix each retry stalled it
-    for the whole of the key service's wait. The worker backs off 1 s between retries, so the
-    window takes at least two."""
+    """BACKLOG #5727: the running worker retries a token through a key-service outage, where before
+    #5727 it dead-lettered it after one read (BACKLOG #4995). Under a cipher that blocks on I/O, as
+    Transit does, no retry's read may block the event loop. The worker backs off 1 s between
+    retries, so the wait covers at least two."""
     fetch = _fetch(store)
     head = await contract.captured(store, control="UR-S-HEAD", now=1.0)
     [reply] = await fetch("SELECT body FROM response WHERE message_id=?", (head,))
     runner = contract.runner(store)
     loop_thread = threading.get_ident()
-    with contract.faulting_cipher(store, contract.BlockingFaultingCipher) as fault:
-        assert isinstance(fault, contract.BlockingFaultingCipher)
+    with contract.blocking_faulting_cipher(store) as fault:
         fault.target, fault.open_error = reply["body"], CipherUnavailableError("synthetic")
-        async with contract.loop_stalls() as stalls:
+        async with contract.loop_stalls() as gaps:
             task = asyncio.ensure_future(runner._response_worker(LOOP))
             try:
-                await asyncio.sleep(2.6)
+                async with asyncio.timeout(10.0):
+                    while len(fault.blocks) < 2:
+                        await asyncio.sleep(0.02)
             finally:
                 runner._stop.set()
                 runner._response_work.set()
                 await asyncio.wait_for(task, timeout=5.0)
-        # CONTROL: the worker did retry through the outage, so a clean meter is not a miss.
-        assert len(fault.blocked_on) >= 2, fault.blocked_on
-        on_loop = sum(1 for ident in fault.blocked_on if ident == loop_thread)
-        assert (on_loop, stalls) == (0, []), (len(fault.blocked_on), on_loop, stalls)
+        assert fault.loop_cost(loop_thread, gaps) == (0, 0), (fault.blocks, gaps)
     assert not [e for e in await store.events_for(head) if e["event"] == "dead"]
 
 
