@@ -172,7 +172,7 @@ async def test_a_frame_whose_write_never_clears_is_recorded_error_once_at_stop(
     body = _doc_hl7().encode("utf-8")
     assert error == (
         f"[held frame: stored only the head of a {len(body):,}-byte body] "
-        "held until the listener stopped; handler failed 3 times (other copies may exist): "
+        "held until the listener stopped; handler failed 3 times (copies may exist): "
         "OperationalError: [driver message withheld]"
     ), error
     assert "DOE" not in error and "MRN123" not in error, "the reason carries message content"
@@ -278,10 +278,27 @@ async def test_a_cancel_inside_an_attempt_still_records_the_frame(
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     assert (
-        "; last attempt cancelled; handler failed 1 times (other copies may exist)"
-        in (rows[0]["error"])
+        "; last attempt cancelled; handler failed 1 times (copies may exist)" in (rows[0]["error"])
     )
     assert allowance.try_charge(ic.name, _POLICY.allowance_bytes)
+
+
+async def test_a_cut_off_reason_over_a_head_fits_the_error_column_whole(
+    store: MessageStore,
+) -> None:
+    # A cut-off attempt over a frame larger than a head, the case that measured 205 characters:
+    # the head note plus the reason fits the store's 200-character error column, so the fault
+    # text at its end is not cut.
+    runner, ic, _allowance = _runner(store, ConnectorType.TCP)
+    body = _doc_hl7().encode("utf-8")
+    fault = "OperationalError: [driver message withheld]"
+    reason = base_mod._held_loss_reason(1, fault, cut_off=True)
+    await runner._record_lost_frame(ic, body, reason)
+    rows = await _rows(store)
+    error = rows[0]["error"]
+    note = f"[held frame: stored only the head of a {len(body):,}-byte body] "
+    assert error == note + reason, error
+    assert len(error) <= 200 and error.endswith(fault), (len(error), error)
 
 
 async def test_the_runner_injects_the_recorder_at_start(store: MessageStore) -> None:

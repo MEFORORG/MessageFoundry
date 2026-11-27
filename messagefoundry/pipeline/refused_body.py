@@ -210,7 +210,7 @@ class RefusedBodyAllowance:
         """Decide what to store for a held frame a no-reply listener is losing (BACKLOG #1619 item
         6): the whole body when it fits in a head, else its head, and never a charge.
 
-        Such a frame is not refused for anything it holds: the store write failed on every attempt
+        Such a frame is not refused for anything it holds: its handler raised on every attempt
         until the listener stopped. A fault the same body meets every time would otherwise drain
         the allowance for every refused body on that inbound, so this one is never charged. A text
         body is stored whole only when :meth:`bound`'s fit test says its head would be the whole of
@@ -337,7 +337,8 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         return None
     total = _count(record.get("bytes"))
     head = _count(record.get("head_bytes"))
-    # A held frame was not refused for what it holds: its store write failed until the stop.
+    # A held frame was not refused for what it holds: its handler raised on every attempt until the
+    # listener stopped.
     noun = "held frame" if record.get(HELD_FRAME_KEY) is True else "refused body"
     body = f"this {total:,}-byte {noun}" if total is not None else f"this {noun}"
     # The bound, not a count of the sender's bytes: a decoded head is cut to this much UTF-8.
