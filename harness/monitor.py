@@ -402,16 +402,20 @@ class MonitorPanel(QWidget):
 
     def _step_up(self, action: str | None = None) -> bool:
         """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,
-        and re-prove it. ``EngineClient.reauth`` sends the action the refusal named as ``purpose``
-        and adopts the re-keyed session, and the client then retries the call once.
+        and re-prove it through ``EngineClient.reauth``, which adopts the re-keyed session. It
+        posts ``action`` as the ``purpose`` when that is not None, else whatever action the main
+        client has stashed, else no purpose. Once re-proved, the refused call is retried once.
 
-        As the main client's handler it is called with no ``action``, and ``reauth`` takes the
-        action that client stashed from the refusal. A panel whose worker read was refused through
-        the handler-less polling client passes that refusal's ``StepUpRequired.action``, since the
+        As the main client's handler it is called with no ``action``, so ``reauth`` posts whatever
+        that client's one-slot stash holds. ``_request`` fills it with the refusal's action before
+        calling here, but what is posted may be no purpose at all; the comment at the
+        ``_step_up_open`` check below says when. A panel whose worker read was refused through the
+        handler-less polling client passes that refusal's ``StepUpRequired.action``, since the
         main client stashed nothing for that read, and repeats the read itself (BACKLOG #5945). For
         a session-window refusal that action is None, and ``reauth`` then falls back to the main
-        client's stash, which holds an action only while that client's own prompt is open, when
-        the ``_step_up_open`` check below declines the call.
+        client's stash, which holds an action only while that client's step-up handler runs. A
+        panel's call can arrive then only through the prompt's nested event loop, when the
+        ``_step_up_open`` check below declines it.
 
         The re-proof rotates the session, so the poller's copy of the old token is dead: it is
         restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""
@@ -422,10 +426,18 @@ class MonitorPanel(QWidget):
             return False
         if self._step_up_open:
             # The open prompt's nested event loop delivered a second step-up, such as a refused
-            # message search arriving while a Purge prompt is up. Its reauth would post the action
-            # the first refusal stashed (X-Step-Up-Action), minting that action's grant from a
-            # password typed for this one, and leave the first action's own reauth with none. So
-            # it is declined; re-running it once the open prompt closes prompts then.
+            # message search arriving while a Purge prompt is up. It is declined. A refusal
+            # through the polling client
+            # arrives here with that refusal's action. Where that is None, as for a session-window
+            # refusal, going ahead would post the action the first refusal stashed
+            # (X-Step-Up-Action), minting that action's grant from a password typed for this one;
+            # and any reauth here would empty the stash. Declined, the stash stays for the first
+            # action's own reauth. A second refusal through the main client is different: _request
+            # has already overwritten the stash with that refusal's action, or None, before calling
+            # here, and the decline then empties it. The first action's reauth then posts no
+            # purpose, so a retry that needs a per-action grant is refused again. That fails
+            # closed, with no grant minted for the wrong action, but the decline does not save the
+            # first action.
             return False
         self._step_up_open = True
         try:

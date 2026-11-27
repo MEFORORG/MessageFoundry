@@ -857,9 +857,8 @@ class EngineClient:
         #: prompts, calls reauth(), and returns True iff re-verified — then the request is retried.
         self._step_up_handler: Callable[[], bool] | None = None
         #: The action a per-action step-up 403 named in ``X-Step-Up-Action`` (ADR 0077), stashed just
-        #: before the handler runs so :meth:`reauth` can bind the fresh proof to it. None for a plain
-        #: session-window step-up (no header) — then :meth:`reauth` posts no ``purpose`` unless its
-        #: caller passes one.
+        #: before the handler runs. None for a plain session-window step-up (no header) — then
+        #: :meth:`reauth` posts no ``purpose`` unless its caller passes one.
         self._pending_step_up_action: str | None = None
         #: Invoked when the engine demands a second factor (403 + X-MFA-Required, WP-14); the GUI
         #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
@@ -1266,9 +1265,8 @@ class EngineClient:
             and response.headers.get("X-Step-Up-Required")
             and self._step_up_handler is not None
         ):
-            # Stash the action BEFORE the handler runs so the reauth() it calls binds the fresh proof
-            # to it. None (a session-window step-up) → reauth() posts no purpose unless its caller
-            # passes one.
+            # Stash the action BEFORE the handler runs. None (a session-window step-up) → reauth()
+            # posts no purpose unless its caller passes one.
             self._pending_step_up_action = step_up_action
             proved = False
             try:
@@ -1349,7 +1347,7 @@ class EngineClient:
 
         A ``purpose`` that is not None is posted as the purpose, whatever is stashed. With
         ``purpose`` None, whatever action is stashed rides along instead, so the engine mints a
-        grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as for a
+        grant BOUND to it; with neither, it posts ``{"password": …}`` alone, as for a
         session-window step-up. The stash is one slot: the per-action refusal
         (``X-Step-Up-Action``, ADR 0077) that called the step-up handler fills it, but a second
         refusal on this client while that handler runs overwrites it, and that refusal's own
