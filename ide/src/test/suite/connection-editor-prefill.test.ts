@@ -738,7 +738,12 @@ suite("connection editor: create mode shows the transport whose fields are drawn
       transport.value = "file";
       transport.dispatchEvent(new p.window.Event("change"));
       p.deliver({ command: "fields", groups: [] });
-      assert.ok(filled(p) > 0, `an empty fields reply emptied the settings area: ${opts.initial === null ? "create" : "edit"}`);
+      const label = opts.initial === null ? "create" : "edit";
+      assert.ok(filled(p) > 0, `an empty fields reply emptied the settings area: ${label}`);
+      // The reply was drawn: the free-text row replaced the schema controls.
+      const doc = p.window.document;
+      assert.ok(doc.querySelector("#settings .setting"), `the empty reply drew no free-text row: ${label}`);
+      assert.strictEqual(doc.querySelector("#settings [data-key]"), null, `the empty reply was not drawn: ${label}`);
     }
   });
 });

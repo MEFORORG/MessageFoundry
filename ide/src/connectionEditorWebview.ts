@@ -218,15 +218,17 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const choices = f.choices || [];
         const options = ['', ...choices];
         // A recorded value outside the choices gets its own option, so it shows and an untouched
-        // save keeps it, rather than the select going blank and the save dropping the key.
-        // Matched by displayValue, the text each option is written with, as typedValue matches.
-        if (f.value != null && !choices.some((c) => displayValue(c) === displayValue(f.value))) options.push(f.value);
+        // save keeps it, rather than the select going blank and the save dropping the key. A table
+        // matches a table choice by content, whatever its key order; a scalar by its text.
+        const recordedChoice = f.value == null ? undefined : choices.find((c) =>
+          c !== null && typeof c === 'object' ? canon(c) === canon(f.value) : displayValue(c) === displayValue(f.value));
+        if (f.value != null && recordedChoice === undefined) options.push(f.value);
         for (const c of options) {
           const o = document.createElement('option');
           o.value = displayValue(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : displayValue(c);
           control.appendChild(o);
         }
-        control.value = displayValue(f.value);
+        control.value = displayValue(recordedChoice !== undefined ? recordedChoice : f.value);
       } else {
         control = document.createElement('input');
         // Never a number box, only a numeric keyboard hint: a number box reads text it cannot parse
@@ -336,18 +338,21 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
-    // The settings the latest fields request sent, in canonical form (canon); null until the first
-    // request. The reply carries no request id, so the settings are how the page tells which
-    // request a reply answers (the message handler below).
-    let LAST_ASKED = null;
+    // The settings each fields request sent, in canonical form (canon), newest last; the last few
+    // only. The reply carries no request id, so the settings are how the page tells which request a
+    // reply answers (the message handler below).
+    const ASKED = [];
+    const ASKED_KEPT = 32;
 
-    /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
-    function requestFields() {
+    /** Ask the extension to rebuild the descriptors when the transport or direction changes.
+     *  settings: what collectSettings(true) returns, when the caller already has it. */
+    function requestFields(settings) {
       if (!FIELD_GROUPS) { prefillHints(); return; }
       // A setting this request leaves out (removed, or its env key box empty) loses its held default
       // when the reply is drawn (renderGroups), not here.
-      const settings = collectSettings(true);
-      LAST_ASKED = canon(settings);
+      if (settings === undefined) settings = collectSettings(true);
+      ASKED.push(canon(settings));
+      if (ASKED.length > ASKED_KEPT) ASKED.shift();
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -368,11 +373,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       return JSON.stringify(v);
     }
 
-    // The settings a reply was built from. The host builds a reply from the settings its request
-    // sent: buildForm in connectionForm.ts draws every one of them, and only those, carrying its
-    // value, its env reference ({env, cast, default} as envKey, cast, envDefault), or its held
-    // credential (preserveValue). This reads that request back. If that ever stops holding, every
-    // rebuild reply is dropped; the transport round-trip tests run the real buildForm and go red.
+    // The settings a reply was built from, as far as its descriptors say. The host builds a reply
+    // from the settings its request sent: buildForm in connectionForm.ts draws every one of them,
+    // and only those, carrying its value, its env reference ({env, cast, default} as envKey, cast,
+    // envDefault), or its held credential (preserveValue). buildForm may normalize a value on the
+    // way (it drops a cast that is not a string), so a reply that matches no request is taken as
+    // the latest request's answer, never dropped.
     function repliedSettings(groups) {
       const settings = {};
       for (const g of groups) for (const f of g.fields) {
@@ -452,7 +458,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     refreshVisibility();
 
     $('direction').addEventListener('change', () => { refreshVisibility(); requestFields(); });
-    $('transport').addEventListener('change', requestFields);
+    $('transport').addEventListener('change', () => requestFields());
     $('addSetting').addEventListener('click', () => settingRow('', '', false, ''));
 
     function coerce(text) {
@@ -708,18 +714,23 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
-        if (LAST_ASKED !== null) {
-          // A reply not built from the latest request's settings answers an older request: drawing
-          // it would drop or change a setting the latest request carries, or bring back one it left
-          // out. Two requests with the same settings cannot be told apart, so a reply to the older
-          // of them is drawn, as every reply was before; a request id the hosts echo would settle it.
-          if (canon(repliedSettings(d.groups)) !== LAST_ASKED) return;
+        if (ASKED.length) {
+          const latest = ASKED[ASKED.length - 1];
+          // A reply built from an older request's settings, and not the latest's, answers that
+          // older request: drawing it would drop or change a setting the latest request carries, or
+          // bring back one it left out. A reply that matches no request is taken as the latest's
+          // answer (repliedSettings). Two requests with the same settings cannot be told apart, so
+          // a reply to the older of them is drawn, as every reply was before; a request id and
+          // transport the hosts echo would settle it.
+          const replied = canon(repliedSettings(d.groups));
+          if (replied !== latest && ASKED.includes(replied)) return;
           // The form changed since the latest request (a setting removed, kept again, emptied,
           // retyped or switched between a literal and env()): drawing its reply would undo that, so
           // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends
           // at most one request, and the form does not change until a reply is drawn, so this stops
           // once the user stops editing. If the host never answers, the form stays as it is.
-          if (canon(collectSettings(true)) !== LAST_ASKED) { requestFields(); return; }
+          const now = collectSettings(true);
+          if (canon(now) !== latest) { requestFields(now); return; }
         }
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);

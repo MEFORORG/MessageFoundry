@@ -71,6 +71,7 @@ const SCHEMA: ConnectionSchema = {
         port: param({ type: "int", env: true }),
         tls_key_password: param({ secret: true }),
         db_password: param({ secret: true }),
+        headers: param({ type: "table" }),
       },
     },
     file: {
@@ -343,6 +344,22 @@ suite("connection editor: a removal and a keep survive a rebuild's reply (BACKLO
     }
     assert.ok(control(p, "port"), "the mllp reply was not drawn");
     assert.deepStrictEqual(saved(p), RECORD.settings);
+    // Each reply is drawn: the file reply draws the file transport's own setting.
+    const q = load();
+    pick(q, "file");
+    answerFrom(q, 0);
+    assert.ok(control(q, "path"), "the file reply was not drawn");
+  });
+
+  test("a reply whose settings the host normalized is still drawn", () => {
+    // buildForm drops an env reference's cast that is not a string, so this reply matches no
+    // request's settings exactly; it is the latest request's answer and must be drawn.
+    const p = load();
+    control(p, "headers").value = '{"env":"X","cast":5}';
+    pick(p, "file");
+    answerFrom(p, 0);
+    assert.ok(control(p, "path"), "the reply to the latest request was dropped");
+    assert.strictEqual(fieldsRequests(p).length, 1, "a normalized reply sent another request");
   });
 
   test("a kept setting's re-request never sends a held value", () => {
@@ -433,6 +450,14 @@ suite("connection editor: a select takes the picked choice itself (BACKLOG #8243
     const p = selectPage([{ a: 1 }, { b: 2 }], { b: 2 });
     const options = [...control(p, "level").options].map((o: DomNode) => String(o.value));
     assert.deepStrictEqual(options, ["", '{"a":1}', '{"b":2}']);
+  });
+
+  test("a recorded table equal to a table choice in another key order is that choice", () => {
+    const p = selectPage([{ a: 1, b: 2 }], { b: 2, a: 1 });
+    const select = control(p, "level");
+    assert.deepStrictEqual([...select.options].map((o: DomNode) => String(o.value)), ["", '{"a":1,"b":2}']);
+    assert.strictEqual(select.value, '{"a":1,"b":2}', "the select does not show the recorded choice");
+    assert.deepStrictEqual(saved(p).level, { b: 2, a: 1 });
   });
 
   test("a choice with surrounding spaces is posted as the choice", () => {
