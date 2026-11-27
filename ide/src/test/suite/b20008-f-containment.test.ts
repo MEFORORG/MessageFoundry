@@ -160,7 +160,12 @@ windowsSuite("b20008 F: a user-set path that reaches the workspace by another sp
       modelFs({ ids: { "D:\\": "2:1" } }), // the workspace folder itself does not exist
     ]) {
       const got = securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, fsx);
-      assert.ok(!got.ok && got.problem.includes("could not be read"), JSON.stringify(got));
+      assert.ok(!got.ok && got.problem.includes("could not read"), JSON.stringify(got));
+    }
+    // A long-path or device prefix does not split into folders, so it is refused, not walked.
+    for (const spelled of ["\\\\?\\D:\\elsewhere\\x.toml", "\\\\.\\D:\\elsewhere\\x.toml"]) {
+      const got = securityConfigTarget(ws, spelled, user, modelFs({ ids: { ...base, "D:\\elsewhere": "2:5" } }));
+      assert.ok(!got.ok && got.problem.includes("could not read"), `${spelled} ${JSON.stringify(got)}`);
     }
     // And a caller that passes no fileId refuses, rather than accept a path it cannot place.
     const blind: LinkFs = { lstat: () => ({ isSymbolicLink: () => false }), realpath: (p: string) => p };
@@ -273,6 +278,25 @@ windowsSuite("b20008 F: aliases of a real workspace folder (#8237 item 16)", () 
       path: path.join(ws, "sub", "plain", "x.toml"),
     });
   });
+
+  test("known open limit, recorded and not desired: an alias onto a folder that is itself a repository link", function () {
+    // This records a KNOWN OPEN LIMIT, not a wanted outcome (the securityConfigTarget docblock,
+    // "Open limits"). A real path follows every link at once, so an alias onto ws\held, where held
+    // is a link the repository holds, is placed where held leads and held is never checked. A
+    // change that follows each link one hop at a time should turn this assertion into a refusal.
+    const victim = path.join(base, "victim");
+    fs.mkdirSync(victim);
+    try {
+      fs.symlinkSync(victim, path.join(ws, "held"), "junction");
+      fs.symlinkSync(path.join(ws, "held"), path.join(outside, "onto-held"), "junction");
+    } catch {
+      this.skip();
+    }
+    const file = path.join(outside, "onto-held", "x.toml");
+    assert.deepStrictEqual(securityConfigTarget(ws, file, user, real()), { ok: true, path: file });
+    // The same link reached through the workspace folder's own spelling is refused.
+    assert.strictEqual(securityConfigTarget(ws, path.join(ws, "held", "x.toml"), user, real()).ok, false);
+  });
 });
 
 suite("b20008 F: a .code-workspace file cannot choose the folder a path is read against (#8237 item 57)", () => {
@@ -341,6 +365,28 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     };
     const blind = securityConfigTarget(repo, "messagefoundry.toml", inWindow(workspaceScope, workspaceFile), unreadable);
     assert.ok(!blind.ok && blind.problem.includes(".code-workspace"), JSON.stringify(blind));
+  });
+
+  test("a file that chose a folder below its own still has its own folder checked for a user path", function () {
+    const repo = path.join(base, "repo");
+    const victim = path.join(base, "victim");
+    fs.mkdirSync(path.join(repo, "empty"), { recursive: true });
+    fs.mkdirSync(path.join(repo, "plain"));
+    fs.mkdirSync(victim);
+    try {
+      fs.symlinkSync(victim, path.join(repo, "cfg"), "junction");
+    } catch {
+      this.skip();
+    }
+    const workspaceFile = path.join(repo, "evil.code-workspace");
+    const chosen = path.join(repo, "empty");
+    const got = securityConfigTarget(chosen, path.join(repo, "cfg", "messagefoundry.toml"), inWindow(user, workspaceFile), real);
+    assert.ok(!got.ok && got.problem.includes("passes through a link"), JSON.stringify(got));
+    // THE CONTROL: a plain folder in the file's folder is accepted, and outside it nothing changes.
+    const plain = path.join(repo, "plain", "messagefoundry.toml");
+    assert.deepStrictEqual(securityConfigTarget(chosen, plain, inWindow(user, workspaceFile), real), { ok: true, path: plain });
+    const mine = path.join(base, "mine.toml");
+    assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
   });
 
   (process.platform === "win32" ? test : test.skip)("the name checks still run first, with no file-system call", () => {

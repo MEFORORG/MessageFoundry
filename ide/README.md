@@ -246,10 +246,11 @@ and uses your user value or the default instead, until you trust the workspace (
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. A user-set path
   that reaches the workspace folder or a folder below it by another spelling, such as a UNC
-  loopback admin share or a junction outside the folder, is found by real path or file id and gets
-  the same checks. In a window opened from a `.code-workspace` file, which chooses the workspace
-  folder, a path inside that folder, the default one included, is refused unless the folder lies
-  inside the folder holding the file. The rules and the open limits are in the
+  loopback admin share or a junction outside the folder, is found by real path or file id, and the
+  part below the folder gets the same checks, except where the alias leads onto a folder that is
+  itself a link the repository holds. In a window opened from a `.code-workspace` file, which
+  chooses the workspace folder, a path inside that folder, the default one included, is refused
+  unless the folder lies inside the folder holding the file. The rules and the open limits are in the
   `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
