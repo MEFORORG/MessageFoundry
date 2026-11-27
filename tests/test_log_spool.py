@@ -1844,12 +1844,18 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "that does not hold the lock strands none of them. "
         # ``__main__._forward_spool_dir`` and ``_supervisor_forward_spool_dir``: ``engine``,
         # ``shard-<id>`` or ``supervisor`` under ``_forward_spool_root``, which is ``Path(base)``
-        # for a setting (never anchored) and otherwise ``log-spool`` in the resolved store path's
-        # parent, ``--db`` landing in ``[store].path`` on every backend (the next test ties it).
-        "Each process spools in its own subdirectory (engine, shard-<engine shard id>, or "
-        "supervisor) of a root. The root is [logging].forward_spool_dir (environment variable "
+        # for a non-empty setting and otherwise ``log-spool`` in the resolved store path's parent.
+        # The next test ties only the default: ``log-spool`` in the directory that holds a
+        # ``[store].path`` it builds directly, on SQLite and on a database server, shared by two
+        # stores in one directory. Two facts here are checked by reading the code, not tied by any
+        # test: ``--db`` reaching ``[store].path`` (``_serve`` and ``_supervise`` write it into the
+        # CLI layer), and a relative setting being taken against the working directory
+        # (``_forward_spool_root`` returns ``Path(base)`` unanchored).
+        "A process spools in the subdirectory engine, shard-<engine shard id> or supervisor of a "
+        "root. The root is [logging].forward_spool_dir (environment variable "
         "MEFOR_LOGGING_FORWARD_SPOOL_DIR), taken against the working directory when it is a "
-        "relative path. With no setting, the root is log-spool in the directory that holds the "
+        "relative path. With the setting unset or empty, the root is log-spool in the directory "
+        "that holds the "
         "resolved store path (--db, or else [store].path, read even when the store is on a "
         "database server), so two stores in one directory share it. "
         'One directory serves one process (ADR 0200, "One process per directory").'
