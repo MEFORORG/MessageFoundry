@@ -463,12 +463,17 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.deepStrictEqual(saved(p, false).host, initial.settings.host, "a round trip rewrote the key");
   });
 
-  test("edit: a recorded env key holding a line break is saved trimmed, as before, so it can be repaired", () => {
-    // The box cannot show a CR or LF, so leaving it and retyping what it shows look the same; the
-    // trimmed text is written, as origin/main wrote it, and the inline default stays with it.
+  test("edit: a recorded env key holding a line break is saved as recorded when untouched, and can be repaired by typing", () => {
+    // The box cannot show a CR or LF. Leaving it writes the recorded key back exactly (BACKLOG #8243
+    // item 19); typing what it shows is the repair, and the inline default stays with the key.
     const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: "DB_\r\nPW", default: INLINE_DEFAULT } } };
     const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
-    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the line break was written back");
+    assert.deepStrictEqual(saved(p, false).db_password, initial.settings.db_password, "the untouched key was rewritten");
+    const q = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    const box = q.window.document.querySelector('#settings [data-key="db_password"]');
+    box.value = "DB_PW";
+    box.dispatchEvent(new q.window.Event("input"));
+    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the typed repair was not saved");
   });
 
   test("edit: a default dropped by switching to a literal on another transport does not come back (BACKLOG #8243 item 20)", () => {

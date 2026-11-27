@@ -153,6 +153,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // What each control showed right after it was drawn: an untouched control still shows exactly
     // this, whatever the browser did to the value on assignment (a text input strips CR and LF).
     const SHOWN = new WeakMap();
+    // Text boxes the user has typed into. An env key box judges "untouched" by this as well as by
+    // SHOWN: a recorded key holding a line break shows without it, so retyping what the box shows
+    // is the user's repair and saves the typed key, while leaving it saves the recorded key exactly.
+    const TYPED = new WeakSet();
     // The record's inline credentials (HELD_SECRETS) and secret env references' inline defaults
     // (HELD_DEFAULTS), by key. A transport or direction change sends the host HELD_MARK in their
     // place, never the value: the host rebuilds the fields from what it is sent, so the key (and an
@@ -231,6 +235,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         if (f.control === 'number' && !useEnv) control.setAttribute('inputmode', 'decimal');
         control.placeholder = useEnv ? secretHint(f) : (f.placeholder || '');
         control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
+        control.addEventListener('input', () => TYPED.add(control));
       }
       control.dataset.key = f.key;
       control.dataset.kind = f.control === 'checkbox' && !boolish ? 'text' : f.control;
@@ -302,7 +307,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // reply is drawn, not when the request is sent, so a setting kept again before the reply
       // arrives keeps its default (BACKLOG #8243 items 18 and 20). A reference under another key
       // keeps it, so the original key typed back still finds it.
-      const envRefKeys = new Set();
+      // A key the latest request sent as an env reference keeps it too: a reply to an older request
+      // can be drawn first, and the newer request's reply will draw the reference (item 18).
+      const envRefKeys = new Set(LAST_ASKED ? LAST_ASKED.envKeys : []);
       for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
       for (const k of HELD_DEFAULTS.keys()) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
       for (const g of groups) {
@@ -328,20 +335,45 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
+    // The keys the latest fields request sent, and those it sent as env references; null until the
+    // first request. The reply carries no request id, so this is how the page tells which request
+    // a reply answers (the message handler below).
+    let LAST_ASKED = null;
+
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
       // A setting this request leaves out (removed, or its env key box empty) loses its held default
       // when the reply is drawn (renderGroups), not here.
+      const settings = collectSettings(true);
+      const keys = Object.keys(settings);
+      LAST_ASKED = { keys: new Set(keys), envKeys: new Set(keys.filter((k) => isEnvRefValue(settings[k]))) };
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
         command: 'fields',
         transport: $('transport').value,
         direction: $('direction').value,
-        settings: collectSettings(true),
+        settings: settings,
         ${CHANNEL_FIELD}: MF_CHANNEL,
       });
+    }
+
+    function sameKeys(a, b) {
+      if (a.size !== b.size) return false;
+      for (const k of a) if (!b.has(k)) return false;
+      return true;
+    }
+
+    // The keys a reply's descriptors carry a value for. The host builds a reply from the settings
+    // its request sent (buildForm in connectionForm.ts draws every one of them, and only those, with
+    // its value, its env reference, or its held credential), so these are that request's keys.
+    function repliedKeys(groups) {
+      const keys = new Set();
+      for (const g of groups) for (const f of g.fields) {
+        if (f.isEnvRef || f.value !== undefined || f.preserveValue !== undefined) keys.add(f.key);
+      }
+      return keys;
     }
 
     function refreshVisibility() {
@@ -431,20 +463,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
-      // A select of scalar choices takes the picked choice first, with its own type: a select whose
-      // recorded value was a table must not JSON-parse a choice such as "2" into a number (BACKLOG
-      // #8243 item 31). A select with a table or array among its choices cannot match one by its
-      // text, so it keeps the earlier order: a table-valued record parses the picked JSON.
-      const choices = f.choices || [];
-      const pick = () => { const hit = choices.find((c) => String(c) === raw); return hit !== undefined ? hit : raw; };
-      const scalarChoices = !choices.some((c) => c !== null && typeof c === 'object');
-      if (f.control === 'select' && scalarChoices) return pick();
+      // A select takes the picked choice itself, with its own type, matched by the text its option
+      // was written with (displayValue): a select whose recorded value was a table must not
+      // JSON-parse a choice such as "2" into a number, and a table choice is posted as the table,
+      // whatever the other choices are (BACKLOG #8243 item 31). Text no choice matches falls through.
+      if (f.control === 'select') {
+        const hit = (f.choices || []).find((c) => displayValue(c) === raw);
+        if (hit !== undefined) return hit;
+      }
       // TOML's inf / -inf typed into a float field is carried as the tag the engine decodes; "nan"
       // is posted as typed, for the engine to refuse.
       if (f.type === 'float' && (raw === 'inf' || raw === '-inf')) return { [NON_FINITE_TAG]: raw };
       const tableValued = f.value !== null && typeof f.value === 'object' && !isNonFiniteTag(f.value);
       if (f.control === 'table' || tableValued) return parseTable(raw);
-      if (f.control === 'select') return pick();
+      if (f.control === 'select') return raw;
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
       // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
@@ -475,19 +507,18 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const f = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
-          if (!envKey) {
+          // An untouched box writes back the recorded key exactly, surrounding spaces, line breaks
+          // and a key of only spaces included: the engine looks the key up as written, so a trimmed
+          // key names another variable (BACKLOG #8243 item 19). A key the user typed is trimmed,
+          // which is how a key the box shows without its line breaks is repaired (TYPED).
+          const untouchedKey = f.envKey !== undefined && !TYPED.has(el) && el.value === SHOWN.get(el);
+          if (!envKey && !untouchedKey) {
             // No key typed. An inline credential the record already holds is written back as it
             // was, unseen (resolved from HELD_MARK below); deleting a working credential because the
             // form will not show it would be its own outage. Removed on request.
             if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
             continue;
           }
-          // An untouched box writes back the recorded key exactly, surrounding spaces included: the
-          // engine looks the key up as written, so a trimmed key names another variable (BACKLOG
-          // #8243 item 19). A key the user typed is trimmed. A recorded key holding a CR or LF is
-          // the exception: the box cannot show it, so retyping what it shows cannot be told from
-          // leaving it, and the trimmed text is written, as before, so the key can be repaired.
-          const untouchedKey = f.envKey !== undefined && !/[\\r\\n]/.test(f.envKey) && el.value === SHOWN.get(el);
           const ref = { env: untouchedKey ? f.envKey : envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
           // A held inline default goes back only with the env key it was recorded under, compared
@@ -527,7 +558,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           settings[key] = f.value;            // untouched: the recorded value, exactly
           continue;
         }
-        const raw = el.value.trim();
+        // A select's value is the picked option's, written from the choice itself, so it is not
+        // trimmed: a choice with surrounding spaces must still match (typedValue).
+        const raw = el.tagName === 'SELECT' ? el.value : el.value.trim();
         if (raw === '') continue;             // emptied -> omit the key entirely
         settings[key] = typedValue(f, raw);
       }
@@ -657,6 +690,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
+        if (LAST_ASKED) {
+          // A reply whose keys are not the latest request's answers an older request: drawing it
+          // would drop a setting the latest request carries, or bring back one it left out.
+          if (!sameKeys(repliedKeys(d.groups), LAST_ASKED.keys)) return;
+          // A setting removed, kept again, emptied or added since the latest request: drawing its
+          // reply would undo that, so ask again with the form as it is now (BACKLOG #8243 items 18
+          // and 20). Each reply sends at most one request, and the form is unchanged until the
+          // next reply, so this stops once the user stops changing which keys the form holds.
+          if (!sameKeys(new Set(Object.keys(collectSettings(true))), LAST_ASKED.keys)) { requestFields(); return; }
+        }
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);
       }
