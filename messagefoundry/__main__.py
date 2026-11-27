@@ -14036,8 +14036,6 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     # A VACUUM or other schema change stopped the SQLite walk, so a rowid locator may have moved.
     interrupted = False
     audit = CipherAudit()
-    # A server store's cells, and its `keyed_surface`, that its catalog read did not show this login.
-    hidden: list[str] = []
     server = store.backend != StoreBackend.SQLITE
     # How a cell the walk did not read is named: a server schema is the build's own, so one there is
     # hidden from this login rather than missing (see NOT_COVERED below).
@@ -14079,7 +14077,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         label = _store_label(store)
         walk_errors = audit_chain_read_errors()
 
-        async def run_server() -> tuple[bool, CipherAudit, str | None, list[str]] | None:
+        async def run_server() -> tuple[bool, CipherAudit, str | None] | None:
             _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
             # Bound, as `audit-verify` binds it, so the posture census reads the name it passes.
             posture = _command_hop_posture(settings)
@@ -14100,7 +14098,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             except StoreKeylessError as exc:
                 # A keyless open of a keyed store refused by the open itself: the key, not the
                 # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
-                return False, CipherAudit(key_mismatch=safe_exc(exc)), None, []
+                return False, CipherAudit(key_mismatch=safe_exc(exc)), None
             except (RuntimeError, ValueError) as exc:
                 # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
                 # least a missing driver extra, or an engine refusal of this open. Could not start.
@@ -14118,16 +14116,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     raise _StoreUnreachable() from exc
                 if not any(server_cell_present(c, columns) for c in cells):
                     return None
-                # The inventory's names, never the catalog's: what this login's catalog read did
-                # not show. `keyed_surface` too, since without it a keyed surface reads as never
-                # sealed and a keyless shell's key mismatch is not seen.
-                hidden = [
-                    f"{c.table}.{c.column}" for c in cells if not server_cell_present(c, columns)
-                ]
-                if "keyed_surface" not in columns:
-                    hidden.append("keyed_surface")
-                # Filled in place, so a walk that raises part way keeps what it had tallied and a
-                # failure found before the stop is still reported (BACKLOG #1719 item 1).
+                # Filled in place, so a walk that raises part way keeps what it had tallied, and
+                # the cells its catalog read hid (`CipherAudit.hidden`), and a failure found
+                # before the stop is still reported (BACKLOG #1719 items 1 and 9).
                 found = CipherAudit()
                 try:
                     await audit_server_cipher_cells(
@@ -14141,9 +14132,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 except walk_errors as exc:
                     error: Exception = exc
                 except key_service_down as exc:
-                    return server_cipher.encrypts, found, stopped_by_key_service(exc), hidden
+                    return server_cipher.encrypts, found, stopped_by_key_service(exc)
                 else:
-                    return server_cipher.encrypts, found, None, hidden
+                    return server_cipher.encrypts, found, None
                 if is_store_shape_error(error) and failing_value(found) is None:
                     # A table, column or grant the read needs, as `audit-verify` splits it:
                     # nothing about a row, so could not start rather than FAIL.
@@ -14151,7 +14142,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # Part way: a lost connection, a timeout, a value the driver cannot read, or a
                 # grant the walk met after it had found a failing value. The rendering is the
                 # error's class and SQLSTATE, never a row's content.
-                return server_cipher.encrypts, found, _store_error_text(error), hidden
+                return server_cipher.encrypts, found, _store_error_text(error)
             finally:
                 await _close_store_quietly(handle)
 
@@ -14176,7 +14167,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 as_json=as_json,
             )
             return 2
-        keyed, audit, stopped, hidden = outcome
+        keyed, audit, stopped = outcome
     else:
         path = store.path
         if not Path(path).is_file():
@@ -14252,7 +14243,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     elif failing is not None:
         status, code = "FAIL", 1
         reason = failing[0]
-    elif hidden:
+    elif audit.hidden:
         # A server schema is the build's own, so an expected cell the catalog read did not show
         # was hidden from this login (at least a missing grant) rather than never created. Its
         # values were not read, so the store is not audited whole and cannot PASS. The names come
@@ -14285,14 +14276,14 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             )
         if audit.absent and not server:
             reason += f"; {unread}, so not read: {', '.join(audit.absent)}"
-    if hidden:
+    if audit.hidden:
         # On every verdict, so a key or a lost connection fixed first does not hide a grant gap
         # until a second run.
         reason += (
-            f"; {len(hidden)} expected cipher table(s) or cell(s) are not visible in the catalog "
-            f"of {_store_label(store)} and were not read: {', '.join(hidden)}. At least a missing "
-            "grant on the table, or a schema behind this build, hides one: grant the login read "
-            "on it, or let the service's open migrate the store, and run again"
+            f"; {len(audit.hidden)} expected cipher table(s) or cell(s) are not visible in the "
+            f"catalog of {_store_label(store)} and were not read: {', '.join(audit.hidden)}. At "
+            "least a missing grant on the table, or a schema behind this build, hides one: grant "
+            "the login read on it, or let the service's open migrate the store, and run again"
         )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted

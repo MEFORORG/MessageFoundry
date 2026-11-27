@@ -1699,6 +1699,51 @@ def test_a_hidden_keyed_surface_is_not_covered_never_a_pass(
     assert "keyed_surface" in payload["reason"], payload
 
 
+def test_the_server_audit_itself_records_what_the_catalog_hid(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``audit_server_cipher_cells`` returns the hidden cells and a hidden ``keyed_surface`` in
+    ``hidden``, so a caller other than the CLI can refuse a PASS too (BACKLOG #1719 item 9), on
+    the key-mismatch stop as well, which reads no value. Control: nothing hidden, nothing recorded."""
+    db, settings = _copy(_template, tmp_path)
+    keyed = build_store_cipher(settings)
+    audit, _source = _server_audit(db, keyed)
+    assert audit.hidden == [] and audit.failed == 0, _counts(audit)
+    _hide_from_catalog(monkeypatch, "search_presets")
+    _hide_from_catalog(monkeypatch, "keyed_surface")
+    audit, _source = _server_audit(db, keyed)
+    assert audit.hidden == ["search_presets.criteria", "keyed_surface"], audit.hidden
+    assert audit.key_mismatch is None
+    # A walk under no key stops before any value, and still records what it could not see.
+    monkeypatch.undo()
+    _hide_from_catalog(monkeypatch, "search_presets")
+    audit, source = _server_audit(db, build_store_cipher(StoreSettings(path=str(db))))
+    assert audit.hidden == ["search_presets.criteria"], audit.hidden
+    assert audit.key_mismatch is not None and source.limits == {}
+
+
+def test_a_reused_audit_drops_the_hidden_list_its_last_walk_left(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``into`` is reset to the new walk's findings, ``hidden`` with them: a SQLite walk has no
+    catalog to hide a cell, so it leaves the list empty whatever an earlier walk put there."""
+    db, settings = _copy(_template, tmp_path)
+    cipher = build_store_cipher(settings)
+    _hide_from_catalog(monkeypatch, "search_presets")
+    audit, _source = _server_audit(db, cipher)
+    assert audit.hidden == ["search_presets.criteria"], audit.hidden
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        again = audit_cipher_cells(conn, cipher, into=audit)
+    finally:
+        conn.close()
+    assert again is audit and audit.hidden == [], audit.hidden
+
+
 @pytest.mark.parametrize("shape", ["unmarked", "key_mismatch"])
 def test_every_other_verdict_leads_a_hidden_cell_and_still_names_it(
     tmp_path: Path,

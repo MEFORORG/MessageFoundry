@@ -677,6 +677,13 @@ class CipherAudit:
 
     tallies: list[CellTally] = field(default_factory=list)
     key_mismatch: str | None = None
+    #: What a server store's catalog read did not show, so the walk read none of it: each cell
+    #: asked for as ``table.column``, then ``keyed_surface``, without which a keyed surface reads
+    #: as never sealed. Names from the inventory, never the catalog. A server schema is the
+    #: build's own, so a name here is hidden from the login (at least a missing grant), and the
+    #: store is not audited whole: no verdict over it may PASS (BACKLOG #1719 item 9). Always
+    #: empty after a SQLite walk, whose missing cells an older store predates (``present``).
+    hidden: list[str] = field(default_factory=list)
 
     @property
     def opened(self) -> int:
@@ -741,6 +748,7 @@ def _tally_into(into: CipherAudit | None, tallies: list[CellTally]) -> CipherAud
         return CipherAudit(tallies)
     into.tallies[:] = tallies
     into.key_mismatch = None
+    into.hidden.clear()
     return into
 
 
@@ -1005,6 +1013,9 @@ async def audit_server_cipher_cells(
         into,
         [CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted],
     )
+    # Before any value is read, so a stop on the key mismatch, an outage or a store error part way
+    # still says what the walk could not see.
+    audit.hidden = audit.absent if "keyed_surface" in columns else [*audit.absent, "keyed_surface"]
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit
