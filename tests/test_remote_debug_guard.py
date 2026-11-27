@@ -588,7 +588,10 @@ def build_sinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Cal
 
 @pytest.mark.parametrize(("name", "spelled"), _NAMES)
 def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
-    build_sinks: Callable[[], _Sinks], name: str, spelled: str
+    build_sinks: Callable[[], _Sinks],
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    spelled: str,
 ) -> None:
     """The injecting process chooses the name, and it must not be able to keep the refusal out
     of a log. The control for these arms is the test below, on the same sinks."""
@@ -601,15 +604,29 @@ def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
     assert json.dumps(wanted)[1:-1] in sinks.forwarded(REMOTE_SCRIPT_EVENT)
     assert sinks.rolled_aside() == []
     assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
+    # The name's own escape, not the log guard's, kept the line encodable.
+    assert _GUARD_ESCAPED not in capsys.readouterr().err
 
 
-def test_without_the_escape_a_name_outside_cp1252_keeps_the_line_off_stdout(
-    build_sinks: Callable[[], _Sinks], monkeypatch: pytest.MonkeyPatch
+#: The stderr line the log guard writes when it had to escape a line the stream could not encode
+#: (BACKLOG #5813).
+_GUARD_ESCAPED = r"cannot encode; they were written as \uXXXX escapes"
+
+
+def test_without_the_escape_a_name_outside_cp1252_needs_the_guard_to_escape_it(
+    build_sinks: Callable[[], _Sinks],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """CONTROL for the test above: the same sinks, with the name passed as it came. A printable
-    character the strict cp1252 stdout cannot encode is not in the log escape's alphabet, so only
-    ``_ascii`` keeps that line on stdout, and every stdout assertion above could have failed. The
-    UTF-8 file takes the line either way.
+    character the strict cp1252 stdout cannot encode is not in the log escape's alphabet, so
+    without ``_ascii`` the stdout write fails, and the log write guard writes the line again with
+    the character escaped and says so on stderr (BACKLOG #5813). The test above asserts that
+    stderr line is absent, so its stdout assertions do rest on ``_ascii``. The UTF-8 file takes
+    the line either way.
+
+    Until BACKLOG #5813 the guard recorded the stdout sink unwritable here, and this control
+    asserted that.
 
     Until vault BACKLOG #2815 this control used a lone surrogate, which failed every sink. The
     handlers' log escape now covers category ``Cs``, so that arm no longer fails anything;
@@ -617,9 +634,10 @@ def test_without_the_escape_a_name_outside_cp1252_keeps_the_line_off_stdout(
     sinks = build_sinks()
     monkeypatch.setattr(remotedebug, "_ascii", lambda name: name)
     remotedebug._report(f"pay{chr(0x4E2D)}load.py")
-    assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
+    assert _GUARD_ESCAPED in capsys.readouterr().err
+    assert r"script file name pay\u4e2dload.py)" in sinks.on_stdout()
     assert REMOTE_SCRIPT_EVENT in sinks.in_file()
-    assert sinks.states()["stdout"] == "unwritable"
+    assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
 
 
 @pytest.mark.parametrize("character", _BOUNDED)

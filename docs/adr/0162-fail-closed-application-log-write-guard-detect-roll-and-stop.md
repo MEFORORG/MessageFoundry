@@ -471,14 +471,16 @@ delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
 for any write failure. When the formatter cannot format the notice either, the sink is recorded
 unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
 stage 2 then decides the stop as for any other stage-2 failure. (Added 2026-11-25.) A line
-holding a character a strict stream has no byte for is not handled (BACKLOG #5813, open), whether
-it is a record that formats or the stand-in notice, whose logger name can hold one: the write
-raises `UnicodeEncodeError`, and when the roll re-resolves to the same stream the re-write fails
-too, so the sink is recorded unwritable as for a broken sink, and stage 2 decides the stop. The
-stage-1 roll notice is still written to that sink first. `serve` sets its stdout and stderr to
-replace such a character where the stream allows it (`console_streams.harden_console_streams`);
-a stream left strict is not covered. `tests/test_remote_debug_guard.py` pins the unwritable
-outcome for a strict cp1252 stdout.
+holding a character a strict stream has no byte for is written again with each such character
+as a JSON `\uXXXX` escape, a surrogate pair outside the BMP, so a JSON line still parses back
+to the text (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that called the case
+open). That holds for a record that formats, for the stand-in notice, and for the re-write
+after a roll, escaped for the stream the roll left. When the sink takes the escaped line,
+neither stage runs, and the escape is counted on the rate-limited stderr format-fault line;
+nothing shows on `GET /status`. When the sink refuses the escaped line too, the two stages
+decide, as for any write failure. The escape reads the stream's `encoding`, and one that is
+missing or unknown escapes everything outside ASCII. `tests/test_remote_debug_guard.py` pins
+the escaped line for a strict cp1252 stdout.
 `_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 

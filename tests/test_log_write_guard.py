@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import random
 import shutil
@@ -66,7 +67,7 @@ from messagefoundry.logging_guard import (
     active_guard,
     set_active_guard,
 )
-from messagefoundry.logging_setup import LogFile, configure_logging
+from messagefoundry.logging_setup import JsonFormatter, LogFile, configure_logging
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.stage_dispatcher import LaneResultKind
@@ -1063,6 +1064,135 @@ def test_a_record_with_no_name_or_level_name_does_not_raise(tmp_path: Path) -> N
     assert "from logger '<unnameable>' at level <unnameable>" in log_path.read_text(
         encoding="utf-8"
     )
+
+
+def _strict_cp1252() -> tuple[io.BytesIO, io.TextIOWrapper]:
+    """A strict cp1252 text stream over a buffer the test can read: the encoding a redirected
+    stdout has on a stock Windows install."""
+    raw = io.BytesIO()
+    return raw, io.TextIOWrapper(raw, encoding="cp1252", errors="strict", write_through=True)
+
+
+# A CJK character and an emoji, which cp1252 has no byte for, and an e-acute, which it has.
+_UNENCODABLE = "caf\xe9 \u4e2d \U0001f600"
+
+
+def test_a_line_the_stream_cannot_encode_is_escaped_not_a_sink_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The stdout sink on a strict cp1252 stream, which is also the live sys.stdout, so a roll
+    # re-resolves to the same stream. The record formats; the stream refuses a character in it. The
+    # line is written again with that character escaped, nothing pages and the sink stays healthy.
+    # NEGATIVE CONTROL: on 53abdb235b8 the guard rolled onto the same stream, failed the re-write
+    # and recorded the sink unwritable, asking for a stop, with nothing of the line on the stream.
+    raw, stream = _strict_cp1252()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+    handler.emit(_record("the next line"))
+
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    written = raw.getvalue().decode("cp1252")
+    assert "order caf\xe9 \\u4e2d \\ud83d\\ude00" in written
+    assert "the next line" in written
+    assert "rolled after a write failure" not in written
+    err = capsys.readouterr().err
+    assert "cannot encode; they were written as \\uXXXX escapes (x1)" in err
+    assert "IS UNWRITABLE" not in err
+
+
+def test_an_escaped_json_line_parses_back_to_the_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The escape is JSON's own spelling, a surrogate pair outside the BMP, so a JSON sink's line
+    # still parses back to what was logged.
+    # NEGATIVE CONTROL: on 53abdb235b8 nothing of the line reached the stream.
+    raw, stream = _strict_cp1252()
+    monkeypatch.setattr(sys, "stdout", stream)
+    guard = LogWriteGuard()
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(JsonFormatter())
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    (line,) = raw.getvalue().decode("cp1252").splitlines()
+    assert json.loads(line)["message"] == f"order {_UNENCODABLE}"
+
+
+def test_a_roll_onto_a_narrower_stream_escapes_the_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sink's stream is closed, so the write fails for the sink's own reason, and the roll
+    # re-resolves to a strict cp1252 stdout that cannot encode the record. The re-write is escaped
+    # for the stream it lands on, so stage 1 completes and the sink reads rolled, not unwritable.
+    # NEGATIVE CONTROL: on 53abdb235b8 the re-write raised and the sink was recorded unwritable.
+    raw, live = _strict_cp1252()
+    monkeypatch.setattr(sys, "stdout", live)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    dead = io.StringIO()
+    handler = GuardedStreamHandler(dead, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    dead.close()
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    assert [e.stage for e in events] == ["rolled"]
+    assert [s.state for s in guard.status()] == ["rolled"]
+    assert "order caf\xe9 \\u4e2d \\ud83d\\ude00" in raw.getvalue().decode("cp1252")
+
+
+def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CONTROL: the escape is for the line, not a way round a broken sink. A stream that refuses
+    # every write raises UnicodeEncodeError for this line, and then refuses the escaped line too,
+    # so the two stages decide as for any write failure, and the stop is asked for.
+    class _Refuses(io.StringIO):
+        encoding = "cp1252"
+
+        def write(self, text: str) -> int:
+            if not text.isascii():
+                raise UnicodeEncodeError("charmap", text, 0, 1, "character maps to <undefined>")
+            raise OSError(28, "No space left on device")
+
+    stream = _Refuses()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert events[0].stop_requested is True
+    assert [s.state for s in guard.status()] == ["unwritable"]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "text", "expected"),
+    [
+        pytest.param("cp1252", _UNENCODABLE, "caf\xe9 \\u4e2d \\ud83d\\ude00", id="cp1252"),
+        pytest.param("utf-8", _UNENCODABLE, _UNENCODABLE, id="utf-8-keeps-all"),
+        pytest.param(None, _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="no-encoding"),
+        pytest.param(
+            "no-such-codec", _UNENCODABLE, "caf\\u00e9 \\u4e2d \\ud83d\\ude00", id="unknown"
+        ),
+        # Spelled as the log spells one, the backslash doubled, so a strict JSON decoder reads it.
+        pytest.param("utf-8", "a\udcffb", "a\\\\udcffb", id="lone-surrogate"),
+    ],
+)
+def test_the_escape_reads_the_stream_encoding(
+    encoding: str | None, text: str, expected: str
+) -> None:
+    assert logging_guard._encodable(text, encoding) == expected
 
 
 def test_an_owed_stage2_event_is_fired_once_per_failure_not_once_per_thread() -> None:

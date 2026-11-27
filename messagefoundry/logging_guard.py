@@ -76,6 +76,7 @@ scope available. See ADR 0162 section 4.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import logging
 import logging.handlers
@@ -89,7 +90,11 @@ from typing import TYPE_CHECKING, Literal, TextIO
 
 # Bound at MODULE scope, not inlined: that is what lets a test force the scrubber itself to raise
 # and assert the notice is emitted anyway, with no production test hook (BACKLOG #1591).
-from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.controlchars import (
+    escape_lone_surrogates,
+    json_unicode_escape,
+    scrub_control_chars,
+)
 from messagefoundry.redaction import redact_binary_carriage, safe_exc
 from messagefoundry.secretscrub import scrub_credentials
 
@@ -776,6 +781,30 @@ def _escape_only(text: str, *, fallback: str) -> str:
     return _guarded(scrub_control_chars, text, fallback=fallback)
 
 
+def _encodable(line: str, encoding: object) -> str:
+    """``line`` with each character ``encoding`` cannot encode spelled as a JSON ``\\uXXXX``
+    escape, a surrogate pair for one outside the BMP, and a lone surrogate as the log spells it
+    (:func:`~messagefoundry.controlchars.escape_lone_surrogates`) (BACKLOG #5813). An ``encoding``
+    that is not a known codec name reads as ASCII. Never raises."""
+    try:
+        codec = codecs.lookup(encoding).name if isinstance(encoding, str) else "ascii"
+    except LookupError:
+        codec = "ascii"
+    out: list[str] = []
+    for ch in line:
+        if ch.isascii():
+            out.append(ch)
+            continue
+        try:
+            ch.encode(codec)
+        except UnicodeError:
+            escaped = escape_lone_surrogates(ch)
+            out.append(escaped if escaped != ch else json_unicode_escape(ord(ch)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 #: The fallback for a record's logger or level name, or an exception's type name, in the
 #: unformattable-record notice and the formatter-fault line.
 _RECORD_LABEL_DROPPED = "<unnameable>"
@@ -907,10 +936,20 @@ class _GuardedSinkMixin(_SinkBase):
                 )
                 self._report_format_faults()
                 try:
-                    self._write_line(stand_in_line)
+                    self._write_encodable(stand_in_line)
                     return
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
+                    failure = sink_exc
+            elif isinstance(failure, UnicodeEncodeError):
+                # The record formats, and the stream has no byte for a character in the line (a
+                # strict cp1252 stdout, say). That is the line's fault, not the sink's, so it is
+                # written again with each such character escaped, and neither stage runs; a roll
+                # would only re-resolve to the same stream and fail the same way (BACKLOG #5813).
+                try:
+                    self._write_escaped(self.format(record) + self.terminator)
+                    return
+                except Exception as sink_exc:
                     failure = sink_exc
             # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
             # written by ``_write_notice`` straight to the sink's stream through ``_write_line``, so
@@ -934,7 +973,7 @@ class _GuardedSinkMixin(_SinkBase):
                 if stand_in_line is None:
                     self._rewrite(record)
                 else:
-                    self._write_line(stand_in_line)
+                    self._write_encodable(stand_in_line)
             except Exception as roll_exc:
                 # ``_safe_reason``, not a bare ``safe_exc``: the guard scrubs nothing of its own, so
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
@@ -1091,8 +1130,30 @@ class _GuardedSinkMixin(_SinkBase):
     def _emit_direct(self, record: logging.LogRecord) -> None:
         """Format + write + flush WITHOUT going through ``emit`` — an ``emit`` failure would re-enter
         ``handleError`` and be swallowed by the latch, hiding the very Stage 2 we are trying to detect.
-        Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2."""
-        self._write_line(self.format(record) + self.terminator)
+        Here the exception propagates to :meth:`handleError`'s caller and becomes Stage 2. A line
+        the stream cannot encode is escaped for it first, as :meth:`_write_encodable` says."""
+        self._write_encodable(self.format(record) + self.terminator)
+
+    def _write_encodable(self, line: str) -> None:
+        """Write ``line``; if the stream has no byte for one of its characters, write it again
+        with each such character escaped (:meth:`_write_escaped`). Any other failure, and a failure
+        of the escaped write, propagates (BACKLOG #5813)."""
+        try:
+            self._write_line(line)
+        except UnicodeEncodeError:
+            self._write_escaped(line)
+
+    def _write_escaped(self, line: str) -> None:
+        """Write ``line`` with each character the stream cannot encode as a JSON ``\\uXXXX``
+        escape, so a JSON sink's line still parses back to the text, and count it as a format fault
+        for the stderr line. The escape reads the stream's ``encoding``; one that is missing or
+        unknown escapes everything outside ASCII. A failure of the write propagates."""
+        self._write_line(_encodable(line, getattr(self.stream, "encoding", None)))
+        self._note_format_fault(
+            "a line held characters the sink's stream cannot encode; they were written as "
+            "\\uXXXX escapes"
+        )
+        self._report_format_faults()
 
     def _write_line(self, line: str) -> None:
         """Write and flush an already formatted line; a sink failure propagates."""
