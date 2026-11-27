@@ -2651,28 +2651,22 @@ class ConsolidatedLadderReport:
             return 2
         return 0 if self.ok else 1
 
-    @property
-    def _climb_broken(self) -> bool:
-        """A CLIMB rung broke correctness: the same terms :attr:`correctness_ok` applies, read on the climb
-        alone, so the soak's state cannot touch it."""
-        return any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in self.climb) or any(
-            r.lanes_observed < 2
-            for r in self.climb
-            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
+    @staticmethod
+    def _rung_broken(r: RungOutcome) -> bool:
+        """One rung broke correctness: the per-rung terms :attr:`correctness_ok` applies."""
+        return r.verdict is RungVerdict.CORRECTNESS_FAIL or (
+            r.verdict is RungVerdict.SUSTAINED and r.offered != 0 and r.lanes_observed < 2
         )
 
     @property
+    def _climb_broken(self) -> bool:
+        """A CLIMB rung broke correctness, read on the climb alone so the soak's state cannot touch it."""
+        return any(self._rung_broken(r) for r in self.climb)
+
+    @property
     def _soak_broken(self) -> bool:
-        """The SOAK broke correctness: :attr:`_climb_broken`'s terms, read on the soak alone."""
-        soak = self.soak
-        return soak is not None and (
-            soak.verdict is RungVerdict.CORRECTNESS_FAIL
-            or (
-                soak.verdict is RungVerdict.SUSTAINED
-                and soak.offered != 0
-                and soak.lanes_observed < 2
-            )
-        )
+        """The SOAK broke correctness, read on the soak alone."""
+        return self.soak is not None and self._rung_broken(self.soak)
 
     @property
     def _break_outranks_degradation(self) -> bool:
