@@ -1796,13 +1796,25 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """And the control: a directory another process holds is NOT named, because that process sends
-    what it holds."""
+    what it holds. Its WARNING names the remedy instead, a different ``[logging].forward_spool_dir``
+    (BACKLOG #5400); an unusable directory's does not, since a directory of its own does not cure
+    that. Either way the opener returns ``None``, so the forwarder runs without a spool (#1966)."""
+    from messagefoundry.config.settings import load_settings
+
+    # The names the remedy gives are the real ones: the variable reaches the setting.
+    named = load_settings(environ={"MEFOR_LOGGING_FORWARD_SPOOL_DIR": "other"}, default_file=False)
+    assert named.logging.forward_spool_dir == "other"
+
     earlier = LogSpool(spool_dir, max_bytes=100_000)
     earlier.open()
     earlier.append(_entry(0))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
         assert _open_forward_spool(_forward_to(spool_dir)) is None  # held by `earlier`
     assert "in use by another process" in caplog.text and "still holds" not in caplog.text
+    [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
+    assert in_use.levelno == logging.WARNING
+    assert "[logging].forward_spool_dir" in in_use.getMessage()
+    assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
     earlier.close()
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
@@ -1817,43 +1829,6 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
         "could not be opened, but" in caplog.text
         and "still holds 1 spool segment(s)" in caplog.text
     )
-
-
-def test_a_spool_in_use_warns_with_the_remedy_and_the_engine_still_starts_without_one(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The in-use WARNING names the setting that gives each process its own directory (BACKLOG
-    #5400). Still a WARNING and still ``None``, so the start goes on without a spool (#1966). The
-    control: an unusable directory, which a directory of its own does not cure, does not name it."""
-    from messagefoundry.config.settings import load_settings
-
-    # The names the warning gives are the real ones: the variable reaches the setting.
-    named = load_settings(
-        environ={"MEFOR_LOGGING_FORWARD_SPOOL_DIR": str(spool_dir)}, default_file=False
-    )
-    assert named.logging.forward_spool_dir == str(spool_dir)
-
-    earlier = LogSpool(spool_dir, max_bytes=100_000)
-    earlier.open()
-    try:
-        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-            assert _open_forward_spool(_forward_to(spool_dir)) is None  # held by `earlier`
-    finally:
-        earlier.close()
-    [in_use] = [r for r in caplog.records if "in use by another process" in r.getMessage()]
-    assert in_use.levelno == logging.WARNING
-    assert "runs without an on-disk spool" in in_use.getMessage()
-    assert "[logging].forward_spool_dir" in in_use.getMessage()
-    assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
-
-    def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
-        raise PermissionError(13, "read-only directory")
-
-    caplog.clear()
-    monkeypatch.setattr(os, "open", _deny_lock)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
-        assert _open_forward_spool(_forward_to(spool_dir)) is None
-    monkeypatch.undo()
     assert "is not usable" in caplog.text
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" not in caplog.text
 
