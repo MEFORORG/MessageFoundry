@@ -12043,8 +12043,9 @@ def create_app(
         the primary is not serving, closes it. The response does not reliably
         tell that case from a stay-passive release: both answer ``active=false``, and a call that
         changed nothing can answer an earlier release's outcome, its drain fields and
-        ``vip_hook_ran`` included. A ``dr.stay_passive`` audit row, which only a stay-passive
-        release writes, tells the two apart; the alert list shows whether the alert closed."""
+        ``vip_hook_ran`` included. Read the alert list to see whether the alert closed. Only a
+        stay-passive release writes a ``dr.stay_passive`` audit row, but an earlier release's row
+        reads the same, so match its host, actor and time to the call."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")

@@ -93,6 +93,14 @@ _ACTION_RELEASE_FAILED = "dr_release_failed"
 #: operator leaves it passive. Kept apart from ``dr.release`` for the same reason as
 #: ``dr_release_failed``: no drain ran, so it is not a fail-back.
 _ACTION_STAY_PASSIVE = "dr.stay_passive"
+#: How an operator closes ``dr_restarted_passive``, ending both restart ERROR lines. Those lines
+#: print under every alert sink, where the sink's own CRITICAL line may not (BACKLOG #5965).
+_RESTART_CLOSE_GUIDANCE = (
+    "To leave it passive instead, POST /dr/release on this start runs the release_hook when one "
+    "is set, records that it stays passive and closes the dr_restarted_passive alert where "
+    "[alerts] keeps alert instances; there, if you leave the alert open and a later start raises "
+    "none, resolve it by hand, with POST /alerts/{alert_id}/resolve or Resolve in the web console"
+)
 #: The actions a start reads to tell whether this identity was last activated (BACKLOG #5965).
 _TRANSITIONS = (_ACTION_ACTIVATE, _ACTION_RELEASE, _ACTION_STAY_PASSIVE)
 #: How many of the newest :data:`_TRANSITIONS` rows a start reads. The engine shards of one DR
@@ -387,8 +395,10 @@ class DrCoordinator:
         except Exception as exc:
             # Broad on purpose: whatever stops the read, the box may have been serving.
             log.error(
-                "DR: could not read the activation audit rows at start, so this box may have "
-                "been serving when it went down; it stays PASSIVE: %s",
+                "DR: could not read the activation audit rows at start (%s), so this box may have "
+                "been serving when it went down. It stays PASSIVE and holds no DR role; once you "
+                "have confirmed the primary is not serving, re-run POST /dr/activate to serve the "
+                "priority feeds again. " + _RESTART_CLOSE_GUIDANCE,
                 safe_exc(exc),
             )
         else:
@@ -402,11 +412,7 @@ class DrCoordinator:
                 "the same way, and in at least the first two the primary may be serving again. It has "
                 "started PASSIVE, holds no DR role and does not re-activate itself; once you have "
                 "confirmed the primary is not serving, re-run POST /dr/activate to serve the "
-                "priority feeds again. To leave it passive instead, POST /dr/release on this "
-                "start records that it stays passive and closes the dr_restarted_passive alert "
-                "where [alerts] keeps "
-                "alert instances; an alert an earlier start left open is resolved by hand, with "
-                "POST /alerts/{alert_id}/resolve or Resolve in the web console",
+                "priority feeds again. " + _RESTART_CLOSE_GUIDANCE,
                 self._label(),
             )
         self._restart_alerted = True

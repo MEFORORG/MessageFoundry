@@ -1055,8 +1055,8 @@ class AlertSink(Protocol):
     def dr_restarted_passive(self, node: str) -> None:
         """A DR box whose newest own activate or release record is an **activation** started
         **passive** (BACKLOG #5965, ADR 0048), so it may have been serving when it went down; a
-        store restored from a snapshot taken while it was activated reads the same. It serves
-        nothing and never re-activates itself: once the operator has confirmed the primary is not
+        store restored from a snapshot taken while it was activated reads the same. It holds no
+        DR role and never re-activates itself: once the operator has confirmed the primary is not
         serving, the operator re-runs ``POST /dr/activate``. Also raised when the start could not
         read whether the box was activated. Page-worthy, and CRITICAL unless a matching rule names
         its own severity. It closes the open ``dr_activated`` instance for ``node``, which no
@@ -1685,10 +1685,11 @@ class LoggingAlertSink:
             "it went down -- the ERROR line before this says what its store shows. It holds no "
             "DR role until POST /dr/activate, to be run only once you have confirmed the "
             "primary is not serving; an inbound an operator starts on it still binds. To leave "
-            "it passive instead, POST /dr/release on this start records that it stays passive "
-            "and closes this alert where [alerts] keeps alert instances; an alert an earlier "
-            "start left open is resolved by hand, with POST /alerts/{alert_id}/resolve or "
-            "Resolve in the web console",
+            "it passive instead, POST /dr/release on this start runs the release_hook when one "
+            "is set, records that it stays passive and closes this alert where [alerts] keeps "
+            "alert instances; there, if you leave the alert open and a later start raises none, "
+            "resolve it by hand, with POST /alerts/{alert_id}/resolve or Resolve in the web "
+            "console",
             node,
         )
 

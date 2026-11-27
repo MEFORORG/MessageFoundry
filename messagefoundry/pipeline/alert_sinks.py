@@ -1255,7 +1255,7 @@ _DEFAULT_DECISION = _RuleDecision(
 #: The severity an event type carries where that is not warning: when no rule matches it, and
 #: when the matching rule names no ``severity`` of its own (:meth:`AlertRuleSet.decide`). A rule
 #: that names one still sets it. BACKLOG #5965: an activated DR box that came back up passive
-#: serves nothing, and the owner's ruling of 2026-11-25 makes that page critical.
+#: holds no DR role, and the owner's ruling of 2026-11-25 makes that page critical.
 _DEFAULT_SEVERITY: dict[str, str] = {
     "dr_restarted_passive": AlertSeverity.CRITICAL.value,
 }

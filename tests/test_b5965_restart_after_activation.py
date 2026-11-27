@@ -251,8 +251,10 @@ async def test_a_store_rebuilt_from_an_activated_snapshot_alerts_without_claimin
                 # The activate advice is conditional: in these cases the primary may be serving.
                 assert "confirmed the primary is not serving" in line
                 # The ERROR line prints under every sink, so it carries the close guidance too.
-                assert "POST /dr/release on this start records that it stays passive" in line
-                assert "where [alerts] keeps alert instances" in line
+                assert "POST /dr/release on this start runs the release_hook when one" in line
+                assert "records that it stays passive" in line
+                assert "where [alerts] keeps alert instances; there, if you leave" in line
+                assert "a later start raises none, resolve it by hand" in line
                 assert "POST /alerts/{alert_id}/resolve" in line
                 # An operator-started inbound still binds on a passive box.
                 assert "serves nothing" not in line and "holds no DR role" in line
@@ -327,9 +329,10 @@ def test_the_restart_alert_line_says_how_to_close_it(caplog: pytest.LogCaptureFi
     with caplog.at_level(logging.CRITICAL, logger="messagefoundry.pipeline.alerts"):
         LoggingAlertSink().dr_restarted_passive("dr-box")
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
-    assert "POST /dr/release on this start records that it stays passive" in line
-    assert "closes this alert where [alerts] keeps alert instances" in line
-    assert "an alert an earlier start left open is resolved by hand" in line
+    assert "POST /dr/release on this start runs the release_hook when one is set" in line
+    assert "records that it stays passive" in line
+    assert "closes this alert where [alerts] keeps alert instances; there, if you leave" in line
+    assert "a later start raises none, resolve it by hand" in line
     assert "POST /alerts/{alert_id}/resolve" in line and "Resolve in the web console" in line
     assert "serves nothing" not in line and "an operator starts on it still binds" in line
 
@@ -363,7 +366,7 @@ async def test_a_row_another_box_wrote_does_not_count(tmp_path: Path) -> None:
 
 
 async def test_an_unreadable_store_at_start_fails_loud(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     db, archive, ss, key = await _seed(tmp_path)
     store = await MessageStore.open(db, cipher=make_cipher(key))
@@ -376,8 +379,16 @@ async def test_an_unreadable_store_at_start_fails_loud(
         monkeypatch.setattr(store, "recent_audit_of", refuse)
         sink = _Sink()
         coord = _coord(store, ss, archive, sink, None)
-        assert await coord.check_restarted_passive()
+        with caplog.at_level(logging.ERROR):
+            assert await coord.check_restarted_passive()
         assert sink.events == [("dr_restarted_passive", socket.gethostname())]
+        # This sink logs nothing, so the ERROR line is the operator's only text: it says how to
+        # activate, how to leave the box passive, and how the alert closes.
+        (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert "could not read the activation audit rows" in line
+        assert "confirmed the primary is not serving" in line and "holds no DR role" in line
+        assert "POST /dr/release on this start runs the release_hook when one" in line
+        assert "POST /alerts/{alert_id}/resolve" in line
         # The release still settles the alert it raised, though the box was never activated.
         monkeypatch.setattr(store, "recent_audit_of", real)
         await coord.release(actor="bob")
