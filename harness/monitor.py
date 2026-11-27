@@ -409,9 +409,9 @@ class MonitorPanel(QWidget):
         action that client stashed from the refusal. A panel whose worker read was refused through
         the handler-less polling client passes that refusal's ``StepUpRequired.action``, since the
         main client stashed nothing for that read, and repeats the read itself (BACKLOG #5945). For
-        a session-window refusal that is None, and ``reauth`` then falls back to the main client's
-        stash, which holds an action only while that client's own prompt is open, when the guard
-        below declines the call.
+        a session-window refusal that action is None, and ``reauth`` then falls back to the main
+        client's stash, which holds an action only while that client's own prompt is open, when
+        the ``_step_up_open`` check below declines the call.
 
         The re-proof rotates the session, so the poller's copy of the old token is dead: it is
         restarted on the new one. The password is passed straight to ``reauth`` and kept nowhere."""

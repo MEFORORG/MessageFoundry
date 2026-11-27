@@ -858,7 +858,8 @@ class EngineClient:
         self._step_up_handler: Callable[[], bool] | None = None
         #: The action a per-action step-up 403 named in ``X-Step-Up-Action`` (ADR 0077), stashed just
         #: before the handler runs so :meth:`reauth` can bind the fresh proof to it. None for a plain
-        #: session-window step-up (no header) — then :meth:`reauth` posts no ``purpose``, unchanged.
+        #: session-window step-up (no header) — then :meth:`reauth` posts no ``purpose`` unless its
+        #: caller passes one.
         self._pending_step_up_action: str | None = None
         #: Invoked when the engine demands a second factor (403 + X-MFA-Required, WP-14); the GUI
         #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
@@ -1266,7 +1267,8 @@ class EngineClient:
             and self._step_up_handler is not None
         ):
             # Stash the action BEFORE the handler runs so the reauth() it calls binds the fresh proof
-            # to it. None (a session-window step-up) → reauth() posts no purpose (unchanged).
+            # to it. None (a session-window step-up) → reauth() posts no purpose unless its caller
+            # passes one.
             self._pending_step_up_action = step_up_action
             proved = False
             try:
@@ -1346,17 +1348,22 @@ class EngineClient:
         itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route).
 
         A ``purpose`` that is not None is posted as the purpose, whatever is stashed. With
-        ``purpose`` None, the action stashed from the per-action refusal (``X-Step-Up-Action``, ADR
-        0077) that the step-up handler is answering rides along instead, if one is stashed, so the
-        engine mints a grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as
-        for a session-window step-up. Either way the stash is cleared, so it binds one reauth at
-        most.
+        ``purpose`` None, whatever action is stashed rides along instead, so the engine mints a
+        grant BOUND to it; with neither, it posts ``{"password": …}`` unchanged, as for a
+        session-window step-up. The stash is one slot: the per-action refusal
+        (``X-Step-Up-Action``, ADR 0077) that called the step-up handler fills it, but a second
+        refusal on this client while that handler runs overwrites it, and that refusal's own
+        decline or reauth then empties it. Once past the cleartext refusal, every call empties the
+        stash before it posts, so it binds one reauth at most, and a re-proof the engine refuses
+        uses it up too.
 
-        At least two callers pass ``purpose``: one that proves BEFORE the call it is about to make, so the refusal
-        and the retry never happen (vault BACKLOG #2625: a timed reload must not carry a step-up
-        inside its timer), and one answering a refusal this client did not stash, such as a
-        worker read through a handler-less polling client, which passes the refused call's
-        :attr:`StepUpRequired.action` and then repeats that call itself (BACKLOG #5945).
+        At least two callers pass ``purpose``: one that proves BEFORE the call it is about to
+        make, so the refusal and the retry never happen (vault BACKLOG #2625: a timed reload must
+        not carry a step-up inside its timer), and one answering a refusal this client did not
+        stash, such as a worker read through a handler-less polling client, which passes the
+        refused call's :attr:`StepUpRequired.action` and then repeats that call itself (BACKLOG
+        #5945). For a session-window refusal that action is None, so such a call falls back to
+        whatever this client has stashed, and posts no purpose only when nothing is.
 
         Raises :class:`ApiError` with ``status`` None when the 2xx reply carries no usable token
         (BACKLOG #5344). The engine may have rotated the session anyway, so the held token may
