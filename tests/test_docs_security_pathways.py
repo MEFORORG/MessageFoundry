@@ -1288,9 +1288,12 @@ def test_the_mfa_gate_and_window_prose_points_at_one_statement() -> None:
         "`POST /auth/mfa-verify` has no such must-change ask",
         "unless, at least, the temporary credential has lapsed, which ends the session instead",
         "submits a code to `verify_mfa`, through at least `POST /auth/mfa-verify` or `POST /ui/mfa`",
-        "an account holding a TOTP can do while the second-step lock is not live",
+        "an account holding a TOTP can do with effect only when, at least, the second-step lock is "
+        "not live",
         "`GET /ui/mfa` renders its code form only to a session that owes a second factor it has "
         "not met",
+        "That limits the page, not the code: `POST /ui/mfa` can still hand `verify_mfa` a code from "
+        "a session that has met its factor or owes none",
         "or with a user-verified passkey that completes a pending factor, passes the window check",
         "CORRECTED 2026-11-26 (vault BACKLOG #2964 (review of items 19, 26, 28)): this called it the "
         "*second* such signal",

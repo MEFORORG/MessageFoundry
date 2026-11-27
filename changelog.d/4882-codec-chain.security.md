@@ -3,10 +3,11 @@
   arguments or a group member, with a fixed text and no chain. The store open runs its own key
   custody step before the cipher build, under every key provider, and an error that step's guard
   replaces is a `HostCustodyRefused`, as the end of the next bullet says. Under
-  `key_provider = host` the key comes from that step rather than the key resolution, and the cipher
-  build at that open is still judged as this bullet says.** The text names the settings the key
-  comes from and which case it is, and reads nothing from the error or the codec error: no text, no
-  argument, no class name. A `ValueError` is refused as `StoreCipherConfigError`, any other class as
+  `key_provider = host` the `aesgcm` cipher build at the store open takes its key from that step
+  rather than the key resolution, and the cipher build at that open is still judged as this bullet
+  says.** The text names the settings the key comes from and which case it is, and reads nothing
+  from the error or the codec error: no text, no argument, no class name. At the key resolution and
+  the cipher build, a `ValueError` is refused as `StoreCipherConfigError`, any other class as
   `KeyProviderError`, which at least every CLI command with a key arm, `rotate-key` among them,
   reports as a key that could not be resolved, exit 2. Before, a key source error whose own text was
   built from a codec error still on its chain, one whose codec error was a context beside a cause,
@@ -34,7 +35,8 @@
   (`BACKLOG #4882`, `BACKLOG #3471`)
 - **Every other error from the store cipher build or the store key resolution is replaced by a new
   refusal with a fixed text the site chooses, raised after the handler has exited, and nothing from
-  the provider or the build is passed through at either site. What runs once the provider has
+  the provider or the build is passed through at either site; the store open's custody guard, at
+  this bullet's end, passes a recorded `KeyProviderError` through. What runs once the provider has
   answered is not judged: the key check at `resolve_active_key`, whose refusals the engine built and
   raises as built, and the keyring's assembly at `resolve_decrypt_keys`.** The class of every
   refusal that replaces an error at the cipher build or the key resolution, the previous bullet's

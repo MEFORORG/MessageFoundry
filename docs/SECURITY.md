@@ -3815,9 +3815,11 @@ step-up itself (see the Action-bound step-up grant row). A Windows SSO session's
 window-gated action does force a step-up when it met the gate another way: owing no factor, or
 proving a passkey without user verification. That holds
 until its holder submits a code to `verify_mfa`, through at least `POST /auth/mfa-verify` or `POST /ui/mfa`, which an account
-holding a TOTP can do while the second-step lock is not live and, for a directory account, the
-directory confirms it (below).
-`GET /ui/mfa` renders its code form only to a session that owes a second factor it has not met. CORRECTED 2026-11-26 (vault BACKLOG
+holding a TOTP can do with effect only when, at least, the second-step lock is not live and, for a
+directory account, the directory confirms it (below, with more of the conditions).
+`GET /ui/mfa` renders its code form only to a session that owes a second factor it has not met.
+That limits the page, not the code: `POST /ui/mfa` can still hand `verify_mfa` a code from a
+session that has met its factor or owes none (below). CORRECTED 2026-11-26 (vault BACKLOG
 #2964 item 26): this said the holder "submits a code to the MFA gate", and did not say that no gate
 page is rendered for a session that has met its factor or owes none. An `oidc` session's first window-gated action always forces the IdP
 step-up. A passkey assertion on an `oidc` session marks the factor and stamps no window, so that
