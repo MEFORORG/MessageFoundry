@@ -2151,11 +2151,13 @@ def _warn_leftover_segments(spool_dir: str, why: str) -> None:
 
 
 _SPOOL_IN_USE_REMEDY = (
-    ". If another process shares this directory, leave one of them on it and give each of the "
-    "others a different [logging].forward_spool_dir (environment variable "
-    "MEFOR_LOGGING_FORWARD_SPOOL_DIR), the root its own spool subdirectory is made under; give it "
-    "as an absolute path. If this is a second start of the same service, stop the duplicate "
-    "instead, because moving the directory would strand the segments already in it."
+    ". If this is a second start of the same service, stop the duplicate, because moving the "
+    "directory would strand the segments already in it, then restart this one once the other has "
+    "exited; until it restarts, this process runs without a spool. If a different service or "
+    "deployment shares this directory, give that one its own [logging].forward_spool_dir "
+    "(environment variable MEFOR_LOGGING_FORWARD_SPOOL_DIR), the root its spool subdirectories "
+    "are made under, as an absolute path. Never change it for one process of a supervise "
+    "deployment, whose engine shards and supervisor share that root."
 )
 
 

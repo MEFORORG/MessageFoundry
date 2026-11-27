@@ -1815,11 +1815,23 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert in_use.levelno == logging.WARNING
     assert "[logging].forward_spool_dir" in in_use.getMessage()
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
-    # Moving a duplicate start of one service would strand its segments, so that case says stop.
-    assert "second start of the same service, stop the duplicate" in in_use.getMessage()
-    assert "would strand the segments already in it" in in_use.getMessage()
-    assert "as an absolute path" in in_use.getMessage()
-    assert in_use.getMessage().endswith(".")
+    message = in_use.getMessage()
+    # Moving a duplicate start of one service would strand its segments, so that case says stop,
+    # and it comes first: a duplicate start also meets the other remedy's condition.
+    duplicate = message.index("second start of the same service, stop the duplicate")
+    assert "would strand the segments already in it" in message
+    assert "then restart this one once the other has exited" in message
+    assert "until it restarts, this process runs without a spool" in message
+    other = message.index("If a different service or deployment shares this directory")
+    assert duplicate < other
+    assert "as an absolute path" in message
+    # In a supervise deployment the setting is the root every process's directory sits under
+    # (``__main__._forward_spool_root``), so moving it for one process strands the others.
+    assert (
+        "Never change it for one process of a supervise deployment, whose engine shards and "
+        "supervisor share that root." in message
+    )
+    assert message.endswith(".")
     earlier.close()
 
     def _deny_lock(path: Any, flags: int, mode: int = 0o777) -> int:
