@@ -4,13 +4,17 @@
 
 Verifies the asyncio loop handler + sys.excepthook + threading.excepthook route an otherwise-unhandled
 exception through ``safe_exc`` (PHI-redacted, type-preserving) → the log, and that a framed listener
-(MLLP) survives a handler that raises — the error is logged redacted, the connection drops, the server
-stays up.
+(MLLP) survives a handler that raises. A handler fault no longer reaches the listener's last-resort
+arm: the listener's handler-fault arm logs it redacted, records ``handler_error``, answers ``AE``
+and closes the connection (BACKLOG #1619), and the server stays up. The last-resort arm itself,
+``framing_error``, is pinned by ``test_a_codec_fault_in_the_listener_still_drops_as_framing_error``
+in tests/test_mllp_handler_failure.py.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Iterator
@@ -177,8 +181,9 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
             msa = f"MSA|AE|1|{mllp_mod._HANDLER_FAILURE_NAK_TEXT}".encode()
             assert msa in nak[1:-2].split(b"\r"), nak  # the whole MSA segment, text included
             assert b"DOE" not in nak and b"JANE" not in nak
-            # then the connection closes, so a store outage drops nothing the sender owes a resend
-            assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+            # then the connection closes; a reset is a close too, as on the Windows Proactor
+            with contextlib.suppress(ConnectionResetError):
+                assert await asyncio.wait_for(reader.read(), timeout=5) == b""
             writer.close()
             await writer.wait_closed()
         # the server survived — it still accepts a fresh connection
@@ -195,7 +200,7 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
     assert "handler_error" in kinds and "framing_error" not in kinds, kinds
     reason = next(r for k, r in events if k == "handler_error")
     assert reason is not None and "ValueError" in reason
-    assert "DOE" not in reason and "JANE" not in reason
+    assert "DOE" not in reason and "JANE" not in reason and "100^^^H^MR" not in reason
 
 
 # --- every loop outside `serve` carries the handler (BACKLOG #1789) ---------------------------------
