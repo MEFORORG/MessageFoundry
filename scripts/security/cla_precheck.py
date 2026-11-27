@@ -85,9 +85,11 @@ TWO CASES BACKLOG #5645 item 1 names:
     that head, or cannot show that they do, it is read again on the same waits while its verdict
     refuses nothing (BACKLOG #8335 item 3). The budget of waits is one, shared with the case
     above. A re-read that refuses, or whose commits include the head, is the verdict, even one cut
-    short by a fault, with that fault and its own beside it. A re-read that still lacks the head
-    replaces the read kept. A re-read that faults, is cut short refusing nothing before its pages
-    reach the head, or shows another head ends the re-reads. Then, or once the waits run out,
+    short by a fault (a head that moves after its first page included), with that fault and its
+    own beside it; it is not read again. A re-read that still lacks the head replaces the read
+    kept. A re-read that faults with no page kept, is cut short refusing nothing with pages that do
+    not include the head or cannot show that they do, or shows another head on its first page
+    ends the re-reads. Then, or once the waits run out,
     the read kept is judged, with its fault and any later one beside the verdict, which warns
     and passes: a list trailing the head for longer than the waits is still not checked past
     what it holds. A verdict that already refuses is not re-read, since the run fails already, so
@@ -887,8 +889,14 @@ def read_judged_head(
                 return exc.partial, verdict, str(exc)
             if verdict.refusals or _missing_head(exc.partial, expected_head) is None:
                 # A refusal this re-read proves is the verdict, and so is a re-read whose pages
-                # hold the head; its fault names it as a re-read, and its verdict keeps its own.
-                return exc.partial, verdict, f"a re-read was cut short: {exc}"
+                # hold the head. Its fault names it as the read judged, and says that the commits
+                # past the cut are unchecked, since a read cut short has no count check; its
+                # verdict keeps its own faults.
+                return (
+                    exc.partial,
+                    verdict,
+                    f"the re-read judged was cut short, so the commits past it are not checked: {exc}",
+                )
             return _report_kept(kept, f"a re-read was cut short: {exc}")
         verdict = judge(read, True)
         missing = _missing_head(read, expected_head)

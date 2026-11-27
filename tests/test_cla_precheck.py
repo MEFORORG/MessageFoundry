@@ -1448,7 +1448,10 @@ def test_a_trailing_re_read_cut_short_that_refuses_is_the_verdict(
     assert "refused::" in out
     assert "the read judged" not in out
     # The fault is the re-read's, and says so.
-    assert "fault::a re-read was cut short: GraphQL returned an error" in out
+    assert (
+        "fault::the re-read judged was cut short, so the commits past it are not checked: "
+        "GraphQL returned an error" in out
+    )
 
 
 def test_each_fault_of_a_trailing_list_names_the_read_it_belongs_to(
@@ -1493,9 +1496,30 @@ def test_a_trailing_re_read_cut_short_that_holds_the_head_is_the_judged_read(
     warnings = [line for line in out.splitlines() if "fault::" in line]
     assert len(warnings) == 1
     assert warnings[0].startswith(
-        "::warning title=CLA pre-check fault::a re-read was cut short: GraphQL returned an error"
+        "::warning title=CLA pre-check fault::the re-read judged was cut short, so the commits "
+        "past it are not checked: GraphQL returned an error; "
     )
     # The re-read's own verdict fault, for the commit GraphQL errored inside, is kept.
     assert "GraphQL reported an error inside it; not judged" in warnings[0]
     assert "the read judged" not in out
     assert "do not include CLA_HEAD_SHA" not in out
+
+
+def test_a_trailing_re_read_cut_short_that_cannot_show_the_head_reports_the_kept_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The boundary of the case above: a re-read cut short whose pages hold a commit whose id
+    GraphQL nulled cannot show that it holds the head, so the kept read is still the one judged."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    nulled = _page([octo, _commit(2, "Octo", "octo-contributor", 90000001)], 4, True)
+    nulled["data"]["repository"]["pullRequest"]["commits"]["nodes"][1] = None
+    nulled = {**nulled, "errors": [_node_error(1, "commit", "oid")]}
+    replies = [_page([octo], 2, False), nulled, {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    assert replies == []
+    out = capsys.readouterr().out
+    assert "the read judged: the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read was cut short" in out
+    assert "the re-read judged" not in out
