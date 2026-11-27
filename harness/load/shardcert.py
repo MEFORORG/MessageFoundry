@@ -1224,7 +1224,9 @@ class ShardCertReport:
             #
             # v7 (BACKLOG #5440, S27-57) — `correctness.engine_dead` MEANING CHANGED: it is the store's count,
             # where a v6 value was that count summed over every engine shard (N times it). Zero is zero in both,
-            # so the PASS bar is unchanged.
+            # so the PASS bar is unchanged. `recovery_seconds`, reported and not gated, still runs from the kill,
+            # but the kill now lands at the kill deadline rather than at the first tick past it, and the span
+            # now includes the wait for the killed process to exit and its node's stop(); see the field.
             "schema_version": 7,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
@@ -3221,7 +3223,10 @@ def require_kill_leg(
     ids_list: Sequence[str],
     hold_seconds: float,
 ) -> None:
-    """Refuse a kill leg that cannot kill an engine shard of this fleet under load (BACKLOG #5440, S27-55).
+    """Refuse a kill leg whose settings put the kill outside this fleet or outside the hold (BACKLOG #5440,
+    S27-55). It does not prove load was flowing at the kill instant: a positive fraction small enough still
+    kills before the co-located loop's first tick sends, and the two-box engine cannot see when the drive
+    half stops.
 
     Checked before the store reset and the fleet launch. A ``kill_shard`` outside ``ids_list`` used to
     surface as a ``KeyError`` at the kill instant, mid-hold. A ``kill_at_fraction`` of 1 or more never fired
@@ -3242,7 +3247,7 @@ def require_kill_leg(
             f"kill_at_fraction must be strictly between 0 and 1, got {kill_at_fraction!r}"
         )
     if not ids_list:
-        raise KillLegError("kill_shard: the fleet has no engine shard to kill")
+        raise KillLegError("kill leg: the fleet has no engine shard to kill")
     if kill_shard is not None and kill_shard not in ids_list:
         raise KillLegError(
             f"kill_shard {kill_shard!r} is not an engine shard of this fleet ({', '.join(ids_list)})"
@@ -3288,8 +3293,9 @@ async def _restart_killed(
     old = nodes[killed]
     if not await old.wait_exited(_KILL_EXIT_TIMEOUT):
         raise RuntimeError(
-            f"the kill of engine shard {killed} did not take effect: its process was still running "
-            f"{_KILL_EXIT_TIMEOUT:.0f}s after kill(), so no crash recovery can be certified"
+            f"the kill of engine shard {killed} did not take effect: its process was still running when "
+            f"the restart began, and {_KILL_EXIT_TIMEOUT:.0f}s after that, so no crash recovery can be "
+            "certified"
         )
     await old.stop()
     restart = ShardCertNode(
@@ -3695,6 +3701,9 @@ async def run_shardcert_engine(
     store_env = dict(store_env or {})
     routing = load_routing()
     handlers, delivering = _resolve_shape(dests, handlers, delivering)
+    # A stale failure from an earlier run of this run id must not be read as this one's. Cleared first, so a
+    # drive half started after this run began never reads an earlier run's refusal below as its own.
+    coord.clear_messages(ENGINE_SETUP_FAILED)
     ids_list, owned, n, lanes, band_note = _discover(
         dests, handlers, delivering, routing, strict_bands=strict_bands
     )
@@ -3742,8 +3751,6 @@ async def run_shardcert_engine(
     # record, not left to whatever MEFOR_PIPELINE_CLAIM_MODE happened to be in the parent env.
     node_env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
 
-    # A stale failure from an earlier run of this run id must not be read as this one's.
-    coord.clear_messages(ENGINE_SETUP_FAILED)
     await _reset_store_or_signal(coord, node_env)
 
     killed = _choose_killed(kill, kill_shard, ids_list, owned)
@@ -3990,8 +3997,15 @@ async def run_shardcert_engine(
     finally:
         if kill_task is not None and not kill_task.done():
             kill_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            # Swallow only the timer's own CancelledError (R11): a cancel of THIS task that arrives while it
+            # waits here raises the cancelling() count, and that one propagates.
+            me = asyncio.current_task()
+            cancels = me.cancelling() if me is not None else 0
+            try:
                 await kill_task
+            except asyncio.CancelledError:
+                if me is not None and me.cancelling() > cancels:
+                    raise
         for node in nodes.values():
             with contextlib.suppress(Exception):
                 await node.stop()

@@ -273,6 +273,10 @@ _REFUSED = "kill_at_fraction|kill_shard|hold_seconds"
 @pytest.mark.parametrize(
     "over",
     [
+        pytest.param({"kill_at_fraction": 1.0}, id="fraction-1"),
+        pytest.param({"kill_at_fraction": 0.0}, id="fraction-0"),
+        pytest.param({"kill_at_fraction": -0.1}, id="fraction-negative"),
+        pytest.param({"kill_at_fraction": float("nan")}, id="fraction-nan"),
         pytest.param({"kill_shard": "zz"}, id="unknown-shard"),
         pytest.param({"hold_seconds": 0.0}, id="hold-0"),
         pytest.param({"hold_seconds": -1.0}, id="hold-negative"),
@@ -282,8 +286,8 @@ _REFUSED = "kill_at_fraction|kill_shard|hold_seconds"
 async def test_engine_kill_leg_that_cannot_kill_under_load_is_refused_before_launch(
     fleet: types.SimpleNamespace, tmp_path: Path, over: dict[str, Any]
 ) -> None:
-    """S27-55 (2), and the hold (BACKLOG #5440): before the fix the engine half armed its kill timer for a
-    NaN or non-positive hold, which has no load to kill under."""
+    """S27-55 (1) and (2), and the hold (BACKLOG #5440): before the fix the engine half armed its kill timer
+    for a fraction outside the hold, or for a NaN or non-positive hold, which has no load to kill under."""
     coord = FileDropCoord(tmp_path, run_id="refused")
     kw: dict[str, Any] = {"hold_seconds": 0.2, **over}
     with pytest.raises(ValueError, match=_REFUSED) as refused:
@@ -303,6 +307,37 @@ async def test_engine_kill_leg_that_cannot_kill_under_load_is_refused_before_lau
     assert fleet.resets == []
     # The drive half is told at once rather than waiting out its SHARDS_READY timeout.
     assert coord.read(sc.ENGINE_SETUP_FAILED) is not None
+
+
+async def test_engine_clears_a_stale_setup_failure_before_it_checks_the_kill_leg(
+    fleet: types.SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier run's refusal is gone before this run's discovery and kill-leg check, so a drive half
+    started after this run began never reads it as this run's."""
+    coord = FileDropCoord(tmp_path, run_id="stale")
+    coord.post(sc.ENGINE_SETUP_FAILED, {"reason": "an earlier run"})
+    seen: list[object] = []
+    real_discover = sc._discover
+
+    def discover(*args: Any, **kw: Any) -> Any:
+        seen.append(coord.read(sc.ENGINE_SETUP_FAILED))
+        return real_discover(*args, **kw)
+
+    monkeypatch.setattr(sc, "_discover", discover)
+    with pytest.raises(sc.KillLegError):
+        await sc.run_shardcert_engine(
+            dests=2,
+            hold_seconds=0.2,
+            kill=True,
+            kill_shard="zz",
+            drain_timeout=2.0,
+            sink_port=47150,
+            store_env={},
+            coord=coord,
+            inbound_bind_host="127.0.0.1",
+            post_drain_grace=0.0,
+        )
+    assert seen == [None]
 
 
 def test_kill_leg_settings_are_not_read_without_a_kill() -> None:
@@ -335,8 +370,14 @@ def test_engine_cli_exits_2_on_a_refused_kill_leg(
     a traceback, the code of a failed bench result. It is a setup error: exit 2 and one line."""
     import harness.__main__ as hmain
 
-    # Own the env the CLI writes directly, so monkeypatch restores it.
-    for k in ("MEFOR_SHARDCERT_PERSISTENT", "MEFOR_SHARDCERT_ROUTING"):
+    # Own every variable the CLI writes directly, so monkeypatch restores it (the fixture's delenv of an
+    # absent variable records nothing to restore).
+    for k in (
+        "MEFOR_SHARDCERT_SHARDS",
+        "MEFOR_SHARDCERT_LANES_PER_SHARD",
+        "MEFOR_SHARDCERT_PERSISTENT",
+        "MEFOR_SHARDCERT_ROUTING",
+    ):
         monkeypatch.setenv(k, "")
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
     argv = ["shardcert-engine", "--shards", "a,b", "--dests", "2", "--sink-port", "47500", "--kill"]
