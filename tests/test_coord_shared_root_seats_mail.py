@@ -368,8 +368,12 @@ def test_a_seat_directory_with_no_readable_record_is_not_a_seat(repo: Path, shar
     assert not (shared / "mail" / "box").exists()
 
 
+HOUR_AGO = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+
+
 def _ended(rec: dict[str, Any], lifecycle: str, at: str) -> dict[str, Any]:
-    return {**rec, "lifecycle": lifecycle, "lifecycleAt": at}
+    """An ended record whose asOf is an hour old, so a fresh `_record` is newer by what it says."""
+    return {**rec, "lifecycle": lifecycle, "lifecycleAt": at, "asOf": HOUR_AGO}
 
 
 @pytest.mark.parametrize("lifecycle", ["closed", "handed"])
@@ -418,6 +422,21 @@ def test_a_path_send_reads_the_newest_record_in_the_recipients_box(
     reopened = _send(repo, shared, str(repo))
     assert reopened.returncode == 0, reopened.stderr
     assert "WARNING" not in reopened.stderr
+
+
+def test_newest_is_what_the_record_says_not_its_file_time(repo: Path, shared: Path) -> None:
+    """seat.ps1 -ClearHandoff rewrites a dead session's record and leaves its asOf alone."""
+    first = _send(repo, shared, str(repo))
+    key = json.loads(first.stdout)[0]["Key"]
+    live = _plant_record(
+        shared / "seats", key, _record(box=key, session="sess-b", worktree=str(repo), host=None)
+    )
+    os.utime(live, (time.time() - 1800, time.time() - 1800))
+    rec = _record(box=key, session="sess-a", worktree=str(repo), host=None)
+    _plant_record(shared / "seats", key, _ended(rec, "handed", "2026-11-20T10:00:00Z"))
+    proc = _send(repo, shared, str(repo))
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stderr
 
 
 def test_an_unreadable_record_in_the_recipients_box_says_nothing(repo: Path, shared: Path) -> None:

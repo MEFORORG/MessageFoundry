@@ -237,9 +237,12 @@ function Get-EndedSeatWarning {
     try {
         $ended = Get-CoordSeatEnded -Dir (Join-Path $SeatsDir $Key)
         if (-not $ended) { return $null }
+        # Hedged, because the drain never reads lifecycle: a session that closed and kept working,
+        # or another one in that worktree, still drains the box.
         return ("WARNING: the newest seat record for $(Get-PrintableField $Label) reads lifecycle " +
-            "'$($ended.Lifecycle)' at $($ended.At), so this mail will be read only by a future session " +
-            "in that worktree, or expire unshown at its TTL.")
+            "'$($ended.Lifecycle)' at $($ended.At). Unless that session or another in that worktree " +
+            "is still working, this mail will be read only by a future session there, or expire " +
+            "unshown at its TTL.")
     } catch { return $null }
 }
 
@@ -693,7 +696,10 @@ if ($Send) {
     try { $seatsDir = Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot } catch { }
     if ($seatsDir) {
         foreach ($w in @($written | Where-Object { $_.Status -eq 'queued' })) {
-            $warn = Get-EndedSeatWarning -SeatsDir $seatsDir -Key $w.Key -Label $w.To
+            # A seat id names the directory its record was read from. For a legacy id that is not
+            # the box key the mail went to, so read the record where the resolver found it.
+            $recKey = if ($seatTargets.Count -gt 0) { $To } else { $w.Key }
+            $warn = Get-EndedSeatWarning -SeatsDir $seatsDir -Key $recKey -Label $w.To
             if ($warn) { [Console]::Error.WriteLine("mail.ps1: $warn") }
         }
     }

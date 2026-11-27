@@ -335,24 +335,46 @@ function Test-CoordRecordIsHere {
 function Get-CoordSeatEnded {
     # When the NEWEST seat record in one box's registry directory says its session ended itself
     # (seat.ps1 -Close writes `closed`, -Close -Handback `handed`): @{ Lifecycle; At }, At a one-line
-    # printable stamp. Otherwise $null, and never a throw. The newest only, as box-activity.ps1's
-    # Get-BoxRecordHost reads it: one that cannot be read may be the current record mid-write, so
-    # nothing older speaks for it. A record is its writer's claim, never proof a session is gone.
+    # printable stamp. Otherwise $null, and never a throw. A record is its writer's claim, never
+    # proof a session is gone.
+    #
+    # NEWEST BY WHAT THE RECORD SAYS, never by file time, as seat.ps1 picks its prior: -ClearHandoff
+    # rewrites a dead session's record without moving its asOf, and a copy moves the file time too.
+    # Any record that cannot be read may be the current one mid-write, so then nothing older speaks
+    # for the box (box-activity.ps1, Get-BoxRecordHost, reads the same way). A record whose asOf
+    # names no instant sorts oldest; between equal stamps the later file time wins.
     param([string]$Dir)
     try {
         if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
-        $f = Get-ChildItem -LiteralPath $Dir -Filter *.json -File -Force -EA SilentlyContinue |
-             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-        if (-not $f) { return $null }
-        $rec = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop
-        if ($rec -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        $rec = $null
+        $best = [DateTimeOffset]::MinValue
+        foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter *.json -File -Force -EA SilentlyContinue |
+                Sort-Object LastWriteTimeUtc -Descending)) {
+            $one = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop
+            if ($one -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $p = $one.PSObject.Properties['asOf']
+            $v = if ($p) { $p.Value } else { $null }
+            $at = [DateTimeOffset]::MinValue
+            if ($v -is [datetime]) {
+                if ($v.Kind -ne [DateTimeKind]::Unspecified) { $at = [DateTimeOffset]::new($v.ToUniversalTime()) }
+            } elseif ($null -ne $v) {
+                $parsed = [DateTimeOffset]::MinValue
+                if ("$v" -match '(Z|[+-]\d{2}:?\d{2})\s*\z' -and
+                    [DateTimeOffset]::TryParse("$v", [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { $at = $parsed }
+            }
+            if ($null -eq $rec -or $at -gt $best) { $rec = $one; $best = $at }
+        }
+        if ($null -eq $rec) { return $null }
         $p = $rec.PSObject.Properties['lifecycle']
         $life = if ($p) { [string]$p.Value } else { '' }
         if ($life -notin 'closed', 'handed') { return $null }
         $p = $rec.PSObject.Properties['lifecycleAt']
         $at = if ($p) { $p.Value } else { $null }
-        $atText = if ($at -is [datetime]) {
+        $atText = if ($at -is [datetime] -and $at.Kind -ne [DateTimeKind]::Unspecified) {
             $at.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
+        } elseif ($at -is [datetime]) {
+            # No zone: printed as written, never converted as though it were this PC's local time.
+            $at.ToString('yyyy-MM-ddTHH:mm:ss', [cultureinfo]::InvariantCulture) + ' (no zone)'
         } else {
             # Writer-chosen text, so one printable line, capped.
             $t = (([string]$at) -replace '[\p{C}]', ' ' -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
