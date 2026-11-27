@@ -532,7 +532,7 @@ def test_the_console_escapes_the_backend_name() -> None:
 def test_final_reads_skip_a_second_list_that_could_not_count(
     before: frozenset[tuple[str, float]] | None,
 ) -> None:
-    node, (_, _, _, dead_new) = _final([before], _stats_dead(2), frozenset({_A}))
+    node, (_, _, _, dead_new) = _final([before], _stats_dead(2), frozenset({_A, _B}))
     assert node.calls == ["stats", "copies"]
     assert dead_new is None
 
@@ -637,8 +637,8 @@ def test_a_partial_read_logs_no_row_field(
 
 
 def test_the_report_carries_counts_never_a_dead_copy_id() -> None:
-    carried = frozenset({("SYNTHETIC-OID-1", 1.0)})
-    grown = carried | {("SYNTHETIC-OID-2", 2.0)}
+    carried = frozenset({("SYNTHETIC-OID-1", 1.0), ("SYNTHETIC-OID-2", 2.0)})
+    grown = frozenset({("SYNTHETIC-OID-1", 1.0), ("SYNTHETIC-OID-3", 3.0)})
     _, (final, snapshot, held, dead_new) = _final([grown, grown], _stats_dead(2), carried)
     assert dead_new == 1
     profile = _profile()
@@ -657,3 +657,129 @@ def test_the_report_carries_counts_never_a_dead_copy_id() -> None:
     )
     text = json.dumps(rep.to_json_dict()) + rep.render_console() + "".join(rep.notes)
     assert "SYNTHETIC-OID" not in text
+
+
+# --- review round 1: optional reads never end a run, and every fallback says why ------
+
+
+def test_a_refused_second_stats_read_judges_nothing_and_does_not_end_the_run() -> None:
+    carried = frozenset({_A})
+
+    class _RefusesTheSecondStats(_FinalNode):
+        async def stats(self, client: object) -> NodeStats | None:
+            self.calls.append("stats")
+            if self.calls.count("stats") > 1:
+                raise FailoverError("node fo-b: sign-in refused")
+            return _stats_dead(1)
+
+    counters, tracker = Counters(), FailoverTracker()
+    node = _RefusesTheSecondStats([carried, carried], [], counters, tracker)
+    final, _, _, dead_new = asyncio.run(
+        failover._final_reads(node, object(), carried, counters, tracker)  # type: ignore[arg-type]
+    )
+    assert final == _stats_dead(1)
+    assert dead_new is None
+    assert node.calls == ["stats", "copies", "stats"]
+
+
+def test_more_dead_rows_than_were_carried_are_never_listed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        node, (_, _, _, dead_new) = _final([], _stats_dead(3), frozenset({_A, _B}))
+    assert node.calls == ["stats"]
+    assert dead_new is None
+    assert "3 dead rows at the end, more than the 2 carried over" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("copies", "stats", "why"),
+    [
+        ([frozenset({_A})], [_stats_dead(2)], "1 dead copies read at the end, of 2 counted"),
+        (
+            [frozenset({_A, _B})],
+            [_stats_dead(2), NodeStats(done=1, dead=2, pending=0, inflight=0, in_pipeline=0)],
+            "the counts moved",
+        ),
+        ([frozenset({_A, _B}), frozenset({_A, _C})], [_stats_dead(2)], "the dead copies moved"),
+    ],
+)
+def test_a_final_fallback_logs_why(
+    copies: list[frozenset[tuple[str, float]] | None],
+    stats: list[NodeStats | None],
+    why: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        _, (_, _, _, dead_new) = _final(copies, stats, frozenset({_A, _B, _C}))
+    assert dead_new is None
+    assert f"dead-row check stays absolute: {why}" in caplog.text
+
+
+def test_an_opening_count_mismatch_logs_why(caplog: pytest.LogCaptureFixture) -> None:
+    node = _CopyNode(frozenset({_A, _B, _C}))
+    with caplog.at_level(logging.WARNING):
+        got = asyncio.run(failover._opening_dead_copies([node], object(), _stats_dead(2)))  # type: ignore[list-item,arg-type]
+    assert got is None
+    assert "3 dead copies read at the opening, of 2 counted" in caplog.text
+
+
+def test_one_lane_fails_a_named_lane_count_check() -> None:
+    rep = _report(tracker=_tracker(lanes=("d0",)))
+    lanes = next(s for s in rep.slos if s.name == "lanes_observed")
+    assert (lanes.threshold, lanes.observed, lanes.ok) == (2, 1, False)
+    assert "lanes_observed: observed=1 threshold=2" in rep.render_console()
+    assert next(s for s in _report().slos if s.name == "lanes_observed").ok
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ("inf", "must be a finite number"),
+        ("nan", "must be a finite number"),
+        # Each finite, and the lease passes its own bound; 4 x 4e307 + 1e308 does not.
+        ("1e308", "too large"),
+    ],
+)
+def test_a_non_finite_drain_timeout_is_refused_before_any_start(
+    value: str, match: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _PROFILE.replace("pool_size = 1", f"pool_size = 1\ndrain_timeout_s = {value}")
+    knobs = {**_FAILOVER, "leader_lease_ttl_seconds": "4e307"}
+    table = "\n".join(f"{k} = {v}" for k, v in knobs.items())
+    profile = load_profile_text(text.format(failover=table), where="<test>")
+
+    def started(*_a: object, **_k: object) -> object:
+        raise AssertionError("the run started")
+
+    monkeypatch.setattr(failover, "build_corpus", started)
+    ports = FailoverPorts(
+        api_a=1, api_b=2, inbound_adt=3, inbound_results=4, inbound_other=5, sink=6, sink_count=1
+    )
+    with pytest.raises(FailoverError, match=f"drain_timeout_s (is )?{match}"):
+        asyncio.run(failover.run_failover_load(profile, ports=ports, base_env={}))
+
+
+def test_the_dead_copy_read_matches_the_route_it_reads() -> None:
+    """The rig reads four names from ``/dead-letters`` and pages at :data:`failover._DEAD_PAGE`. A
+    rename or a lower ``limit`` ceiling there would make every read partial and switch the per-copy
+    check off with no test red, so both are pinned to the route's own definitions."""
+    import ast
+    from pathlib import Path
+
+    from messagefoundry.api.models import DeadLetterList, DeadLetterRow
+
+    assert {"total", "dead_letters"} <= set(DeadLetterList.model_fields)
+    assert {"outbox_id", "failed_at"} <= set(DeadLetterRow.model_fields)
+    app = Path(__file__).resolve().parents[1] / "messagefoundry" / "api" / "app.py"
+    route = next(
+        n
+        for n in ast.walk(ast.parse(app.read_text(encoding="utf-8")))
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "list_dead_letters"
+    )
+    limit = next(a for a in route.args.args if a.arg == "limit")
+    default = route.args.defaults[route.args.args.index(limit) - len(route.args.args)]
+    assert isinstance(default, ast.Call)
+    le = next(k.value for k in default.keywords if k.arg == "le")
+    assert isinstance(le, ast.Constant) and isinstance(le.value, int)
+    assert le.value >= failover._DEAD_PAGE

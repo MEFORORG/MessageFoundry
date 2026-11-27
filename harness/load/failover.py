@@ -30,9 +30,9 @@ The harness reaches the engines only over MLLP (the sender/sink) and the HTTP AP
 ``/cluster/status``, ``/stats``, and ``/dead-letters`` only on a store that already held dead rows);
 it never imports the engine in-process (it shells out to ``serve``, as a deployment would) and never
 touches the store. All metrics are aggregate — never message bodies or control-id lists (PHI rule);
-the dead-letter read keeps only each row's outbox id and failure time, in memory. Two nodes on one host share the **same** inbound MLLP ports: only the leader
-binds them, so the sender hits a fixed port and reconnects through the rebind — the floating-VIP collapsed
-to "one binder, one port".
+the dead-letter read keeps only each row's outbox id and failure time, in memory. Two nodes on one
+host share the **same** inbound MLLP ports: only the leader binds them, so the sender hits a fixed
+port and reconnects through the rebind — the floating-VIP collapsed to "one binder, one port".
 """
 
 from __future__ import annotations
@@ -86,8 +86,8 @@ _OPENING_STATS_RETRY_S = 0.5
 _DEAD_PAGE = 500
 #: The most dead copies the per-copy check reads (BACKLOG #5572). Past it the check stays absolute,
 #: so a store carrying more fails a clean run, as every reused store with dead rows did before. Each
-#: page is a PHI-gated read: it spends the rig account's per-actor PHI-read budget (120 a minute by
-#: default) and writes an exposure audit row. A run reads the whole set at most four times (the
+#: page is a PHI-gated read that spends the rig account's per-actor PHI-read budget (120 a minute by
+#: default); the rig API row of docs/CONNECTIONS.md says what the route returns and audits. A run reads the whole set at most four times (the
 #: opening read, once per node if the first is not whole, and twice after the final stats read),
 #: so this cap keeps a run to about 40 pages, plus a re-ask of any page that met an expired
 #: session. Raising it, or a lower engine budget, turns pages into refusals.
@@ -100,8 +100,8 @@ DeadCopy = tuple[str, float]
 #: The most bytes the rig reads of one engine API answer (ASVS 5.1.1, BACKLOG #1127). The routes
 #: it polls, ``/health``, ``/cluster/status`` and ``/stats``, answer a role or a few counters, well
 #: under a KiB, so 1 MiB leaves room and still stops a node that streams without end. It also reads
-#: ``/dead-letters`` pages, which are larger: 500 rows, each with the engine's error text and
-#: summary. A page past the cap is no answer, which leaves the dead-row check absolute (BACKLOG
+#: ``/dead-letters`` pages, which are larger: up to 500 rows, each with its identifiers and times
+#: and a masked or null summary and error. A page past the cap is no answer, which leaves the dead-row check absolute (BACKLOG
 #: #5572), so a smaller cap would quietly switch that check off.
 MAX_STATUS_REPLY_BYTES = 1 << 20
 
@@ -740,7 +740,7 @@ async def run_failover_load(
     fo = profile.failover
     if fo is None:
         raise FailoverError("the profile has no [load.failover] table — not a failover profile")
-    _refuse_non_finite(fo)
+    _refuse_non_finite(fo, profile.drain_timeout_s)
     if len(profile.targets) != 1:
         raise FailoverError(
             "a failover profile must declare exactly one [[load.target]] (single-stream FIFO ordering)"
@@ -1054,13 +1054,15 @@ def _build_report(
         # Non-vacuous like single_leader (S26-62). One lane is still checked for FIFO, but the graph
         # fans out to several destinations, so fewer than two lanes means a lane key that collapsed
         # (MSH-6 not stamped, every destination on one label) or too few destinations reached. Zero
-        # inversions then does not show per-destination order, so the check FAILS.
+        # inversions then does not show per-destination order, so the check FAILS. The lane count is
+        # also its own named check, so a console line never reads FAIL with observed equal to its bar.
         SloCheck(
             "per_lane_ordering",
             0,
             tracker.lane_inversions,
             tracker.lanes_observed >= 2 and tracker.lane_inversions == 0,
         ),
+        SloCheck("lanes_observed", 2, tracker.lanes_observed, tracker.lanes_observed >= 2),
         SloCheck("max_dup_rate", fo.max_dup_rate, round(dup_rate, 5), dup_rate <= fo.max_dup_rate),
         # A run the engine accepted nothing from proves none of the above, so it is a violation of
         # its own, which the console then counts (S26-62).
@@ -1253,13 +1255,27 @@ async def _opening_dead_copies(
     does not match the opening count, so that every excused copy is one the report counts in
     ``dead_opening``; each way the dead-row check stays absolute. A store with no dead rows is never
     listed, and nor is one past :data:`_DEAD_COPIES_MAX`, which no read could cover."""
-    if opening.dead == 0 or opening.dead > _DEAD_COPIES_MAX:
+    if opening.dead == 0:
+        return None
+    if opening.dead > _DEAD_COPIES_MAX:
+        _absolute(
+            f"{opening.dead} dead rows at the opening read, past the {_DEAD_COPIES_MAX} it reads"
+        )
         return None
     for n in nodes:
         copies = await n.dead_copies(client)
         if copies is not None:
-            return copies if len(copies) == opening.dead else None
+            if len(copies) == opening.dead:
+                return copies
+            _absolute(f"{len(copies)} dead copies read at the opening, of {opening.dead} counted")
+            return None
     return None
+
+
+def _absolute(why: str) -> None:
+    """Log why the per-copy dead-row check judged nothing, so the run's dead rows all count. The
+    reason holds counts only, never a copy's id (BACKLOG #5572)."""
+    log.warning("dead-row check stays absolute: %s", why)
 
 
 async def _final_reads(
@@ -1279,7 +1295,8 @@ async def _final_reads(
     dead-copy reads below counts for nothing (BACKLOG #5572).
 
     Only then are the dead copies read, and only when there is something to excuse: a reused store
-    whose opening copies were read whole, with dead rows at the end. The copies are read twice, on
+    whose opening copies were read whole, with dead rows at the end and no more of them than were
+    carried over (more means at least one is new, so the run fails unread). The copies are read twice, on
     both sides of a second stats read, and judged only when the two reads are the same set, its size
     is the dead count, and the second stats read matches the first in every count. Each later read
     is skipped wherever its answer could not change that, so it spends no PHI-read budget for
@@ -1291,12 +1308,32 @@ async def _final_reads(
     held = copy.deepcopy(tracker)
     if not carried or final.dead == 0:
         return final, snapshot, held, None
-    first = await survivor.dead_copies(client)
-    if first is None or len(first) != final.dead:
+    if final.dead > len(carried):
+        # At most every carried copy is still dead, so at least the difference is new and the run
+        # fails whatever the copies say: reading them would spend PHI-read budget on a settled verdict.
+        _absolute(f"{final.dead} dead rows at the end, more than the {len(carried)} carried over")
         return final, snapshot, held, None
-    if await survivor.stats(client) != final:
+    first = await survivor.dead_copies(client)
+    if first is None:  # dead_copies logged why
+        return final, snapshot, held, None
+    if len(first) != final.dead:
+        _absolute(f"{len(first)} dead copies read at the end, of {final.dead} counted")
+        return final, snapshot, held, None
+    try:
+        again = await survivor.stats(client)
+    except FailoverError as exc:
+        # As in dead_copies: this read is optional, so a refused session judges nothing and does
+        # not end a run whose verdict is already read.
+        _absolute(
+            f"the second stats read was refused: {escape_for_terminal(str(exc), single_line=True)}"
+        )
+        return final, snapshot, held, None
+    if again != final:
+        _absolute("the counts moved across the dead-copy read")
         return final, snapshot, held, None
     second = await survivor.dead_copies(client)
+    if second is not None and second != first:
+        _absolute("the dead copies moved between the two reads")
     return final, snapshot, held, _judge_new_dead(carried, first, second, final.dead)
 
 
@@ -1323,7 +1360,7 @@ def _judge_new_dead(
     return len(second - opening)
 
 
-def _refuse_non_finite(fo: Failover) -> None:
+def _refuse_non_finite(fo: Failover, drain_timeout_s: float) -> None:
     """Refuse a ``[load.failover]`` knob that is NaN or infinite, before anything starts (S26-62).
 
     The profile's range checks pass NaN, which fails every comparison, and pass infinity wherever a
@@ -1331,7 +1368,12 @@ def _refuse_non_finite(fo: Failover) -> None:
     and ``max_promotion_seconds`` and ``leader_lease_ttl_seconds`` as infinity. Each lands in the
     JSON report, and ``NaN`` and ``Infinity`` are not JSON. The recovery bound is checked too: two
     finite knobs can multiply past the float range, so a lease near ``1e308`` would still print
-    ``Infinity``. The other profile knobs are the profile loader's to check."""
+    ``Infinity``.
+
+    ``drain_timeout_s`` is a ``[load]`` knob, but this run's drain wait and monitor deadline are
+    computed from it, so it is checked here too: infinity would hang a run whose survivor never
+    drains, and NaN would skip the drain wait outright. The other profile knobs are the profile
+    loader's to check."""
     for f in fields(fo):
         value = getattr(fo, f.name)
         if isinstance(value, float) and not math.isfinite(value):
@@ -1343,6 +1385,16 @@ def _refuse_non_finite(fo: Failover) -> None:
                 "[load.failover] leader_lease_ttl_seconds is too large: a bound computed from it "
                 "is not a finite number"
             )
+    if not math.isfinite(drain_timeout_s):
+        raise FailoverError(
+            f"[load] drain_timeout_s must be a finite number, not {drain_timeout_s}"
+        )
+    # The monitor's deadline, as run_failover_load computes it.
+    if not math.isfinite(4.0 * fo.leader_lease_ttl_seconds + drain_timeout_s + 30.0):
+        raise FailoverError(
+            "[load] drain_timeout_s is too large: the monitor deadline computed from it is not a "
+            "finite number"
+        )
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:
