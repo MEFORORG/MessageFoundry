@@ -1397,8 +1397,9 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > SQLite-only: on the server backends those methods are documented no-ops, and log management / space
 > reclamation (plus the DB-tier `[backup]` snapshot) are DBA operations there. `min_free_disk_mb` is
 > SQLite-only too. The runner skips its free-space probe unless the store is SQLite, and the stock WAL
-> truncate gives the runner a pass to run only on a file-backed SQLite store. Each pass that does real work
-> writes one `retention_purge` `audit_log` entry (cutoffs + counts, **no** message content).
+> truncate gives the runner a pass to run only on a file-backed SQLite store. A `retention_purge`
+> `audit_log` entry records cutoffs + counts, **no** message content. CORRECTED 2026-11-26: this
+> said each pass that does real work writes one `retention_purge` `audit_log` entry.
 > Per-backend table: [PHI.md §8](PHI.md#8-retention--purge).
 
 ### `[update_check]`
@@ -3205,10 +3206,12 @@ on the database's own clock so node clock skew is irrelevant to who may hold it)
 acquires only once that lease has **expired**. A leader that cannot renew within
 `leader_fence_timeout_seconds` (which must be `< leader_lease_ttl_seconds`) **self-fences** — it stops
 acting as leader *before* the lease can expire and a standby acquire it, so a network-partitioned old
-leader never double-processes (the split-brain guard). The leader-only **WRITE singletons**
-run on that one node while followers **no-op** them (reactive-by-polling, so failover is automatic on
-the next tick):
-- **`[retention]` purge/VACUUM/audit** — runs on the leader only.
+leader never double-processes (the split-brain guard). The leader-gated **WRITE** work runs on
+that one node (reactive-by-polling, so failover is automatic on the next tick):
+- **`[retention]` shared-store phases** (the store purges, WAL checkpoint and VACUUM) — leader-gated.
+  A standby runs retention's host-local phases, the `app_log_days` sweep and `app_log_compress_days`
+  compression on its own `[logging].log_dir`, and writes the `retention_purge` audit row on the
+  leader's rule, at least for a pass that deleted or compressed a file (BACKLOG #6526).
 - **the lease-reclaim sweep** — the leader periodically calls `reclaim_expired_leases` (cadence
   `reclaim_interval_seconds`) to recover **crashed** nodes' in-flight rows (only rows whose lease has
   *expired*, never a live sibling's). In clustered mode the engine therefore **skips** the

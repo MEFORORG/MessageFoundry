@@ -2530,13 +2530,34 @@ under `enforce`, or an explicit `0` alone under `warn`, which warns and starts.
 policy.** The engine picks that number; a deploying site with a retention obligation of its own must
 set each window explicitly, because an auto-bounded window is a number nobody decided.
 
-**The pass itself.** It is **leader-gated twice** — at entry and again immediately before the purges, so
-a node demoted mid-pass never nulls PHI as a stale ex-leader. An optional between-phase wall-clock cap
-(`[retention].max_pass_seconds`, default 0 = off) bounds one pass: once hit, the remaining phases are
+**The pass itself.** It is **leader-gated** at entry, and leadership is read again before every
+shared-store phase, so a node demoted mid-pass skips the store phases left for the new leader. The read
+is the coordinator's cached flag, not a fence: it is only as current as the coordinator's last lease
+check. A
+standby purges nothing in the store (BACKLOG #6526). *Corrected 2026-11-26:* this said the pass was "leader-gated
+twice — at entry and again immediately before the purges, so a node demoted mid-pass never nulls PHI
+as a stale ex-leader"; the second read had no await before it, so it could not see a demotion. An
+optional between-phase wall-clock cap (`[retention].max_pass_seconds`, default 0 = off) bounds one pass: once hit, the remaining phases are
 **skipped and left due** (their last-run markers are not advanced), so work is deferred, never dropped;
-a running `VACUUM` is never interrupted. **Each pass that does real work writes exactly one
-`retention_purge` `audit_log` entry** with the cutoffs, counts and per-connection overrides — no message
-content, no PHI.
+a running `VACUUM` is never interrupted. The `retention_purge` `audit_log` entry a pass writes holds the
+cutoffs, counts and per-connection overrides — no message content, no PHI. Each purge phase commits on
+its own, so the entry of a pass that raises or is stopped partway covers the phases that finished, marked
+`interrupted`, and names the phase it
+ended in as `interrupted_phase`. The entry may not count what that phase changed; the comment on
+`RetentionPass.interrupted_phase` in [pipeline/retention.py](../messagefoundry/pipeline/retention.py)
+says which counts the pass's entry keeps. An entry
+can still be missing at least when the audit write itself fails, for example under the store fault
+that ended the pass (logged at ERROR), when the write is still unfinished 5 seconds after the pass ends,
+or when the engine's stop gives up waiting for it, after at most 5 seconds and less under the service's
+stop budget (both logged at ERROR), when the process dies first, or by design when a purge that runs in
+one transaction raises, from its COMMIT say, with nothing else done, which is taken to have rolled
+back and writes no entry. **A stop the budget cuts can lose
+the entry.** The owner ruled on 2026-11-22 that the stop budget wins over the work it cuts
+([SERVICE.md](SERVICE.md)), so when the engine's stop runs out of budget before the retention loop has
+ended, the stop returns with the pass possibly still running when the store closes, and the interrupted
+entry for the phases it finished can be lost. An ERROR says so. *Corrected 2026-11-26:* this paragraph
+said, in bold, that each pass that does real work writes exactly one `retention_purge` entry; a pass
+whose entry is lost as above writes none.
 
 ### What each pass does, per backend
 

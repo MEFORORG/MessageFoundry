@@ -185,10 +185,11 @@ _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
 #: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
 #: however little of the budget is left.
 _STOP_WAIT_FLOOR_SECONDS = 0.1
-#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the CRL
-#: runner's wait alone does not cut the remote-debug watch's last audit pass or the alert-state
-#: drain to the floor. The unbudgeted steps between them can still spend it, and then those waits
-#: get the floor. tests/test_engine_stop_budget.py sums it against the engine's reserve.
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the
+#: retention runner's or the CRL runner's wait alone does not cut a later wait, such as the
+#: remote-debug watch's last audit pass or the alert-state drain, to the floor. The unbudgeted
+#: steps between them can still spend it, and then those waits get the floor.
+#: tests/test_engine_stop_budget.py sums it against the engine's reserve.
 _STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
@@ -198,14 +199,15 @@ _STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
 class _StopBudget:
     """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
 
-    The budgeted waits are the CRL reload runner's stop, the remote-debug refusal watch's stop and
-    the alert-state drain. With no budget each keeps its fixed bound. Under one, a wait gets the
-    shorter of its fixed bound and what is left of the budget once the time kept for the steps after
-    it is taken out, and never less than :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is
-    less. So a wait is shortened only when its fixed bound would run into the time kept for the
-    later steps. The budget ends the wait, not what follows it: a wait that runs out does what it
-    does at its fixed bound. The CRL runner's wait then cancels the pass it waited for and waits for
-    that cancel to land with no bound, as before. The graph supervisor's wait and the other stop
+    The budgeted waits are the retention runner's stop (BACKLOG #6526), the CRL reload runner's
+    stop, the remote-debug refusal watch's stop and the alert-state drain. With no budget each
+    keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left
+    of the budget once the time kept for the steps after it is taken out, and never less than
+    :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
+    when its fixed bound would run into the time kept for the later steps. The budget ends the
+    wait, not what follows it: a wait that runs out does what it does at its fixed bound. The CRL
+    runner's wait then cancels the pass it waited for and waits for that cancel to land with no
+    bound, as before. The graph supervisor's wait and the other stop
     steps are not budgeted, so they can still run past the budget."""
 
     def __init__(self, seconds: float | None) -> None:
@@ -2409,9 +2411,8 @@ class Engine:
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
         # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
         # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
-        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is a
-        # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
-        # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is
+        # gated on the coordinator: single-node always leads.
         if self._retention_settings is not None:
             engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(
@@ -4347,6 +4348,7 @@ class Engine:
         alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
         watch_kept = alert_kept + _STOP_WAIT_SHARE_SECONDS + config_kept
         crl_kept = watch_kept + _STOP_WAIT_SHARE_SECONDS + STOP_FLOOR_SECONDS
+        retention_kept = crl_kept + _STOP_WAIT_SHARE_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
@@ -4366,8 +4368,19 @@ class Engine:
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
+        retention_cancelled = False
         if self._retention_runner is not None:
-            await self._retention_runner.stop()
+            retention = self._retention_runner
+            try:
+                await retention.stop(
+                    timeout=budget.wait(retention.stop_timeout_seconds, kept=retention_kept)
+                )
+            except asyncio.CancelledError:
+                # BACKLOG #6526: the retention stop passes a cancel of this stop on once its own
+                # bounded wait ends. It is held, as the intake monitor's below is, so this stop
+                # still closes the store, and raised once the store has closed. A cancel that
+                # lands in a later step before the guarded teardown still leaves at once.
+                retention_cancelled = True
         if self._backup_runner is not None:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
@@ -4418,7 +4431,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled
+        cancelled = monitor_cancelled or retention_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is

@@ -7009,8 +7009,8 @@ class ClusterSettings(_Section):
     leader election (Step 4 — exactly one node drains the graph; a standby takes over on failover),
     leader-gated poll-source intake (Step 4b), cross-node reference + config-reload + transform-state
     convergence (Steps 6/6b), and the read-only observability API (Step 7 — ``/cluster/status`` +
-    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE singletons (retention, the
-    lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
+    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE work (retention's shared-store
+    phases, the lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
     snapshot; an operator config reload propagates cluster-wide via a version token; and operators can
     see membership + leadership over the API. Operators must keep node clocks synced (NTP — the
     failover-recovery leases are wall-clock), run identical config dirs on every node, and apply config
