@@ -134,6 +134,27 @@ def test_single_lane_driven_soak_behind_an_unconfirmed_climb_rung_is_fail() -> N
     assert rep.result_label == "FAIL"
 
 
+def test_soak_duplicate_with_an_unattributed_shortfall_behind_an_unconfirmed_climb_rung_stays_degraded() -> (
+    None
+):
+    """A soak whose ``sent`` fell short with the cause unrecorded (OFFER_SHORTFALL) may be one the rig could
+    not drive, so its duplicate is not proven next to an unconfirmed climb rung: exit 2."""
+    full = _drive(20.0)
+    drive = dataclasses.replace(
+        full,
+        offered=full.offered * 2,
+        deferred_backpressure=-1,
+        deferred_schedule=-1,
+        lane_repeats=1,
+    )
+    soak = build_rung_outcome(_SOAK_RUNG, drive, _clean_gate(), None)
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung()], soak=soak)
+    assert rep.soak_offer_shortfall is True
+    assert rep.ok is False
+    assert rep.exit_code == 2
+    assert rep.result_label == "SETUP_DEGRADED"
+
+
 def test_clean_soak_behind_an_unconfirmed_climb_rung_stays_setup_degraded() -> None:
     """Control: with no break anywhere, the unconfirmed climb rung is still exit 2."""
     soak = build_rung_outcome(_SOAK_RUNG, _drive(20.0), _clean_gate(), None)

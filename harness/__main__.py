@@ -1047,7 +1047,7 @@ def _add_bench_truth_args(parser: argparse.ArgumentParser) -> None:
     pool is the narrow one and a destination sweep plateaus on ingress. G < L is TRUE at the shipped defaults
     (4 x 1 = 4 bands vs 8 dests), so the pre-flight WARNS by default; this flag makes it REFUSE, which is what
     a deliberate lane sweep wants."""
-    from harness.load.shardcert import PRODUCT_STORE_POOL_SIZE
+    from harness.load.shardcert import POOL_SIZE_CLIFF, PRODUCT_STORE_POOL_SIZE
 
     parser.add_argument(
         "--store-pool-size",
@@ -1062,7 +1062,7 @@ def _add_bench_truth_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--force-store-pool-size",
         action="store_true",
-        help="RUN a --store-pool-size at/over the ADR 0062 collapse cliff (POOL_SIZE_CLIFF per process) "
+        help=f"RUN a store pool at/over the ADR 0062 collapse cliff ({POOL_SIZE_CLIFF} per process) "
         "instead of refusing it. Past the cliff the pool itself thrashes the shared store, so the measured "
         "wall is the pool's, not the engine's",
     )

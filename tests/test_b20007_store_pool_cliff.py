@@ -92,17 +92,44 @@ def _cli_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
 
 
-def test_cli_refusal_is_a_setup_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A refused pool is exit 2 (setup), never a traceback or a bench result."""
+def test_cli_refusal_is_a_setup_exit(
+    monkeypatch: pytest.MonkeyPatch, reset_calls: list[int], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Through the real run_shardcert: a refused pool is exit 2 (setup), never a traceback or a bench
+    result, and the store is never reset."""
     import harness.__main__ as cli
 
     _cli_env(monkeypatch)
+    assert cli._run_shardcert(["--store-pool-size", str(POOL_SIZE_CLIFF)]) == 2
+    assert reset_calls == []
+    assert "refusing to run: STORE POOL AT/OVER" in capsys.readouterr().err
 
-    async def refuse(**_k: object) -> None:
+
+def test_engine_ladder_cli_refusal_is_a_setup_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import harness.__main__ as cli
+
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    seen: list[object] = []
+
+    async def refuse(**kwargs: object) -> None:
+        seen.append(kwargs["force_store_pool_size"])
         raise StorePoolOverCliff("STORE POOL AT/OVER THE ADR 0062 CLIFF")
 
-    monkeypatch.setattr(shardcert, "run_shardcert", refuse)
-    assert cli._run_shardcert(["--store-pool-size", str(POOL_SIZE_CLIFF)]) == 2
+    monkeypatch.setattr("harness.load.shardcert_ladder.run_engine_ladder", refuse)
+    argv = ["--rate-ladder", "24,28", "--sink-port", "9000", "--coord-dir", str(tmp_path)]
+    assert cli._run_shardcert_engine_ladder(argv) == 2
+    assert seen == [False]
+
+
+def test_no_warning_below_the_cliff(capsys: pytest.CaptureFixture[str]) -> None:
+    """The product default sits at the optimum; announce_store_pool already says so, so the check is
+    silent there and only a forced run past the cliff prints."""
+    assert shardcert.check_store_pool_size(shardcert.PRODUCT_STORE_POOL_SIZE, 4) is not None
+    assert capsys.readouterr().err == ""
+    shardcert.check_store_pool_size(POOL_SIZE_CLIFF, 4, force=True)
+    assert "WARNING: STORE POOL AT/OVER" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("argv", "forced"), [([], False), (["--force-store-pool-size"], True)])

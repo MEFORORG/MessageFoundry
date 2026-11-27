@@ -2492,16 +2492,9 @@ class ConsolidatedLadderReport:
         correctness break). Mirrors the single-box ShardCertLadderReport.ok, which since BACKLOG #5441 gates
         lanes on its sustained (non-ceiling) rungs only, for the same reason."""
         recs = self.all_records
-        if not recs:
-            return False
-        if any(r.verdict is RungVerdict.CORRECTNESS_FAIL for r in recs):
-            return False
-        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape.
-        return all(
-            r.lanes_observed >= 2
-            for r in recs
-            if r.verdict is RungVerdict.SUSTAINED and r.offered != 0
-        )
+        # BACKLOG #5861: a zero-offered rung paces one first-tick message, so one lane is its normal shape
+        # (:meth:`_rung_broken` skips it).
+        return bool(recs) and not any(self._rung_broken(r) for r in recs)
 
     @property
     def store_truth_unconfirmed(self) -> bool:
@@ -2671,16 +2664,18 @@ class ConsolidatedLadderReport:
     @property
     def _break_outranks_degradation(self) -> bool:
         """Correctness broke on a rung whose own evidence is proven, so the break is the answer (exit 1 /
-        FAIL) whatever else degraded. A climb rendezvous abort proves nothing about any rung's break.
+        FAIL) whatever else degraded. A climb rendezvous abort leaves every break but a soak inversion
+        unproven.
 
         * A FIFO inversion on the SOAK always outranks (BACKLOG #5862). The sink tracker counts one only
           for a NEW seq below a lane's high-water, which neither a teardown's redelivery nor a late ACK from
           a starved sink can produce.
-        * A soak DUPLICATE or single-lane term outranks only on a soak the engine did not abort and the rig
-          fully drove: a torn-down or overloaded sink can provoke an at-least-once redelivery, which the
-          tracker counts as a repeat, and an under-driven soak can see few lanes. On a fully driven soak an
-          unconfirmed CLIMB rung does not void it, because one rung's missing store-truth says nothing about
-          another rung's sink-observed order.
+        * A soak DUPLICATE or single-lane term never outranks a soak abort or a rig shortfall: a torn-down
+          or overloaded sink can provoke an at-least-once redelivery, which the tracker counts as a repeat,
+          and an under-driven soak can see few lanes. It outranks an unconfirmed CLIMB rung only when the
+          soak's fidelity was also recorded (not :attr:`soak_fidelity_unattributed`), so the rig is known
+          not to have run out: one rung's missing store-truth says nothing about another rung's
+          sink-observed order.
         * A CLIMB break outranks a soak degradation and a pool bind, but not an unconfirmed climb
           store-truth."""
         if self.ok:
@@ -2689,9 +2684,14 @@ class ConsolidatedLadderReport:
             return True
         if self.climb_aborted:
             return False
-        if self._soak_broken and not (self.soak_aborted or self.soak_drive_shortfall):
+        soak_break_driven = self._soak_broken and not (
+            self.soak_aborted or self.soak_drive_shortfall
+        )
+        if soak_break_driven and not self.soak_fidelity_unattributed:
             return True
-        return self._climb_broken and not self.store_truth_unconfirmed
+        if self.store_truth_unconfirmed:
+            return False
+        return self._climb_broken or soak_break_driven
 
     @property
     def result_label(self) -> str:
@@ -3144,8 +3144,8 @@ class ConsolidatedLadderReport:
             #
             # v11 (BACKLOG #5862) — no new key, two SCORING changes, each moving a run from SETUP_DEGRADED /
             # exit 2 to FAIL / exit 1: (1) a FIFO inversion on the soak, under a soak abort, a rig shortfall
-            # or an unconfirmed climb rung; (2) a soak duplicate or single-lane term on a soak the rig fully
-            # drove and the engine did not abort, under an unconfirmed climb rung. A soak duplicate or
+            # or an unconfirmed climb rung; (2) a soak duplicate or single-lane term under an unconfirmed
+            # climb rung, on a soak with no abort, no rig shortfall and a recorded fidelity. A soak duplicate or
             # single-lane term under a soak abort or rig shortfall still reads SETUP_DEGRADED (a redelivery
             # counts as a repeat, and an under-driven soak can see few lanes).
             "schema_version": 11,

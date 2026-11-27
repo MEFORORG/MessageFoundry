@@ -334,7 +334,8 @@ def store_pool_warning(pool_size: int, shard_count: int) -> str | None:
     fleet = pool_size * max(1, shard_count)
     if pool_size >= POOL_SIZE_CLIFF:
         return (
-            f"STORE POOL AT/OVER THE ADR 0062 CLIFF: --store-pool-size {pool_size} >= {POOL_SIZE_CLIFF} "
+            f"STORE POOL AT/OVER THE ADR 0062 CLIFF: store pool {pool_size} (--store-pool-size or an ambient "
+            f"MEFOR_STORE_POOL_SIZE) >= {POOL_SIZE_CLIFF} "
             f"({fleet} connections fleet-wide against ONE unified store). ADR 0062 MEASURED throughput "
             f"COLLAPSING past this point (ACK p99 30-90x) as the extra connections thrash a shared instance. "
             "A ceiling measured here is a POOL-THRASH ceiling and is column-for-column identical to the claim "
@@ -348,13 +349,16 @@ def store_pool_warning(pool_size: int, shard_count: int) -> str | None:
 
 
 def check_store_pool_size(pool_size: int, shard_count: int, *, force: bool = False) -> str | None:
-    """Emit the ADR 0062 pool bound: return the note (also printed to stderr) or ``None``. At/over the CLIFF
-    it RAISES :class:`StorePoolOverCliff` unless ``force`` — because a run above the cliff cannot produce an
-    engine ceiling, only a pool-thrash one, and would be indistinguishable from the wall under investigation."""
+    """Enforce the ADR 0062 pool bound: return the note or ``None``. At/over the CLIFF it RAISES
+    :class:`StorePoolOverCliff` unless ``force`` — because a run above the cliff cannot produce an engine
+    ceiling, only a pool-thrash one, and would be indistinguishable from the wall under investigation. Only
+    a FORCED run past the cliff prints its note (as a WARNING to stderr): below the cliff
+    :func:`announce_store_pool` already states the optimum and the cliff, and a WARNING on the product
+    default would teach an operator to skip the one that matters."""
     note = store_pool_warning(pool_size, shard_count)
-    if note is None:
-        return None
-    if pool_size >= POOL_SIZE_CLIFF and not force:
+    if note is None or pool_size < POOL_SIZE_CLIFF:
+        return note
+    if not force:
         raise StorePoolOverCliff(
             note + " — pass --force-store-pool-size to run above the cliff anyway"
         )
@@ -1415,10 +1419,15 @@ def _check_store_pool_or_signal(
     try:
         check_store_pool_size(pool_size, shard_count, force=force)
     except StorePoolOverCliff:
-        with contextlib.suppress(OSError):
+        try:
             coord.post(
                 ENGINE_SETUP_FAILED,
                 {"reason": "store pool at/over the ADR 0062 cliff (see the engine box's stderr)"},
+            )
+        except OSError as exc:
+            # Logged, so a drive half left waiting out its timeout is explained on this box.
+            _log.warning(
+                "could not post %s for the refused store pool: %s", ENGINE_SETUP_FAILED, exc
             )
         raise
 
