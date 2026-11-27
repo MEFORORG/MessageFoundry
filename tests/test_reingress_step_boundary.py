@@ -1,0 +1,307 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""BACKLOG #5727: whatever escapes the re-ingress step leaves only as a QueueOpenFault or as a
+type name (the Lander's hold on PR 3155, items 1 to 3).
+
+The step's store writes seal their error text, and a raw cipher error can chain a key service's
+URL or body, a driver error its statement, and a traceback the frames that hold the reply. The
+fault arm logs what escapes with its traceback. SQLite only: the boundary is in the runner, and
+the store contract runs on every backend from ``tests/_undecryptable_reply_contract.py``.
+"""
+
+from __future__ import annotations
+
+import logging
+import pathlib
+import sqlite3
+from typing import Any
+
+import pytest
+
+from messagefoundry.pipeline.wiring_runner import _ReplyStepFault
+from messagefoundry.store import MessageStore, OutboxStatus, Stage
+from messagefoundry.store.crypto import (
+    CipherError,
+    CipherUnavailableError,
+    cell_aad,
+    generate_key,
+    make_cipher,
+)
+from messagefoundry.store.queue_tag import QueueOpenFault
+from tests import _undecryptable_reply_contract as contract
+from tests._erased_reply_contract import LOOP, children
+from tests._queue_tag_contract import RawFetch
+
+#: A marker the reply carries, to show no frame of the escaping fault holds it.
+REPLY_MARK = "SYNTHETIC-REPLY-MARK"
+
+
+@pytest.fixture
+async def store(tmp_path: pathlib.Path) -> Any:
+    s = await MessageStore.open(
+        tmp_path / "step_boundary.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    yield s
+    await s.close()
+
+
+def _seal_error(outage: bool) -> CipherError:
+    """A seal failure whose own cause carries the key service's text: no verdict with ``outage``,
+    else the invocation ceiling, a verdict."""
+    error: CipherError = (
+        CipherUnavailableError("synthetic") if outage else CipherError("synthetic ceiling")
+    )
+    error.__cause__ = ValueError(contract.KEY_SERVICE_TEXT)
+    return error
+
+
+def _assert_clean(fault: BaseException, outage: bool) -> None:
+    """``fault`` is the boundary's: the right class, no chain, no key-service text or reply in its
+    rendering, and no frame that holds the reply."""
+    assert isinstance(fault, QueueOpenFault if outage else _ReplyStepFault), type(fault)
+    assert fault.__cause__ is None and fault.__context__ is None
+    rendered = logging.Formatter().formatException((type(fault), fault, fault.__traceback__))
+    assert contract.KEY_SERVICE_TEXT not in rendered and REPLY_MARK not in rendered
+    walked, holding = contract._engine_frames_holding(fault, (REPLY_MARK,))
+    assert holding == [], holding
+    # The traceback starts at the boundary, so the step's frame, which holds the reply, is not on
+    # it. This module's own frame is walked too, so name the boundary's.
+    assert "bounded" in walked and "_process_response_item" not in walked, walked
+
+
+async def _head(store: MessageStore) -> tuple[str, Any]:
+    mid = await contract.captured(store, control="SB-HEAD", now=1.0, reply=REPLY_MARK)
+    item = await store.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+    assert item is not None and item.message_id == mid
+    return mid, item
+
+
+async def _status(store: MessageStore, row_id: str) -> str:
+    cur = await store._db.execute("SELECT status FROM queue WHERE id=?", (row_id,))
+    row = await cur.fetchone()
+    assert row is not None
+    return str(row["status"])
+
+
+@pytest.mark.parametrize("outage", [True, False], ids=["outage", "verdict"])
+async def test_a_failed_seal_in_the_missing_inbound_revert_leaves_clean(
+    store: MessageStore, outage: bool
+) -> None:
+    """Item 1: a loopback a reload removed reverts its token with ``mark_failed``, whose seal can
+    fail. Before the boundary the raw error, chain and all, reached the fault arm."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    del step.registry.inbound[LOOP]
+    with contract.faulting_cipher(store) as fault:
+        fault.seal_error = _seal_error(outage)
+        with pytest.raises(Exception) as caught:
+            await step._process_response_item(LOOP, item)
+    _assert_clean(caught.value, outage)
+    # Nothing was written: the step's caller, the fault arm, re-pends it.
+    assert await _status(store, item.id) == OutboxStatus.INFLIGHT.value
+
+
+async def test_a_failure_to_build_the_replacement_leaves_a_fixed_text_fault(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The last loop's item 1: if building the replacement raises, its error would carry the raw
+    seal error, and its key-service chain, as context. The boundary drops it and raises a
+    fixed-text QueueOpenFault outside the handler instead, so the fault has no chain. It logs one
+    WARNING, and names in the fault, only the two type names: the step's error and the build's."""
+    import messagefoundry.pipeline.wiring_runner as wiring_runner
+
+    def _broken(exc: Exception) -> Exception:
+        raise RuntimeError(f"building failed {REPLY_MARK}")
+
+    monkeypatch.setattr(wiring_runner, "_reply_step_fault", _broken)
+    _, item = await _head(store)
+    step = contract.runner(store)
+    del step.registry.inbound[LOOP]
+    with contract.faulting_cipher(store) as fault:
+        fault.seal_error = _seal_error(outage=False)
+        with caplog.at_level(logging.WARNING), pytest.raises(Exception) as caught:
+            await step._process_response_item(LOOP, item)
+    raised = caught.value
+    assert isinstance(raised, QueueOpenFault), type(raised)
+    assert raised.__cause__ is None and raised.__context__ is None
+    names = "CipherError; building its fault raised RuntimeError"
+    assert str(raised) == f"re-ingress step fault could not be named ({names})", str(raised)
+    rendered = logging.Formatter().formatException((type(raised), raised, raised.__traceback__))
+    assert contract.KEY_SERVICE_TEXT not in rendered and REPLY_MARK not in rendered, rendered
+    [record] = [r for r in caplog.records if "could not be named" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"re-ingress step fault could not be named ({names})"
+    logged = logging.Formatter().format(record)
+    assert contract.KEY_SERVICE_TEXT not in logged and REPLY_MARK not in logged, logged
+
+
+#: A key id planted in a stored marker, which the local cipher's refusal echoes (BACKLOG #5982).
+PLANTED_KEY_ID = "SYNTHKEYIDMARK"
+
+
+async def test_a_refusal_echoing_a_planted_key_id_reaches_no_reason_or_fault(
+    store: MessageStore,
+) -> None:
+    """The Lander's hold at 8b8bb0ed026 (main's #5982 retracts "a CipherError's text never holds a
+    value"): a real refusal of a reply cell whose marker names a planted ``key_id``. The step's
+    read dead-letters it, and neither the token's ``last_error`` nor its ``dead`` event may hold
+    the planted text. The same refusal, raised where the step has no handler of its own, leaves
+    the boundary as a fault whose text does not hold it either. CONTROL: the refusal's own text
+    holds it, so a clean read is not a miss."""
+    mid, item = await _head(store)
+    fetch = _fetch(store)
+    [row] = await fetch("SELECT body FROM response WHERE message_id=?", (mid,))
+    parts = str(row["body"]).split(":")
+    assert parts[1] == "v4", parts[:2]  # mfenc:v4:<alg>:<key_id>:<salt>:<base64>
+    parts[3], parts[-1] = PLANTED_KEY_ID, "AA"
+    planted = ":".join(parts)
+    await store._db.execute("UPDATE response SET body=? WHERE message_id=?", (planted, mid))
+    await store._db.commit()
+    with pytest.raises(CipherError) as refused:
+        store._cipher.decrypt(planted, aad=cell_aad("response", "body", mid, "OB_X", 1))
+    assert PLANTED_KEY_ID in str(refused.value)  # CONTROL
+
+    # The step's read: dead-lettered, with no planted text in the reason.
+    step = contract.runner(store)
+    await step._process_response_item(LOOP, item)
+    [token] = await fetch("SELECT id, status, last_error FROM queue WHERE id=?", (item.id,))
+    assert token["status"] == OutboxStatus.DEAD.value
+    reason = store._cipher.decrypt(
+        token["last_error"], aad=cell_aad("queue", "last_error", item.id)
+    )
+    assert "undecryptable" in reason and PLANTED_KEY_ID not in reason, reason
+    details = [str(e["detail"]) for e in await store.events_for(mid) if e["event"] == "dead"]
+    assert details and not [d for d in details if PLANTED_KEY_ID in d], details
+
+    # The boundary: the same refusal raised by a store call the step does not handle.
+    _, other = await _head(store)
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise refused.value
+
+    del step.registry.inbound[LOOP]
+    step.store.mark_failed = _refuse  # type: ignore[method-assign]
+    with pytest.raises(_ReplyStepFault) as caught:
+        await step._process_response_item(LOOP, other)
+    assert PLANTED_KEY_ID not in str(caught.value), str(caught.value)
+    assert str(caught.value).startswith("CipherError"), str(caught.value)
+
+
+@pytest.mark.parametrize("outage", [True, False], ids=["outage", "verdict"])
+async def test_a_failed_seal_in_the_unstorable_dead_letter_leaves_clean(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, outage: bool
+) -> None:
+    """Item 1: an unstorable reply (a lone surrogate, BACKLOG #5616) is dead-lettered, and that
+    seal can fail with the reply in the step's frame. No frame of what escapes may hold it."""
+    _, item = await _head(store)
+
+    async def _read(row_id: str) -> str | None:
+        return f'{{"a": "{REPLY_MARK}\udc80"}}'
+
+    monkeypatch.setattr(store, "response_body_for_work_row", _read)
+    step = contract.runner(store)
+    with contract.faulting_cipher(store) as fault:
+        fault.seal_error = _seal_error(outage)
+        with pytest.raises(Exception) as caught:
+            await step._process_response_item(LOOP, item)
+    _assert_clean(caught.value, outage)
+    assert await _status(store, item.id) == OutboxStatus.INFLIGHT.value
+
+
+async def test_a_verdict_seal_in_the_handoff_leaves_clean(store: MessageStore) -> None:
+    """Item 2: a seal in the handoff that counts as a verdict, a Vault 400 for example, is
+    re-raised by the store as it is. The step boundary names it by type. Armed after the step's
+    own read, so the handoff is what seals. CONTROL: the token hands off once the fault clears."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    real_handoff = store.ingress_handoff
+    with contract.faulting_cipher(store) as fault:
+
+        async def armed_handoff(**kwargs: Any) -> bool:
+            fault.seal_error = _seal_error(outage=False)
+            produced: bool = await real_handoff(**kwargs)
+            return produced
+
+        store.ingress_handoff = armed_handoff  # type: ignore[method-assign]
+        try:
+            with pytest.raises(Exception) as caught:
+                await step._process_response_item(LOOP, item)
+        finally:
+            del store.ingress_handoff
+        _assert_clean(caught.value, outage=False)
+        fault.heal()
+        await step._process_response_item(LOOP, item)
+    assert len(await children(_fetch(store))) == 1
+
+
+def _fetch(store: MessageStore) -> RawFetch:
+    async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        cur = await store._db.execute(sql, params)
+        return [dict(r) for r in await cur.fetchall()]
+
+    return fetch
+
+
+async def test_a_failed_pooled_reply_buildup_check_logs_no_driver_text(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item 3: the pooled reply lane's build-up check, after a handed-off token, logs a failed
+    store read as the per-lane check does, as a redacted stand-in. ``_pooled_maybe_buildup``'s
+    ``log.exception`` wrote the driver's raw text."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+
+    async def _broken(name: str, *, stage: str = "") -> tuple[int, float | None]:
+        raise sqlite3.OperationalError(f"driver text quoting {REPLY_MARK}")
+
+    monkeypatch.setattr(store, "pending_depth", _broken)
+    with caplog.at_level(logging.DEBUG):
+        await step._dispatch_response(LOOP, item)
+    failed = [r for r in caplog.records if "build-up check failed" in r.getMessage()]
+    assert failed, [r.getMessage() for r in caplog.records]  # CONTROL: the check ran and failed
+    assert REPLY_MARK not in caplog.text
+
+
+async def test_a_pooled_reply_buildup_check_is_skipped_after_a_stopped_result(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last loop's item 3: a STOPPED result, the missing-inbound revert, runs no build-up
+    check on the pooled reply lane, as the per-lane worker runs none. CONTROL: the step did
+    revert the token, so the STOPPED path is the one that ran."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    del step.registry.inbound[LOOP]
+    reads: list[str] = []
+
+    async def _depth(name: str, *, stage: str = "") -> tuple[int, float | None]:
+        reads.append(name)
+        return 0, None
+
+    monkeypatch.setattr(store, "pending_depth", _depth)
+    await step._dispatch_response(LOOP, item)
+    assert await _status(store, item.id) == OutboxStatus.PENDING.value
+    assert reads == []
+
+
+async def test_a_pooled_reply_buildup_check_runs_on_the_leader_only(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 6: a node that does not lead runs no build-up check on the pooled reply lane, as the
+    per-lane worker's paths do not, since a successor may own the lane."""
+    _, item = await _head(store)
+    step = contract.runner(store)
+    step._coordinator.is_leader = lambda: False  # type: ignore[method-assign]
+    reads: list[str] = []
+
+    async def _depth(name: str, *, stage: str = "") -> tuple[int, float | None]:
+        reads.append(name)
+        return 0, None
+
+    monkeypatch.setattr(store, "pending_depth", _depth)
+    await step._dispatch_response(LOOP, item)
+    assert reads == []
+    # CONTROL: the leader does run it.
+    step._coordinator.is_leader = lambda: True  # type: ignore[method-assign]
+    step._pooled_buildup_at.clear()
+    await step._dispatch_response(LOOP, item)  # an already-consumed token: a no-op handoff
+    assert reads == [LOOP]

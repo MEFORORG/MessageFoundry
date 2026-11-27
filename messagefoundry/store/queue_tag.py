@@ -63,6 +63,8 @@ __all__ = [
     "QUEUE_TAG_FAILED_ACTION",
     "TRANSIENT_OPEN_BACKOFF_SECONDS",
     "QueueOpenFault",
+    "fault_text",
+    "no_verdict_fault",
     "queue_open_fault",
     "release_unreturned",
     "set_aside_deadline",
@@ -147,23 +149,43 @@ PROGRAMMING_ERRORS: Final = (AssertionError, AttributeError, LookupError, NameEr
 class QueueOpenFault(Exception):
     """A claimed queue row that could not be opened for a reason that is not the row (BACKLOG
     #5735): a key service that gave no verdict, a failed store read, or a failed dead-letter write.
-    Built by :func:`queue_open_fault` with no cause, context or traceback, so a handler that logs
-    it with ``exc_info`` prints neither the raw key-service error, which can echo a URL or a
-    request body (BACKLOG #2318), nor the claim's frames, which hold other rows' plaintext (BACKLOG
-    #6706)."""
+    Built by :func:`queue_open_fault` with no cause or context, so a handler that logs it with
+    ``exc_info`` does not print the raw key-service error, which can echo a URL or a request body
+    (BACKLOG #2318). A claim hands it on unraised, so it has no traceback into the claim's frames,
+    which hold other rows' plaintext (BACKLOG #6706). The re-ingress worker and handoff DO raise it
+    (BACKLOG #5727), so there it gains a traceback through the frames it leaves. The worker drops
+    the handoff's frames from that traceback and its own copies of the reply and the values peeked
+    from it. The worker and dispatcher frames left hold that lane's response tokens, whose payloads
+    are references to the reply rather than its body."""
+
+
+def fault_text(exc: BaseException) -> str:
+    """``exc`` named by its type, and by its own text only where ``exc`` is a
+    :class:`CipherError`, whose text is the cipher's own wording and names no row's body. It is
+    not value-free: a cipher's text can echo a field cut from the stored value (``crypto._echo``),
+    and a Transit outage's can name its key with the cause's class or a fixed refusal text
+    (BACKLOG #5982). Any other error, a failed store read or dead-letter write, is named by its
+    type alone: a driver's text can echo a statement, a key or a truncated value. A text that must
+    hold no stored text uses :func:`unopenable_log_text` instead."""
+    if isinstance(exc, CipherError):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
 
 
 def queue_open_fault(exc: BaseException) -> QueueOpenFault:
-    """:class:`QueueOpenFault` naming ``exc`` by its type, and by its own text only where ``exc``
-    is a :class:`CipherError`, whose text is the cipher's own wording and names no row's body. It is
-    not value-free: a cipher's text can echo a field cut from the stored value (``crypto._echo``),
-    and a Transit outage's can name its key with the cause's class or a fixed refusal text. Any
-    other error, a failed store read or dead-letter write, is named by its type alone: a driver's
-    text can echo a statement, a key or a truncated value, and the T17 path logs this fault at
-    ERROR."""
-    if isinstance(exc, CipherError):
-        return QueueOpenFault(f"{type(exc).__name__}: {exc}")
-    return QueueOpenFault(type(exc).__name__)
+    """:class:`QueueOpenFault` named by :func:`fault_text`, whose docstring says what that text
+    holds; it is not value-free. The T17 path logs this fault at ERROR."""
+    return QueueOpenFault(fault_text(exc))
+
+
+def no_verdict_fault(exc: BaseException) -> QueueOpenFault | None:
+    """The :class:`QueueOpenFault` for ``exc`` when the key service gave it no verdict
+    (:func:`is_transient_open_failure`), else ``None`` (BACKLOG #5727). A fault in the engine's
+    own code (:data:`PROGRAMMING_ERRORS`) is never one. The caller raises the fault outside its
+    handler, so it carries no chain to the raw key-service error."""
+    if isinstance(exc, PROGRAMMING_ERRORS) or not is_transient_open_failure(exc):
+        return None
+    return queue_open_fault(exc)
 
 
 class _Releaser(Protocol):

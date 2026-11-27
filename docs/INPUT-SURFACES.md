@@ -176,9 +176,16 @@ reply check 7 admits meets the document handle marker check the HL7 v2 row furth
 when `_read_ingress_fields` then reads its fields; a fault there of a type `PEEK_READ_FAULTS` names
 refuses the reply first, with `REINGRESS_PEEK_FAILED`. Check 1 does not run, because the reply is
 already text, and check 8 does not run. A reply a check refuses is recorded with status `ERROR`,
-with at least these exceptions. A reply that does not decrypt, or that holds a lone surrogate
-(`_unstorable_reply`), is dead-lettered by `dead_letter_now` before the size ceiling, and no
-`ERROR` child is stored for it. A refused reply on a token the handoff stores no child for, such as
+with at least these exceptions. A reply whose read fails because a key service gave no verdict is
+not dead-lettered: the token is re-pended with a backoff and holds its FIFO lane, and a pooled lane
+under `infra_fault_policy = stop` can go `STOPPED` with the token left pending. A reply that fails
+to decrypt for any other reason, or that holds a lone surrogate (`_unstorable_reply`), is
+dead-lettered by `dead_letter_now` before the size ceiling, and no `ERROR` child is stored for it.
+A CipherError on the step's read that is an engine fault, such as an AADComponentError, is
+dead-lettered with its reference kept. Any other exception in the step re-pends and holds the lane.
+The handoff's own decrypt failures dead-letter the token through
+`_consume_dead`, except at least a key service with no verdict, which re-pends it the same way.
+A refused reply on a token the handoff stores no child for, such as
 a depth-capped token, gets no `ERROR` child either.
 [ADR 0013](adr/0013-query-response-orchestration.md) describes the path.
 

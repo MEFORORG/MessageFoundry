@@ -2076,10 +2076,12 @@ class StageDispatcher:
                     # The claim could not open this row for a reason that is not the row (a key
                     # service with no verdict, a failed store read or dead-letter write), so it is
                     # an infra fault at this item, never content poison (BACKLOG #5735). It takes
-                    # the T17 outcome directly and is never raised: a raise would give the fault a
-                    # traceback reaching this frame, whose `items` hold other rows' plaintext
-                    # (BACKLOG #6706). T17 logs a fresh, never-raised copy with no traceback,
-                    # cause or context.
+                    # the T17 outcome directly and this claim-set fault is not raised: a raise would
+                    # give it a traceback reaching this frame, whose `items` can hold other rows'
+                    # plaintext (BACKLOG #6706). T17 logs a fresh, never-raised copy with no
+                    # traceback, cause or context. A QueueOpenFault the re-ingress body raises does
+                    # reach this frame, where `items` are response tokens holding references
+                    # (BACKLOG #5727; QueueOpenFault's docstring says what that traceback holds).
                     return self._infra_fault_outcome(
                         lane, items, i, _fresh_open_fault(item.open_fault)
                     )

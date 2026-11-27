@@ -89,7 +89,7 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_call_gate import require_call_gate as _require_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
+from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -195,6 +195,7 @@ from messagefoundry.store.queue_tag import (
     QueueTagError,
     alert_queue_tag_failure,
     is_transient_open_failure,
+    no_verdict_fault,
     open_queue_cell,
     queue_open_fault,
     queue_payload_aad,
@@ -9877,12 +9878,20 @@ class SqlServerStore(ServerCipherWalk):
                 tag_failures=tag_failures,
                 queue_tag_rows=queue_tag_rows,
             )
+        except CipherError as exc:
+            # BACKLOG #5727: a seal, or any other cipher call no inner arm contains, that the key
+            # service gave no verdict on is retried as a QueueOpenFault, raised below, outside this
+            # handler, as on SQLite.
+            seal_fault = no_verdict_fault(exc)
+            if seal_fault is None:
+                raise
         finally:
             await report_cell_tag_failures(self, tag_failures)
             for row, error in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
                 await report_queue_tag_failure(
                     self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
+        raise seal_fault
 
     async def _ingress_handoff_txn(
         self,
@@ -9957,7 +9966,11 @@ class SqlServerStore(ServerCipherWalk):
                     await self._commit(conn)
                     return True
 
-                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
+                # (2) Decrypt + parse the artifact ref. A transient open failure re-raises and the
+                # token is retried; any other failure consumes and dead-letters it.
+                # BACKLOG #5727: each dead-letter on the reference runs after the try, as on SQLite.
+                ref_fault: QueueOpenFault | None = None
+                ref_tag_failed = ref_corrupt = False
                 try:
                     ref = (
                         await cipher_call(self._cipher, open_queue_cell, self._cipher, work_row)
@@ -9970,12 +9983,22 @@ class SqlServerStore(ServerCipherWalk):
                     # first, so a dead-letter write that fails is still reported.
                     # Without its traceback, so the queued error holds no frame of this transaction.
                     queue_tag_rows.append((work_row, err.with_traceback(None)))
+                    ref_tag_failed = True
+                except Exception as exc:  # noqa: BLE001 - dead-letters unless transient
+                    # BACKLOG #5727: no verdict on the cell. Raised below, outside this handler, so
+                    # the fault carries no chain to the raw key-service error.
+                    # Not no_verdict_fault, which never retries an engine fault: as on SQLite.
+                    ref_fault = queue_open_fault(exc) if is_transient_open_failure(exc) else None
+                    ref_corrupt = ref_fault is None
+                if ref_tag_failed:
                     return await _consume_dead(
                         "ingress_handoff(tag-failed)",
                         REINGRESS_TOKEN_TAG_FAILED,
                         "re-ingress work-row failed its integrity check",
                     )
-                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                if ref_fault is not None:
+                    raise ref_fault
+                if ref_corrupt:
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
                         "re-ingress work-row reference is corrupt/unparseable",
@@ -10006,18 +10029,61 @@ class SqlServerStore(ServerCipherWalk):
                         "re-ingress reply erased",
                         erased=True,
                     )
-                body = (
-                    await self._adecrypt(
-                        art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
+
+                # BACKLOG #5727, as on Postgres (#5689): a decrypt failure on a reply or origin cell
+                # dead-letters the token. A failure that dead-letters can still clear later, for
+                # example a key the store lacks, so the token keeps its reference and a replay can
+                # recover it. A key service that gave no verdict leaves as a QueueOpenFault, raised
+                # outside the handler so it carries no chain to the raw key-service error, and the
+                # token is retried. An engine fault propagates from the reply cell. On a token
+                # reference or origin metadata it can dead-letter the token instead: whether an
+                # AADComponentError there reads as a corrupt cell depends on the cipher. The
+                # encrypts are contained only in ingress_handoff, and only where the key service
+                # gave no verdict: the invocation ceiling stays a hard stop.
+                # The dead-letter runs after the handler, so a failure in it chains no raw decrypt
+                # error; only the error's type name is kept, as on SQLite.
+                async def _dead_unopenable(error_type: str, what: str, label: str) -> bool:
+                    log.warning(
+                        "ingress_handoff: %s of work-row %s does not decrypt (%s); dead-lettering",
+                        what,
+                        response_row_id,
+                        error_type,
                     )
-                ) or ""
+                    return await _consume_dead(
+                        label,
+                        f"re-ingress {what} does not decrypt ({error_type})",
+                        f"re-ingress {what} undecryptable",
+                    )
+
+                open_fault: QueueOpenFault | None = None
+                unopenable: str | None = None
+                try:
+                    body = (
+                        await self._adecrypt(
+                            art[0], aad=cell_aad("response", "body", origin_msg_id, dest, seq)
+                        )
+                    ) or ""
+                except CipherError as exc:
+                    if isinstance(exc, PROGRAMMING_ERRORS):
+                        raise
+                    open_fault = no_verdict_fault(exc)
+                    if open_fault is None:
+                        unopenable = type(exc).__name__
+                if open_fault is not None:
+                    raise open_fault
+                if unopenable is not None:
+                    return await _dead_unopenable(
+                        unopenable, "reply", "ingress_handoff(reply-unopenable)"
+                    )
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute(
                     "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
                 )
                 mrow = await cur.fetchone()
                 # EF-3: metadata ciphered at rest, bound to the origin message's cell and its
-                # channel (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+                # channel (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable;
+                # its dead-letter runs after the try, with only the error's text kept, as on SQLite.
+                origin_tag_error: str | None = None
                 try:
                     meta_json = (
                         (
@@ -10036,14 +10102,51 @@ class SqlServerStore(ServerCipherWalk):
                     )
                 except CellTagError as err:
                     tag_failures.append(err)  # audited once the transaction has closed
+                    origin_tag_error = str(err)
+                except CipherError as exc:
+                    if isinstance(exc, PROGRAMMING_ERRORS):
+                        raise
+                    open_fault = no_verdict_fault(exc)
+                    if open_fault is None:
+                        unopenable = type(exc).__name__
+                if origin_tag_error is not None:
                     return await _consume_dead(
                         "ingress_handoff(origin-tag)",
-                        str(err),
+                        origin_tag_error,
                         "re-ingress origin failed its integrity check",
                     )
-                loaded = json.loads(meta_json) if meta_json else {}
+                if open_fault is not None:
+                    raise open_fault
+                if unopenable is not None:
+                    return await _dead_unopenable(
+                        unopenable, "origin metadata", "ingress_handoff(origin-unopenable)"
+                    )
+                # BACKLOG #5727, as on Postgres (#5689): unparseable metadata, or a depth int()
+                # cannot read, dead-letters the token with a content-free refusal, as on SQLite.
+                refusal: str | None = None
+                loaded: Any = {}
+                if meta_json:
+                    loaded, refusal = json_loads_or_refusal(meta_json)
+                    if refusal is None and not isinstance(loaded, dict):
+                        # Valid JSON that is not an object holds no lineage, as on SQLite.
+                        refusal = f"not an object: {type(loaded).__name__}"
                 origin_meta = loaded if isinstance(loaded, dict) else {}
-                child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                try:
+                    child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                except (ValueError, TypeError, OverflowError) as exc:
+                    refusal = type(exc).__name__
+                if refusal is not None:
+                    log.warning(
+                        "ingress_handoff: origin metadata of work-row %s is unparseable (%s);"
+                        " dead-lettering",
+                        response_row_id,
+                        refusal,
+                    )
+                    return await _consume_dead(
+                        "ingress_handoff(origin-metadata)",
+                        f"re-ingress origin metadata is unparseable ({refusal})",
+                        "re-ingress origin metadata unparseable",
+                    )
                 root = origin_meta.get("correlation_root_id") or origin_id
                 # (5) Depth-cap -> consume-and-dead-letter.
                 if child_depth > correlation_depth_cap:

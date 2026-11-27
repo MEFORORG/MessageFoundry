@@ -995,7 +995,20 @@ class QueueStore(StoreLifecycle, Protocol):
         and keys merged into its engine-internal metadata. ``None`` stores the whole reply and adds
         nothing, as before. Both are ignored unless ``peek_failed``. Neither moves the child's
         content-addressed id, which still hashes the whole reply. Returns ``True`` if this call
-        performed the handoff."""
+        performed the handoff.
+
+        **What a failed open or seal does (BACKLOG #5727).** A key service that gave no verdict, on
+        any open or seal in the transaction, raises
+        :class:`~messagefoundry.store.queue_tag.QueueOpenFault` with no cause or context, never a
+        raw :class:`~messagefoundry.store.crypto.CipherError`; the transaction rolls back and the
+        token stays claimed for its caller to re-pend. A reply or origin metadata cell that does
+        not open for a reason that is the cell's, and origin metadata that does not parse, are
+        dead-lettered: the token is consumed with its reference kept, so a replay can retry it once
+        the cause is fixed. A token reference that does not open, or fails its tag, is dead-lettered
+        the same way. Any other cipher error is raised as it is, at least the encrypt's invocation
+        ceiling and an engine fault on the reply cell such as an ``AADComponentError``; the
+        re-ingress step replaces what escapes with a fault that has no chain, named by its type and
+        a cipher error's own text, before it reaches a log."""
         ...
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
