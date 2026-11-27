@@ -95,7 +95,8 @@
     The WHOLE-MAP cache is a plain last-write-wins file: a stale-by-seconds view of who is editing what
     is fine, and two sessions refreshing at once cost a duplicate walk, not corruption. It is keyed on
     the querying worktree's root AND HEAD, because Files depends on both. There is ONE FILE PER ROOT,
-    mefor-coord/overlap-cache/<first 8 hex of sha256(root)>.json. It was one shared file until
+    mefor-coord/overlap-cache/<first 8 hex of sha256(root)>.json, and one more, <same>.live.json, for
+    -LiveOnly walks (see that parameter). It was one shared file until
     2026-10-13, when collision_gate.ps1 began running this script from each session's own worktree
     rather than from the primary checkout. A shared file then held one root at a time, so every
     session's edit evicted the last one's map and each gated edit paid a full walk. The term memo beside it is
@@ -167,7 +168,19 @@ param(
     # two worktrees share anything, so this is the lever that turns process startup from a sum into a
     # throughput figure. Measured 2026-08-30 across 162 worktrees: 28.9s at 1, 3.98s at 16, no further
     # gain at 32. 1 or less runs the same body serially, which is what the tests pin against.
-    [int]$ParallelLimit = 16
+    [int]$ParallelLimit = 16,
+    # WALK ONLY THE WORKTREES A LIVE SESSION OWNS, for a caller that reads only Live rows. The
+    # collision gate denies only on a Live row and names only Live rows in its notice, and
+    # session-context.ps1 lists only Live rows, so a dormant row changes no output of either. Without
+    # it they walked every worktree for nothing. Measured 2026-11-27 at 1481 worktrees: the walk
+    # reached 395 of them in its 16s budget, the gate ran 33s against its 20s harness timeout, and the
+    # harness killed it on every Edit and Write. SessionStart's 30s timeout killed session-context.ps1
+    # the same way.
+    #
+    # The mode has its own whole-map cache file, <key>.live.json, and never reads or writes the full
+    # one: a map holding only Live rows would under-report to a bare run reading the same file. The
+    # term memo is shared, and still pruned against every worktree, live or not.
+    [switch]$LiveOnly
 )
 
 # A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
@@ -309,7 +322,7 @@ if ($myHead) {
 $cacheSha = [System.Security.Cryptography.SHA256]::Create()
 $cacheKey = -join ($cacheSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($myRootNorm))[0..3] | ForEach-Object { $_.ToString('x2') })
 $cacheSha.Dispose()
-$cacheFile = Join-Path $common "mefor-coord/overlap-cache/$cacheKey.json"
+$cacheFile = Join-Path $common "mefor-coord/overlap-cache/$cacheKey$(if ($LiveOnly) { '.live' }).json"
 $termCacheFile = Join-Path $common "mefor-coord/overlap-terms.json"
 
 # THE ANCHOR EVERY COMMITTED-HALF TERM IS MEASURED AGAINST, resolved once so it can go in the memo key.
@@ -347,11 +360,12 @@ try {
 # Empty Head is tolerated (an unborn checkout, or a git too old to print the line). It disables the
 # memo for that worktree and the terms are computed the long way, which is slow and correct.
 function Get-WorktreeList {
-    $out = @(); $cur = $null
+    # A list, not `+=`, for the reason given at $jobs.
+    $out = [System.Collections.Generic.List[object]]::new(); $cur = $null
     foreach ($line in (& git @gitArgs worktree list --porcelain 2>$null)) {
         if ($line -like "worktree *") {
             $cur = [pscustomobject]@{ Path = $line.Substring(9).Trim(); Branch = ""; Head = "" }
-            $out += $cur
+            $out.Add($cur)
         }
         elseif ($line -like "HEAD *" -and $cur) { $cur.Head = $line.Substring(5).Trim() }
         elseif ($line -like "branch *" -and $cur) { $cur.Branch = ($line.Substring(7).Trim() -replace '^refs/heads/', '') }
@@ -552,10 +566,11 @@ function Build-Map {
     # Longest prefix wins is the only rule that survives nesting: a session in .../worktrees/foo matches
     # both the primary and foo, and foo is the one it is actually sitting in.
     $ownerByWorktree = @{}
+    # Normalised once, not once per session: this loop is sessions times worktrees.
+    $worktreeNorms = @(foreach ($w in $worktrees) { ConvertTo-Norm $w.Path })
     foreach ($k in @($sessionsByCwd.Keys | Sort-Object)) {
         $best = $null
-        foreach ($w in $worktrees) {
-            $wn = ConvertTo-Norm $w.Path
+        foreach ($wn in $worktreeNorms) {
             if ($k -eq $wn -or $k.StartsWith("$wn/")) {
                 if ($null -eq $best -or $wn.Length -gt $best.Length) { $best = $wn }
             }
@@ -575,11 +590,21 @@ function Build-Map {
     # PLAN THE WALK BEFORE RUNNING ANY OF IT. Everything that needs this script's own scope -- the
     # caller's HEAD, the inheritor set, the memo -- is resolved into a flat job list here, so the body
     # below can run in a runspace that shares none of it.
-    $jobs = @()
-    foreach ($w in $worktrees) {
-        $norm = ConvertTo-Norm $w.Path
+    #
+    # A list, not `+=`: that copies the array on every append, so it costs n squared in the worktree
+    # count.
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    # Every memo key this walk could still use, walked or not, and in both modes the same set for the
+    # same caller. The prune below keeps exactly these. Every key embeds the caller's HEAD, so another
+    # caller's prune still drops them; this only stops -LiveOnly dropping more than a full walk does.
+    $memoKeys = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $worktrees.Count; $i++) {
+        $w = $worktrees[$i]
+        $norm = $worktreeNorms[$i]
         if ($norm -eq $myRootNorm) { continue }   # not a collision with yourself
-        if (-not (Test-Path -LiteralPath $w.Path)) { continue }
+        # -LiveOnly: no live session owns this worktree, so its row would be dormant and it is not
+        # walked. Test-Path waits until after the key, so both modes keep the same keys.
+        $skipWalk = $LiveOnly -and -not $ownerByWorktree.ContainsKey($norm)
 
         # $inheritors GATES THE SPAWN, not the answer. A peer holding none of my unlanded commits
         # cannot be narrowed by the third term below, so running that diff for it buys a guaranteed
@@ -599,11 +624,14 @@ function Build-Map {
         if ($originMain -and $w.Head -and $myHead) {
             $key = "nrz|$originMain|$($w.Head)|$myHead|$(if ($mayHaveMine) { 1 } else { 0 })"
         }
-        $jobs += [pscustomobject]@{
+        if ($key) { $memoKeys.Add($key) }
+        if ($skipWalk) { continue }
+        if (-not (Test-Path -LiteralPath $w.Path)) { continue }
+        $jobs.Add([pscustomobject]@{
             Path = $w.Path; Branch = $w.Branch; Norm = $norm; Key = $key
             Memo = $(if ($key -and $termCache.ContainsKey($key)) { @($termCache[$key]) } else { $null })
             MyHead = $myHead; MayHaveMine = $mayHaveMine
-        }
+        })
     }
     $script:WorktreeCount = $jobs.Count
 
@@ -941,10 +969,9 @@ function Build-Map {
     # untouched. There is no under-report to pin, which is the only reason the other cache is withheld.
     try {
         $keep = @{}
-        foreach ($w in $jobs) {
-            if (-not $w.Key) { continue }
-            if ($fresh.ContainsKey($w.Key)) { $keep[$w.Key] = $fresh[$w.Key] }
-            elseif ($termCache.ContainsKey($w.Key)) { $keep[$w.Key] = $termCache[$w.Key] }
+        foreach ($k in $memoKeys) {
+            if ($fresh.ContainsKey($k)) { $keep[$k] = $fresh[$k] }
+            elseif ($termCache.ContainsKey($k)) { $keep[$k] = $termCache[$k] }
         }
         New-Item -ItemType Directory -Force -Path (Split-Path $termCacheFile) | Out-Null
         $keep | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $termCacheFile -Encoding UTF8
@@ -1010,8 +1037,9 @@ if ($null -eq $map) {
     # zero-rows guard below still fires -- but it serializes into the cache as `"rows": null`, and the
     # next run reads that back as `@($null)`, a ONE-element array holding $null. Count is then 1, the
     # guard does not fire, and the table prints a phantom occupant. The hook arms this constantly:
-    # collision_gate.ps1 runs `overlap.ps1 -File ... -Json` on every gated edit and the cache is written
-    # before the -File early exit, so any bare `overlap.ps1` inside $CacheSeconds inherits it.
+    # collision_gate.ps1 runs `overlap.ps1 -File ... -Json -LiveOnly` on every gated edit and the cache
+    # is written before the -File early exit, so any -LiveOnly run inside $CacheSeconds inherits it,
+    # and any bare run inherits a full walk's file the same way.
     $map = @(Build-Map)
     $script:MapPartial = [bool]$script:WalkAbandoned
     # OVERRAN THE BUDGET: keep the rows, stamp every one of them, exit 3, and DO NOT CACHE. The rows are
@@ -1069,9 +1097,11 @@ function Exit-Overlap { if ($script:MapPartial) { exit 3 }; exit 0 }
 function Write-PartialBanner {
     if (-not $script:MapPartial) { return }
     Write-Host ""
-    Write-Host "PARTIAL MAP -- walked $($script:WalkedCount) of $($script:WorktreeCount) worktrees before running out of time."
+    $scope = if ($LiveOnly) { "worktrees a live session owns" } else { "worktrees" }
+    Write-Host "PARTIAL MAP -- walked $($script:WalkedCount) of $($script:WorktreeCount) $scope before running out of time."
     Write-Host "The rest were NOT checked. Nothing below is an all-clear: a peer in an unwalked worktree"
-    Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0 for the complete answer."
+    if ($LiveOnly) { Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0, without -LiveOnly, for the complete answer." }
+    else { Write-Host "cannot appear here at all. Re-run with -TimeBudgetSeconds 0 for the complete answer." }
 }
 
 # --- single-file query (the hook's fast path) ----------------------------------------------------
@@ -1129,7 +1159,11 @@ if (@($map).Count -eq 0) {
     # behind: "no other worktree has changes" is a claim about git, and a reader takes it as a claim
     # about the fleet unless the sentence before it says what was actually read.
     Write-Host (Format-Census $script:Census)
-    if (-not $script:MapPartial) { Write-Host "No other worktree has changes." }
+    # -LiveOnly never looked at a dormant worktree, so it can speak only for the live ones.
+    if (-not $script:MapPartial) {
+        if ($LiveOnly) { Write-Host "No other live session's worktree has changes. Dormant worktrees were not walked (-LiveOnly)." }
+        else { Write-Host "No other worktree has changes." }
+    }
     Exit-Overlap
 }
 Write-Host ""

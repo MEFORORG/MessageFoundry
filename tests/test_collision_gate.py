@@ -1316,8 +1316,10 @@ def live_peer(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     (config / "sessions" / "peer.json").write_text(json.dumps(record), encoding="utf-8")
     wrapper = base / "overlap-real.ps1"
     wrapper.write_text(
-        "param([string]$File,[switch]$Json,[int]$TimeBudgetSeconds)\n"
-        f"& pwsh -NoProfile -NonInteractive -File '{OVERLAP}' -File $File -Json -Refresh "
+        "param([string]$File,[switch]$Json,[switch]$LiveOnly,[int]$TimeBudgetSeconds)\n"
+        # The gate passes -LiveOnly. Refuse without it, so these tests cannot pass in full mode.
+        "if (-not $LiveOnly) { exit 9 }\n"
+        f"& pwsh -NoProfile -NonInteractive -File '{OVERLAP}' -File $File -Json -Refresh -LiveOnly "
         f"-TimeBudgetSeconds $TimeBudgetSeconds -ConfigRoot '{config}' -TasksDir '{base / 'no-tasks'}'\n"
         "exit $LASTEXITCODE\n",
         encoding="utf-8",
