@@ -153,9 +153,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // What each control showed right after it was drawn: an untouched control still shows exactly
     // this, whatever the browser did to the value on assignment (a text input strips CR and LF).
     const SHOWN = new WeakMap();
-    // Text boxes the user has typed into. An env key box judges "untouched" by this as well as by
-    // SHOWN: a recorded key holding a line break shows without it, so retyping what the box shows
-    // is the user's repair and saves the typed key, while leaving it saves the recorded key exactly.
+    // Text boxes the user has typed into. An env key box whose recorded key holds a line break
+    // shows it without, so it judges "untouched" by this as well as by SHOWN: retyping what the box
+    // shows is the user's repair and saves the typed key, while leaving it saves the recorded key.
     const TYPED = new WeakSet();
     // The record's inline credentials (HELD_SECRETS) and secret env references' inline defaults
     // (HELD_DEFAULTS), by key. A transport or direction change sends the host HELD_MARK in their
@@ -219,7 +219,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const options = ['', ...choices];
         // A recorded value outside the choices gets its own option, so it shows and an untouched
         // save keeps it, rather than the select going blank and the save dropping the key.
-        if (f.value != null && !choices.some((c) => String(c) === displayValue(f.value))) options.push(f.value);
+        // Matched by displayValue, the text each option is written with, as typedValue matches.
+        if (f.value != null && !choices.some((c) => displayValue(c) === displayValue(f.value))) options.push(f.value);
         for (const c of options) {
           const o = document.createElement('option');
           o.value = displayValue(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : displayValue(c);
@@ -335,9 +336,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
-    // The keys the latest fields request sent, and those it sent as env references; null until the
-    // first request. The reply carries no request id, so this is how the page tells which request
-    // a reply answers (the message handler below).
+    // The latest fields request: its settings in canonical form, and the keys it sent as env
+    // references; null until the first request. The reply carries no request id, so the settings
+    // are how the page tells which request a reply answers (the message handler below).
     let LAST_ASKED = null;
 
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
@@ -347,7 +348,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // when the reply is drawn (renderGroups), not here.
       const settings = collectSettings(true);
       const keys = Object.keys(settings);
-      LAST_ASKED = { keys: new Set(keys), envKeys: new Set(keys.filter((k) => isEnvRefValue(settings[k]))) };
+      LAST_ASKED = { settings: canon(settings), envKeys: new Set(keys.filter((k) => isEnvRefValue(settings[k]))) };
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -359,21 +360,35 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       });
     }
 
-    function sameKeys(a, b) {
-      if (a.size !== b.size) return false;
-      for (const k of a) if (!b.has(k)) return false;
-      return true;
+    // A settings table as text that does not depend on key order, so two tables compare by content.
+    function canon(v) {
+      if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+      if (v !== null && typeof v === 'object') {
+        return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+      }
+      return JSON.stringify(v);
     }
 
-    // The keys a reply's descriptors carry a value for. The host builds a reply from the settings
-    // its request sent (buildForm in connectionForm.ts draws every one of them, and only those, with
-    // its value, its env reference, or its held credential), so these are that request's keys.
-    function repliedKeys(groups) {
-      const keys = new Set();
+    // The settings a reply was built from. The host builds a reply from the settings its request
+    // sent: buildForm in connectionForm.ts draws every one of them, and only those, carrying its
+    // value, its env reference ({env, cast, default} as envKey, cast, envDefault), or its held
+    // credential (preserveValue). This reads that request back. If that ever stops holding, every
+    // rebuild reply is dropped; the transport round-trip tests run the real buildForm and go red.
+    function repliedSettings(groups) {
+      const settings = {};
       for (const g of groups) for (const f of g.fields) {
-        if (f.isEnvRef || f.value !== undefined || f.preserveValue !== undefined) keys.add(f.key);
+        if (f.isEnvRef) {
+          const ref = { env: f.envKey };
+          if (f.cast !== undefined) ref.cast = f.cast;
+          if (f.envDefault !== undefined) ref.default = f.envDefault;
+          settings[f.key] = ref;
+        } else if (f.preserveValue !== undefined) {
+          settings[f.key] = f.preserveValue;
+        } else if (f.value !== undefined) {
+          settings[f.key] = f.value;
+        }
       }
-      return keys;
+      return settings;
     }
 
     function refreshVisibility() {
@@ -509,9 +524,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           const envKey = el.value.trim();
           // An untouched box writes back the recorded key exactly, surrounding spaces, line breaks
           // and a key of only spaces included: the engine looks the key up as written, so a trimmed
-          // key names another variable (BACKLOG #8243 item 19). A key the user typed is trimmed,
-          // which is how a key the box shows without its line breaks is repaired (TYPED).
-          const untouchedKey = f.envKey !== undefined && !TYPED.has(el) && el.value === SHOWN.get(el);
+          // key names another variable (BACKLOG #8243 item 19). A key the user typed is trimmed.
+          // A box that shows the recorded key is untouched while it still shows it, typed in or
+          // not; one that shows it without its line breaks is untouched only until typed in, which
+          // is how such a key is repaired (TYPED).
+          const shownKey = SHOWN.get(el);
+          const untouchedKey = f.envKey !== undefined && el.value === shownKey &&
+            (shownKey === f.envKey || !TYPED.has(el));
           if (!envKey && !untouchedKey) {
             // No key typed. An inline credential the record already holds is written back as it
             // was, unseen (resolved from HELD_MARK below); deleting a working credential because the
@@ -691,14 +710,17 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
         if (LAST_ASKED) {
-          // A reply whose keys are not the latest request's answers an older request: drawing it
-          // would drop a setting the latest request carries, or bring back one it left out.
-          if (!sameKeys(repliedKeys(d.groups), LAST_ASKED.keys)) return;
-          // A setting removed, kept again, emptied or added since the latest request: drawing its
-          // reply would undo that, so ask again with the form as it is now (BACKLOG #8243 items 18
-          // and 20). Each reply sends at most one request, and the form is unchanged until the
-          // next reply, so this stops once the user stops changing which keys the form holds.
-          if (!sameKeys(new Set(Object.keys(collectSettings(true))), LAST_ASKED.keys)) { requestFields(); return; }
+          // A reply not built from the latest request's settings answers an older request: drawing
+          // it would drop or change a setting the latest request carries, or bring back one it left
+          // out. Two requests with the same settings cannot be told apart, so a reply to the older
+          // of them is drawn, as every reply was before; a request id the hosts echo would settle it.
+          if (canon(repliedSettings(d.groups)) !== LAST_ASKED.settings) return;
+          // The form changed since the latest request (a setting removed, kept again, emptied,
+          // retyped or switched between a literal and env()): drawing its reply would undo that, so
+          // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends
+          // at most one request, and the form does not change until a reply is drawn, so this stops
+          // once the user stops editing. If the host never answers, the form stays as it is.
+          if (canon(collectSettings(true)) !== LAST_ASKED.settings) { requestFields(); return; }
         }
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);

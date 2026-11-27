@@ -288,6 +288,46 @@ suite("connection editor: a removal and a keep survive a rebuild's reply (BACKLO
     assert.deepStrictEqual(saved(p).db_password, RECORD.settings.db_password, "the older reply pruned the default");
   });
 
+  test("an edit made while a rebuild is in flight survives its reply: a value, a replaced env key, a switch to a literal", () => {
+    // A value typed in flight.
+    {
+      const p = load();
+      pick(p, "file");
+      control(p, "port").value = "7000";
+      let next = answerFrom(p, 0);
+      pick(p, "mllp");
+      next = answerFrom(p, next);
+      assert.strictEqual(saved(p).port, 7000, "the value typed in flight was undone by the reply");
+    }
+    // A secret env key replaced in flight does not get the old key's inline default back.
+    {
+      const p = load();
+      pick(p, "file");
+      control(p, "db_password").value = "NEW_KEY";
+      let next = answerFrom(p, 0);
+      pick(p, "mllp");
+      next = answerFrom(p, next);
+      assert.deepStrictEqual(saved(p).db_password, { env: "NEW_KEY" }, "the replaced key was undone by the reply");
+    }
+    // A reference switched to a literal in flight does not come back with its inline default.
+    {
+      const p = load();
+      pick(p, "file");
+      let next = answerFrom(p, 0);
+      pick(p, "mllp");
+      const toggle = p.window.document.querySelector('#settings [data-env-toggle="db_password"]');
+      assert.ok(toggle, "the file transport drew db_password with no env() switch");
+      toggle.checked = false;
+      toggle.dispatchEvent(new p.window.Event("change"));
+      control(p, "db_password").value = "synthetic-literal";
+      next = answerFrom(p, next);
+      answerFrom(p, next);
+      const written = saved(p).db_password;
+      assert.ok(!JSON.stringify(written ?? null).includes(INLINE_DEFAULT), `the inline default came back: ${JSON.stringify(written)}`);
+      assert.notDeepStrictEqual(written, { env: "DB_PW" }, "the switch to a literal was undone by the reply");
+    }
+  });
+
   test("a plain transport round trip still draws each reply, and never sends a held value", () => {
     const p = load();
     let next = 0;
@@ -343,6 +383,17 @@ suite("connection editor: an untouched env key is written back exactly (BACKLOG 
     assert.deepStrictEqual(saved(load({ initial })).host, initial.settings.host);
   });
 
+  test("a key with surrounding spaces typed in and put back as it was is saved as recorded", () => {
+    const initial = { ...RECORD, settings: { ...RECORD.settings, host: { env: "  PEER_HOST ", default: "localhost" } } };
+    const p = load({ initial });
+    const box = control(p, "host");
+    for (const text of ["  PEER_HOSTX ", "  PEER_HOST "]) {
+      box.value = text;
+      box.dispatchEvent(new p.window.Event("input"));
+    }
+    assert.deepStrictEqual(saved(p).host, initial.settings.host, "the key was trimmed");
+  });
+
   test("a key holding a line break, retyped as the box shows it, is saved as typed and keeps its default", () => {
     const p = withDbPassword("DB_\r\nPW");
     const box = control(p, "db_password");
@@ -376,6 +427,12 @@ suite("connection editor: a select takes the picked choice itself (BACKLOG #8243
     const p = selectPage([{ a: 1 }, { b: 2 }], "x");
     control(p, "level").value = '{"b":2}';
     assert.deepStrictEqual(saved(p).level, { b: 2 }, "the picked table was posted as text");
+  });
+
+  test("a recorded value equal to a table choice is that choice, not an extra option", () => {
+    const p = selectPage([{ a: 1 }, { b: 2 }], { b: 2 });
+    const options = [...control(p, "level").options].map((o: DomNode) => String(o.value));
+    assert.deepStrictEqual(options, ["", '{"a":1}', '{"b":2}']);
   });
 
   test("a choice with surrounding spaces is posted as the choice", () => {

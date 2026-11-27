@@ -724,10 +724,13 @@ suite("connection editor: create mode shows the transport whose fields are drawn
       const p = load({ clone, groups: [] });
       assert.ok(filled(p) > 0, `the settings area is empty: ${clone ? "clone" : "edit"} with no fields`);
     }
-    // A rebuild that draws nothing, for a create and an edit page.
+    // A rebuild that draws nothing, for a create and an edit page. The edit page's record has no
+    // settings, so its request sends none and the empty reply answers it: a reply that does not
+    // carry the request's settings answers an older request and is not drawn (BACKLOG #8243 item 18).
+    const noSettings = { ...RECORD, settings: {} };
     const pages: Array<Parameters<typeof load>[0]> = [
       { initial: null, groups: buildForm(SCHEMA, "mllp", "inbound", {}), fieldGroupsFor: { transport: "mllp", direction: "inbound" } },
-      { groups: buildForm(SCHEMA, "mllp", "outbound", RECORD.settings) },
+      { initial: noSettings, groups: buildForm(SCHEMA, "mllp", "outbound", {}) },
     ];
     for (const opts of pages) {
       const p = load(opts);
