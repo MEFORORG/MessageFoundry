@@ -56,10 +56,11 @@ _REGENERATOR = "python3 scripts/security/runtime_closure.py"
 _EXPORT_RE = re.compile(r"^\s*uv export\s+(?P<flags>.*?)\s+-o\s+(?P<path>\S+)\s*$", re.MULTILINE)
 # The gate's own verification list.
 _DIFF_EXIT_RE = re.compile(r"^\s*git diff --exit-code --\s+(?P<paths>.+?)\s*$", re.MULTILINE)
-# The resync's "nothing changed, skip the push" short-circuit (inside `if ...; then`). It compares the
-# index, which the staging step writes by content, with HEAD.
+# The resync's "nothing changed, skip the push" compare. It compares the index, which the staging
+# step writes by content, with HEAD, and keeps its exit code so that a failed compare is not read as
+# a change (BACKLOG #5477).
 _DIFF_QUIET_RE = re.compile(
-    r"^\s*if git diff --cached --quiet --\s+(?P<paths>.+?);\s*then\s*$", re.MULTILINE
+    r"^\s*git diff --cached --quiet --\s+(?P<paths>.+?)\s*\|\|\s*diff_rc=\$\?\s*$", re.MULTILINE
 )
 
 
@@ -178,7 +179,7 @@ def test_the_resync_regenerates_the_closure_file() -> None:
     names = [str(step.get("name", "")) for step in steps]
 
     def index_of(needle: str, where: list[dict[str, Any]]) -> int:
-        found = [i for i, step in enumerate(where) if needle in str(step.get("run", ""))]
+        found = [i for i, step in enumerate(where) if needle in _executed_run(step)]
         assert len(found) == 1, f"expected one step running {needle!r}, found {found}"
         return found[0]
 
@@ -366,6 +367,95 @@ def _all_steps() -> list[tuple[str, dict[str, Any]]]:
 
 def _steps_using(prefix: str) -> list[tuple[str, dict[str, Any]]]:
     return [(j, s) for j, s in _all_steps() if str(s.get("uses", "")).startswith(prefix)]
+
+
+def _executed_run(step: dict[str, Any]) -> str:
+    """``step``'s run body without its comment lines, so a step is located by what it runs and not
+    by a comment that quotes a command (BACKLOG #5477)."""
+    from tests.test_ci_venv_pinning import _executed_shell
+
+    return _executed_shell(str(step.get("run") or ""))
+
+
+#: An executable ``git commit`` or ``git commit-tree``, the commit step's locator.
+_COMMITS = re.compile(r"\bgit\s+commit(?:-tree)?(?![\w-])")
+
+
+def test_the_step_locators_read_only_executed_lines() -> None:
+    """RED when: a step is located by a command that appears only in one of its comments.
+
+    The push step's comments quote `git commit`, which it deliberately does not run. A locator
+    that matched the whole run body would keep finding a commit step whose executable commit was
+    gone, and the order and closure-failure checks that rest on it would pass against a comment.
+    """
+    commented = {"run": "# git commit refreshes the index\n# git push origin x\necho hi"}
+    assert not _COMMITS.search(_executed_run(commented))
+    assert "git push" not in _executed_run(commented)
+    assert _COMMITS.search(_executed_run({"run": 'commit="$(git commit-tree "${tree}")"'}))
+    assert _COMMITS.search(_executed_run({"run": "git commit -m x"}))
+    assert not _COMMITS.search("git commit-graph write")
+    located = [s.get("name") for s in _job_steps("push") if _COMMITS.search(_executed_run(s))]
+    assert located == ["Commit and push the resynced locks"], located
+
+
+#: An action reference pinned to a full commit SHA: ``owner/repo@<40 lower-case hex>``. A tag or a
+#: branch can be moved to other code after review; a commit SHA cannot.
+_PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
+#: The same, as the line spells it, with an optional trailing ``# <version>`` comment.
+_PINNED_USES_LINE = re.compile(
+    r"\s*(?:-\s+)?uses:\s+(?P<ref>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40})(?:\s+#\s*\S.*)?"
+)
+
+
+def _unpinned_uses(text: str) -> list[str]:
+    """Every ``uses:`` in the workflow ``text`` that is not pinned to a full commit SHA, read both
+    from the parsed steps and from the lines that spell them."""
+    import yaml
+
+    parsed = yaml.safe_load(text)
+    refs = [
+        str(step.get("uses"))
+        for body in (parsed.get("jobs") or {}).values()
+        for step in (body or {}).get("steps") or []
+        if "uses" in step
+    ]
+    bad = [ref for ref in refs if not _PINNED_USES.fullmatch(ref)]
+    lines = [ln for ln in text.splitlines() if re.match(r"\s*(?:-\s+)?uses\s*:", ln)]
+    bad += [f"line {ln.strip()!r}" for ln in lines if not _PINNED_USES_LINE.fullmatch(ln)]
+    if len(lines) != len(refs):
+        bad.append(f"{len(refs)} parsed uses: but {len(lines)} lines spell one")
+    return bad
+
+
+def test_every_action_is_pinned_to_a_full_commit_sha() -> None:
+    """RED when: any step's ``uses:`` names a tag, a branch, a short SHA, a local path or a docker
+    image rather than ``owner/repo@<40-hex SHA>`` (BACKLOG #5477).
+
+    The content pins below hash an action's ``uses:`` by its name alone, so a Dependabot SHA bump
+    needs no re-pin. That left the ref itself unchecked: ``actions/checkout@main`` hashed the same
+    as the reviewed SHA. This holds every ref in the workflow to a commit SHA, which Dependabot
+    bumps to another commit SHA, so the name-only hash stays green across a bump.
+    """
+    assert not _unpinned_uses(_text(_RESYNC)), _unpinned_uses(_text(_RESYNC))
+    sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    good = f"jobs:\n  j:\n    steps:\n      - uses: actions/checkout@{sha} # v7.0.1\n"
+    assert not _unpinned_uses(good), _unpinned_uses(good)
+    assert not _unpinned_uses(good.replace(" # v7.0.1", "")), "a SHA without a comment is pinned"
+    for ref in (
+        "actions/checkout@main",
+        "actions/checkout@v7",
+        "actions/checkout@v7.0.1",
+        "actions/checkout@3d3c42e",
+        f"actions/checkout@{sha.upper()}",
+        f"actions/checkout@{sha}0",
+        "./.github/actions/local",
+        "docker://alpine:3",
+        f"actions/checkout/sub@{sha}",
+    ):
+        mutated = good.replace(f"actions/checkout@{sha}", ref)
+        assert _unpinned_uses(mutated), ref
+    hidden = good.replace(f"actions/checkout@{sha} # v7.0.1", f'"actions/checkout@main" # {sha}')
+    assert _unpinned_uses(hidden), "a quoted mutable ref with a SHA in its comment passed"
 
 
 # What hands a step the minted token or the App key, in any spelling a step could use: the dotted or
@@ -559,6 +649,9 @@ _GIT_ENV_PAIR = re.compile(
 _ASSIGNABLE = re.compile(r"[a-z_][a-z0-9_]*|IFS|GIT_CONFIG_COUNT|GIT_CONFIG_(?:KEY|VALUE)_\d+")
 _ASSIGNMENT = re.compile(r"(?P<name>[A-Za-z_]\w*)=(?P<value>.*)", re.DOTALL)
 _REDIRECT = re.compile(r"\d*(?:<|>|>>|&>)")
+#: find's actions that run a program (-exec, -execdir, -ok, -okdir), delete (-delete), or write a
+#: file the step names (-fprint, -fprint0, -fprintf, -fls).
+_FIND_REFUSED = ("-exec", "-ok", "-delete", "-fprint", "-fls")
 
 
 def _substitutions(text: str) -> tuple[str, list[str]]:
@@ -655,8 +748,8 @@ def _disallowed_commands(script: str) -> list[str]:
                     bad.append(
                         f"git diff other than `git diff --cached --quiet -- <paths>`: {shown!r}"
                     )
-            elif name == "find" and any(a.startswith(("-exec", "-ok", "-delete")) for a in args):
-                bad.append(f"find runs or deletes: {shown!r}")
+            elif name == "find" and any(a.startswith(_FIND_REFUSED) for a in args):
+                bad.append(f"find runs, deletes or writes a file: {shown!r}")
     return bad
 
 
@@ -697,6 +790,12 @@ def test_the_command_allowlist_refuses_what_it_must() -> None:
         ">/dev/null python3 evil.py",
         "</dev/null python3 evil.py",
         "find . -exec python3 {} \\;",
+        "find . -execdir python3 {} +",
+        "find . -delete",
+        "find . -fprint /tmp/x",
+        "find . -fprint0 ~/.bashrc",
+        "find . -fprintf ~/.bashrc %p",
+        "find . -fls /tmp/x",
         "git -c alias.x=!sh x",
         "git submodule foreach python3 evil.py",
         "git config alias.x '!python3 evil.py'",
@@ -841,7 +940,7 @@ _PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
         ),
         (
             "Commit and push the resynced locks",
-            "03992f0faf7d08e33b9578e3847192932885184ff50efcc36c63e521680c9012",
+            "68da54d7a9f8ac156bc775c34ebae73ddeafd6cbf4d0ad43652be4a551b2896d",
         ),
         (
             "Fail if the closure inventory could not be regenerated",
@@ -849,6 +948,54 @@ _PINNED_CREDENTIAL_JOBS: dict[str, list[tuple[str, str]]] = {
         ),
     ],
 }
+
+
+#: The workflow's ``on:``, ``permissions:`` and ``concurrency:``, by the sha256 of their parsed
+#: content. RE-PIN ONLY AFTER A REVIEW OF THE EDIT: the triggers decide which events run the jobs
+#: that hold the App key, the permissions bound every job's GITHUB_TOKEN that a job does not
+#: narrow, and the concurrency group decides which run cancels which (BACKLOG #5477).
+_PINNED_WORKFLOW_SETTINGS = "8cbb320284637a3c46e5f357ba14871b55e073544f8bb4474f931b7c84805c29"
+#: The top-level keys the workflow may carry. Any other (``env``, ``defaults``, ``run-name``, ...)
+#: is refused rather than left unpinned.
+_WORKFLOW_KEYS = frozenset({"name", "on", "permissions", "concurrency", "jobs"})
+
+
+def _workflow_key_pin(workflow: dict[Any, Any]) -> str:
+    # YAML 1.1 reads a bare `on:` as the boolean True; a quoted "on": stays a string.
+    on = workflow["on"] if "on" in workflow else workflow.get(True)
+    return _content_hash(
+        {
+            "on": on,
+            "permissions": workflow.get("permissions"),
+            "concurrency": workflow.get("concurrency"),
+        }
+    )
+
+
+def test_the_workflow_triggers_permissions_and_concurrency_are_pinned_by_content() -> None:
+    """RED when: the workflow's ``on:``, ``permissions:`` or ``concurrency:`` changes at all, or the
+    workflow gains a top-level key off ``_WORKFLOW_KEYS`` (BACKLOG #5477).
+
+    The step and job pins below hold what the credential jobs run; these keys decide when they run
+    and with what default token, and were held only by the tests that read one property each. The
+    failure prints the new pin to paste in.
+    """
+    workflow = load_workflow(_RESYNC.name)
+    keys = {"on" if k is True else str(k) for k in workflow}
+    assert keys <= _WORKFLOW_KEYS, f"the resync has top-level keys {sorted(keys - _WORKFLOW_KEYS)}"
+    assert {"on", "permissions", "concurrency"} <= keys, f"the resync's top-level keys: {keys}"
+    actual = _workflow_key_pin(workflow)
+    assert actual == _PINNED_WORKFLOW_SETTINGS, (
+        f"the resync's on:, permissions: or concurrency: changed; review the edit, then re-pin "
+        f"_PINNED_WORKFLOW_SETTINGS = {actual!r}"
+    )
+    widened = {**workflow, "permissions": {"contents": "write"}}
+    assert _workflow_key_pin(widened) != actual, "the pin does not cover permissions:"
+    retriggered = {k: v for k, v in workflow.items() if k not in ("on", True)}
+    retriggered["on"] = {"pull_request_target": None}
+    assert _workflow_key_pin(retriggered) != actual, "the pin does not cover on:"
+    regrouped = {**workflow, "concurrency": {"group": "x", "cancel-in-progress": False}}
+    assert _workflow_key_pin(regrouped) != actual, "the pin does not cover concurrency:"
 
 
 def _credential_job_pins() -> dict[str, list[tuple[str, str]]]:
@@ -976,7 +1123,7 @@ def test_the_lock_files_cross_jobs_as_one_artifact_of_the_staged_set() -> None:
     download_at = next(
         i for i, s in enumerate(push) if str(s.get("uses", "")).startswith(_DOWNLOAD)
     )
-    commit_at = next(i for i, s in enumerate(push) if "git commit" in str(s.get("run", "")))
+    commit_at = next(i for i, s in enumerate(push) if _COMMITS.search(_executed_run(s)))
     assert download_at < order.index(_COPY_STEP) < commit_at, f"push job order: {order}"
 
 
@@ -1140,8 +1287,51 @@ def test_the_copy_step_refuses_what_the_artifact_or_tree_could_plant(tmp_path: P
         ), f"{build.__name__}: a file from outside the artifact was written into the checkout"
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the steps run on an ubuntu runner; GNU realpath and base64 -w0 are needed",
+)
+@pytest.mark.parametrize("code", [128, 2])
+def test_the_commit_step_fails_when_git_cannot_compare(tmp_path: Path, code: int) -> None:
+    """RED when: a ``git diff --cached --quiet`` that exits other than 0 or 1 is read as a change
+    and the step goes on to push (BACKLOG #5477).
+
+    Executes the staging step, then the commit step with a ``git`` shim ahead on PATH that fails
+    every ``diff`` with ``code`` and hands every other command to the real git. Before the fix the
+    error fell into the ``if``'s change branch, and the step committed and pushed.
+    """
+    staged = sorted(set(_exports(_GATE)) | _CLOSURES)
+    stage, commit = str(_copy_step()["run"]), str(_commit_step()["run"])
+    bash = require_bash(tmp_path)
+    real_git = shutil.which("git")
+    assert real_git, "git is not on PATH"
+    staging = _run_copy(tmp_path, lambda ws, art: None, staged, stage, bash)
+    assert staging.returncode == 0, staging.stdout + staging.stderr
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'for a in "$@"; do [ "$a" = diff ] && exit {code}; done\n'
+        f'exec "{real_git}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    ref = "refs/heads/dependabot/uv/resync-probe"
+    env = {
+        "HEAD_REF": ref.removeprefix("refs/heads/"),
+        "APP_TOKEN": "not-a-token",
+        "PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+    result = _run_step(tmp_path / "ws", commit, bash, **env)
+    pushed = _git(tmp_path / "origin.git", "for-each-ref", "--format=%(objectname)", ref).strip()
+    assert not pushed, f"the commit step pushed after git diff exited {code}: {result.stdout}"
+    assert result.returncode != 0, f"the commit step passed after git diff exited {code}"
+    assert "::error" in result.stdout, result.stdout + result.stderr
+
+
 def _commit_step() -> dict[str, Any]:
-    steps = [s for s in _job_steps("push") if "git push" in str(s.get("run", ""))]
+    steps = [s for s in _job_steps("push") if "git push" in _executed_run(s)]
     assert len(steps) == 1, "expected one push job step that runs git push"
     return steps[0]
 

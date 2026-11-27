@@ -41,10 +41,10 @@ name: Dependabot lock resync
 #    index with plumbing (write-tree, commit-tree), which reads no working-tree file. Each job is
 #    its own GitHub-hosted runner, so nothing `export` writes to $GITHUB_ENV, $GITHUB_PATH,
 #    BASH_ENV, .git/config or its filesystem reaches `push`. What does cross is untrusted, and at
-#    least this: the artifact (its entry names and file contents, which the staging step checks),
-#    the `closure` job output (read only in an `if:`), and whether `export` succeeded (which gates
-#    `push`). The read-only GITHUB_TOKEN is in the export and push jobs; preflight's carries no
-#    permission.
+#    least this: the artifact (the staging step checks its entry names against a fixed list,
+#    and that each listed entry is a regular file, not a symlink; it does not check their
+#    contents), the `closure` job output (read only in an `if:`), and whether `export` succeeded
+#    (which gates `push`). The read-only GITHUB_TOKEN is in export and push; preflight's has none.
 #  - WHAT HOLDS THE CREDENTIAL JOBS TO THAT. tests/test_dep1_lock_resync_lockstep.py pins every step
 #    of `preflight` and `push`, and each job's own keys, by a hash of their whole content (an
 #    action's `uses:` by its name, so a Dependabot SHA bump does not re-pin). That holds them
@@ -280,10 +280,12 @@ jobs:
       # file is written through a path in the working tree: a lock path the tree made a symlink, a
       # directory (even one holding a same-named symlink), or a path under a symlinked directory
       # cannot redirect a write outside it. The shell checks refuse each of those. git refuses only
-      # some on its own: an entry under a tracked directory or a symlinked parent (exit 128), but NOT
-      # a tracked symlink at the lock path itself, which update-index silently replaces; the `-L`
-      # check is what refuses that one. Every entry is staged as 100644, whatever mode the tree
-      # tracked it with. Any other file in the artifact fails the step, and so does a failed listing.
+      # some on its own, as a directory/file conflict (exit 128): a lock path the tree tracks as a
+      # directory, and a lock path under one the tree tracks as a symlink. It does NOT refuse a lock
+      # path the tree tracks as a symlink itself, which update-index silently replaces with a 100644
+      # entry; the `-L` check is what refuses that one. Every entry is staged as 100644, whatever
+      # mode the tree tracked it with. Any other file in the artifact fails the step, and so does a
+      # failed listing.
       - name: Stage the re-exported files by content
         run: |
           set -euo pipefail
@@ -354,9 +356,18 @@ jobs:
           export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --cached --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt; then
+          # 0 is no change and 1 is a change. Any other exit is git failing to compare (128 for a
+          # broken index or repository), so the step fails rather than reading the error as a change
+          # and pushing (BACKLOG #5477). The `|| diff_rc=$?` keeps set -e from exiting on the 1.
+          diff_rc=0
+          git diff --cached --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-postgres.txt security/runtime-closure-harness.txt || diff_rc=$?
+          if [ "${diff_rc}" -eq 0 ]; then
             echo 'Exported lock files and the closure files already in sync; nothing to push.'
             exit 0
+          fi
+          if [ "${diff_rc}" -ne 1 ]; then
+            echo "::error title=lock-resync compare::git diff --cached --quiet exited ${diff_rc}, not 0 or 1; nothing was pushed"
+            exit 1
           fi
           # No `git add`: the staging step already put each file in the index by content, and
           # the working tree still holds the PR head's bytes, so adding from it would undo that.
