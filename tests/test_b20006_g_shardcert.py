@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -160,7 +161,10 @@ def test_ladder_fails_a_rung_the_single_run_bar_refuses(over: dict[str, int]) ->
 def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """The two-box test's offline fakes, two engine shards of one lane each, with every node's lifecycle
     logged as ``(event, node index)`` in ``rec.events``. ``rec.fail_start`` names the engine shards, or
-    the node indexes, whose start raises."""
+    the node indexes, whose start raises; ``rec.kill_fails`` the engine shards whose ``kill()`` fails
+    silently, as ``EngineNode.kill`` can. ``rec.kill_times`` and ``rec.submit_times`` hold the monotonic
+    instants of each kill and each message offered; ``rec.stall_first_submit`` blocks the event loop
+    for that many seconds on the first message, as a stalled loop would."""
     monkeypatch.setenv("MEFOR_SHARDCERT_SHARDS", "a,b")
     monkeypatch.delenv("MEFOR_SHARDCERT_LANES_PER_SHARD", raising=False)
     monkeypatch.delenv("MEFOR_SHARDCERT_PERSISTENT", raising=False)
@@ -169,7 +173,14 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     rec = _install_fakes(monkeypatch)
     rec.events = []
     rec.fail_start = set()
+    rec.kill_fails = set()
+    rec.kill_times = []
+    rec.submit_times = []
+    rec.stall_first_submit = 0.0
     base: Any = sc.ShardCertNode
+    base_conn: Any = vars(sc)[
+        "PersistentConnection"
+    ]  # the fixture's fake, which the module now names
 
     class Node(base):  # type: ignore[misc]
         """Logs start/kill/stop and, under MEFOR_BENCH_KEEP_NODE_LOGS, keeps a log the way EngineNode
@@ -193,8 +204,10 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
                 self.log.write(f"log of node {self.index}\n".encode())
 
         def kill(self) -> None:
-            super().kill()
+            rec.kill_times.append(time.monotonic())
             rec.events.append(("kill", self.index))
+            if self.shard not in rec.kill_fails:
+                super().kill()
 
         async def stop(self) -> None:
             self.stops += 1
@@ -202,7 +215,15 @@ def fleet(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             if self.log is not None:
                 self.log.close()
 
+    class Conn(base_conn):  # type: ignore[misc]
+        def submit_nowait(self, out: Any) -> bool:
+            if not rec.submit_times and rec.stall_first_submit:
+                time.sleep(rec.stall_first_submit)  # blocks the loop, as a stalled event loop would
+            rec.submit_times.append(time.monotonic())
+            return bool(super().submit_nowait(out))
+
     monkeypatch.setattr(sc, "ShardCertNode", Node)
+    monkeypatch.setattr(sc, "PersistentConnection", Conn)
     return rec
 
 
@@ -227,36 +248,55 @@ def _sizes(**over: Any) -> dict[str, Any]:
         pytest.param({"kill_at_fraction": -0.1}, id="fraction-negative"),
         pytest.param({"kill_at_fraction": float("nan")}, id="fraction-nan"),
         pytest.param({"kill_shard": "zz"}, id="unknown-shard"),
+        pytest.param({"hold_seconds": 0.0}, id="hold-0"),
+        pytest.param({"hold_seconds": -1.0}, id="hold-negative"),
+        pytest.param({"hold_seconds": float("nan")}, id="hold-nan"),
     ],
 )
 async def test_colocated_kill_leg_that_cannot_kill_under_load_is_refused_before_launch(
     fleet: types.SimpleNamespace, over: dict[str, Any]
 ) -> None:
     """S27-55 (1) and (2). Before the fix a fraction of 1 never fired the kill, then started a second
-    process over the live engine shard; an unknown one raised KeyError mid-hold after the whole fleet ran."""
-    with pytest.raises(ValueError, match="kill_(at_fraction|shard)") as refused:
+    process over the live engine shard; an unknown one raised KeyError mid-hold after the whole fleet ran.
+    A hold with no load to kill under is refused the same way."""
+    with pytest.raises(ValueError, match=_REFUSED) as refused:
         await sc.run_shardcert(**_sizes(kill=True, **over))
     assert isinstance(refused.value, sc.KillLegError)
     assert fleet.nodes == []
     assert fleet.resets == []
 
 
-async def test_engine_kill_leg_with_an_unknown_shard_is_refused_before_launch(
-    fleet: types.SimpleNamespace, tmp_path: Path
+#: What every KillLegError message names: the setting it refused.
+_REFUSED = "kill_at_fraction|kill_shard|hold_seconds"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"kill_shard": "zz"}, id="unknown-shard"),
+        pytest.param({"hold_seconds": 0.0}, id="hold-0"),
+        pytest.param({"hold_seconds": -1.0}, id="hold-negative"),
+        pytest.param({"hold_seconds": float("nan")}, id="hold-nan"),
+    ],
+)
+async def test_engine_kill_leg_that_cannot_kill_under_load_is_refused_before_launch(
+    fleet: types.SimpleNamespace, tmp_path: Path, over: dict[str, Any]
 ) -> None:
-    coord = FileDropCoord(tmp_path, run_id="unknown")
-    with pytest.raises(ValueError, match="kill_(at_fraction|shard)") as refused:
+    """S27-55 (2), and the hold (BACKLOG #5440): before the fix the engine half armed its kill timer for a
+    NaN or non-positive hold, which has no load to kill under."""
+    coord = FileDropCoord(tmp_path, run_id="refused")
+    kw: dict[str, Any] = {"hold_seconds": 0.2, **over}
+    with pytest.raises(ValueError, match=_REFUSED) as refused:
         await sc.run_shardcert_engine(
             dests=2,
-            hold_seconds=0.2,
             kill=True,
-            kill_shard="zz",
             drain_timeout=2.0,
             sink_port=47100,
             store_env={},
             coord=coord,
             inbound_bind_host="127.0.0.1",
             post_drain_grace=0.0,
+            **kw,
         )
     assert isinstance(refused.value, sc.KillLegError)
     assert fleet.nodes == []
@@ -266,11 +306,47 @@ async def test_engine_kill_leg_with_an_unknown_shard_is_refused_before_launch(
 
 
 def test_kill_leg_settings_are_not_read_without_a_kill() -> None:
-    sc.require_kill_leg(False, "zz", 7.0, [])
-    sc.require_kill_leg(True, None, 0.01, ["a", "b"])
-    sc.require_kill_leg(True, "b", 0.99, ["a", "b"])
+    sc.require_kill_leg(False, "zz", 7.0, [], float("nan"))
+    sc.require_kill_leg(True, None, 0.01, ["a", "b"], 0.1)
+    sc.require_kill_leg(True, "b", 0.99, ["a", "b"], 60.0)
     with pytest.raises(sc.KillLegError, match="no engine shard"):
-        sc.require_kill_leg(True, None, 0.5, [])
+        sc.require_kill_leg(True, None, 0.5, [], 60.0)
+    with pytest.raises(sc.KillLegError, match="hold_seconds"):
+        sc.require_kill_leg(True, None, 0.5, ["a", "b"], float("inf"))
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        pytest.param(["--kill-at-fraction", "1.5"], id="fraction"),
+        pytest.param(["--kill-shard", "zz"], id="unknown-shard"),
+        pytest.param(["--hold-seconds", "0"], id="hold-0"),
+        pytest.param(["--hold-seconds", "nan"], id="hold-nan"),
+    ],
+)
+def test_engine_cli_exits_2_on_a_refused_kill_leg(
+    fleet: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+) -> None:
+    """BACKLOG #5440: the shardcert-engine CLI let KillLegError escape, so a refused setting exited 1 with
+    a traceback, the code of a failed bench result. It is a setup error: exit 2 and one line."""
+    import harness.__main__ as hmain
+
+    # Own the env the CLI writes directly, so monkeypatch restores it.
+    for k in ("MEFOR_SHARDCERT_PERSISTENT", "MEFOR_SHARDCERT_ROUTING"):
+        monkeypatch.setenv(k, "")
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    argv = ["shardcert-engine", "--shards", "a,b", "--dests", "2", "--sink-port", "47500", "--kill"]
+    argv += flags
+    rc = hmain.main([*argv, "--coord-dir", str(tmp_path), "--run-id", "cli-kill"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err.startswith("refusing to run: ")
+    assert err.count("\n") == 1
+    assert fleet.nodes == []
 
 
 async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
@@ -280,9 +356,9 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     before the deadline and the next is past the hold, so before the fix the loop ended unkilled, the
     restart started over the live engine shard, and the report still named it killed. The tick now wakes at
     the kill instant."""
-    monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 0.3)
+    monkeypatch.setattr(sc, "_MAX_TICK_SLEEP", 0.6)
     rep = await sc.run_shardcert(
-        **_sizes(aggregate_rate=1.0, hold_seconds=0.1, kill=True, kill_at_fraction=0.5)
+        **_sizes(aggregate_rate=1.0, hold_seconds=0.4, kill=True, kill_at_fraction=0.25)
     )
     killed = [i for ev, i in fleet.events if ev == "kill"]
     assert len(killed) == 1
@@ -290,7 +366,15 @@ async def test_colocated_kill_fires_inside_the_hold_when_ticks_are_far_apart(
     assert fleet.nodes[killed[0]].shard == rep.killed_shard
     assert fleet.events.index(("kill", killed[0])) < fleet.events.index(("start", restart.index))
     assert rep.recovery_seconds is not None
-    assert not any("after the load" in note for note in rep.notes)
+    # Inside the hold: the first message is offered as the hold starts and the kill is due 0.1 s after it,
+    # while a tick that slept to its own next wake would not come back before 0.6 s, past the 0.4 s hold.
+    assert _kill_offset(fleet) < 0.4
+
+
+def _kill_offset(rec: types.SimpleNamespace) -> float:
+    """Seconds from the first message offered (the start of the hold) to the kill."""
+    (kill_at,) = rec.kill_times
+    return float(kill_at - rec.submit_times[0])
 
 
 async def test_colocated_kill_leg_stops_the_killed_node_and_keeps_its_log(
@@ -339,11 +423,48 @@ async def test_colocated_restart_whose_start_raises_is_still_stopped(
 async def test_colocated_kill_that_never_fired_under_load_fails_the_run(
     fleet: types.SimpleNamespace,
 ) -> None:
-    """S27-55 (1): a hold that ends before the kill instant (here a hold of 0) certifies no kill leg.
-    The run fails, no engine shard is killed after the load, and nothing restarts over a live one."""
+    """S27-55 (1): a loop that stalls past both the kill instant and the end of the hold certifies no kill
+    leg. The run fails, no engine shard is killed after the load, and nothing restarts over a live one."""
+    fleet.stall_first_submit = 0.3
     with pytest.raises(RuntimeError, match="kill leg never fired"):
-        await sc.run_shardcert(**_sizes(hold_seconds=0.0, kill=True, kill_at_fraction=0.5))
+        await sc.run_shardcert(**_sizes(hold_seconds=0.1, kill=True, kill_at_fraction=0.5))
     assert [ev for ev, _ in fleet.events if ev == "kill"] == []
+    assert len(fleet.nodes) == 2
+    assert [n.stops for n in fleet.nodes] == [1, 1]
+
+
+async def test_colocated_kill_that_did_not_take_effect_fails_the_run(
+    fleet: types.SimpleNamespace,
+) -> None:
+    """BACKLOG #5440: kill() can fail silently. Before the fix the restart stopped the still-running node
+    GRACEFULLY and timed a recovery after it, certifying a graceful stop as crash recovery."""
+    fleet.kill_fails.update({"a", "b"})
+    with pytest.raises(RuntimeError, match="did not take effect"):
+        await sc.run_shardcert(**_sizes(kill=True, kill_at_fraction=0.3))
+    assert len(fleet.nodes) == 2  # nothing was restarted over the live engine shard
+    assert [n.stops for n in fleet.nodes] == [1, 1]  # the teardown stopped it, not the restart
+
+
+async def test_engine_kill_that_did_not_take_effect_fails_the_run(
+    fleet: types.SimpleNamespace, tmp_path: Path
+) -> None:
+    fleet.kill_fails.update({"a", "b"})
+    coord = FileDropCoord(tmp_path, run_id="engine-kill-failed")
+    coord.post(DRIVE_START, {"t0": 0.0})
+    with pytest.raises(RuntimeError, match="did not take effect"):
+        await sc.run_shardcert_engine(
+            dests=2,
+            hold_seconds=0.2,
+            kill=True,
+            kill_at_fraction=0.3,
+            drain_timeout=2.0,
+            sink_port=47250,
+            store_env={},
+            coord=coord,
+            inbound_bind_host="127.0.0.1",
+            post_drain_grace=0.0,
+        )
+    assert [ev for ev, _ in fleet.events].count("kill") == 1
     assert len(fleet.nodes) == 2
     assert [n.stops for n in fleet.nodes] == [1, 1]
 

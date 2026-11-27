@@ -159,8 +159,13 @@ def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
     negative one drives nothing and then reads the empty run as a verdict. Checked at entry, before any
     coord wait or child spawn, so a bad value is a setup error rather than a stall or a fake rung."""
     for name, value in (("aggregate_rate", aggregate_rate), ("hold_seconds", hold_seconds)):
-        if not (math.isfinite(value) and value > 0):
+        if not _finite_above_zero(value):
             raise DriveShapeError(f"{name} must be a finite number above 0, got {value!r}")
+
+
+def _finite_above_zero(value: float) -> bool:
+    """The drive-shape predicate: a finite number above 0 (NaN, infinities, 0 and negatives fail)."""
+    return math.isfinite(value) and value > 0
 
 
 #: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
@@ -942,6 +947,28 @@ class ShardCertNode(EngineNode):
             *_insecure_bind_args(self._env),
         )
 
+    async def wait_exited(self, timeout: float) -> bool:
+        """True once this node's ``serve`` process has exited, waiting at most ``timeout`` seconds. False
+        if it is still running then, or was never started.
+
+        The kill leg's proof that :meth:`kill` took effect (BACKLOG #5440). ``kill()`` is silent when it
+        fails: ``terminate_job`` ignores a failed ``TerminateJobObject``, and a ``PermissionError`` from
+        the root's own kill is suppressed. :meth:`stop` would then shut the live process down GRACEFULLY,
+        and the run would certify that graceful stop as crash recovery."""
+        proc = self._proc
+        if proc is None:
+            return False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+
+#: How long :func:`_restart_killed` waits for a SIGKILLed engine shard's process to exit before it calls
+#: the kill failed. Matches :meth:`EngineNode.stop`'s own wait for a terminated process.
+_KILL_EXIT_TIMEOUT = 10.0
+
 
 def _copies_ok(delivering: int, acked_copies_missing: int) -> bool:
     """The per-message copy check both co-located and driver pass bars gate on (BACKLOG #5575, #5640):
@@ -1054,6 +1081,10 @@ class ShardCertReport:
     e2e_second_half_count: int = 0
     ack_p50_ms: float = 0.0  # ACK-on-receipt latency (across every shard lane)
     ack_p99_ms: float = 0.0
+    #: Kill leg only, reported and not gated: from the kill instant to the restarted engine shard's health.
+    #: It includes at least the rest of the hold, the senders' ACK grace (up to 2 s), the wait for the killed
+    #: process to exit, the killed node's ``stop()`` and the restart's start (:func:`_restart_killed`), so
+    #: it bounds the engine's own recovery from above rather than measuring it.
     recovery_seconds: float | None = None
     notes: list[str] = field(default_factory=list)
     # BACKLOG #209 topology: the shape this run SERVED. `dests` is the destination-CONNECTION count
@@ -1723,7 +1754,7 @@ async def run_shardcert(
         reg = load_config(_CONFIG_DIR)
     ids_list = shard_ids(reg)
     owned = {s: sorted(owned_destination_set(reg, s, ids_list)) for s in ids_list}
-    require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list)
+    require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list, hold_seconds)
     n = len(ids_list)
     # Lanes per shard (many-thin-lanes): the built graph has N*lanes inbound rows, so derive it from the
     # registry rather than re-reading the env (keeps the driver and the served graph in lock-step).
@@ -3179,12 +3210,16 @@ def _escapes(inbound_bind_host: str) -> dict[str, str]:
 
 
 class KillLegError(ValueError):
-    """A kill leg asked for an engine shard the fleet does not have, or a kill instant that is not inside
-    the hold (:func:`require_kill_leg`)."""
+    """A kill leg asked for an engine shard the fleet does not have, a hold with no load to kill under,
+    or a kill instant that is not inside the hold (:func:`require_kill_leg`)."""
 
 
 def require_kill_leg(
-    kill: bool, kill_shard: str | None, kill_at_fraction: float, ids_list: Sequence[str]
+    kill: bool,
+    kill_shard: str | None,
+    kill_at_fraction: float,
+    ids_list: Sequence[str],
+    hold_seconds: float,
 ) -> None:
     """Refuse a kill leg that cannot kill an engine shard of this fleet under load (BACKLOG #5440, S27-55).
 
@@ -3193,9 +3228,15 @@ def require_kill_leg(
     on the co-located bench, which then started a second process over the live engine shard, and fired after
     the hold on the two-box engine. One of 0 kills before the first message is sent. So the fraction must be
     strictly between 0 and 1, as a failover profile's ``kill_at_fraction`` must; the comparison refuses NaN
-    too. Nothing is checked when ``kill`` is false, as nothing reads the other two then."""
+    too. The hold must be a finite number above 0, as :func:`require_drive_shape` requires of a drive: a
+    hold of 0 or less has no load to kill under, and a NaN one makes the kill delay NaN. Nothing is checked
+    when ``kill`` is false, as nothing reads the other settings for a kill then."""
     if not kill:
         return
+    if not _finite_above_zero(hold_seconds):
+        raise KillLegError(
+            f"hold_seconds must be a finite number above 0 for a kill leg, got {hold_seconds!r}"
+        )
     if not 0.0 < kill_at_fraction < 1.0:
         raise KillLegError(
             f"kill_at_fraction must be strictly between 0 and 1, got {kill_at_fraction!r}"
@@ -3233,8 +3274,24 @@ async def _restart_killed(
 
     BACKLOG #5440 (S27-56): the killed node is stopped first, because ``kill()`` neither reaps the process
     nor closes its log, and overwriting its entry dropped the only reference the caller's teardown had. The
-    restart is registered BEFORE it starts, so a start that raises is still stopped by that teardown."""
-    await nodes[killed].stop()
+    restart is registered BEFORE it starts, so a start that raises is still stopped by that teardown.
+
+    BACKLOG #5440: the kill must be seen to have taken effect before that stop. ``kill()`` can fail
+    silently (:meth:`ShardCertNode.wait_exited`), and ``stop()`` would then end the live process
+    gracefully, so a recovery timed after it would certify a graceful stop as crash recovery. A process
+    still running :data:`_KILL_EXIT_TIMEOUT` seconds on fails the run; it stays in ``nodes``, so the
+    caller's teardown stops it.
+
+    The caller's ``recovery_seconds`` runs from the kill instant to the restart's health, so it includes
+    this wait for the exit, the old node's ``stop()`` (on a process already gone, the log close and the job
+    teardown) and the restart's start, besides what the caller itself spends before calling this."""
+    old = nodes[killed]
+    if not await old.wait_exited(_KILL_EXIT_TIMEOUT):
+        raise RuntimeError(
+            f"the kill of engine shard {killed} did not take effect: its process was still running "
+            f"{_KILL_EXIT_TIMEOUT:.0f}s after kill(), so no crash recovery can be certified"
+        )
+    await old.stop()
     restart = ShardCertNode(
         killed, api_port, env=_restart_env(env), config_dir=_CONFIG_DIR, cwd=cwd
     )
@@ -3375,6 +3432,10 @@ class ShardCertEngineReport:
     routed_stranded: int = -1
     outbound_stranded: int = -1
     in_pipeline_final: int = -1
+    #: Kill leg only, reported and not gated: from the kill instant to the restarted engine shard's health.
+    #: It includes at least the rest of the hold, the wait for the killed process to exit, the killed node's
+    #: ``stop()`` and the restart's start (:func:`_restart_killed`), so it bounds the engine's own recovery
+    #: from above rather than measuring it.
     recovery_seconds: float | None = None
     #: D1: the engine-side drain duration (this box's own await_drain elapsed) — the RELIABLE drain the drive
     #: uses for the honest sustainable rate (its own remote drain misses under load). Guaranteed non-None
@@ -3638,7 +3699,7 @@ async def run_shardcert_engine(
         dests, handlers, delivering, routing, strict_bands=strict_bands
     )
     try:
-        require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list)
+        require_kill_leg(kill, kill_shard, kill_at_fraction, ids_list, hold_seconds)
     except KillLegError:
         # Tell a waiting drive half at once, as _reset_store_or_signal does, with a fixed reason. A coord
         # write error must not replace the refusal, so it is logged rather than raised.

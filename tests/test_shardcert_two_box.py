@@ -80,6 +80,11 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             # A local PID SIGKILL — recorded so a kill-leg test can prove it hit a LOCAL object.
             self.kill_calls += 1
 
+        async def wait_exited(self, timeout: float) -> bool:
+            # The kill leg confirms the kill took effect before it stops the node (BACKLOG #5440): a fake
+            # process has exited once kill() has run on it.
+            return self.kill_calls > 0
+
         async def stop(self) -> None:
             return None
 
