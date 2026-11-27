@@ -1,6 +1,6 @@
 # ADR 0156 — ASVS scorecard as data: a derived count, verified evidence anchors, and a fail-closed drift gate
 
-**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below; the title is qualified for the vault's pre-commit hook by the hook note dated 2026-11-27 under Amendment 2
+**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below; for the vault's pre-commit hook, see the 2026-11-27 note under Amendment 2
 **Date:** 2026-08-01
 **Supersedes:** —
 **Related:** ADR 0155 (DAST) · BACKLOG #205 (risk-acceptance register) · ASVS cell 15.1.3
@@ -150,6 +150,10 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 
 > ### Amendment 2 (2026-08-17) — the hook the amendment above calls "the enforcement that works today" HAS NEVER BEEN INSTALLED
 >
+> *(2026-11-27: for the vault's `asvs-scorecard` pre-commit hook, read the vault's copy of this ADR,
+> Amendment 2 onward. This amendment describes the hook, its installation and its remedy as of
+> 2026-08-17, and this copy is not kept current for the hook.)*
+>
 > Amendment 1 closes by naming its own lesson: a confident, plausible statement about system state that
 > nobody had checked. **Its replacement claim was never checked either, and it is wrong in the same
 > way.** Measured on the vault checkout, 2026-08-17, twice about three hours apart:
@@ -172,25 +176,6 @@ That last row is the fix for **15.1.3**: the guards stop being inspection-only t
 > *"a gate that is red by construction teaches everyone to ignore it"* hazard that
 > `scripts/asvs/register_check.py` cites as its reason for staying advisory. Whoever installs it must
 > set that variable in the same change.
->
-> *(2026-09-21, in the vault's copy, and brought into this copy on 2026-11-27: the vault's
-> `scripts/asvs/register_check.py` no longer stays advisory. The owner chose the enforcing form
-> under BACKLOG #353, so that script is no longer an instance of the hazard. The hazard itself, and
-> this paragraph's point about the hook, stand unchanged. Since vault PR 3065 that point about the
-> hook no longer holds: see the next note.)*
->
-> *(2026-11-27: this amendment's table, and the two paragraphs between it and the 2026-09-21 note,
-> describe the vault's `asvs-scorecard` hook, its installation and its remedy as they stood on
-> 2026-08-17. Do not act on what they say about the hook. Vault PR 3065, merged 2026-11-26,
-> replaced the hook's entry, and this copy does not restate the hook's behaviour beyond two
-> consequences for this ADR. The hook's source of record is the docstring of the vault's
-> `scripts/asvs/precommit_scorecard.py`. Amendment 2's 2026-11-25 note in the vault's copy of this
-> ADR summarises it, cites the owner ruling behind it, and says what still holds for the verifier
-> and how the hook's shim is installed. The two consequences: the hook has at least one path on
-> which it passes without verifying, which qualifies this ADR's title and section 6 at least for
-> the pre-commit hook, and it no longer refuses every FAIL the verifier reports. The remedy above,
-> `pre-commit install`, is one the header of the vault's `scripts/coord/install-git-hooks.ps1`
-> forbids.)*
 >
 > **WHY THIS IS RECORDED RATHER THAN QUIETLY FIXED.** The claim is load-bearing in a security record:
 > it tells a reader that authoring-time enforcement is in place, and a reader who believes it will not
