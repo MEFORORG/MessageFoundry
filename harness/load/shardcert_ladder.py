@@ -2638,8 +2638,8 @@ class ConsolidatedLadderReport:
         (BACKLOG #5442 made a gate-only rung's pool readable, which would otherwise relabel a FIFO break as
         a pool-sizing setup issue). Nor does a SOAK degradation outrank a break on a CLIMB rung: that break
         was measured before the soak ran, so an aborted or un-driven soak must not hide it behind exit 2. A
-        FIFO inversion on the soak is exit 1 whatever the degradation, and so is a soak duplicate or
-        single-lane term on a fully driven soak (BACKLOG #5862; :attr:`_break_outranks_degradation`)."""
+        FIFO inversion on the soak is exit 1 whatever the degradation; when a soak duplicate or single-lane
+        term is, is :attr:`_break_outranks_degradation`'s to say (BACKLOG #5862)."""
         if self.setup_degraded and not self._break_outranks_degradation:
             return 2
         return 0 if self.ok else 1
@@ -2672,10 +2672,12 @@ class ConsolidatedLadderReport:
           a starved sink can produce.
         * A soak DUPLICATE or single-lane term never outranks a soak abort or a rig shortfall: a torn-down
           or overloaded sink can provoke an at-least-once redelivery, which the tracker counts as a repeat,
-          and an under-driven soak can see few lanes. It outranks an unconfirmed CLIMB rung only when the
-          soak's fidelity was also recorded (not :attr:`soak_fidelity_unattributed`), so the rig is known
-          not to have run out: one rung's missing store-truth says nothing about another rung's
-          sink-observed order.
+          and an under-driven soak can see few lanes. It outranks an unconfirmed CLIMB rung only on
+          evidence the soak's own fidelity proves: a duplicate on a soak whose rate reached the engine
+          (:attr:`RungOutcome.fidelity_driven`, an engine bind included), a single-lane term only on a soak
+          the rig drove AND the engine took (:attr:`RungOutcome.fidelity_admissible`), since an engine that
+          refused most of the soak also leaves its sinks few lanes. One rung's missing store-truth says
+          nothing about another rung's sink-observed order.
         * A CLIMB break outranks a soak degradation and a pool bind, but not an unconfirmed climb
           store-truth."""
         if self.ok:
@@ -2684,10 +2686,18 @@ class ConsolidatedLadderReport:
             return True
         if self.climb_aborted:
             return False
+        soak = self.soak
         soak_break_driven = self._soak_broken and not (
             self.soak_aborted or self.soak_drive_shortfall
         )
-        if soak_break_driven and not self.soak_fidelity_unattributed:
+        if (
+            soak is not None
+            and soak_break_driven
+            and (
+                soak.fidelity_admissible
+                or (soak.verdict is RungVerdict.CORRECTNESS_FAIL and soak.fidelity_driven)
+            )
+        ):
             return True
         if self.store_truth_unconfirmed:
             return False
@@ -3145,7 +3155,8 @@ class ConsolidatedLadderReport:
             # v11 (BACKLOG #5862) — no new key, two SCORING changes, each moving a run from SETUP_DEGRADED /
             # exit 2 to FAIL / exit 1: (1) a FIFO inversion on the soak, under a soak abort, a rig shortfall
             # or an unconfirmed climb rung; (2) a soak duplicate or single-lane term under an unconfirmed
-            # climb rung, on a soak with no abort, no rig shortfall and a recorded fidelity. A soak duplicate or
+            # climb rung, on a soak with no abort whose fidelity proves it (a duplicate needs the rate to have
+            # reached the engine, a single-lane term an admissible soak). A soak duplicate or
             # single-lane term under a soak abort or rig shortfall still reads SETUP_DEGRADED (a redelivery
             # counts as a repeat, and an under-driven soak can see few lanes).
             "schema_version": 11,
@@ -3907,7 +3918,8 @@ async def run_drive_ladder(
                 sign_in=not sign_in_refused,
             )
         except EngineSetupFailed as exc:
-            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset) and it has exited. Not a
+            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset, or since BACKLOG #5953 a
+            # store pool refused at the ADR 0062 cliff) and it has exited. Not a
             # drive abort: say whose it was, and post no RUNG_ABORTED to an engine that is gone. LADDER_STOP
             # still goes out for a half that is still polling. The soak is skipped below.
             base_coord.post(

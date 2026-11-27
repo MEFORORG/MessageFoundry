@@ -349,15 +349,16 @@ def store_pool_warning(pool_size: int, shard_count: int) -> str | None:
 
 
 def check_store_pool_size(pool_size: int, shard_count: int, *, force: bool = False) -> str | None:
-    """Enforce the ADR 0062 pool bound: return the note or ``None``. At/over the CLIFF it RAISES
-    :class:`StorePoolOverCliff` unless ``force`` — because a run above the cliff cannot produce an engine
-    ceiling, only a pool-thrash one, and would be indistinguishable from the wall under investigation. Only
-    a FORCED run past the cliff prints its note (as a WARNING to stderr): below the cliff
-    :func:`announce_store_pool` already states the optimum and the cliff, and a WARNING on the product
-    default would teach an operator to skip the one that matters."""
+    """Enforce the ADR 0062 pool bound. At/over the CLIFF it RAISES :class:`StorePoolOverCliff` unless
+    ``force`` — because a run above the cliff cannot produce an engine ceiling, only a pool-thrash one, and
+    would be indistinguishable from the wall under investigation. A FORCED run past the cliff gets the note
+    back (also printed as a WARNING to stderr) for its report's notes, so the artifact says so too. Below
+    the cliff it returns ``None`` and prints nothing: :func:`announce_store_pool` already states the optimum
+    and the cliff, and a WARNING on the product default would teach an operator to skip the one that
+    matters."""
     note = store_pool_warning(pool_size, shard_count)
     if note is None or pool_size < POOL_SIZE_CLIFF:
-        return note
+        return None
     if not force:
         raise StorePoolOverCliff(
             note + " — pass --force-store-pool-size to run above the cliff anyway"
@@ -1413,11 +1414,11 @@ async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, st
 
 def _check_store_pool_or_signal(
     coord: FileDropCoord, pool_size: int, shard_count: int, *, force: bool
-) -> None:
+) -> str | None:
     """The ENGINE half's :func:`check_store_pool_size` (BACKLOG #5953, S27-74), telling a waiting drive
     half at once when it refuses, as :func:`_reset_store_or_signal` does. Best-effort post, fixed reason."""
     try:
-        check_store_pool_size(pool_size, shard_count, force=force)
+        return check_store_pool_size(pool_size, shard_count, force=force)
     except StorePoolOverCliff:
         try:
             coord.post(
@@ -1799,7 +1800,9 @@ async def run_shardcert(
     # — what changed is the DEFAULT (8 -> 40, the product's) and the fact that the value is now RECORDED.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
     # BACKLOG #5953 (S27-74): refuse a pool at/over the ADR 0062 cliff before the store is touched.
-    check_store_pool_size(pool_size, n, force=force_store_pool_size)
+    pool_note = check_store_pool_size(pool_size, n, force=force_store_pool_size)
+    if pool_note is not None:
+        setup_notes.append(pool_note)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -3610,7 +3613,7 @@ async def run_shardcert_engine(
     # default 40) and ASSIGNED, so its value is CHOSEN in one place and RECORDED in the rung's report; it
     # used to be `setdefault`-pinned at 8 (1/5 of product, 32 connections fleet-wide) and recorded nowhere.
     pool_size = resolve_store_pool_size(store_env, store_pool_size)
-    _check_store_pool_or_signal(coord, pool_size, n, force=force_store_pool_size)
+    pool_note = _check_store_pool_or_signal(coord, pool_size, n, force=force_store_pool_size)
     store_env["MEFOR_STORE_POOL_SIZE"] = str(pool_size)
     announce_store_pool(pool_size, n)
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -3627,6 +3630,8 @@ async def run_shardcert_engine(
     # ARTIFACT 5: the G < L pre-flight note leads the rung's notes — it is a setup condition that governs how
     # every number in this report must be read, and it rides the ENGINE_RUNG_REPORT to the drive box.
     notes: list[str] = [] if band_note is None else [band_note]
+    if pool_note is not None:  # a forced run past the ADR 0062 cliff rides the report too
+        notes.append(pool_note)
     recovery_seconds: float | None = None
     stranded = -1
     breakdown = "QUEUE <not-read>"

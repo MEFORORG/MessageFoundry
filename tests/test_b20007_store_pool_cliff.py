@@ -110,7 +110,7 @@ def test_engine_ladder_cli_refusal_is_a_setup_exit(
 ) -> None:
     import harness.__main__ as cli
 
-    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    _cli_env(monkeypatch)
     seen: list[object] = []
 
     async def refuse(**kwargs: object) -> None:
@@ -126,9 +126,10 @@ def test_engine_ladder_cli_refusal_is_a_setup_exit(
 def test_no_warning_below_the_cliff(capsys: pytest.CaptureFixture[str]) -> None:
     """The product default sits at the optimum; announce_store_pool already says so, so the check is
     silent there and only a forced run past the cliff prints."""
-    assert shardcert.check_store_pool_size(shardcert.PRODUCT_STORE_POOL_SIZE, 4) is not None
+    assert shardcert.check_store_pool_size(shardcert.PRODUCT_STORE_POOL_SIZE, 4) is None
     assert capsys.readouterr().err == ""
-    shardcert.check_store_pool_size(POOL_SIZE_CLIFF, 4, force=True)
+    note = shardcert.check_store_pool_size(POOL_SIZE_CLIFF, 4, force=True)
+    assert note is not None and note.startswith("STORE POOL AT/OVER")
     assert "WARNING: STORE POOL AT/OVER" in capsys.readouterr().err
 
 

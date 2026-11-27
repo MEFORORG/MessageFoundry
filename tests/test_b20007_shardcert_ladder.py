@@ -155,6 +155,21 @@ def test_soak_duplicate_with_an_unattributed_shortfall_behind_an_unconfirmed_cli
     assert rep.result_label == "SETUP_DEGRADED"
 
 
+def test_single_lane_engine_bound_soak_behind_an_unconfirmed_climb_rung_stays_degraded() -> None:
+    """An engine that took half the soak (ENGINE_INTAKE_BIND) also leaves its sinks few lanes, so the soak's
+    single-lane term is a throughput finding there, not a proven break: exit 2."""
+    full = _drive(20.0)
+    drive = dataclasses.replace(
+        full, offered=full.offered * 2, sent=full.offered * 2, lanes_observed=1
+    )
+    soak = build_rung_outcome(_SOAK_RUNG, drive, _clean_gate(), None)
+    assert soak.verdict is RungVerdict.SUSTAINED
+    assert soak.fidelity_driven and not soak.fidelity_admissible
+    rep = _consolidated([_sustained(0, 20.0), _unconfirmed_climb_rung()], soak=soak)
+    assert rep.ok is False
+    assert rep.exit_code == 2
+
+
 def test_clean_soak_behind_an_unconfirmed_climb_rung_stays_setup_degraded() -> None:
     """Control: with no break anywhere, the unconfirmed climb rung is still exit 2."""
     soak = build_rung_outcome(_SOAK_RUNG, _drive(20.0), _clean_gate(), None)
