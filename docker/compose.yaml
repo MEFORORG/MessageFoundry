@@ -121,7 +121,8 @@ x-ha-engine-env: &ha-engine-env
   # name in a MEFOR_SECRETS_DIRECTORY would still win over this variable, and fail at store
   # login if it differs. Postgres reads POSTGRES_PASSWORD only when it first initializes the
   # mefor-pg volume, so changing the value later splits them until that volume is recreated or
-  # the role's password is changed to match.
+  # the role's password is changed to match. A deployment that gives the engines their own
+  # row-only role (the DEV-ONLY note below) replaces this alias with that role's password.
   MEFOR_STORE_PASSWORD: *store-password
   MEFOR_STORE_POOL_SIZE: "40"        # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
