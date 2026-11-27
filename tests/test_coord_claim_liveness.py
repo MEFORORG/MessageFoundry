@@ -884,3 +884,74 @@ def test_merging_main_INTO_the_branch_is_NOTHING_BUILT_not_a_squash(
     ev = evidence_lines(claim(evidence_repo, "-List").stdout)
     assert any(ln.startswith("evidence: NOTHING BUILT --") and "all merges" in ln for ln in ev), ev
     assert not any(ln.startswith("evidence: CONTENT ON MAIN") for ln in ev), ev
+
+
+# --------------------------------------------------------------------------------------------------
+# The holder's own seat record saying it closed: evidence beside the state, never a licence
+# --------------------------------------------------------------------------------------------------
+
+CLOSED_AT = "2026-11-20T10:00:00Z"
+
+
+@pytest.fixture
+def keyed_repo(repo: Path) -> Path:
+    """The box keyer, so claim.ps1 can find a holder's seat records. Without it the line is absent."""
+    shutil.copy2(CLAIM.parent / "mail-key.ps1", repo / "scripts" / "coord" / "mail-key.ps1")
+    return repo
+
+
+def plant_seat(repo: Path, holder: Path, session: str, lifecycle: str, age_s: float = 0) -> None:
+    lib = repo / "scripts" / "coord"
+    script = (
+        f". '{lib / 'coord-root.ps1'}'; . '{lib / 'mail-key.ps1'}'; "
+        f"ConvertTo-BoxKey -Path (Resolve-BoxPath -Path '{holder}')"
+    )
+    key = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    ).stdout.strip()
+    common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    box = Path(common) / "mefor-coord" / "seats" / key
+    box.mkdir(parents=True, exist_ok=True)
+    rec = {"worktree": str(holder), "sessionKey": session, "lifecycle": lifecycle}
+    if lifecycle != "open":
+        rec["lifecycleAt"] = CLOSED_AT
+    f = box / f"{session}.json"
+    f.write_text(json.dumps(rec), encoding="utf-8")
+    os.utime(f, (time.time() - age_s, time.time() - age_s))
+
+
+@pytest.mark.parametrize("lifecycle", ["closed", "handed"])
+def test_a_holder_that_closed_itself_is_reported_and_still_refused(
+    keyed_repo: Path, tmp_path: Path, lifecycle: str
+) -> None:
+    peer = peer_holding(keyed_repo, tmp_path, "k")
+    plant_seat(keyed_repo, peer, "s1", lifecycle)
+    note = f"holder's seat record self-declared {lifecycle} at {CLOSED_AT}"
+
+    take = claim(keyed_repo, "-Take", "k", "-Note", "mine now")
+    assert take.returncode == 1
+    assert note in take.stdout and "not authority to release" in take.stdout
+    assert "-Release k -Force" not in take.stdout
+
+    release = claim(keyed_repo, "-Release", "k")
+    assert release.returncode == 1
+    assert note in release.stdout
+    assert "-Release k -Force" not in release.stdout
+
+    assert note in claim(keyed_repo, "-List").stdout
+    # The refusals did not release it.
+    assert claim(keyed_repo, "-Take", "k", "-Note", "x").returncode == 1
+
+
+def test_a_holder_whose_newest_record_is_open_reports_no_close(
+    keyed_repo: Path, tmp_path: Path
+) -> None:
+    peer = peer_holding(keyed_repo, tmp_path, "k")
+    plant_seat(keyed_repo, peer, "s-old", "closed", age_s=3600)
+    plant_seat(keyed_repo, peer, "s-new", "open")
+    for args in (("-Take", "k", "-Note", "x"), ("-Release", "k"), ("-List",)):
+        assert "self-declared" not in claim(keyed_repo, *args).stdout

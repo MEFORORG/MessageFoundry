@@ -130,6 +130,9 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 }
 . $coordRootScript
 $thisHost = Get-CoordHost
+# The box keyer, for reading a holder's seat record (Get-HolderSeatClose). Best-effort and never
+# fatal, like occupancy.ps1 above: without it that evidence is simply not shown.
+try { . "$PSScriptRoot/mail-key.ps1" } catch { }
 
 # THE MACHINE A RECORD WAS WRITTEN ON (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would
 # ship"). On a shared root a claim taken on another PC names a worktree path that does not exist HERE,
@@ -462,7 +465,45 @@ function Get-OccupancyForHolder([string]$HeldPath) {
     catch { return $false }
 }
 
+# THE HOLDER'S OWN WORD THAT IT ENDED. seat.ps1 -Close writes lifecycle `closed` (`handed` with
+# -Handback) into the session's seat record as its last act, so the newest record in the holder
+# worktree's box can say the session declared itself finished. EVIDENCE, NEVER A LICENCE: the
+# record is the writer's claim, a resumed or later session in the same worktree may not have
+# declared yet, and nothing on this host proves a session gone (#1348 above). So it is a field
+# beside State, never a State of its own, and no branch below reads it to refuse, release or
+# recommend -Force. Any failure to look reads as no evidence at all.
+$script:HolderSeatsDir = $null   # $null = not resolved yet; '' = could not be resolved.
+
+function Get-HolderSeatClose([string]$HeldPath) {
+    try {
+        if ($null -eq $script:HolderSeatsDir) {
+            $script:HolderSeatsDir = ''
+            $r = Resolve-CoordDir -From $registryRepo -Kind 'seats'
+            if (-not $r.Error -and $r.Path) { $script:HolderSeatsDir = $r.Path }
+        }
+        if (-not $script:HolderSeatsDir -or -not (Get-Command ConvertTo-BoxKey -EA SilentlyContinue)) { return $null }
+        $ended = Get-CoordSeatEnded -Dir (Join-Path $script:HolderSeatsDir (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $HeldPath)))
+        if (-not $ended) { return $null }
+        return "holder's seat record self-declared $($ended.Lifecycle) at $($ended.At)"
+    }
+    catch { return $null }
+}
+
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
+    $live = Get-HolderPresence $HeldPath $Record
+    # Not for a holder on another PC, whose box this host's key does not name, nor for a vanished
+    # one, which is already provably gone.
+    $closed = if ($live.State -notin 'elsewhere', 'gone') { Get-HolderSeatClose $HeldPath } else { $null }
+    $live | Add-Member -NotePropertyName SelfClosed -NotePropertyValue $closed -Force
+    return $live
+}
+
+function Write-SelfClosedNote($Live, [string]$Indent = '  ') {
+    if (-not $Live.SelfClosed) { return }
+    Write-Host "$Indent$($Live.SelfClosed) -- EVIDENCE, not authority to release: a later session in that worktree may not have declared yet."
+}
+
+function Get-HolderPresence([string]$HeldPath, $Record = $null) {
     # A holder on another machine is NOT CHECKABLE HERE, and that is a state of its own rather than
     # `gone` or `unknown`: this disk says nothing about that PC's worktrees (docs/COORD-SHARED-ROOT.md).
     if (-not (Test-CoordRecordIsHere $Record)) {
@@ -856,6 +897,7 @@ function Show-List {
         # to prevent, arrived at by following the tool's own recommendation. A long claim is the normal
         # shape of long work; report what the HOLDER is doing and let the operator decide.
         $age = ""
+        $live = $null
         # Its own try: an unreadable stamp costs only the age, never the liveness verdict (BACKLOG #5871).
         $hrs = try { [int]([datetimeoffset]::UtcNow - (ConvertTo-ClaimedInstant $c.claimed)).TotalHours } catch { '?' }
         try {
@@ -898,7 +940,7 @@ function Show-List {
             # what it could not. A claim whose liveness could not be determined must not look routine.
             $age = "  [liveness check FAILED -- treat as unknown, confirm before releasing]"
         }
-        [pscustomobject]@{ File = $f.Name; Claim = $c; Held = $held; Mine = $mine; Age = $age; State = $state }
+        [pscustomobject]@{ File = $f.Name; Claim = $c; Held = $held; Mine = $mine; Age = $age; State = $state; Live = $live }
     }
     # BACKLOG #1466. One batched pass over every directory-only holder, not a git call per claim.
     $unoccupied = @($rows | Where-Object State -EQ 'unoccupied')
@@ -909,6 +951,7 @@ function Show-List {
     foreach ($r in $rows) {
         Write-Host ("  {0,-34} {1}" -f $r.Claim.key, $r.Claim.note)
         Write-Host ("      held by {0} [{1}]{2}{3}" -f $r.Held, $r.Claim.branch, $r.Mine, $r.Age)
+        if ($r.Live -and -not $r.Mine) { Write-SelfClosedNote $r.Live '        ' }
         if ($r.State -eq 'unoccupied') {
             foreach ($e in $evidence[$r.File]) { Write-Host "        $e" }
         }
@@ -1000,6 +1043,7 @@ if ($Release) {
                 Write-Host "  Confirm with that session before using -Force."
             }
         }
+        Write-SelfClosedNote $live
         # BACKLOG #1358, and this is the placement that earns the most. The refusal above says the claim
         # is "held by another worktree" -- but under divergence the ownership test ran against the SCRIPT's
         # tree, so "another worktree" can be the operator's OWN, with the foreign thing being the copy of
@@ -1274,6 +1318,7 @@ try {
             Write-Host "  Treat it as live: coordinate with that session before -Force."
         }
     }
+    Write-SelfClosedNote $live
     exit 1
 }
 try {
