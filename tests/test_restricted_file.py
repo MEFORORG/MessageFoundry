@@ -2327,10 +2327,13 @@ def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
 
 
 @windows_only
-@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "\\??\\"])
 def test_windows_a_plain_device_spelling_is_still_walked(tmp_path: Path, prefix: str) -> None:
     """The control for the test above: a device prefix naming the same object as its plain
-    spelling is walked as before."""
+    spelling is walked as before. The open reads ``\\??\\C:\\...`` as the plain path too, where
+    ``os.path.abspath`` read it as a rooted name on the current drive (``D:\\??\\C:\\...``), so
+    the walk refused a key the open reads (vault BACKLOG #5515, engine PR 3347 finding B). Red on
+    that prefix under origin/main."""
     real = tmp_path / "real"
     real.mkdir()
     key = real / "store.key"

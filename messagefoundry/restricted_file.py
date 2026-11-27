@@ -843,14 +843,18 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     # abspath collapses ``.`` and ``..`` the open may read otherwise: as names after a verbatim
     # prefix, or, after a ``\\.\`` one, as climbing out of the drive. So a device prefix is judged
     # as written, by the walk's own rule (vault BACKLOG #5515), before abspath runs. A spelling that
-    # passes is walked as before.
+    # passes is walked as before, except an NT ``\??\`` one: the open reads it as the plain path,
+    # where abspath reads a rooted name on the current drive (``D:\??\C:\...``), so its stripped
+    # form is walked instead.
     text = os.fspath(path)
     if text[:4].replace("/", "\\") in ("\\\\.\\", "\\\\?\\", "\\??\\"):
         plain = _strip_win_prefix(text)
         if plain is None or _drive_relative(plain):
             return _windows_cause_problem(WalkCause.plain(_DEVICE_PATH))
+        if text.startswith("\\??\\"):
+            text = plain
     try:
-        full = Path(os.path.abspath(path))
+        full = Path(os.path.abspath(text))
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
     # The path's own name is not walked, so a stream name, or a name ending in a dot or a space, is
