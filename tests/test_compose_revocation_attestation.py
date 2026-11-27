@@ -302,27 +302,46 @@ def test_every_required_substitution_names_the_same_sources() -> None:
             assert phrase in msg, f"{var}'s message omits {phrase!r}"
 
 
-# Finding 23: under --profile ha the engines read MEFOR_STORE_PASSWORD from secrets.env, and the
-# local postgres reads it by substitution, which that env_file does not feed. The example's note
-# named only the SQL Server image, so a reader who filled in secrets.env alone was refused at load.
+# BACKLOG #5400 finding 23, the env-file half: the ha services read MEFOR_STORE_PASSWORD from
+# secrets.env, and the local postgres reads it by substitution, which that env_file does not feed.
+# The example's note named only the SQL Server image, so a reader who filled in secrets.env alone
+# would be refused at load. The note points at the POSTGRES_PASSWORD message, which the test above
+# pins, rather than restating where substitution reads.
 _SECRETS_EXAMPLE = _COMPOSE.parent / "secrets.env.example"
 _STORE_PASSWORD = "MEFOR_STORE_PASSWORD"
+#: Every ha service that logs in to the Postgres store (tests/test_b622_5827_compose_ha_store_tls.py).
+_HA_STORE_USERS = ("schema-provision", "engine-ha", "engine-standby")
 
 
 @functools.cache
 def _store_password_note() -> str:
     """The comment block directly above the example's ``MEFOR_STORE_PASSWORD`` entry."""
     lines = _SECRETS_EXAMPLE.read_text(encoding="utf-8").splitlines()
-    [at] = [
-        n for n, line in enumerate(lines) if line.lstrip("# ").startswith(f"{_STORE_PASSWORD}=")
-    ]
+    entry = f"{_STORE_PASSWORD}="
+    found = [n for n, line in enumerate(lines) if line.lstrip("# ").startswith(entry)]
+    assert len(found) == 1, f"{_SECRETS_EXAMPLE.name}: expected one {entry} entry, found {found}"
     block: list[str] = []
-    for line in reversed(lines[:at]):
+    for line in reversed(lines[: found[0]]):
         if not line.startswith("#"):
             break
         block.insert(0, line.lstrip("#").strip())
-    assert block, f"no comment above {_STORE_PASSWORD}= in {_SECRETS_EXAMPLE.name}"
+    assert block, f"no comment above {entry} in {_SECRETS_EXAMPLE.name}"
     return " ".join(block)
+
+
+def _env_file_paths(svc: dict[str, Any]) -> set[str]:
+    """``env_file`` paths in any of compose's three syntaxes: a string, a list, or long form."""
+    entries = svc.get("env_file") or []
+    if isinstance(entries, str):
+        entries = [entries]
+    return {str(e["path"] if isinstance(e, dict) else e) for e in entries}
+
+
+def _env_names(svc: dict[str, Any]) -> set[str]:
+    env = svc.get("environment") or {}
+    if isinstance(env, dict):
+        return set(env)
+    return {str(item).split("=", 1)[0] for item in env}
 
 
 def test_the_ha_profile_reads_the_store_password_from_two_sources() -> None:
@@ -330,16 +349,19 @@ def test_the_ha_profile_reads_the_store_password_from_two_sources() -> None:
     services = _all_services()
     m = _SUBSTITUTION.fullmatch(str(_env(services["postgres"])["POSTGRES_PASSWORD"]))
     assert m and m["var"] == _STORE_PASSWORD
-    for engine in ("engine-ha", "engine-standby"):
-        paths = {str(e["path"]) for e in services[engine].get("env_file") or []}
-        assert "./secrets.env" in paths, engine
+    for name in _HA_STORE_USERS:
+        svc = services[name]
+        assert "./secrets.env" in _env_file_paths(svc), name
+        # An environment: entry would override the env_file, leaving one source, not two.
+        assert _STORE_PASSWORD not in _env_names(svc), name
 
 
-def test_the_store_password_note_names_the_ha_image_and_the_substitution_sources() -> None:
+def test_the_store_password_note_names_the_ha_image_and_points_at_the_substitution() -> None:
     note = _store_password_note()
     image = str(_all_services()["engine-ha"]["image"])
-    assert image in note, f"the {_STORE_PASSWORD} note does not name {image}, the ha engines' image"
-    for phrase in ("SUBSTITUTION", "does NOT feed", ".env beside compose.yaml", "--env-file"):
+    # Parenthesised, so a shorter tag that is a prefix of the note's does not match.
+    assert f"({image})" in note, f"the {_STORE_PASSWORD} note does not name {image}"
+    for phrase in ("SUBSTITUTION", "does NOT feed", "POSTGRES_PASSWORD", "docker/README.md"):
         assert phrase in note, f"the {_STORE_PASSWORD} note omits {phrase!r}"
 
 
