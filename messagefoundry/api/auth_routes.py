@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_ACTION_MAX,
     STEP_UP_VIA_HEADER,
     STEP_UP_VIA_IDP,
     AdGroupMap,
@@ -70,6 +71,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    StepUpStatusReply,
     UserCreatedResponse,
     UserCreateRequest,
     UserListEntry,
@@ -79,6 +81,10 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
     changed_name_refusal,
     custom_role_name_refusal,
+)
+from messagefoundry.api.message_scope import (
+    SCOPED_READER_REFUSALS,
+    refuse_a_channel_scoped_reader,
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
@@ -98,6 +104,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline_for,
     public_route,
     recheck_standing,
+    record_check_grant,
     record_repeated_credential,
     refuse_unless_step_up_window_live,
     require,
@@ -106,6 +113,7 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
     spend_step_up_action,
+    step_up_status,
 )
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
@@ -299,9 +307,11 @@ async def _service(request: Request) -> AuthService:
 
 
 async def _arrival() -> float:
-    """The wall-clock moment a route's dependencies began to be solved, for ``POST /auth/logout``
-    (BACKLOG #3715). Wall clock, because the store stamps a lineage link with ``time.time()``."""
-    return time.time()
+    """The moment a route's dependencies began to be solved, for ``POST /auth/logout`` (BACKLOG
+    #3715), on the monotonic clock. The sign-out measures only the time since it, and the store
+    measures the window on its own clock (vault BACKLOG #4276), so a wall-clock step between the
+    two readings must not move it."""
+    return time.monotonic()
 
 
 def _current_user(identity: Identity) -> CurrentUser:
@@ -837,6 +847,60 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def me(identity: Identity = Depends(require())) -> CurrentUser:
         return _current_user(identity)
 
+    # ADR 0215 section 2: gate-only routes, for the web console's later slices to sub-request before
+    # a page that shows no engine data of its own renders. No console code calls them yet. Each is a
+    # static gate, require(p) for one permission, registered in a loop over Permission so the route
+    # walk and the route map read it; the permission never comes from the request. Each writes the
+    # grant row its permission's own routes audit (record_check_grant), except the
+    # SCOPED_READER_REFUSALS routes, which first refuse a channel-scoped caller; see below.
+    # docs/SECURITY.md (Gate-only check routes) states what they answer and which rows they write.
+    @app.get("/auth/check", response_model=SimpleMessage)
+    async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
+        return SimpleMessage(detail="authorized")
+
+    def _add_permission_check(permission: Permission) -> None:
+        # A permission in SCOPED_READER_REFUSALS is refused to a channel-scoped holder here too,
+        # with the same auth.channel_denied row its real routes write (BACKLOG #4346). Not every
+        # permission whose routes refuse such a holder is in that map: at least messages:purge
+        # is not, so its check route still admits one. The other gates the real routes add, such
+        # as require_phi_read's on GET /logs/tail, are not run here.
+        refuses_scoped = permission in SCOPED_READER_REFUSALS
+
+        async def auth_check_permission(
+            request: Request,
+            identity: Identity = Depends(require(permission)),
+        ) -> SimpleMessage:
+            if refuses_scoped:
+                # With no auth service attached the caller is the open-mode identity, which no
+                # scope narrows, and there is no store to read through it.
+                auth = get_auth(request)
+                if auth is not None:
+                    await refuse_a_channel_scoped_reader(
+                        auth.store, identity, permission, client_ip(request)
+                    )
+            await record_check_grant(request, identity, permission)
+            return SimpleMessage(detail="authorized")
+
+        app.add_api_route(
+            f"/auth/check/{permission.value}",
+            auth_check_permission,
+            methods=["GET"],
+            response_model=SimpleMessage,
+            name=f"auth_check_{permission.name.lower()}",
+        )
+
+    for check_permission in Permission:
+        _add_permission_check(check_permission)
+
+    @app.get("/me/step-up", response_model=StepUpStatusReply)
+    async def my_step_up_status(
+        request: Request,
+        action: Annotated[str | None, Query(max_length=STEP_UP_ACTION_MAX)] = None,
+        identity: Identity = Depends(require()),
+    ) -> StepUpStatusReply:
+        """:func:`step_up_status`, for the caller's own session (ADR 0215 section 2)."""
+        return await step_up_status(request, identity, action)
+
     @app.post("/me/password", response_model=SimpleMessage)
     async def change_password(
         body: PasswordChangeRequest,
@@ -1110,7 +1174,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> MfaEnrollResponse:
         """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
         Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
-        have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
+        have none yet; and not the shared login window, so a hijacked session can't bind a factor,
+        except under ``[auth].require_action_step_up = false``, see docs/CONFIGURATION.md); not
         active until confirmed via ``/me/mfa/confirm``. No provider gate: an engine factor is engine-
         held state and every provider may hold one (BACKLOG #1144, and see
         :meth:`~messagefoundry.auth.service.AuthService.begin_mfa_enrollment` for why)."""
@@ -1134,7 +1199,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
         directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
         account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
-        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
+        password step-up BOUND to this confirm action (ADR 0077), except under
+        ``[auth].require_action_step_up = false`` (docs/CONFIGURATION.md); the bound proof is
+        independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "mfa-confirm")
@@ -1278,9 +1345,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
-        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
-        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke; a
-        # pending session on an account WITH a factor is refused (#1951). The gate runs before the
+        # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it, except
+        # under [auth].require_action_step_up = false (docs/CONFIGURATION.md, that row). Still the
+        # reauth-only family and NOT the MFA gate, but no pending session passes it: one on an
+        # account WITH a factor is refused (#1951), and so is one with NO factor that require_mfa
+        # covers, which is told to enrol (#1149). The gate runs before the
         # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
@@ -1300,6 +1369,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # 7.5.2 (ASVS): action-bound password re-proof before mass-terminating the user's other
         # sessions (BACKLOG #1149). This is the route the cell turns on — a login-seeded window let a
         # caller sign every other session out with no proof beyond the sign-in they already held.
+        # Under [auth].require_action_step_up = false it still can (docs/CONFIGURATION.md, that row).
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
@@ -1755,7 +1825,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         Refuses the caller's own account (BACKLOG #1149, ASVS 7.5.2). This route takes the login
         window, so on yourself it would end every session you hold with no fresh proof. The
         self-service ``DELETE /me/sessions`` ends your other sessions behind a single-use
-        ``session_terminate`` grant, and sign-out ends the current one."""
+        ``session_terminate`` grant, except under ``[auth].require_action_step_up = false``
+        (docs/CONFIGURATION.md, that row), and sign-out ends the current one."""
         target = await read_user_or_unreadable(service.store.get_user(user_id))
         await _refuse_if_self(
             request,
@@ -1783,15 +1854,22 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         compromise. The caller's own session is kept where the revoke re-stamps it, so the caller
         stays signed in; otherwise it ends too, and the reply says which. Their other sessions end
         with everyone's. ``users:manage``, as the per-account revoke above, behind a
-        single-use proof bound to this action, since it ends sessions of the caller's own.
-        Audited, with the count, even when nothing was live."""
+        single-use proof bound to this action while ``[auth].require_action_step_up`` is on (the
+        default), since it ends sessions of the caller's own; off, the session's step-up window
+        serves instead. The audit row, with the count even when it is zero, is written after the
+        revoke commits: a store that refuses it fails the request with the sessions already
+        ended."""
         revoked, kept = await service.revoke_every_session(
             actor=identity.username,
             keep_token_hash=hash_token(bearer_token(request) or ""),
             client=client_ip(request),
         )
         outcome = "this session was kept" if kept else "this session was ended too"
-        return SimpleMessage(detail=f"revoked {revoked} session(s); {outcome}")
+        # The count is every unrevoked row the sweep ended, an expired one never purged among
+        # them, as admin-revoke-sessions words it (BACKLOG #5095).
+        return SimpleMessage(
+            detail=f"ended {revoked} unrevoked session row(s), expired ones included; {outcome}"
+        )
 
     @app.put("/users/{user_id}/roles", response_model=SimpleMessage)
     async def set_user_roles(
@@ -1807,19 +1885,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # the body model. A body that fails ``RolesUpdateRequest`` is answered first, with no audit
         # row: FastAPI answers 422 on the JSON plane, and the console route that builds the model
         # renders "invalid input" with a 400.
-        user = await service.store.get_user(user_id)
         await _refuse_if_self(
             request,
             service,
             identity,
             user_id,
-            user,
             op="set_roles",
             detail="another administrator must change your own roles",
         )
         await _validate_roles(service, body.roles)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # BACKLOG #5520 items 2 and 13: the route decides on the record, so it reads it checked: a
+        # record that fails its seal answers the reads' 423, not the write's own 409.
+        user = await _checked_user(service, user_id)
         if _externally_managed(user.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
@@ -1827,8 +1904,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #315: promotion mints an approver exactly as creation does, so it pages too. Only a
         # GRANT pages: re-saving an existing Administrator's roles changes nothing.
         granted = (
-            Role.ADMINISTRATOR.value in body.roles
-            and Role.ADMINISTRATOR.value not in await service.store.get_user_role_ids(user_id)
+            Role.ADMINISTRATOR.value in body.roles and Role.ADMINISTRATOR.value not in user.role_ids
         )
         try:
             # The last-administrator guard is inside, in one store transaction with the role write
@@ -1854,7 +1930,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         # BACKLOG #1148 (ASVS 7.5.1): the proof must be BOUND TO THIS ACTION and single-use, not
-        # the login-seeded window. require_step_up_ACTION, never the reauth_only variant -- that
+        # the login-seeded window, except under [auth].require_action_step_up = false
+        # (docs/CONFIGURATION.md, that row). require_step_up_ACTION, never the reauth_only variant -- that
         # one carries mfa_gate=False and would DROP the second factor from an admin resetting
         # someone else's credential. The enrolment deadlock that justifies mfa_gate=False does
         # not exist here: the operator's own enrolment has nothing to do with the target's.
@@ -1877,6 +1954,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             op="password_reset",
             detail="use change-password for your own account",
         )
+        # BACKLOG #5520 items 2 and 13: a record that fails its seal answers the reads' 423, not
+        # the service loader's 404. The service reads the account again before it writes.
+        await _checked_user(service, user_id)
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
@@ -2222,6 +2302,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``ChannelScope`` is answered 422 by FastAPI before the guard runs, with no audit row; the
         console route runs the guard before its own checks (BACKLOG #3393)."""
         await _refuse_own_channel_scope(request, service, identity, user_id)
+        # BACKLOG #5520 items 2 and 13: as on the role write, a record that fails its seal answers
+        # the reads' 423, not the service loader's 404. The service reads it again to decide.
+        await _checked_user(service, user_id)
         try:
             await service.set_channel_scope(
                 user_id,
@@ -2435,8 +2518,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         action: str | None = None,
         since: float | None = None,
         until: float | None = None,
+        client: str | None = None,
     ) -> AuditList:
         """Plain-default core shared by the HTTP route below and the webconsole seam wrapper.
+
+        A channel-scoped caller is refused before any read (BACKLOG #4346):
+        :func:`refuse_a_channel_scoped_reader`. ``client`` is the address for that refusal's row.
 
         The total is counted under the same exclusion as the page, so a reader without
         users:manage is told how many rows IT can page through, never how many the trail holds
@@ -2445,6 +2532,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``require(AUDIT_READ)`` writes before each read would push every row down one, so each
         page would repeat the last row of the one before it. The pin is a timestamp and never a
         row id: :mod:`messagefoundry.api.paging` says why an id would leak the lock rows."""
+
+        await refuse_a_channel_scoped_reader(service.store, identity, Permission.AUDIT_READ, client)
 
         def bound(pin: float | None) -> float | None:
             # The pin is one more ``until``, so the tighter of the two applies.
@@ -2487,6 +2576,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/audit", response_model=AuditList)
     async def list_audit(
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_READ)),
         limit: int = Query(100, ge=1, le=1000),
@@ -2513,6 +2603,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             action=action,
             since=since,
             until=until,
+            client=client_ip(request),
         )
 
     async def _audit_ui_list(
@@ -2581,7 +2672,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
         failed standing stops the stream. So does a caller who may now read fewer rows than the
-        export started with. A stop records ``audit.export.stopped`` and raises
+        export started with, and one that is now channel-scoped (BACKLOG #4346). A stop records ``audit.export.stopped`` and raises
         :class:`ExportStopped`, which reaches the client as a failed download (BACKLOG #3907); see that class. The JSON route
         reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
         session."""
@@ -2589,6 +2680,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # the audit.export row, so a wiring fault never reads as a revoked grant in the trail.
         if not isinstance(token, str):
             raise TypeError("export_audit needs the caller's session token")
+        # BACKLOG #4346: a channel-scoped caller is refused before the first page and before the
+        # audit.export row, so a refusal records no export.
+        await refuse_a_channel_scoped_reader(
+            service.store, identity, Permission.AUDIT_EXPORT, client_ip(request)
+        )
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 
         async def _page(size: int, before_id: int | None) -> Sequence[Any]:
@@ -2653,6 +2749,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             if current is None:
                 return "standing_changed"
+            # A caller that is now channel-scoped may not read the trail at all (BACKLOG #4346).
+            # A scope edit ends the account's sessions, which the line above catches; this covers a
+            # standing that resolves narrowed with its session still live.
+            if current.allowed_channels is not None:
+                return "channel_scoped"
             # The pages are read with the starting identity's exclusion. If the caller may now
             # read fewer rows, as after losing users:manage, the export stops. If it may read the
             # same rows or more, it goes on: the start already hid at least as much.

@@ -136,12 +136,38 @@ def test_an_off_box_smtp_login_is_refused_when_it_checks_no_revocation() -> None
         _email(ENFORCING)
     text = str(exc.value)
     assert _SMTP_CELL in text
-    # This hop's own levers, not the connection-shaped one it cannot use.
+    # This hop's own levers, not the connection-shaped one it cannot use. Built with no [tls]
+    # policy, the text names [tls].crl_file only to say it does not reach the hop (BACKLOG #5527).
     assert "[tls].crl_file" in text
     assert "[alerts].email_tls_revocation_attested" in text
     assert "tls_revocation_attested=true" not in text
     # The login password never reaches the refusal.
     assert "synthetic-not-a-secret" not in text
+
+
+def test_a_login_built_with_no_tls_policy_is_not_offered_the_crl_as_its_remedy() -> None:
+    """BACKLOG #5527: with no ``[tls]`` policy handed to the sink by its caller,
+    ``[tls].crl_file`` cannot reach the hop's context, so the refusal must not tell the operator
+    that setting it is enough."""
+    for build in (_email, _notifier):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            build(ENFORCING)
+        text = str(exc.value)
+        assert "Configure [tls].crl_file so the engine checks a CRL on this hop" not in text
+        assert "This sink was built with no [tls] policy" in text
+        assert "instance-wide" in text
+        assert "[alerts].email_tls_revocation_attested" in text
+
+
+def test_a_login_built_with_a_tls_policy_is_offered_the_crl_as_its_remedy() -> None:
+    """The other arm: a ``[tls]`` policy with no ``crl_file`` reaches the hop, so setting the file
+    is a remedy the operator can perform."""
+    for build in (_email, _notifier):
+        with pytest.raises(InsecureHopRefused, match="revocation") as exc:
+            build(ENFORCING, trust_anchor_policy=TrustAnchorPolicy())
+        text = str(exc.value)
+        assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in text
+        assert "built with no [tls] policy" not in text
 
 
 def test_the_security_notifier_takes_the_same_guard() -> None:
@@ -740,8 +766,9 @@ async def test_the_alerts_test_send_reports_the_refusal_a_live_alert_would_meet(
 
 
 async def test_the_alerts_test_send_reports_the_whole_remedy(tmp_path: Path) -> None:
-    """The refusal runs to about 900 characters and its levers start past the 200 that ``safe_exc``
-    keeps by default, so the default cut left an operator a refusal with no way across."""
+    """The refusal runs to about 900 to 1,150 characters and its levers start past the 200 that
+    ``safe_exc`` keeps by default, so the default cut left an operator a refusal with no way
+    across. This app holds no tls_settings, so the reply carries the no-policy remedy."""
     detail = (await _test_send(tmp_path)).json()["detail"]
     assert "[tls].crl_file" in detail
     assert "[alerts].email_tls_revocation_attested" in detail

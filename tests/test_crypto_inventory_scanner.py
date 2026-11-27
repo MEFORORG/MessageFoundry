@@ -40,6 +40,7 @@ import importlib.util
 import re
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -534,7 +535,7 @@ def test_a_planted_operation_the_import_arm_cannot_see_reds_the_operation_arm(
     import_undocumented, _ = gate.find_violations(imports, gate.INVENTORY, check_stale=False)
     assert import_undocumented == [], "the import arm should be blind to this; the test is moot"
 
-    violations, _ops = gate.check_operations(files, tmp_path, check_stale=False)
+    violations, _ops, _judged = gate.check_operations(files, tmp_path, check_stale=False)
     assert violations == [
         f"{rel}: undocumented crypto operation use ['hash:hashlib.md5'] "
         "(documented: ['hash:hashlib.sha256'])"
@@ -591,7 +592,7 @@ def test_an_unbacked_operation_row_is_stale(
     )
     monkeypatch.setattr(gate, "INVENTORY", {})
     monkeypatch.setattr(gate, "IMPORT_ONLY", {})
-    violations, _ops = gate.check_operations(files, tmp_path, check_stale=True)
+    violations, _ops, _judged = gate.check_operations(files, tmp_path, check_stale=True)
     assert violations == [
         f"{rel}: inventory lists ['mac:hmac.new'] but the file no longer performs it"
     ]
@@ -619,7 +620,7 @@ def test_import_only_is_diffed_both_ways(tmp_path: Path, monkeypatch: pytest.Mon
 
     # An INVENTORY row whose file performs no operation, with no IMPORT_ONLY reason: red.
     monkeypatch.setattr(gate, "IMPORT_ONLY", {})
-    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    violations, _, _ = gate.check_operations(files, tmp_path, check_stale=True)
     assert len(violations) == 1 and violations[0].startswith("pkg/typesonly.py: INVENTORY lists")
 
     # Explained: green.
@@ -632,7 +633,7 @@ def test_import_only_is_diffed_both_ways(tmp_path: Path, monkeypatch: pytest.Mon
         "IMPORT_ONLY",
         {"pkg/typesonly.py": "a type annotation only", "pkg/does.py": "claims no operation"},
     )
-    violations, _ = gate.check_operations(files, tmp_path, check_stale=True)
+    violations, _, _ = gate.check_operations(files, tmp_path, check_stale=True)
     assert len(violations) == 1 and violations[0].startswith("pkg/does.py: IMPORT_ONLY says")
 
 
@@ -1005,6 +1006,25 @@ def test_a_weakening_bit_clear_is_not_the_same_token_as_a_hardening_bit_set() ->
     found = ops.aggregate(ops.discover_operations_in(sources))
     assert found["pkg/a.py"] == frozenset({"tls_context:.options |= OP_NO_TLSv1"})
     assert found["pkg/b.py"] == frozenset({"tls_context:.options &= ~OP_NO_TLSv1"})
+
+
+def test_a_bit_clear_through_int_names_the_flag_it_clears() -> None:
+    """Vault BACKLOG #5511: ``~int(FLAG)`` names FLAG rather than reading as an unlabelled ``&=``,
+    and keeps a token apart from ``~FLAG``, which also clears the bits VerifyFlags does not name."""
+    ops = _gate().crypto_operations
+    sources = {
+        "pkg/a.py": "import ssl\n\ndef f(ctx):\n"
+        "    ctx.verify_flags &= ~int(ssl.VERIFY_X509_PARTIAL_CHAIN)\n",
+        "pkg/b.py": "import ssl\n\ndef f(ctx):\n"
+        "    ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["pkg/a.py"] == frozenset(
+        {"tls_context:.verify_flags &= ~int(VERIFY_X509_PARTIAL_CHAIN)"}
+    )
+    assert found["pkg/b.py"] == frozenset(
+        {"tls_context:.verify_flags &= ~VERIFY_X509_PARTIAL_CHAIN"}
+    )
 
 
 def test_an_algorithm_in_a_method_calls_nested_arguments_is_carried() -> None:
@@ -1776,7 +1796,7 @@ def test_an_extra_multi_binding_token_alone_does_not_keep_an_operation_row_green
     monkeypatch.setattr(gate, "OPERATION_INVENTORY", {"pkg/a.py": frozenset({"hash:hashlib.sha1"})})
     monkeypatch.setattr(gate, "INVENTORY", {})
     monkeypatch.setattr(gate, "IMPORT_ONLY", {})
-    violations, _ops = gate.check_operations(files, tmp_path, check_stale=True)
+    violations, _ops, _judged = gate.check_operations(files, tmp_path, check_stale=True)
     assert violations == expected
 
 
@@ -1901,11 +1921,12 @@ def test_a_call_only_the_scope_aware_reading_gives_is_not_added() -> None:
         ),
     }
     modules = ops.parse_sources(sources)
-    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    discovered = ops.discover_operations_in_modules(modules)
+    found = ops.aggregate(discovered)
     scoped = ops.aggregate(ops.discover_operations_in_modules(modules, scope_aware=True))
     assert "messagefoundry/x.py" not in found
     assert scoped.get("messagefoundry/x.py") == frozenset({"sign_verify:.verify()"})
-    assert gate.judge_operations(modules, found) == found
+    assert gate.judge_operations(modules, discovered) == found
 
 
 @pytest.mark.parametrize(
@@ -1991,9 +2012,10 @@ def test_an_over_resolved_algorithm_label_does_not_mark_a_real_call() -> None:
         "    return alg\n"
     )
     modules = ops.parse_sources({"messagefoundry/x.py": source})
-    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    discovered = ops.discover_operations_in_modules(modules)
+    found = ops.aggregate(discovered)
     assert found["messagefoundry/x.py"] == frozenset({"mac:hmac.new[md5,sha256]"})
-    assert gate.judge_operations(modules, found) == found
+    assert gate.judge_operations(modules, discovered) == found
 
 
 def test_an_out_of_scope_tls_value_is_still_marked() -> None:
@@ -2005,8 +2027,8 @@ def test_an_out_of_scope_tls_value_is_still_marked() -> None:
         "    from ssl import CERT_REQUIRED as mode\n    ctx.verify_mode = mode\n"
     )
     modules = ops.parse_sources({"messagefoundry/x.py": source})
-    found = ops.aggregate(ops.discover_operations_in_modules(modules))
-    assert gate.judge_operations(modules, found)["messagefoundry/x.py"] == frozenset(
+    discovered = ops.discover_operations_in_modules(modules)
+    assert gate.judge_operations(modules, discovered)["messagefoundry/x.py"] == frozenset(
         {
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:.verify_mode = CERT_NONE (out of scope)",
@@ -2029,9 +2051,10 @@ def _hook_caller_tokens(init_source: str) -> frozenset[str]:
         "messagefoundry/caller.py": "from messagefoundry import sec\n\n\ndef f(b):\n    return sec.seal(b)\n",
     }
     modules = ops.parse_sources(sources)
-    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    discovered = ops.discover_operations_in_modules(modules)
+    found = ops.aggregate(discovered)
     assert found["messagefoundry/caller.py"] == frozenset({"hash:via messagefoundry.sec.impl"})
-    judged: frozenset[str] = gate.judge_operations(modules, found)["messagefoundry/caller.py"]
+    judged: frozenset[str] = gate.judge_operations(modules, discovered)["messagefoundry/caller.py"]
     return judged
 
 
@@ -2309,10 +2332,11 @@ def test_the_lexer_verdict_positive_control_reds_when_the_template_scan_is_dead(
     assert gate.lexer_verdict_self_test("operations")
 
 
-def test_list_operations_prints_each_sites_verdict(
+def test_list_operations_prints_each_tokens_verdict_at_every_site(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Added item 7: --list-operations printed no verdict on origin/main.
+    # Added item 7: --list-operations printed no verdict on origin/main. It prints each token's
+    # verdict at every site that carries the token, not each site's own.
     gate = _gate()
     package = tmp_path / "selftest"
     package.mkdir()
@@ -2325,3 +2349,76 @@ def test_list_operations_prints_each_sites_verdict(
     sha1 = [line for line in lines if "(hashlib.sha1)" in line]
     assert md5 and not md5[0].endswith(gate.OUT_OF_SCOPE), lines
     assert sha1 and sha1[0].endswith(gate.OUT_OF_SCOPE), lines
+
+
+# --- BACKLOG #5578 added item 4, and #8299 items 22 and 24 ------------------------------------------
+
+
+def test_an_out_of_scope_label_variant_is_judged_at_its_own_site() -> None:
+    # Added item 4: origin/main confirmed by callee file-wide, so the in-scope sha256 call in f kept
+    # green the md5 variant in g, which the union reading gives through the stdlib ``hmac`` that g's
+    # first-party ``hmac`` shadows.
+    gate = _gate()
+    ops = gate.crypto_operations
+    source = (
+        "import hmac\n\n\ndef f(k, m):\n    return hmac.new(k, m, 'sha256')\n\n\n"
+        "def g(k, m):\n    from messagefoundry import helper as hmac\n"
+        "    return hmac.new(k, m, 'md5')\n"
+    )
+    modules = ops.parse_sources(
+        {"messagefoundry/x.py": source, "messagefoundry/helper.py": "def new(*a):\n    return a\n"}
+    )
+    discovered = ops.discover_operations_in_modules(modules)
+    assert ops.aggregate(discovered)["messagefoundry/x.py"] == frozenset(
+        {"mac:hmac.new[sha256]", "mac:hmac.new[md5]"}
+    )
+    assert gate.judge_operations(modules, discovered)["messagefoundry/x.py"] == frozenset(
+        {"mac:hmac.new[sha256]", "mac:hmac.new[md5] (out of scope)"}
+    )
+
+
+def test_the_positive_control_reds_when_judgment_is_file_wide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate's own control must notice a revert to judging by callee file-wide (added item 4).
+    gate = _gate()
+    assert gate.operations_self_test() == []
+    real = gate._site_key
+    monkeypatch.setattr(gate, "_site_key", lambda op: (*real(op)[:1], 0, real(op)[2]))
+    assert gate.operations_self_test()
+    # A key that drops the callee lets an in-scope call confirm another on its line.
+    monkeypatch.setattr(gate, "_site_key", lambda op: (*real(op)[:2], ""))
+    assert gate.operations_self_test()
+
+
+def test_list_operations_judges_the_scanned_operations_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #8299 item 22: origin/main judged the scanned tree's operations twice under --list-operations.
+    gate = _gate()
+    package = tmp_path / "listed"
+    package.mkdir()
+    (package / "x.py").write_text("import hashlib\n\nhashlib.sha256(b'')\n", encoding="utf-8")
+    real = gate.judge_operations
+    calls: list[set[str]] = []
+
+    def counted(modules: Any, operations: Any) -> dict[str, frozenset[str]]:
+        # origin/main passed the aggregated map, so read the paths either way.
+        calls.append(
+            set(operations) if isinstance(operations, dict) else {o.path for o in operations}
+        )
+        result: dict[str, frozenset[str]] = real(modules, operations)
+        return result
+
+    monkeypatch.setattr(gate, "judge_operations", counted)
+    gate.main(["--package", str(package), "--list-operations"])
+    assert [paths for paths in calls if "listed/x.py" in paths] == [{"listed/x.py"}], calls
+
+
+def test_a_weak_call_marked_not_code_names_both_remedies(tmp_path: Path) -> None:
+    # #8299 item 24: on origin/main the message offered only rewording for a real call it marks.
+    gate = _gate()
+    repo = _ts_repo(tmp_path, {"ide/src/planted.ts": "const t = `a\n * ${Math.random()}\n`;\n"})
+    weak = [v for v in gate.check_non_python_randomness(repo)[0] if "WEAK randomness" in v]
+    assert len(weak) == 1 and "Math.random (not code)" in weak[0], weak
+    assert "THE RESIDUAL" in weak[0] and "only if it is prose, reword" in weak[0], weak

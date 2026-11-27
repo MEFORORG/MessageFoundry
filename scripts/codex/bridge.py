@@ -57,8 +57,9 @@ def user_skill_directory() -> Path:
 def repo_skill_directories(root: Path) -> tuple[Path, ...]:
     """This checkout's skills, then the primary checkout's for a linked worktree.
 
-    .gitignore keeps .claude/skills out of git, so a linked worktree holds none of its own. Cached,
-    because sync_skills resolves every pointer through source_skill and each would ask git again.
+    .gitignore keeps .claude/skills out of git but for e2e-smoke/SKILL.md, so a linked worktree holds
+    almost none of its own. Cached, because sync_skills resolves every pointer through source_skill
+    and each would ask git again.
     """
     own = (root / ".claude/skills",)
     top = root.resolve()
@@ -136,8 +137,9 @@ def sync_skills(
                 if not backup.exists():
                     backup.write_bytes(target.read_bytes())
         # Never a markdown link into .claude/skills/: .gitignore keeps everything under .claude/
-        # except settings.json out of git, so such a link dangles in every other clone and fails
-        # tests/test_link_resolution.py. source_skill() applies the repo-first precedence at run time.
+        # except settings.json and skills/e2e-smoke/SKILL.md out of git, so such a link dangles in
+        # every other clone and fails tests/test_link_resolution.py. source_skill() applies the
+        # repo-first precedence at run time.
         pointer = (
             match[0].rstrip()
             + "\n\n"

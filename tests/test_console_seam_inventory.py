@@ -513,6 +513,10 @@ _SEAM_FIELDS: dict[str, Field] = {
             "GET /users/{user_id}/channel-scope",
             "GET /users/{user_id}/permissions",
             "PATCH /users/{user_id}",
+            # BACKLOG #5520 items 2 and 13: the writes that decide on the record read it checked.
+            "PUT /users/{user_id}/roles",
+            "PUT /users/{user_id}/channel-scope",
+            "POST /users/{user_id}/reset-password",
         ),
     ),
     "admin.list_custom_roles": _endpoint("GET /roles/custom"),
@@ -710,16 +714,14 @@ def _J(authority: str, reach: str) -> Ui:
 _AS = "AuthService"
 _E = "get_engine"
 
-#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 129 with OIDC off,
-#: as ADR 0215 measured, and the 4 OIDC legs. A write's authority is its write routes, and a read
-#: only where the write's own gate names a permission that read decides and no write route does:
+#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 130 with OIDC off,
+#: the number :func:`test_the_ui_route_counts_are_the_measured_ones` pins, and the 4 OIDC legs.
+#: A write's authority is its write routes, and a read only where the write's own gate names a permission that read decides and no write route does:
 #: under ADR 0215 section 2 a write makes one sub-request and redirects, and the page it re-renders
 #: on an error today is read on the following GET. :func:`_write_authority_problems` checks it.
 _UI_ROUTES: dict[str, Ui] = {
     "GET /ui/users": _J("GET /users", f"{_AS} admin.list_users"),
-    "GET /ui/users/new": _J(
-        "GET /roles;ADD GET /auth/check/users:manage", f"{_AS} admin.list_roles"
-    ),
+    "GET /ui/users/new": _J("GET /roles;GET /auth/check/users:manage", f"{_AS} admin.list_roles"),
     "GET /ui/users/{user_id}": _J(
         "ADD GET /users/{user_id};GET /roles;GET /users/{user_id}/federated-identity",
         f"{_AS} admin.checked_user admin.federated_identity_view admin.list_roles "
@@ -784,15 +786,20 @@ _UI_ROUTES: dict[str, Ui] = {
         f"{_AS} admin.admin_revoke_user_sessions admin.federated_identity_view admin.list_roles "
         "admin.user_summary_scoped admin.checked_user",
     ),
+    # BACKLOG #5559: the delete confirmation reads the account only to see that it fails its seal,
+    # the checked read the users:manage federated-identity read of one account makes.
+    "GET /ui/users/{user_id}/delete-confirm": _J(
+        "GET /users/{user_id}/federated-identity", f"{_AS} admin.checked_user"
+    ),
     "POST /ui/users/{user_id}/delete": _J(
         "DELETE /users/{user_id}",
         f"{_AS} admin.delete_user admin.federated_identity_view admin.list_roles "
         "admin.user_summary_scoped admin.checked_user",
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
-    "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
+    "GET /ui/roles/new": Ui("check", "GET /auth/check/users:manage", ""),
     "GET /ui/roles/{role_id}/edit": _J(
-        "GET /roles/custom;ADD GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
+        "GET /roles/custom;GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
     ),
     "POST /ui/roles/custom": _J("POST /roles/custom", f"{_AS} admin.create_custom_role"),
     "POST /ui/roles/custom/{role_id}/update": _J(
@@ -935,7 +942,7 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /messages/{message_id}/replay", f"core.replay_message {_E}"
     ),
     "GET /ui/messages/{message_id}/resend-confirm": Ui(
-        "check", "ADD GET /auth/check/messages:resend", ""
+        "check", "GET /auth/check/messages:resend", ""
     ),
     "GET /ui/messages/{message_id}/resend-done": _J(
         "ADD GET /messages/{message_id}/prior-resend", f"core.prior_resend {_E}"
@@ -945,8 +952,7 @@ _UI_ROUTES: dict[str, Ui] = {
         f"{_AS} core.prior_resend core.resend_message {_E}",
     ),
     "GET /ui/messages/{message_id}/edit": _J(
-        "GET /messages/{message_id};GET /messages/{message_id}/raw;"
-        "ADD GET /auth/check/messages:edit",
+        "GET /messages/{message_id};GET /messages/{message_id}/raw;GET /auth/check/messages:edit",
         f"core.get_message core.get_message_body {_E}",
     ),
     # Its gate names messages:view_raw beside messages:edit (BACKLOG #324), because it reads the
@@ -971,7 +977,7 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "POST /ui/csp-report": Ui("public", "", ""),
     "GET /ui/uploaded-logs": _J("GET /uploads", f"core.list_uploaded_files {_E}"),
-    "GET /ui/uploaded-logs/upload-form": Ui("check", "ADD GET /auth/check/files:upload", ""),
+    "GET /ui/uploaded-logs/upload-form": Ui("check", "GET /auth/check/files:upload", ""),
     "POST /ui/uploaded-logs/upload": _J("POST /uploads", f"core.upload_file {_E}"),
     "GET /ui/uploaded-logs/file/{file_id}": _J(
         "GET /uploads/{file_id}/messages", f"core.browse_uploaded_file {_E}"
@@ -983,10 +989,10 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /uploads/{file_id}/resend", f"core.resend_uploaded_message {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/resend-confirm": _J(
-        "GET /uploads;ADD GET /auth/check/messages:edit", f"core.list_uploaded_files {_E}"
+        "GET /uploads;GET /auth/check/messages:edit", f"core.list_uploaded_files {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/delete-confirm": _J(
-        "GET /uploads;ADD GET /auth/check/files:delete", f"core.list_uploaded_files {_E}"
+        "GET /uploads;GET /auth/check/files:delete", f"core.list_uploaded_files {_E}"
     ),
     "POST /ui/uploaded-logs/file/{file_id}/delete": _J(
         "DELETE /uploads/{file_id}", f"core.delete_uploaded_file {_E}"
@@ -1023,11 +1029,11 @@ _UI_ROUTES: dict[str, Ui] = {
         "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
     ),
     "GET /ui/cluster/stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        "GET /cluster/nodes;GET /cluster/status;GET /auth/check/cluster:control",
         f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "GET /ui/cluster/force-stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        "GET /cluster/nodes;GET /cluster/status;GET /auth/check/cluster:control",
         f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "POST /ui/cluster/stepdown": _J("POST /cluster/stepdown", f"core.cluster_stepdown {_E}"),
@@ -1070,7 +1076,7 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /connections/{name}/flag", f"core.audit_channel_denied core.set_connection_flag {_E}"
     ),
     "GET /ui/connections/purge-confirm": _J(
-        "ADD GET /connections/quiesced;ADD GET /auth/check/messages:purge",
+        "ADD GET /connections/quiesced;GET /auth/check/messages:purge",
         f"core.audit_channel_denied {_E} engine.registry_runner",
     ),
     "POST /ui/connections/purge-bulk": _J(
@@ -1563,13 +1569,13 @@ def test_every_ui_route_is_classified_by_the_json_route_carrying_its_authority(
 
 
 def test_the_ui_route_counts_are_the_measured_ones() -> None:
-    """129 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured and ADR 0207's two
-    enrolment-code writes, and 4 OIDC legs."""
+    """130 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured, ADR 0207's two
+    enrolment-code writes and BACKLOG #5559's delete confirmation, and 4 OIDC legs."""
     default = set(_ui_routes(create_app(serve_ui=True)))
-    assert len(default) == 129
+    assert len(default) == 130
     assert set(_UI_ROUTES) == default | _OIDC_ONLY
     counts = Counter(u.kind for u in _UI_ROUTES.values())
-    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
+    assert counts == {"json": 110, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
         counts
     )
 
@@ -1787,7 +1793,7 @@ def test_a_wrong_ui_class_or_authority_is_reported(facts: _UiFacts) -> None:
         "GET /ui/messages/{message_id}/summary": Ui("ceremony", "", body),
         "GET /ui/messages/{message_id}/errors": Ui("public", "", body),
         # A check page given a permission its gate does not name.
-        "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/monitoring:read", ""),
+        "GET /ui/roles/new": Ui("check", "GET /auth/check/monitoring:read", ""),
         # A confirmation page carried by a list read weaker than its own gate.
         "GET /ui/cluster/stepdown-confirm": _J(
             "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"

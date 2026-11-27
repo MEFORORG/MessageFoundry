@@ -166,8 +166,10 @@ def _install_directory(
     monkeypatch.setattr(ldap3, "Connection", FakeConnection)
 
 
-def test_the_kerberos_lookup_resolves_no_principal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``resolve_principal`` with no object id is what the Kerberos sign-in calls."""
+def test_the_name_lookup_resolves_no_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``resolve_principal`` by name alone, as ``create_directory_account`` calls it. The Kerberos
+    sign-in passes ``kerberos_realm`` since BACKLOG #4846, which drops V as a UPN-only match; see
+    tests/test_kerberos_realm_binding.py."""
     _install_directory(monkeypatch, [])
     auth = _authenticator()
     assert auth.resolve_principal("victor") is None
@@ -256,8 +258,9 @@ def test_two_entries_carrying_the_stored_object_id_are_refused() -> None:
 
 
 def test_two_entries_holding_the_name_are_refused_whatever_the_stored_id() -> None:
-    """Same-named accounts in two domains under one search base. The ticket's realm is dropped
-    before the lookup, so it cannot say which one signed in, and the row's id must not choose."""
+    """Same-named accounts in two domains under one search base. The name alone cannot say which
+    one is meant, and the row's id must not choose. The Kerberos lookup keeps only the one in the
+    ticket's realm (BACKLOG #4846); this is the name lookup the other callers keep."""
     other_domain = _carrying(_Entry("victor", "CN=victor,DC=y"), _GUID_V)
     conn = _Conn([_carrying(_X, _GUID_X), other_domain])
     found = _authenticator()._lookup_by_name(conn, "victor", tie_break_object_id=str(_GUID_X))
@@ -318,7 +321,12 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     The real ``LdapAuthenticator`` over a faked ``ldap3``; only the SPNEGO acceptor is replaced. The
     first sign-in finds X alone, and the row it creates is bound to X's id. Then V's UPN collides
     with the name. The sign-in must land on X's row, the one the engine already holds, and a
-    ticket for a name with no row must still be refused."""
+    ticket for a name with no row must still be refused.
+
+    Since BACKLOG #4846 the Kerberos lookup drops V before the tie-break, because V holds the name
+    only as a UPN, so this is still green with #3228 reverted and no longer exercises it. The realm
+    is ``X`` because the entries sit under ``DC=x``: that lookup keeps only entries in the realm's
+    domain."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.store.store import MessageStore
 
@@ -335,7 +343,7 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     _install_directory(monkeypatch, [], answer)
     store = await MessageStore.open(tmp_path / "tie-break.db")
     try:
-        settings = _settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
+        settings = _settings(kerberos_enabled=True, kerberos_realm="X")
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
         await service.initialize()
         await service.set_ad_group_map([(group.lower(), "operator")], actor="admin")
@@ -350,7 +358,8 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
         assert again.ok, again.error
         assert again.identity is not None and again.identity.user_id == row.id
 
-        # Control: the same two entries, for a name no row holds, are still refused.
+        # Control: a name neither entry holds as its sAMAccountName is refused. Since BACKLOG
+        # #4846 that is a no-match rather than the ambiguity it once was.
         ticket["name"] = "vsmith-alias"
         refused = await service.authenticate_kerberos(b"spnego-token")
         assert not refused.ok

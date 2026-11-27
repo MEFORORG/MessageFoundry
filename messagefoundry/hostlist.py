@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A ``host[:port]`` allowlist entry: how one is read, and how a host and a port compare against it
-(BACKLOG #5915).
+(BACKLOG #5915), and the reading of a database ``server`` that names no host (BACKLOG #5512).
 
 One parse serves both sides of the rule. :mod:`messagefoundry.transports.egress` matches with it,
 and :mod:`messagefoundry.config.settings` refuses at load every entry it cannot read, so an entry
@@ -23,9 +23,11 @@ __all__ = [
     "HostKey",
     "allow_entry_problem",
     "canonical_host",
+    "names_no_host",
     "parse_allow_entry",
     "port_number",
     "port_or_zero",
+    "split_generic_server",
 ]
 
 #: A host as the allowlist compares it: an IP literal as an address, a name lowercased.
@@ -190,3 +192,58 @@ def allow_entry_problem(entry: str) -> str | None:
     if port and not port_or_zero(port):
         return "its port is not a number from 1 to 65535"
     return None
+
+
+def split_generic_server(server: str) -> tuple[str, str]:
+    """Split a generic-dialect ``server`` into its host and the text after a port separator, which
+    is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
+
+    ``host:port`` and ``[v6]:port`` are split. A bare IPv6 literal carries more than one colon and
+    is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
+    of hosts, so the text before it need not be the only host dialled. Each caller deals with a
+    comma before it gets here: the egress reading refuses it, and ``generic_hop_endpoint`` in
+    :mod:`messagefoundry.transports.db_endpoint` reads it as its docstring says."""
+    host = server.strip()
+    in_server = ""
+    if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
+        close = host.find("]")
+        if close != -1:
+            host, rest = host[1:close], host[close + 1 :]
+            in_server = rest[1:] if rest.startswith(":") else ""
+    elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
+        host, _, in_server = host.partition(":")
+    return host.strip(), in_server.strip()
+
+
+_ONLY_PUNCTUATION_AND_DIGITS = frozenset("[]:0123456789")
+
+
+def _entry_names_no_host(entry: str) -> bool:
+    host = split_generic_server(entry)[0]
+    if not host:
+        return True
+    # Text made only of brackets, colons and digits is a host only as an IPv6 literal or a plain
+    # number, so `[`, `]` and `:1433:` name none. `::1` and `fe80::1` are literals and stay.
+    if not set(host) <= _ONLY_PUNCTUATION_AND_DIGITS or host.isdigit():
+        return False
+    try:
+        ipaddress.IPv6Address(host)
+    except ValueError:
+        return True
+    return False
+
+
+def names_no_host(server: str) -> bool:
+    """Whether ``server`` names no host (BACKLOG #5512): it is blank, or an entry on either side
+    of a comma is. An entry names none when it is empty, a bare port such as ``:1433``, empty
+    brackets such as ``[]`` or ``[]:1433``, or a host (the text before a ``:port``, brackets
+    removed) made only of brackets, colons and digits that is neither all digits nor an IPv6 literal,
+    such as ``[``, ``]`` or ``:1433:``. A driver has to pick such a destination itself, so no
+    reading here can place the hop.
+
+    **At least these are accepted.** A plain number, bare, bracketed or before a port, such as
+    ``1433``, ``[1433]``, ``1:2`` or ``12:34``, reads as a digits-only host name. ``::`` and ``[::]``
+    are IPv6 literals. A single colon reads as ``host:port``, so a protocol prefix
+    with nothing after it, such as ``tcp:``, counts as naming the host ``tcp``. Other text that is
+    no host name is not judged either."""
+    return any(_entry_names_no_host(entry) for entry in server.split(","))

@@ -90,7 +90,11 @@ from messagefoundry.pipeline.log_forward_watch import LogForwardWatch
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
-from messagefoundry.pipeline.remote_debug_watch import RemoteDebugRefusalWatch
+from messagefoundry.pipeline.remote_debug_watch import (
+    STOP_FLOOR_SECONDS,
+    RemoteDebugRefusalWatch,
+    StopDeadline,
+)
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
@@ -129,6 +133,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    InjectAudit,
     MessageOrigin,
     OperatorAudit,
     OwnedLanes,
@@ -140,6 +145,7 @@ from messagefoundry.store.store import (
     read_audit_anchor_file,
 )
 from messagefoundry.store.transit_attestation import enforce_transit_bound_attestation
+from messagefoundry.threadhop import to_thread_or_loop
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = [
@@ -170,6 +176,56 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 #: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
 #: ``api/app.py``), and spent only while such a write is still running.
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
+
+#: How long stop waits for the graph supervisor to exit on its own, an in-flight reconcile
+#: included, before it cancels it and waits for the cancel to land. A stop budget does not
+#: shorten it (:class:`_StopBudget`).
+_GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
+
+#: Under a stop budget (BACKLOG #3191, :class:`_StopBudget`): the least any budgeted wait is given,
+#: however little of the budget is left.
+_STOP_WAIT_FLOOR_SECONDS = 0.1
+#: Under a stop budget: what an earlier budgeted wait keeps back for each later one, so the
+#: retention runner's or the CRL runner's wait alone does not cut a later wait, such as the
+#: remote-debug watch's last audit pass or the alert-state drain, to the floor. The unbudgeted
+#: steps between them can still spend it, and then those waits get the floor.
+#: tests/test_engine_stop_budget.py sums it against the engine's reserve.
+_STOP_WAIT_SHARE_SECONDS = 0.3
+#: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
+#: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
+_STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
+
+
+class _StopBudget:
+    """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
+
+    The budgeted waits are the retention runner's stop (BACKLOG #6526), the CRL reload runner's
+    stop, the remote-debug refusal watch's stop and the alert-state drain. With no budget each
+    keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left
+    of the budget once the time kept for the steps after it is taken out, and never less than
+    :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
+    when its fixed bound would run into the time kept for the later steps. The budget ends the
+    wait, not what follows it: a wait that runs out does what it does at its fixed bound. The CRL
+    runner's wait then cancels the pass it waited for and waits for that cancel to land with no
+    bound, as before. The graph supervisor's wait and the other stop
+    steps are not budgeted, so they can still run past the budget."""
+
+    def __init__(self, seconds: float | None) -> None:
+        self._deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
+
+    def wait(self, fixed: float, *, kept: float) -> float:
+        """The bound for a wait whose fixed bound is ``fixed``, with ``kept`` seconds held back for
+        the steps after it."""
+        if self._deadline is None:
+            return fixed
+        left = self._deadline - asyncio.get_running_loop().time() - kept
+        return min(fixed, max(_STOP_WAIT_FLOOR_SECONDS, left))
+
+    def deadline(self, *, kept: float) -> StopDeadline | None:
+        """The event-loop time a wait that splits its own share must end by, with ``kept``
+        seconds held back for the steps after it; None with no budget."""
+        return None if self._deadline is None else StopDeadline(self._deadline - kept)
+
 
 #: How long a connection flag toggle waits for the lock, then again for the store (BACKLOG #2623). A
 #: write normally takes milliseconds, so this is a stuck or saturated store. Well under the API's
@@ -697,8 +753,10 @@ class Engine:
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
-        # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at start.
-        # ALERT-ONLY — a break logs WARNING + fires the AlertSink but NEVER crashes startup.
+        # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at
+        # start. ALERT-ONLY — a break logs WARNING + fires the AlertSink, where one is configured,
+        # but NEVER crashes startup.
+        # The anchor read it arms can (see _load_audit_anchor).
         self._audit_verify_on_start = audit_verify_on_start
         # [integrity].audit_anchor_file (#328): the COUNT:HEAD anchor the startup walk compares against,
         # as a PREFIX (`audit_prefix_verdict`) rather than as the CLI's exact seal — see
@@ -1833,19 +1891,23 @@ class Engine:
         reload's swapped declarations, and a value it adds or rotates, are picked up without
         rebuilding it (vault BACKLOG #5698).
 
-        The values are the engine's applied ones, set only once a reload has committed, never the
-        registry runner's, which hold a reload's values before it can still be refused. A sync
-        during a reload can still pair the specs of one graph with the other graph's values, and
-        fail that set; the sync after the reload corrects it."""
+        The specs and values are the last COMMITTED graph's, with its generation, so a pass during
+        a reload never loads a graph or values that reload can still refuse, and never pairs one
+        graph's specs with the other's values (BACKLOG #5892)."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
-                self._registry_runner.registry.references.values()
+                self._registry_runner.committed_graph()[1].references.values()
                 if self._registry_runner is not None
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=lambda: self._env_values,
+            graph_generation=lambda: (
+                self._registry_runner.committed_graph()[0]
+                if self._registry_runner is not None
+                else None
+            ),
+            env_values=self._committed_reference_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -1856,6 +1918,12 @@ class Engine:
             # #3533 item 2 none of them reads it: the weakened-TLS refusal holds at every posture.
             hop_posture=self._hop_posture,
         )
+
+    def _committed_reference_values(self) -> Mapping[str, Any]:
+        # A committed reload's values, which reach self._env_values only once reload returns.
+        runner = self._registry_runner
+        values = None if runner is None else runner.committed_graph()[2]
+        return self._env_values if values is None else values
 
     async def _reconcile_reference_sync(self, *, startup: bool) -> None:
         """Ensure the reference runner exists, materialize the declared sets, and (re-)arm the loop.
@@ -1974,13 +2042,24 @@ class Engine:
         survives restarts while still catching the two things #328 is about — a truncated tail and a
         mid-chain rewrite. A stale anchor therefore stays VALID here; it just witnesses less.
 
-        **Never raises, and never fires the tamper alert.** A missing, unreadable or malformed anchor is a
-        CONFIG fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
-        handling — the same defect :func:`~messagefoundry.store.store.parse_audit_anchor` refuses on the
-        CLI side, and worse here, because an alarm that fires on a typo is an alarm operators learn to
-        ignore. It logs a WARNING naming the file and the reason, and the caller runs the bare walk: the
-        chain is still checked as far as it can be, and the operator is told, in the same line, that the
-        truncation half did not run.
+        **It CAN raise, and so fail startup.** The read catches only ``OSError`` and
+        ``UnicodeDecodeError``, so anything else the reader raises escapes: at least a path carrying
+        a NUL character raises ``ValueError`` out of this method and out of :meth:`start`, before
+        any walk runs, so no audit check runs and the engine does not start (pinned by
+        ``test_startup_anchor_nul_path_raises_value_error``). This docstring states it for the
+        code, and the other code comments point here; the ``audit_anchor_file`` row in
+        docs/CONFIGURATION.md states it for operators. Change the two together.
+
+        For the faults it does catch it never fires the tamper alert. A missing or unreadable
+        anchor, or one :func:`~messagefoundry.store.store.parse_audit_anchor` refuses, is a CONFIG
+        fault, and routing it to ``integrity_drift`` would manufacture a tamper alarm out of input
+        handling, and worse here than on the CLI, because an alarm that fires on a typo is an alarm
+        operators learn to ignore. It logs a WARNING naming the file and the reason, and the caller
+        runs the bare walk: the chain is still checked as far as it can be, and the operator is
+        told, in the same line, that the truncation half did not run. The parser refuses at least a
+        malformed count, but passes a ``vault:v`` head through unchecked, so a malformed one is not
+        caught here and is compared; :func:`~messagefoundry.store.store._audit_head_shape` states
+        what that costs.
 
         The read goes through ``asyncio.to_thread`` like every other file the engine touches, so a slow or
         hung filesystem cannot block the loop during startup."""
@@ -2036,10 +2115,11 @@ class Engine:
 
     async def _verify_audit_chain_on_start(self) -> None:
         """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
-        fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
-        be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
-        without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
-        signal). Swallows every error: the check is defense-in-depth, never a startup gate.
+        fires the AlertSink, where one is configured, but NEVER crashes startup — refusing to boot
+        on a tripped tamper alarm would be a self-inflicted DoS, and the alarm may itself be a false
+        positive (e.g. keyed store opened without the DEK). Reuses the ``integrity_drift`` alert
+        channel (the existing in-place-tamper signal). It swallows every error the walk raises.
+        :meth:`_load_audit_anchor` runs outside that handler and can raise; its docstring says what.
 
         With ``[integrity].audit_anchor_file`` set it also passes that anchor as ``expected_prefix``, which
         is what lets the walk see a TRUNCATED TAIL — the walk alone cannot, because deleting the newest
@@ -2220,8 +2300,9 @@ class Engine:
                 Exception
             ) as exc:  # a sweep failure must never block startup (best-effort hygiene)
                 log.warning("startup attachment sweep failed: %s", safe_exc(exc))
-        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY (never crashes startup); runs
-        # after recovery so the chain is walked in its post-recovery state.
+        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY for a failed verdict, but
+        # the anchor read can still fail startup (see _load_audit_anchor); runs after recovery so
+        # the chain is walked in its post-recovery state.
         if self._audit_verify_on_start:
             await self._verify_audit_chain_on_start()
         elif self._audit_anchor_file is not None:
@@ -2328,10 +2409,10 @@ class Engine:
                     self._reference_runner = self._make_reference_runner()
                 self._reference_runner.start()
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
-        # runs whether or not a graph is wired and survives config reloads. The runner is a no-op when
-        # nothing is configured, so this only spawns a task when [retention] is actually set. It is a
-        # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
-        # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
+        # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
+        # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is
+        # gated on the coordinator: single-node always leads.
         if self._retention_settings is not None:
             engine_dirs, engine_trees = self._engine_owned_dirs()
             self._retention_runner = RetentionRunner(
@@ -3231,7 +3312,7 @@ class Engine:
         snapshot = await self._content_snapshot(path)
         if snapshot is None:
             raise ConfigDigestUnavailable(None)
-        return await asyncio.to_thread(self._approval_of, snapshot)
+        return await to_thread_or_loop("config approval check", self._approval_of, snapshot)
 
     def _approval_of(self, snapshot: ConfigSnapshot) -> ApprovedConfig:
         """What a hold binds of ``snapshot``: its published content digest, which leaves the value
@@ -3272,7 +3353,9 @@ class Engine:
         cannot be read. An approval binds content, so that failure must not refuse a release. That
         one also stays best-effort, skipping what it cannot read, because it records provenance and
         refuses nothing."""
-        return await asyncio.to_thread(self._content_snapshot_blocking, path, self._value_file())
+        return await to_thread_or_loop(
+            "config directory read", self._content_snapshot_blocking, path, self._value_file()
+        )
 
     @staticmethod
     def _content_snapshot_blocking(
@@ -3323,7 +3406,9 @@ class Engine:
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
         reload reads the values from disk."""
-        return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
+        return await to_thread_or_loop(
+            "config directory read", self._reload_snapshot_blocking, path, self._value_file()
+        )
 
     @staticmethod
     def _reload_snapshot_blocking(
@@ -3382,8 +3467,12 @@ class Engine:
         :class:`ConfigDirUnreadable` when resolving or listing it raises another ``OSError``.
         Off the event loop: the resolve opens the target and each parent, and a slow
         volume would otherwise stall every listener for as long as that takes (vault BACKLOG
-        #2581)."""
-        return await asyncio.to_thread(self._existing_reload_target_blocking, config_dir)
+        #2581). A default executor that refuses the hop runs it on a thread of its own, or on
+        the loop when no thread can start, with a WARNING, rather than failing the reload (BACKLOG
+        #5755, item 5)."""
+        return await to_thread_or_loop(
+            "config reload target check", self._existing_reload_target_blocking, config_dir
+        )
 
     def _existing_reload_target_blocking(self, config_dir: str | Path | None) -> Path:
         """:meth:`_existing_reload_target` on a worker thread, in one hop."""
@@ -3689,7 +3778,9 @@ class Engine:
             # Before load_config, which runs every config module's top-level code, so bytes
             # changed since the request are refused before they run. An edit after this read
             # changes nothing: the load runs this snapshot.
-            await asyncio.to_thread(_require_approved, snapshot, approval, self.store.cipher())
+            await to_thread_or_loop(
+                "config approval check", _require_approved, snapshot, approval, self.store.cipher()
+            )
         # The values this reload resolves env() against. A real reload applies them only at the
         # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
         env_values = self._env_values
@@ -3767,7 +3858,8 @@ class Engine:
                 # A provider not handed the snapshot may have read a value file the digest covers
                 # from disk after the check, so the release checks the directory again now, and
                 # refuses an edit made in between rather than apply values nobody approved.
-                await asyncio.to_thread(
+                await to_thread_or_loop(
+                    "config approval check",
                     _require_approved,
                     await self._content_snapshot(path),
                     approval,
@@ -3873,10 +3965,15 @@ class Engine:
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
             failures.append(_outbound_close_failure(close_failures))
+        # The retention loop re-reads the live graph each interval. wake() ends its sleep only when
+        # it is idle, so a window this reload set is enforced at once if the loop was idle, and
+        # otherwise on its next scheduled pass (BACKLOG #6804). It only sets an event.
+        if self._retention_runner is not None:
+            self._retention_runner.wake()
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
-        # CANNOT move before the swap: the runner reads its specs LIVE off _registry_runner.registry
+        # CANNOT move before the swap: the runner reads its specs off the committed graph
         # (see _make_reference_runner), so pre-swap it would materialize the OLD graph's sets and a
         # reload that ADDS a set would leave it unarmed.
         try:
@@ -4062,7 +4159,7 @@ class Engine:
         raw: str,
         source_type: str = "upload",
         metadata: str | None = None,
-        audit: OperatorAudit[str],
+        audit: InjectAudit,
         actor: str,
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
@@ -4075,11 +4172,24 @@ class Engine:
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
         validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
         #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
-        (BACKLOG #2624). Returns the new message id. The message's origin is ``operator_upload`` with
-        ``actor`` as its acting user (vault BACKLOG #2615)."""
+        (BACKLOG #2624). It is an :data:`~messagefoundry.store.store.InjectAudit`, which always
+        builds a row, as the store requires of an inject (BACKLOG #6589). Returns the new message
+        id. The message's origin is ``operator_upload`` with ``actor`` as its acting user (vault
+        BACKLOG #2615). The row records the control id, type and summary, less any value over the
+        bounds of :meth:`RegistryRunner.ingress_fields_for`, which apply the narrowest backend's
+        column widths on every backend (BACKLOG #5707). With no runner they stay ``None``."""
+        runner = self._registry_runner
+        control_id, message_type, summary = (
+            (None, None, None)
+            if runner is None
+            else await runner.ingress_fields_for(channel_id, raw)
+        )
         mid = await self.store.enqueue_ingress(
             channel_id=channel_id,
             raw=raw,
+            control_id=control_id,
+            message_type=message_type,
+            summary=summary,
             source_type=source_type,
             metadata=metadata,
             audit=audit,
@@ -4213,15 +4323,38 @@ class Engine:
             count += 1
         return count
 
-    async def stop(self) -> None:
-        """Stop the retention task + the wired graph, then close the store."""
+    async def stop(self, *, budget_seconds: float | None = None) -> None:
+        """Stop the retention task + the wired graph, then close the store.
+
+        ``budget_seconds`` is the time the managed API lifespan hands this stop, a share of NSSM's
+        graceful-stop window (BACKLOG #3191). It bounds the waits :class:`_StopBudget` names and no
+        others. With none, every wait keeps its fixed bound.
+
+        A tight budget can cut those waits to :data:`_STOP_WAIT_FLOOR_SECONDS` and lose the work
+        they wait for (the owner ruled on 2026-11-22 that the budget wins).
+        docs/SERVICE.md, *Start / stop / status*, says what each cut loses."""
         log.info("engine stopping")
         self._stopping = True
+        budget = _StopBudget(budget_seconds)
+        # Kept back, at each budgeted wait, for the waits after it and the store's close: each
+        # later budgeted wait its share, the watch's cancel wait its floor, and the config-write
+        # drain the bound it will use, or nothing when the gate is closed and no write runs.
+        if self._config_writes_closed and not self._config_writes:
+            config_kept = 0.0
+        elif self._config_writes_closed:
+            config_kept = _CONFIG_WRITE_LATE_DRAIN_SECONDS
+        else:
+            config_kept = _CONFIG_WRITE_DRAIN_SECONDS
+        alert_kept = _STOP_CLOSE_ALLOWANCE_SECONDS
+        watch_kept = alert_kept + _STOP_WAIT_SHARE_SECONDS + config_kept
+        crl_kept = watch_kept + _STOP_WAIT_SHARE_SECONDS + STOP_FLOOR_SECONDS
+        retention_kept = crl_kept + _STOP_WAIT_SHARE_SECONDS
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
         # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
-        # graph itself is then stopped by the registry_runner.stop() below, as before.
+        # stop budget does not shorten that timeout (BACKLOG #3191). The graph itself is then stopped
+        # by the registry_runner.stop() below, as before.
         if self._graph_supervisor is not None:
             self._graph_stop.set()
             # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
@@ -4231,18 +4364,30 @@ class Engine:
             supervisor = self._graph_supervisor
             self._graph_supervisor = None
             try:
-                await asyncio.wait_for(supervisor, timeout=10.0)
+                await asyncio.wait_for(supervisor, timeout=_GRAPH_SUPERVISOR_STOP_SECONDS)
             except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
+        retention_cancelled = False
         if self._retention_runner is not None:
-            await self._retention_runner.stop()
+            retention = self._retention_runner
+            try:
+                await retention.stop(
+                    timeout=budget.wait(retention.stop_timeout_seconds, kept=retention_kept)
+                )
+            except asyncio.CancelledError:
+                # BACKLOG #6526: the retention stop passes a cancel of this stop on once its own
+                # bounded wait ends. It is held, as the intake monitor's below is, so this stop
+                # still closes the store, and raised once the store has closed. A cancel that
+                # lands in a later step before the guarded teardown still leaves at once.
+                retention_cancelled = True
         if self._backup_runner is not None:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
         if self._crl_reload_runner is not None:
-            await self._crl_reload_runner.stop()
+            crl = self._crl_reload_runner
+            await crl.stop(timeout=budget.wait(crl.stop_timeout_seconds, kept=crl_kept))
             self._crl_reload_runner = None
         if self._log_forward_watch is not None:
             await self._log_forward_watch.stop()
@@ -4286,7 +4431,7 @@ class Engine:
         # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
         # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
         # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
-        cancelled = monitor_cancelled
+        cancelled = monitor_cancelled or retention_cancelled
         failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
@@ -4300,7 +4445,7 @@ class Engine:
             # reported by the watch's last pass. That pass may write an audit row and raise an alert,
             # so it runs while the store is open, and ahead of the alert-state drain at the end.
             if self._remote_debug_watch is not None:
-                await self._remote_debug_watch.stop()
+                await self._remote_debug_watch.stop(deadline=budget.deadline(kept=watch_kept))
                 self._remote_debug_watch = None
             # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
             # unused remainder of this process's reserved block and unhooks the refill signal, so anything
@@ -4341,7 +4486,7 @@ class Engine:
             # to land before the store closes. Last, so it covers every stop step above.
             drain = getattr(self._alert_sink, "drain_state", None)
             if drain is not None:
-                await drain(_ALERT_STATE_DRAIN_SECONDS)
+                await drain(budget.wait(_ALERT_STATE_DRAIN_SECONDS, kept=alert_kept))
         except asyncio.CancelledError:
             cancelled = True
         except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised

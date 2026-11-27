@@ -1049,6 +1049,25 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         assert layered.status_code == 404, layered.text
 
 
+async def _store_criteria(engine: Engine, pid: str, criteria: dict[str, Any]) -> None:
+    """Replace a preset's stored criteria THROUGH the store, so the cell is sealed by the cipher as
+    every real write is. A raw ``UPDATE`` of plaintext works only on an engine with no key, so a
+    test that planted it would pass for a reason a keyed store does not share (BACKLOG #6700)."""
+    assert isinstance(engine.store, MessageStore)  # a SQLite engine: the owner read needs _db
+    cur = await engine.store._db.execute(
+        "SELECT owner_user_id, name FROM search_presets WHERE id=?", (pid,)
+    )
+    row = await cur.fetchone()
+    assert row is not None, pid
+    effective, replaced = await engine.store.upsert_search_preset(
+        preset_id=pid,
+        owner_user_id=row["owner_user_id"],
+        name=row["name"],
+        criteria=json.dumps(criteria),
+    )
+    assert (effective, replaced) == (pid, True)
+
+
 async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) -> None:
     """BACKLOG #6700: create_search_preset ran make_spec only beside content or field_path, so a
     criteria holding only field_value was saved and never applied. Control: beside a field path it
@@ -1091,12 +1110,7 @@ async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) ->
         # A stored lone field_value (saved before the refusal existed) is refused on the layered
         # read rather than dropped by the compose.
         pid = meta_only.json()["id"]
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"field_value": "MRN999"}), pid),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, pid, {"field_value": "MRN999"})
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 400, r.text
         assert "field_value needs an HL7 field path" in r.json()["detail"]
@@ -1110,7 +1124,6 @@ async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engin
     non-str field_value on a preset that is NOT the needle was never read on origin/main, so it must
     not become a 500 now. Control: the same layering with an intact second preset also answers 200."""
     pytest.importorskip("psutil")
-    import json
 
     from messagefoundry.api import create_app
 
@@ -1127,21 +1140,12 @@ async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engin
             ids.append(r.json()["id"])
         control = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert control.status_code == 200, control.text
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"channel_id": "ch1", "field_value": 5}), ids[1]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[1], {"channel_id": "ch1", "field_value": 5})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
         # On the NEEDLE preset the same malformed field_value is read by make_spec, which refuses a
         # non-text needle value: a 400, never an AttributeError's 500.
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"content": "MRN999", "field_value": 5}), ids[0]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[0], {"content": "MRN999", "field_value": 5})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 400, r.text
         assert "field_value must be text" in r.json()["detail"]
@@ -1154,7 +1158,6 @@ async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_nee
     spaces beside a channel filter is not a second content predicate, so the layered search runs
     the other preset's DOE search inside IB_A (BACKLOG #6700)."""
     pytest.importorskip("psutil")
-    import json
 
     from messagefoundry.api import create_app
 
@@ -1172,12 +1175,7 @@ async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_nee
             )
             assert r.status_code == 200, r.text
             ids.append(r.json()["id"])
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"content": "   ", "channel_id": "IB_A"}), ids[1]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[1], {"content": "   ", "channel_id": "IB_A"})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
         assert r.json()["matched"] == 1

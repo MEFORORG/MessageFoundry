@@ -23,9 +23,11 @@ reproduces the defect this file exists to prevent one level up.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 from tests import _tooling_manifest as tooling_manifest  # noqa: E402
+from tests._workflow_contexts import changes_arm_pattern  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -51,18 +54,10 @@ def _gate_regex() -> str:
     comment cannot silently pick up a different arm. If the shape changes, this raises and the file
     goes red -- which is the correct outcome, not a false pass.
     """
-    text = _CI.read_text(encoding="utf-8")
     # `tooling=true` is emitted THREE times: the workflow_dispatch and push early-exits, and the
-    # pull_request path arm. Only the last is a path decision -- the first two are unconditional and
-    # sit ahead of any grep in the step. rfind, deliberately: anchoring on the first match found no
-    # preceding `grep -qE` at all, which is the honest failure this comment exists to prevent
-    # recurring as a silent wrong-arm pickup if the block order ever changes.
-    emit = text.rfind('echo "tooling=true" >> "$GITHUB_OUTPUT"')
-    assert emit > 0, "the tooling arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
-    # the LAST grep -qE before that emission is the path arm
-    matches = list(re.finditer(r"grep -qE '([^']*)'", text[:emit]))
-    assert matches, "no `grep -qE` found before the tooling emission"
-    return matches[-1].group(1)
+    # pull_request path arm. Only the last is a path decision, which is why the shared reader
+    # anchors on the LAST emission; anchoring on the first found no preceding `grep -qE` at all.
+    return changes_arm_pattern("tooling", "tooling_manifest")
 
 
 def gate(changed: list[str]) -> bool:
@@ -125,17 +120,32 @@ _CASES = [
     ([".pre-commit-config.yaml"], True, "an autoupdate PR must face test_lint_scope_parity"),
     (["constraints.lock"], True, "a lock-only ruff bump edits no other file this gate names"),
     # Two negatives, one per way those two alternatives can go wrong, because neither way reds
-    # anything else here. `uv.lock` is the SCOPE guard: ci.yml lists constraints.lock rather than its
-    # two siblings because it is the file the test READS, and a widening (an added sibling, or a
-    # `\.lock$`-shaped alternative) would run this whole tier on every dependency PR while quietly
-    # replacing a reasoned choice. `constraints_lock` is the SHAPE guard: it is not a path and cannot
+    # anything else here. `uv.lock` is the SCOPE guard: ci.yml lists constraints.lock and
+    # requirements.lock because listed tests READ them (requirements.lock since BACKLOG #5472, through
+    # test_ci_venv_pinning's runtime-export sweep), and no listed test reads uv.lock by name. A widening to it
+    # (or a `\.lock$`-shaped alternative) would run this whole tier on every edit of a lock nothing
+    # here reads, while quietly replacing a reasoned choice. `constraints_lock` is the SHAPE guard: it is not a path and cannot
     # become one, which is exactly why it works -- it matches only if `constraints\.lock` loses its
     # backslash, and an unescaped dot reads as correct in review. The leading `\.` of
     # `\.pre-commit-config\.yaml` gets no equivalent probe: under the `^` anchor an unescaped one
     # matches any single leading character, so every candidate is a path nobody would ever add, and a
     # row nobody believes gets deleted the first time it is inconvenient.
-    (["uv.lock"], False, "sibling locks are unlisted: constraints.lock is what the test READS"),
+    (["uv.lock"], False, "no listed test reads uv.lock by name; constraints.lock is what it READS"),
     (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
+    # BACKLOG #5472: each file below is read from the repository by a manifest entry, and before
+    # that row none matched an arm, so a PR editing only one met the test that reads it on no leg.
+    # NOT CLOSED: a listed test that scans every tracked file, such as
+    # test_defaulted_credential_lint, reads paths no arm names, so a PR touching only those meets
+    # it first on push-to-main.
+    ([".gitleaks.toml"], True, "test_merge_gate_controls reads the gitleaks allowlist"),
+    ([".semgrep/messagefoundry.yml"], True, "test_required_contexts scans the semgrep rules"),
+    ([".codex/config.toml"], True, "test_codex_bridge reads the Codex hook config"),
+    (["ci/locks/release-tools.lock"], True, "test_ci_venv_pinning reads the release lock"),
+    (["ci/locks/ci-quality.lock"], True, "test_quality_advisory_invariants reads it"),
+    (["ci/locks/ci-scanners.lock"], True, "a sibling under the same ci/locks/ arm"),
+    (["requirements.lock"], True, "test_ci_venv_pinning sweeps the runtime exports"),
+    (["docker/locks/requirements-core.lock"], True, "one of those runtime exports"),
+    (["security/locks/requirements-harness.lock"], True, "one of those runtime exports"),
     # The CI Python pin. A patch bump edits that one file, and the test that reads it is a manifest
     # entry, so without this arm the bump PR would meet that test on no leg.
     (
@@ -272,6 +282,11 @@ def _pr_repo(cwd: Path, changed: list[str]) -> str:
     return base
 
 
+def _legs(matrix: str) -> list[str]:
+    """The os of each leg in a `tooling_matrix` output, an `include` list, in order."""
+    return [str(leg["os"]) for leg in json.loads(matrix)["include"]]
+
+
 def test_the_tooling_job_reads_the_matrix_and_does_not_carry_a_literal() -> None:
     """A literal `os: [...]` here would silently undo the narrowing and still look correct."""
     doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
@@ -291,9 +306,7 @@ def test_every_non_pr_arm_emits_a_matrix(tmp_path: Path, event: str) -> None:
         f"the `{event}` arm exits without writing tooling_matrix. fromJSON on an unset output FAILS "
         "the job -- it does not fall back to a full matrix"
     )
-    assert json.loads(outputs["tooling_matrix"])["os"], (
-        f"the `{event}` arm emitted an empty os list"
-    )
+    assert _legs(outputs["tooling_matrix"]), f"the `{event}` arm emitted an empty leg list"
 
 
 def test_a_docs_only_pr_gets_one_leg_and_a_code_pr_gets_both(tmp_path: Path) -> None:
@@ -314,14 +327,14 @@ def test_a_docs_only_pr_gets_one_leg_and_a_code_pr_gets_both(tmp_path: Path) -> 
         "THE FILTER MUST NOT NARROW. 22 manifest files read documents, so a docs PR still runs this "
         "tier -- the change here narrows the MATRIX only"
     )
-    docs_legs = json.loads(docs_out["tooling_matrix"])["os"]
+    docs_legs = _legs(docs_out["tooling_matrix"])
 
     code = tmp_path / "code_pr"
     code.mkdir()
     base = _pr_repo(code, ["messagefoundry/api/app.py"])
     code_out = _run_detector(bash, code, "pull_request", base_sha=base)
     assert code_out["code"] == "true"
-    code_legs = json.loads(code_out["tooling_matrix"])["os"]
+    code_legs = _legs(code_out["tooling_matrix"])
 
     assert docs_legs == ["ubuntu-latest"], (
         f"docs-only PR should run one ubuntu leg, got {docs_legs}"
@@ -340,11 +353,169 @@ def test_a_fork_never_pays_for_the_windows_leg(tmp_path: Path) -> None:
     """The rule the `matrix` and `ide_matrix` outputs already follow, asserted for this one too."""
     bash = require_bash(tmp_path)
     outputs = _run_detector(bash, tmp_path, "push", repo="someone/MessageFoundry")
-    legs = json.loads(outputs["tooling_matrix"])["os"]
+    legs = _legs(outputs["tooling_matrix"])
     assert legs == ["ubuntu-latest"], (
         f"a fork should build this tier on ubuntu only, got {legs} -- the 2x-billed Windows leg "
         "would be spending a contributor's own minutes"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE TEST SHARDS (owner ruling 2026-11-24): windows-2025 runs the tier as 3 test shards, ubuntu as
+# one leg. A leg's `shard` and `of` reach scripts/quality/shard_tests.py `--suite tooling`; that
+# script's own tests hold the split, these hold the wiring. A leg whose shards had a gap, a second
+# `of`, a shared check name or a shared artifact name would drop files, fail the upload, or hide a
+# red leg behind its sibling's name, each with every other check here green.
+# ---------------------------------------------------------------------------------------------
+
+_HARNESS_STEP = "Harness tests (pytest)"
+_GUARD_STEP = "Tooling shards partition pytest's collection"
+_RECEIPT_STEP = "Prove the tier actually ran"
+
+
+@functools.cache
+def _tooling_job() -> dict[str, object]:
+    """Parsed once per process: ci.yml does not change under a test run, and nothing mutates it."""
+    job: dict[str, object] = yaml.safe_load(_CI.read_text(encoding="utf-8"))["jobs"]["tooling"]
+    return job
+
+
+def _tooling_step(name: str) -> dict[str, object]:
+    steps = _tooling_job()["steps"]
+    assert isinstance(steps, list)
+    found = [s for s in steps if s.get("name") == name]
+    assert len(found) == 1, f"expected one {name!r} step in the tooling job, found {len(found)}"
+    return dict(found[0])
+
+
+@pytest.fixture(scope="module")
+def full_matrix(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, str]]:
+    """The push arm's `tooling_matrix`, from one run of the real detector step for this module."""
+    work = tmp_path_factory.mktemp("tooling_matrix")
+    bash = require_bash(work)
+    outputs = _run_detector(bash, work, "push")
+    return list(json.loads(outputs["tooling_matrix"])["include"])
+
+
+def test_windows_2025_runs_the_tier_in_three_test_shards_and_ubuntu_in_one(
+    full_matrix: list[dict[str, str]],
+) -> None:
+    """Falsified by dropping `$TW"3"}` from TOOLING_FULL in ci.yml: RED. Restored."""
+    legs = full_matrix
+    assert legs == [
+        {"os": "ubuntu-latest", "shard": "1", "of": "1"},
+        *({"os": "windows-2025", "of": "3", "shard": str(n)} for n in (1, 2, 3)),
+    ], legs
+
+
+def test_every_tooling_leg_has_its_own_check_name_and_junit_artifact(
+    full_matrix: list[dict[str, str]],
+) -> None:
+    """The name is the expression ci-gate's CHECK_NAMES shows as `repo harness tests (*)`. THE PIN
+    ON IT IS THE CONTROL: the per-leg names below are this file's own rendering of that expression,
+    so they show what the pinned text produces and cannot catch an edit made to both. Falsified by
+    naming the job `repo harness tests (${{ matrix.os }})`: RED on the pin. Restored."""
+    assert _tooling_job()["name"] == (
+        "repo harness tests (${{ matrix.of == '1' && matrix.os || format('{0}, shard {1} of {2}', "
+        "matrix.os, matrix.shard, matrix.of) }})"
+    )
+    legs = full_matrix
+    names = [
+        leg["os"] if leg["of"] == "1" else f"{leg['os']}, shard {leg['shard']} of {leg['of']}"
+        for leg in legs
+    ]
+    assert "ubuntu-latest" in names, "the ubuntu leg's check name changed"
+    assert len(set(names)) == len(names), names
+    upload = _tooling_step("Upload the tier's junit")
+    template = str(dict(upload["with"])["name"])  # type: ignore[call-overload]
+    assert (
+        template == "tooling-junit-${{ matrix.os }}-shard-${{ matrix.shard }}-of-${{ matrix.of }}"
+    )
+    artifacts = {
+        template.replace("${{ matrix.os }}", leg["os"])
+        .replace("${{ matrix.shard }}", leg["shard"])
+        .replace("${{ matrix.of }}", leg["of"])
+        for leg in legs
+    }
+    assert len(artifacts) == len(legs), artifacts
+
+
+def test_each_leg_runs_its_own_shard_of_the_tier() -> None:
+    """The selector call, the `@file` argument and the env that feeds both, read off the step."""
+    step = _tooling_step(_HARNESS_STEP)
+    env = dict(step["env"])  # type: ignore[call-overload]
+    assert env["TOOLING_SHARD"] == "${{ matrix.shard }}"
+    assert env["TOOLING_OF"] == "${{ matrix.of }}"
+    run = str(step["run"])
+    assert (
+        'shard_tests.py --suite tooling --shard "$TOOLING_SHARD" --of "$TOOLING_OF"'
+        " > out/tooling-shard/files.txt"
+    ) in run
+    pytest_line = next(line for line in run.splitlines() if line.startswith("pytest "))
+    assert pytest_line.endswith(" @out/tooling-shard/files.txt"), pytest_line
+    for needle in ('-n "$TOOLING_WORKERS"', "--dist loadfile", "-m tooling", "--durations="):
+        assert needle in pytest_line, f"{needle!r} left the harness step: {pytest_line}"
+
+
+def test_the_partition_guard_reads_the_tier_s_selection_on_one_leg(
+    full_matrix: list[dict[str, str]],
+) -> None:
+    """Falsified by `--of 2` on the guard line: RED on the count. Restored."""
+    harness = str(_tooling_step(_HARNESS_STEP)["run"])
+    pytest_line = next(line for line in harness.splitlines() if line.startswith("pytest "))
+    guard = _tooling_step(_GUARD_STEP)
+    condition = str(guard["if"])
+    for needle in ("!cancelled()", "steps.tests.outcome == 'success'", "runner.os == 'Linux'"):
+        assert needle in condition, condition
+    match = re.fullmatch(
+        r"python scripts/quality/shard_tests\.py --suite tooling --of (\d+) --check-collection"
+        r" -- (.+)",
+        str(guard["run"]).strip(),
+    )
+    assert match, guard["run"]
+    shard_counts = {leg["of"] for leg in full_matrix if leg["of"] != "1"}
+    assert shard_counts == {match.group(1)}, (shard_counts, match.group(1))
+    # The selection is every `-m` and every `--ignore-glob` the harness line carries, and the
+    # guard's tail must be exactly that: a narrower or broader guard compares the wrong collection.
+    argv = shlex.split(pytest_line)
+    selection = [w for i, w in enumerate(argv) if w == "-m" or (i and argv[i - 1] == "-m")]
+    selection += [w for w in argv if w.startswith("--ignore-glob")]
+    assert shlex.split(match.group(2)) == selection, (match.group(2), selection)
+    assert selection[:2] == ["-m", "tooling"], selection
+
+
+def test_the_receipt_holds_each_shard_to_its_share_and_a_dead_marker_still_goes_red(
+    tmp_path: Path,
+) -> None:
+    """A dead marker executes nothing on every shard, so the per-shard floor still fires on it.
+    Falsified by `return min_executed` in floor_for: RED on the 334-test shard. Restored."""
+    step = _tooling_step(_RECEIPT_STEP)
+    assert str(step["run"]).endswith('--shards "$TOOLING_OF"'), step["run"]
+    assert dict(step["env"])["TOOLING_OF"] == "${{ matrix.of }}"  # type: ignore[call-overload]
+    script = _ROOT / "scripts" / "ci" / "tooling_receipt.py"
+
+    def receipt(executed: int, skipped: int, shards: int) -> int:
+        report = tmp_path / f"junit-{executed}-{skipped}-{shards}.xml"
+        cases = (
+            '<testcase name="t"/>' * executed + '<testcase name="s"><skipped/></testcase>' * skipped
+        )
+        report.write_text(
+            f"<testsuites><testsuite>{cases}</testsuite></testsuites>", encoding="utf-8"
+        )
+        done = subprocess.run(  # noqa: S603  # nosec B603 - this interpreter, fixed argv
+            [sys.executable, str(script), "--report", str(report), "--shards", str(shards)],
+            capture_output=True,
+            timeout=120,
+            check=False,
+            cwd=str(_ROOT),
+        )
+        return done.returncode
+
+    assert receipt(0, 2000, 3) == 1, "a dead marker (everything skipped) passed a shard's receipt"
+    assert receipt(334, 0, 3) == 0, "a shard that ran its third of the floor went red"
+    assert receipt(333, 0, 3) == 1
+    assert receipt(334, 0, 1) == 1, "the unsharded leg must keep the whole floor"
+    assert receipt(1000, 0, 1) == 0
 
 
 # ---------------------------------------------------------------------------------------------

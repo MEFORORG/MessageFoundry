@@ -75,10 +75,25 @@ from messagefoundry.logging_guard import (
 from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
+    clamp_untrusted,
     prepare_log_record,
+    redact,
     redact_binary_carriage,
     redact_untrusted,
     safe_traceback,
+)
+from messagefoundry.secretscrub import (
+    _BYTES_PROBE,
+    _KV_TAILS,
+    _SHIPPED_TAILS,
+    CREDENTIAL_PLACEHOLDER,
+    _braced_tail,
+    _mask_only,
+    _without_tails,
+    could_take_a_tail,
+    mask_private_key_blocks_then,
+    scrub_credentials,
+    scrub_credentials_without_tails,
 )
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
@@ -91,7 +106,6 @@ from messagefoundry.redaction import (
 from messagefoundry.secretscrub import (
     _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS,
 )
-from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
     "LogFile",
@@ -308,7 +322,7 @@ class RedactionFilter(logging.Filter):
         # pattern can tell from prose. The tray's chain shares the step, through the same function.
         prepare_log_record(record)
         try:
-            _rewrite_record(record, redact_untrusted)
+            _rewrite_record(record, _redact_masking_key_blocks)
         except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
             # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
             # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
@@ -390,9 +404,16 @@ _QUERY_VALUE = (
     r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
 )
 
+#: A query value that is a Python bytes literal, ``token=b"v w"``, takes ``secretscrub``'s bytes tail
+#: after the ``b`` the value class takes, and writes it back masked (BACKLOG #5547). Refusing the
+#: ``b`` instead would print what the value class hid.
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _QUERY_VALUE,
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _BYTES_PROBE + _QUERY_VALUE + _KV_TAILS,
 )
+# Registered where secretscrub's ``_without_tails`` checks it, so a strip of this pattern that
+# changes nothing, a respelled fragment, raises rather than leaving :func:`_scrub_credential_query`
+# comparing a reading with itself.
+_SHIPPED_TAILS[id(_CREDENTIAL_QUERY_RE)] = (_KV_TAILS, _BYTES_PROBE)
 
 
 def _scrub_credential_query(text: str) -> str:
@@ -401,7 +422,47 @@ def _scrub_credential_query(text: str) -> str:
     ``CREDENTIAL_PLACEHOLDER`` rather than a second literal ``<redacted>``: one log line must not be
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
-    return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+    tailed = _CREDENTIAL_QUERY_RE.sub(_query_repl, text)
+    if tailed is text or not could_take_a_tail(text):
+        return tailed
+    # A bytes tail masks text the credential pass after this filter reads (BACKLOG #5547), and this
+    # filter has no union behind it. So the tailed value is kept only where what that pass then
+    # prints is what it printed before the tails, with characters written as "x"; the comment on
+    # secretscrub's _NO_LABEL_BEFORE states this control.
+    before = _scrub_credential_query_without_tails(text)
+    if tailed == before or _mask_only(
+        scrub_credentials_without_tails(before), scrub_credentials(tailed)
+    ):
+        return tailed
+    return before
+
+
+def _scrub_credential_query_without_tails(text: str) -> str:
+    """:func:`_scrub_credential_query` as it read before the masked tails (BACKLOG #5547)."""
+    return _without_tails(_CREDENTIAL_QUERY_RE).sub(_query_repl, text)
+
+
+def _query_repl(m: re.Match[str]) -> str:
+    return f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}{_braced_tail(m)}"
+
+
+def _redact_masking_key_blocks(text: str) -> str:
+    """:func:`~messagefoundry.redaction.redact_untrusted` with the PRIVATE KEY block mask between
+    its clamp and its scan (BACKLOG #5550). The mask runs before the PHI pass because that pass reads
+    a block's markers as a name run and rewrites them, so no pass after it could find the block;
+    after the clamp, so it scans no more than the PHI pass does (BACKLOG #1576).
+    :func:`~messagefoundry.secretscrub.mask_private_key_blocks_then` keeps the PHI pass's reading of
+    the unmasked text wherever, read through the credential passes the chain runs next
+    (:func:`_credential_passes`), the masked one differs from it at anything but an "x". The
+    comparison holds only as read through those passes, so a caller that does not run them after
+    compares through the PHI pass alone, as :class:`JsonFormatter`'s ``exc_info`` branch does."""
+    return mask_private_key_blocks_then(clamp_untrusted(text), redact, _credential_passes)
+
+
+def _credential_passes(text: str) -> str:
+    """The credential passes the chain runs after the PHI pass, which the key-block comparison
+    reads through: a masked body line can take away a label they read."""
+    return scrub_credentials(_scrub_credential_query(text))
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:
@@ -532,9 +593,9 @@ def redacted_log_field(
     text: str,
     limit: int,
     *,
-    before: str = "",
+    before: str,
     after: str = "",
-    checks: tuple[tuple[str, str], ...] = (),
+    checks: tuple[tuple[str, str], ...],
 ) -> str:
     """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
     :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
@@ -552,7 +613,13 @@ def redacted_log_field(
     or ``after``. What a caller passes there decides what the field hides, and empty or wrongly
     spelled context can leave readable what the shipped filters would redact in the full line. A new
     caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py does, before it
-    ships.
+    ships. Two checks back this up in code (BACKLOG #3770): ``before`` and ``checks`` have no
+    default, so a caller states both, an empty one included; and
+    ``tests/test_redacted_log_field_census.py`` pins the references to this function,
+    :func:`redact_log_value` and :func:`~messagefoundry.controlchars.log_field_token` that its walk
+    of the shipped packages finds by name, fails on a new one or on a ``before`` or ``after`` that
+    is not a literal or a module constant bound once, and names for each pinned caller a test
+    module with a test that calls it. That test's docstring lists at least what the walk misses.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would
@@ -697,9 +764,12 @@ class JsonFormatter(_SafeExcFormatter):
     alphabet. It writes the rest raw: at least DEL, the C1 controls, the format characters such as a
     bidirectional override, U+2028 and U+2029, a lone surrogate, and the private-use and unassigned
     code points (vault BACKLOG #2815). Such a handler also leaves the message, its arguments and
-    ``stack_info`` unredacted, and scrubs no credential anywhere. The ``exc_info`` branch below is
-    the only PHI redaction on it, and it runs only when no earlier formatter on the same record has
-    already cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
+    ``stack_info`` unredacted, and scrubs no credential anywhere, except that the ``exc_info``
+    branch below can mask the body of a PRIVATE KEY block in the traceback it renders, where the
+    masked reading passes that branch's comparison; where it does not, the body prints whole
+    (BACKLOG #5550). That branch is the only
+    PHI redaction on it, and it runs only when no earlier formatter on the same record has already
+    cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
     carries the filters, so none of this reaches a configured sink. Use this formatter only on a
     handler that carries the same filters.
 
@@ -726,7 +796,12 @@ class JsonFormatter(_SafeExcFormatter):
             # lists what still passes.
             # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
             # filter-less handler is exactly the one with nothing upstream to have clamped it already.
-            payload["exception"] = redact_untrusted(self.formatException(record.exc_info))
+            # The key-block mask is compared through the PHI pass alone: no credential pass runs
+            # after this branch, so its output is the PHI pass's reading of the clamped traceback,
+            # or that reading with characters written as "x" (BACKLOG #5550).
+            payload["exception"] = mask_private_key_blocks_then(
+                clamp_untrusted(self.formatException(record.exc_info)), redact
+            )
         if record.stack_info:
             payload["stack"] = record.stack_info
         return json.dumps(payload, ensure_ascii=False)
@@ -846,6 +921,11 @@ _SPOOL_POLL = 1.0
 #: instead, which keeps the order.
 _SPOOL_REPLAY_BATCH = 500
 
+#: The least time, in seconds, from a UDP forwarder's socket being built to its rebuild after a
+#: failed send (BACKLOG #5923). A rebuild clears a socket that went bad; the interval keeps an
+#: outage from costing a new socket per record.
+_UDP_SOCKET_REBUILD_SECONDS = 30.0
+
 
 def is_permanent_connect_error(exc: BaseException) -> bool:
     """Whether a connect failure will not fix itself by waiting (BACKLOG #1966).
@@ -918,6 +998,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     send_error_cause: str = ""
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
+    #: When :meth:`createSocket` last ran, on the monotonic clock: a UDP socket is rebuilt after a
+    #: failed send only once :data:`_UDP_SOCKET_REBUILD_SECONDS` have passed since.
+    _socket_built_at: float = 0.0
 
     def __init__(
         self,
@@ -953,6 +1036,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.startup_error = exc
 
     def createSocket(self) -> None:
+        self._socket_built_at = time.monotonic()
         super().createSocket()
         # SysLogHandler.socket is set at runtime (not in typeshed); getattr keeps this mypy-clean
         # across typeshed versions without a fragile per-version type: ignore.
@@ -989,7 +1073,8 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
+        """Drop a stream socket after a network error, so the **next** record reconnects (BACKLOG
+        #1199); a UDP socket only on the age and error terms the comment in the body gives.
 
         ``SysLogHandler.emit`` reconnects only under ``if not self.socket``, and it never clears
         ``self.socket`` when a send fails. On the shipped handler a stream forwarder that broke
@@ -1038,9 +1123,19 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
-            # An unconnected datagram socket stays usable after a failed sendto, so only a stream
-            # socket is dropped; a UDP reset would cost a fresh lookup per record in an outage.
-            if sock is not None and self.socktype != socket.SOCK_DGRAM:
+            # A stream socket is dropped on every failure. An unconnected datagram socket usually
+            # stays usable after a failed sendto, so it is dropped, for the next send to rebuild,
+            # only once it is older than an interval (BACKLOG #5923): never dropped, one that went
+            # bad stayed bad for good; dropped each time, an outage would cost a new socket per
+            # record. A failed lookup of the collector's name is no fault of the socket, so it
+            # drops nothing.
+            if sock is not None and (
+                self.socktype != socket.SOCK_DGRAM
+                or (
+                    not isinstance(exc, socket.gaierror)
+                    and time.monotonic() - self._socket_built_at >= _UDP_SOCKET_REBUILD_SECONDS
+                )
+            ):
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
                 # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
                 # it) is achieved above, and logging from inside the logging error path would recurse.
@@ -1235,15 +1330,22 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
 
 def scrub_log_text(text: str) -> str:
-    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order: PHI
-    redaction (bounded), the credential query scrub, the credential scrub, then the binary-carriage
-    pass. The control scrub, which runs last on a handler, is left out, so a control character stays
+    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order, as
+    they read before the masked tails (see below): PHI redaction (bounded), the credential query
+    scrub, the credential scrub, then the binary-carriage pass. The control scrub, which runs last on a handler, is left out, so a control character stays
     as it is.
 
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
-    #3045). A handler still runs its chain over the encoded line afterwards."""
+    #3045). A handler still runs its chain over the encoded line afterwards.
+
+    It reads as those passes did before the masked tails and the PRIVATE KEY block mask (BACKLOG
+    #5546 to #5550). The tee compares readings of a value with its controls read as spaces, where a
+    tail can fire that the value itself refuses, and it hid the whole field where the two
+    differed. The chain a handler runs over the encoded line still takes the tails."""
     return redact_binary_carriage(
-        scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+        scrub_credentials_without_tails(
+            _scrub_credential_query_without_tails(redact_untrusted(text))
+        )
     )
 
 
@@ -2389,6 +2491,29 @@ def configure_logging(
                 )
             root.addHandler(_build_queued_forwarder(fwd_handler, fmt=forward.fmt, spool=spool))
             forwarder_installed = True
+            if spool is None and forward.spool_dir and forward.spool_max_bytes <= 0:
+                # Logged once the forwarder is installed, so the line is sent to the collector too
+                # (best effort, like every forwarded line), and only when it is. A start whose
+                # forwarder does not install says so through the arm above that it takes: at least
+                # a WARNING for a transient connect failure and an ERROR for a permanent one, both
+                # of which [logging].level can still filter, while a refused hop raises. A clean
+                # spool-off start was otherwise silent (vault BACKLOG #1199). Through Logger.handle,
+                # which skips the logger's level, so [logging].level does not filter this line.
+                # Unlike __main__._write_start_audit it does not check logging.disable() and records
+                # no caller location (at least the line number and function name).
+                _log.handle(
+                    _log.makeRecord(
+                        _log.name,
+                        logging.WARNING,
+                        __file__,
+                        0,
+                        "off-box log forwarding to %s:%d (%s) runs without loss protection: the "
+                        "on-disk log spool is turned off ([logging].forward_spool_max_bytes = 0), "
+                        "so a record whose send fails is dropped, not kept on disk for a later send",
+                        (forward.host, forward.port, forward.protocol),
+                        None,
+                    )
+                )
 
     # Let uvicorn's loggers flow to the root handler(s) (one shared format/stream/forwarder).
     for name in _UVICORN_LOGGERS:
@@ -2478,7 +2603,8 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
 
     **Not a forwarder.** This puts the record in front of an operator and into whatever the service
     manager captures; it does not transmit anything off the host. The durable off-box forwarder, and
-    the question of what ASVS 16.4.3 requires beyond it, stay open on BACKLOG #1199.
+    the question of what the ASVS off-box logging requirement asks beyond it, stay open on BACKLOG
+    #1199.
 
     Costs nothing on a configured process: it takes the ``hasHandlers`` branch and builds nothing, so
     no new work lands on the event-loop thread a caller may be running on.

@@ -513,8 +513,12 @@ def _encoding_cfg(directory: Path, body: str) -> Path:
             "outbound connection 'o'",
         ),
         # `base64` IS a registered codec, so codecs.lookup() accepts it — but str.encode/bytes.decode
-        # refuse it ("not a text encoding"), and those are what the transports actually call.
-        ("inbound('i', MLLP(port=2575, encoding='base64'), router='r')", "'base64' is not"),
+        # refuse it ("not a text encoding"), and those are what the transports actually call. The
+        # refusal names the connection and withholds the literal (BACKLOG #3765 item 1).
+        (
+            "inbound('i', MLLP(port=2575, encoding='base64'), router='r')",
+            "inbound connection 'i': encoding is not a Python text codec",
+        ),
     ],
 )
 def test_unusable_encoding_refuses_to_load(tmp_path: Path, body: str, match: str) -> None:
@@ -524,9 +528,21 @@ def test_unusable_encoding_refuses_to_load(tmp_path: Path, body: str, match: str
 
 
 def test_validate_config_reports_invalid_inbound_encoding(tmp_path: Path) -> None:
+    """The refusal names the connection and withholds the literal: it is config-module text, which
+    a load error does not quote (BACKLOG #3765 item 1, the encoding limb engine PR 2703 left)."""
     _encoding_cfg(tmp_path, "inbound('i', MLLP(port=2575, encoding='utf8-8'), router='r')")
     diags = [d for d in validate_config(tmp_path) if d.severity == "error"]
-    assert any("'i'" in d.message and "'utf8-8'" in d.message for d in diags)
+    assert any("'i'" in d.message and "not a Python text codec" in d.message for d in diags)
+    assert not any("utf8-8" in d.message for d in diags)
+
+
+def test_a_literal_encoding_naming_no_codec_is_refused_without_its_value(tmp_path: Path) -> None:
+    _encoding_cfg(tmp_path, "outbound('o', File(directory='.', encoding='S3cret-Not-A-Codec'))")
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path)
+    assert "outbound connection 'o'" in str(ei.value)
+    assert "value withheld" in str(ei.value)
+    assert "S3cret" not in str(ei.value)
 
 
 def test_check_validate_fails_on_invalid_encoding(tmp_path: Path) -> None:

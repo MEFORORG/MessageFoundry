@@ -11,7 +11,8 @@ static credential was sent it is what would have crossed; a lone Basic half sent
 refused under one rule, beside Digest a connection configures exactly one HTTP credential, by
 ``refuse_http_digest_conflicts``. REST, SOAP and FHIR call it at the top of construction, and
 ``digest_handler_from_settings`` calls it again. A signing header named ``Authorization`` is
-refused once the connector has built the signer, by ``refuse_authorization_signer_beside_digest``.
+refused once the connector has built the signer, by
+``refuse_authorization_signer_beside_credential``.
 
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
 handler, so a REST connection built with no Digest auth. The pair is refused at construction; the

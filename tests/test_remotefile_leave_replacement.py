@@ -157,6 +157,9 @@ class _Ftp:
     def nlst(self, path: str) -> list[str]:
         return [f"{path}/a.hl7"]
 
+    def voidcmd(self, command: str) -> str:
+        return "200 ok"
+
     def size(self, path: str) -> int:
         return 7
 

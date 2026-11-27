@@ -76,10 +76,11 @@ transformed/routed output against Corepoint's — without MEFOR delivering to re
   (`AE`/`AR`) **does not propagate back to Epic** — Epic sees the relay, not Corepoint. That's why the
   relay **logs every NAK** (see below). Corepoint still NAKs internally; transport failures are surfaced
   via the fail-closed shutdown.
-* **Fail-closed.** On a Corepoint **transport** failure (unreachable, after `--corepoint-attempts` quick
-  retries), the relay **stops accepting on Listener A and drops live Epic connections** so Epic sees the
-  outage and queues/retries on its side. It does **not** exit (so it can't crash-loop against a down
-  Corepoint) — **restart it once Corepoint is healthy.** A message in flight at the instant of the failure
+* **Fail-closed.** On a Corepoint **transport** failure (unreachable on every one of the
+  `--corepoint-attempts` tries, which count the first try, so `1` means no retry), the relay **stops
+  accepting on Listener A and drops live Epic connections** so Epic sees the outage and
+  queues/retries on its side. It does **not** exit (so it can't crash-loop against a down Corepoint)
+  — **restart it once Corepoint is healthy.** A message in flight at the instant of the failure
   may be `AA`'d-but-undelivered; the shutdown bounds further loss and Epic's resend/queue covers the rest.
   (This is a simple fail-closed relay, **not** durable store-and-forward — by design.)
 * **Shadow leg is decoupled.** The MEFOR copy goes through a bounded in-memory queue drained by its own
@@ -110,9 +111,10 @@ python -m tee run --listen-epic :6661 --corepoint corehost:5000 --mefor meforhos
 python -m tee naks --db ./tee.db
 ```
 
-Useful flags: `--corepoint-attempts` / `--corepoint-retry-delay` (quick retries before tripping
-fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame-size DoS cap),
-`--mefor-queue-max` (shadow buffer bound), `--capture-bodies` (persist full bodies — **test data only**),
+Useful flags: `--corepoint-attempts` (tries before tripping fail-closed, a positive integer; see
+*Fail-closed* above) / `--corepoint-retry-delay` (seconds between tries), `--connect-timeout` /
+`--send-timeout`, `--max-frame-bytes` (frame-size DoS cap), `--mefor-queue-max` (shadow buffer
+bound, a positive integer), `--capture-bodies` (persist full bodies — **test data only**),
 `-y/--yes` (skip the test-data-only confirmation for an unattended/service start), `--log-level`,
 `--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
 messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
@@ -186,6 +188,11 @@ consequences follow from it:
   that is neither a regular file nor a directory, such as NUL or CON, for writing in place instead
   of replacing it; the open can be refused, for example for a named pipe, and that is an error and
   exit 1. It writes the platform's line endings.
+* **A failed write can leave a temp file beside the target.** Where the writer does not write in
+  place, it first writes the whole output to a `.<name>.*.tmp` file in the target's folder, and it
+  tries to remove that file when the write raises. At least a failed removal, a killed process or a
+  crash leaves it there. The leading dot hides it on POSIX only. After a failed `--out`, look for
+  one and delete it.
 
 ### Purge
 

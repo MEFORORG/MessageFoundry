@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 from types import MappingProxyType
@@ -719,8 +720,8 @@ def test_dryrun_logs_a_reference_file_it_skips_once(
     was left out with no log line, so a later read reported the set missing with no word on why. The
     line names the set only, never the loader's text: a duplicate-key error quotes the key, which may
     be PHI for a patient-keyed set. It names no cause either, since a guess from the path misnames
-    one. And it is logged once per set per process: `check` rebuilds the view for every fixture on
-    every inbound, and a line per rebuild buries the log."""
+    one. And it is logged once per set per process: a caller that passes no view, as this test
+    does, rebuilds it for every message, and a line per rebuild buries the log."""
     from messagefoundry.pipeline import dryrun
 
     monkeypatch.setattr(dryrun, "_skipped_reference_sets_logged", set())
@@ -1212,3 +1213,219 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         assert [r["key"] for r in rows] == ["OLD"], "the freshly-eligible rows were destroyed"
     finally:
         await store.close()
+
+
+# --- BACKLOG #6820: check reads each reference file once per run, not once per fixture -----------
+
+_REF_RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+
+
+def _counting_loader(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Count the dry run's reference-file loads; the list grows by one path per load."""
+    from messagefoundry.config.code_sets import load_code_set as real
+    from messagefoundry.pipeline import dryrun
+
+    loads: list[str] = []
+
+    def counting(path: str) -> Any:
+        loads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(dryrun, "load_code_set", counting)
+    return loads
+
+
+def test_route_message_reads_a_passed_reference_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that passes ``reference_view`` previews against it, and no file is read; with
+    none passed, each call builds the view and reads the file again (BACKLOG #6820)."""
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    reg = _ref_graph(csv)
+    reg.handlers["h"] = lambda m: [Send("OB_REF", reference("provider_npi")["MED1"])]
+    ic = reg.inbound["IB_REF"]
+
+    view = {"provider_npi": {"MED1": "PASSED"}}
+    passed = [route_message(reg, ic, _REF_RAW, reference_view=view) for _ in range(2)]
+    assert [o.deliveries[0].payload for o in passed] == ["PASSED", "PASSED"]
+    assert loads == []
+
+    built = [route_message(reg, ic, _REF_RAW) for _ in range(2)]
+    assert [o.deliveries[0].payload for o in built] == ["9991", "9991"]
+    assert loads == [str(csv), str(csv)]
+
+
+def _check_repo(
+    tmp_path: Path, ref: Path, handler_body: str, fixtures: int = 3
+) -> tuple[Path, Path]:
+    """A config dir declaring ``provider_npi`` from ``ref`` and one Handler, and ``fixtures``
+    copies of one ADT fixture."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "from messagefoundry import Reference, FileRef, reference\n"
+        f"Reference('provider_npi', source=FileRef(path={str(ref)!r}))\n"
+        "inbound('IB_REF', File(directory='in'), router='r')\n"
+        "outbound('OB_REF', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        f"def h(m):\n{handler_body}",
+        encoding="utf-8",
+    )
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    for n in range(fixtures):
+        (msgs / f"m{n}.hl7").write_text(_REF_RAW, encoding="utf-8")
+    return cfg, msgs
+
+
+def test_check_reads_each_reference_file_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`check` previews every fixture on every inbound, and each preview used to re-read and
+    re-parse every file-backed reference set (BACKLOG #6820). It now builds the view once per run:
+    three fixtures read the file once, and each still reads the set."""
+    from messagefoundry import checks
+
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    body = "    return Send('OB_REF', reference('provider_npi')['MED1'])\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
+
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
+    assert result.ok, result.detail
+    assert result.detail.startswith("3 run(s) clean"), result.detail
+    assert loads == [str(csv)]
+
+
+def test_check_fixtures_each_read_a_fresh_reference_value(tmp_path: Path) -> None:
+    """The run's one view hands every read its own copy of a value, as the live sealed cache does,
+    so a Handler that edits a container it read in one fixture does not change what the next
+    fixture reads (BACKLOG #6820). A shared plain view failed the second and third fixtures."""
+    from messagefoundry import checks
+
+    toml = tmp_path / "npi.toml"
+    toml.write_text('MED1 = ["9991"]\n', encoding="utf-8")
+    body = (
+        "    value = reference('provider_npi')['MED1']\n"
+        "    if value != ['9991']:\n"
+        "        raise ValueError('the reference value changed between fixtures')\n"
+        "    value.append('EDITED')\n"
+        "    return Send('OB_REF', m)\n"
+    )
+    cfg, msgs = _check_repo(tmp_path, toml, body)
+
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
+    assert result.ok, result.detail
+    assert result.detail.startswith("3 run(s) clean"), result.detail
+
+
+def test_check_fails_the_leg_when_the_reference_view_faults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loader fault the view builder does not turn into a skipped set fails the dry-run leg,
+    naming its type alone, rather than raising out of ``check`` and losing the report: built once
+    per run, the view sits outside each fixture's own guard (BACKLOG #6820)."""
+    from messagefoundry import checks
+    from messagefoundry.pipeline import dryrun
+
+    def faulting(path: str) -> Any:
+        raise RecursionError("MRN999SECRET")
+
+    monkeypatch.setattr(dryrun, "load_code_set", faulting)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    body = "    return Send('OB_REF', m)\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
+
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
+    assert not result.ok and result.required and not result.skipped
+    assert result.detail == "reference sets did not load for the preview (RecursionError)"
+
+
+def test_trace_dry_run_reads_a_passed_reference_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``trace_dry_run`` threads a passed ``reference_view`` to the dry run, so no file is read;
+    with none passed, each call builds the view and reads the file again (BACKLOG #6820)."""
+    from messagefoundry.pipeline.dryrun_trace import trace_dry_run
+
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    reg = _ref_graph(csv)
+    read: list[str] = []
+
+    def handle(m: Any) -> list[Send]:
+        read.append(reference("provider_npi")["MED1"])
+        return [Send("OB_REF", m)]
+
+    reg.handlers["h"] = handle
+
+    view = {"provider_npi": {"MED1": "PASSED"}}
+    for _ in range(2):
+        assert trace_dry_run(reg, _REF_RAW, reference_view=view)["error"] is None
+    assert read == ["PASSED", "PASSED"]
+    assert loads == []
+
+    for _ in range(2):
+        assert trace_dry_run(reg, _REF_RAW)["error"] is None
+    assert read[2:] == ["9991", "9991"]
+    assert loads == [str(csv), str(csv)]
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_cli_reads_each_reference_file_once_per_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    trace: list[str],
+) -> None:
+    """The ``dryrun`` CLI, plain and traced, builds the view once per run, as ``check`` does: three
+    fixtures read the file once, and each still reads the set (BACKLOG #6820). Each fixture used
+    to build the view, and read the file, again."""
+    from messagefoundry.__main__ import main
+
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    body = "    return Send('OB_REF', reference('provider_npi')['MED1'])\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
+
+    rc = main(
+        ["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", "--show-phi", *trace]
+    )
+    assert rc == 0
+    assert loads == [str(csv)]
+    entries = json.loads(capsys.readouterr().out)
+    assert len(entries) == 3
+    assert [e["error"] for e in entries] == [None, None, None]
+    if not trace:
+        assert [[d["payload"] for d in e["deliveries"]] for e in entries] == [["9991"]] * 3
+
+
+@pytest.mark.parametrize("trace", [[], ["--trace"]])
+def test_dryrun_cli_refuses_a_reference_view_fault_by_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    trace: list[str],
+) -> None:
+    """A loader fault the view builder does not turn into a skipped set ends the run naming its
+    type alone, as ``check``'s leg does, since the view is built outside each fixture's guard
+    (BACKLOG #6820)."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.pipeline import dryrun
+
+    def faulting(path: str) -> Any:
+        raise RecursionError("MRN999SECRET")
+
+    monkeypatch.setattr(dryrun, "load_code_set", faulting)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    cfg, msgs = _check_repo(tmp_path, csv, "    return Send('OB_REF', m)\n")
+
+    rc = main(["dryrun", "--config", str(cfg), "--messages", str(msgs), "--json", *trace])
+    printed = "".join(capsys.readouterr())
+    assert rc != 0
+    assert "reference sets did not load for the preview (RecursionError)" in printed
+    assert "MRN999SECRET" not in printed

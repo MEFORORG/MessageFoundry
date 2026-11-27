@@ -41,7 +41,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from operator import itemgetter
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, BinaryIO, ClassVar, Literal, NamedTuple, Self, TypeVar
 
 from messagefoundry.config.models import (
@@ -50,6 +50,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     WindowsCredential,
+    flag_from_settings,
 )
 from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7PeekError, Peek
@@ -58,6 +59,7 @@ from messagefoundry.parsing.sniff import (
     _looks_like_hl7,
 )
 from messagefoundry.parsing.split import one_message_bytes, split_batch
+from messagefoundry.path_reach import is_absent
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
@@ -84,6 +86,7 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.framing import declared_encoding
+from messagefoundry.transports.intake import IntakeContext, deliver
 
 __all__ = [
     "FileDestination",
@@ -172,8 +175,9 @@ _TRANSIENT_ERRNOS = frozenset(
     )
     if hasattr(errno, name)
 )
-# Windows maps several of these errnos to EACCES or EINVAL, which alone would read as lasting, so the Windows
-# code is checked first: ERROR_NOT_READY 21, ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
+# Windows codes, checked before the errno: the errno CPython maps a Windows code to does not say
+# whether the failure clears by itself, so these are judged by the code. ERROR_NOT_READY 21,
+# ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
 # ERROR_BAD_NETPATH 53, ERROR_UNEXP_NET_ERR 59, ERROR_NETNAME_DELETED 64, ERROR_BAD_NET_NAME 67,
 # ERROR_DEV_NOT_EXIST 55, ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240,
 # ERROR_NO_NET_OR_BAD_PATH 1222, ERROR_NETWORK_UNREACHABLE 1231, ERROR_HOST_UNREACHABLE 1232,
@@ -546,7 +550,7 @@ class FileDestination(DestinationConnector):
         self.validate_directory: bool = bool(s.get("validate_directory", False))
         self.filename_template: str = s.get("filename", "{MSH-10}.hl7")
         # When two messages resolve to the same name, append a counter rather than clobber.
-        self._overwrite: bool = bool(s.get("overwrite", False))
+        self._overwrite: bool = flag_from_settings(s, "overwrite")
         self.encoding: str = s.get("encoding", "utf-8")
         # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
         # service-account identity, byte-identical. On a non-Windows host a configured credential
@@ -1023,9 +1027,12 @@ class FileSource(SourceConnector):
         if self.sort not in ("name", "mtime"):
             raise ValueError(f"file source sort must be 'name' or 'mtime', got {self.sort!r}")
         self.recursive: bool = bool(s.get("recursive", False))
-        # Encoding used to re-encode split batch messages back to bytes for the handler. A single
-        # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
+        # Encoding _emit decodes a file with to split it, and re-encodes each split message with.
+        # A single (non-batch) message is handed off as parsing.split.one_message_bytes says,
+        # which re-encodes it with this where a byte order mark or an FHS/BHS header leads it.
         # The name rule is the one the runner decodes by (BACKLOG #2431).
+        # CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a single message went verbatim;
+        # the _emit docstring holds the retraction.
         self.encoding: str = declared_encoding(s.get("encoding"))
         self.max_file_bytes: int | None = positive_cap(
             s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
@@ -1125,6 +1132,23 @@ class FileSource(SourceConnector):
         """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
         credential is set). In ``leave`` mode both are best-effort (a read-only share can't create them
         and must not fail start); otherwise both are required."""
+        # _archive_subdir compares spellings, so a value spelled outside the watch directory that
+        # reaches it through a link, a junction, an 8.3 name, or a device or UNC form passes it.
+        # Moved files would then sit where the scan lists them and its spelling-based skip does
+        # not, and be ingested again on every poll (BACKLOG #5682). Compared here by file identity,
+        # before either directory is created, so a refused one is not made inside the watch tree.
+        # processed_dir is written only by the move mode; error_dir takes a quarantine in any mode.
+        archives = [("error_subdir", self.error_dir)]
+        if self.after_read == "move":
+            archives.insert(0, ("processed_subdir", self.processed_dir))
+        for knob, dest in archives:
+            if _inside_watch_tree_by_identity(dest, self.directory, knob):
+                raise SourceStartupError(
+                    f"file source {knob} reaches the watch directory {self.directory} or a "
+                    "directory inside it through another spelling (a link, a junction or a short "
+                    "name), so every archived file would be ingested again; spell it relative to "
+                    "the watch directory, or point it outside the watch directory (value withheld)"
+                )
         if self.after_read == "leave":
             # Leave-in-place (#142) never moves/deletes a source file, so it needs no .processed dir — and
             # a genuinely read-only share can't create either subdir anyway. Best-effort: a quarantine
@@ -1289,8 +1313,9 @@ class FileSource(SourceConnector):
                     logger.warning(
                         "file source %s: the poll task did not stop within %.1fs, most likely a share "
                         "call blocked on an unreachable directory; cancelled it. The blocked call "
-                        "finishes on its own thread, and any file it was working on is left in place "
-                        "and re-read on the next start.",
+                        "finishes on its own thread. When it is the move or delete that disposes of "
+                        "a file, it may still complete there; otherwise the file it was working on "
+                        "is left in place and re-read on the next start.",
                         self.directory,
                         _STOP_GRACE_S,
                     )
@@ -1565,7 +1590,11 @@ class FileSource(SourceConnector):
             return _Step.FREE
         try:
             with self._store_call():
-                completed = await self._emit(raw)
+                # Vault BACKLOG #2607: a poll source has no peer, so its intake context is the
+                # path it read.
+                completed = await self._emit(
+                    raw, IntakeContext(transport="file", source=str(path.absolute()))
+                )
         except Exception as exc:
             # The handler records every message-level outcome (parse/validation/routing → ERROR)
             # itself and returns, so an exception escaping here is an infrastructure failure: the
@@ -1940,7 +1969,7 @@ class FileSource(SourceConnector):
         self._seen_add(file_key)
         return True
 
-    async def _emit(self, raw: bytes) -> bool:
+    async def _emit(self, raw: bytes, intake: IntakeContext | None = None) -> bool:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO). Returns
         ``False`` when a stop arrived between a batch's hand-offs and the rest were not handed off
         (BACKLOG #1620): the caller then leaves the file in place, so the next start re-emits it whole.
@@ -1956,30 +1985,37 @@ class FileSource(SourceConnector):
         below, byte-identical to before this gate existed.
 
         Corepoint-style **batch split** (Tier 2.2-A): a dropped file may hold several MSH-delimited
-        messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off — the same
-        per-message split a dry-run / ``messagefoundry check`` sees, via the shared
-        :func:`~messagefoundry.parsing.split.split_batch`.
+        messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off, cut by
+        :func:`~messagefoundry.parsing.split.split_batch`. A dry run and ``messagefoundry check``
+        cut with the same function, but on a latin-1 view of the bytes rather than this decode, so
+        their split can differ from this one, for example on a UTF-16 batch, which they read as one
+        message; :func:`~messagefoundry.pipeline.dryrun.split_messages` says where. CORRECTED
+        2026-11-23 (BACKLOG #8357 item 5): this said each hand-off is "the same per-message split a
+        dry-run / ``messagefoundry check`` sees".
 
         Splitting must decode the bytes to find the MSH boundaries, so we decode with the
         connection's **declared encoding** (``errors="strict"``) — never UTF-8 by accident — so a
-        non-UTF-8 batch (e.g. latin-1) splits without mojibake. If the file isn't decodable in that
-        encoding, or it holds a single message, the **original bytes are handed off verbatim** (one
-        hand-off): a single-message file is then byte-for-byte identical to before the split existed,
-        unless a byte order mark or an ``FHS``/``BHS`` header the parser refuses leads it, when the
-        message goes as the split read it (ADR 0206), and an undecodable file flows to the pipeline
-        unchanged so its ``normalize(errors="strict")`` records the proper ``ERROR`` disposition
-        exactly as today (we don't pre-empt that here). A true batch is split and each message
+        non-UTF-8 batch (e.g. latin-1) splits without mojibake. A file that isn't decodable in that
+        encoding is handed off as its **original bytes**, unchanged, so the pipeline's
+        ``normalize(errors="strict")`` records the proper ``ERROR`` disposition (we don't pre-empt
+        that here). A file holding a single message is one hand-off, of the bytes
+        :func:`~messagefoundry.parsing.split.one_message_bytes` gives, which are not always its
+        original bytes. A true batch is split and each message
         **re-encoded with the same declared encoding**, so the handler still receives ``bytes``
-        exactly as in the un-split path.
+        exactly as in the un-split path. CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a
+        single-message file "is then byte-for-byte identical to before the split existed", which
+        the trailer-line cut of BACKLOG #5806 made untrue.
 
         Any exception (a durable-store failure on hand-off K) propagates to the caller, which then
         leaves the whole file in place for the next scan — preserving at-least-once with no partial
-        move (see :meth:`_scan_once`)."""
+        move (see :meth:`_scan_once`).
+
+        ``intake`` names the file every message in it came from (vault BACKLOG #2607)."""
         assert self._handler is not None
         if self.content_type is not None and self.content_type is not ContentType.HL7V2:
             # Non-hl7v2: hand the file's RAW BYTES off verbatim — no text-decode, no HL7 batch split
             # (see the docstring). A binary payload's exact bytes survive to RawMessage.from_bytes.
-            await self._handler(raw)
+            await deliver(self._handler, raw, intake)
             return True
         try:
             text = raw.decode(self.encoding)
@@ -1989,24 +2025,24 @@ class FileSource(SourceConnector):
             # records ERROR for it, exactly as in the pre-split single-hand-off path. Never a drop.
             # UnicodeError, not only UnicodeDecodeError: a codec that refuses every conversion, such
             # as "undefined", raises the base class, and must reach that decode too (BACKLOG #5102).
-            await self._handler(raw)
+            await deliver(self._handler, raw, intake)
             return True
         messages = split_batch(
             text
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
         if len(messages) == 1:
-            # Fast path / strict back-compat: a lone message is handed off as its original bytes, so a
-            # non-batch file behaves as before the split was introduced, unless the parser would
-            # refuse what leads them (a byte order mark, an FHS/BHS header): then it goes as the
-            # split read it, as a batch member does (ADR 0206).
-            await self._handler(one_message_bytes(raw, text, messages[0], self.encoding))
+            # A lone message goes as one_message_bytes says (ADR 0206, BACKLOG #5806). CORRECTED
+            # 2026-11-23 (BACKLOG #8357 item 5): the docstring above holds the retraction.
+            await deliver(
+                self._handler, one_message_bytes(raw, text, messages[0], self.encoding), intake
+            )
             return True
         for message in messages:
             if self._stop.is_set():
                 return False  # stopping: the rest are re-emitted with the whole file next start
             # FIFO per connection: emit in file order, awaiting each so a slow/failing hand-off
             # back-pressures the rest (and a failure stops the file from being moved — see above).
-            await self._handler(message.encode(self.encoding))
+            await deliver(self._handler, message.encode(self.encoding), intake)
         return True
 
     def _candidates(self) -> list[Path]:
@@ -2666,9 +2702,9 @@ def _win_delete_aged(path: Path, older_than: float) -> bool:
 
 
 # --- helpers -----------------------------------------------------------------
-# The pure magic-byte sniffers (_looks_like_hl7 / _lstrip_bom_ws / _content_matches_declared) were hoisted
-# to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py can reuse them without importing a transport;
-# they are re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
+# The pure magic-byte sniffers were hoisted to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py
+# can reuse them without importing a transport; _looks_like_hl7 and _content_matches_declared are
+# re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
 # existing tests that import them from here are unchanged.
 
 
@@ -3382,6 +3418,90 @@ def _open_dest(dest_dir: Path, directory: Path, root_real: Path) -> _Dest:
     if dirs is None:
         return _Dest(dest_dir)
     return _Dest(root_real.joinpath(*dirs), held=_win_hold_dirs(root_real, dirs))
+
+
+def _inside_watch_tree_by_identity(
+    dest_dir: Path, directory: Path, setting: str = "archive directory"
+) -> bool:
+    """True when ``dest_dir`` is spelled outside the watch ``directory`` but is, by file identity,
+    that directory or one inside it (BACKLOG #5682). Each of ``dest_dir``'s resolved path and its
+    parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
+    below the watch directory returns False: the scan's skip matches its spelling, and
+    :func:`_open_dest` refuses a link in it. ``dest_dir`` need not exist yet: its nearest existing
+    parent is what is compared. When the watch directory cannot be read or reports no file
+    identity (an inode of 0, as some SMB servers do, which would make every directory on the volume
+    match), the check does not run. A part of ``dest_dir`` that cannot be read, a Windows share
+    fault that maps to ENOENT included (:func:`~messagefoundry.path_reach.is_absent`), is not
+    compared, and the walk goes on to its parents, which can still match. When the walk then
+    matches nothing and some part could not be read, or no part gave an identity at all, the
+    False is no verdict. Each of those outcomes is logged at WARNING, naming ``setting`` and the
+    archive path's class, never its text. The False return does not tell a verdict from no
+    verdict. Touches the filesystem, so call it off the event loop."""
+    if _dirs_below(dest_dir, directory) is not None:
+        return False
+    try:
+        watch = os.stat(directory)
+        real = Path(os.path.realpath(dest_dir))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "file source %s: the %s identity check did not run: %s",
+            directory,
+            setting,
+            _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
+        )
+        return False
+    if watch.st_ino == 0:
+        logger.warning(
+            "file source %s: the %s identity check did not run: the watch directory reports no "
+            "file identity",
+            directory,
+            setting,
+        )
+        return False
+    compared = False
+    fault: str | None = None
+    for candidate in (real, *real.parents):
+        try:
+            st = os.stat(candidate)
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and is_absent(exc):
+                continue  # not created yet: its parent is compared next
+            if fault is None:  # the first fault names the cause; later parts usually repeat it
+                fault = _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__
+            continue
+        if os.path.samestat(st, watch):
+            return True
+        # An inode of 0 is no identity (some SMB servers), so it is no comparison either.
+        compared = compared or st.st_ino != 0
+    if fault is not None or not compared:
+        # A part that could not be read may be the one that reaches the watch tree, and with no
+        # identity read nothing was compared, so this False is no verdict.
+        logger.warning(
+            "file source %s: the %s identity check gave no verdict on its %s path: %s",
+            directory,
+            setting,
+            _path_class(real),
+            f"a part could not be read: {fault}"
+            if fault is not None
+            else "no part gave a file identity to compare",
+        )
+    return False
+
+
+def _path_class(path: PurePath) -> str:
+    """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a UNC path,
+    ``//?/UNC/`` and ``//./UNC/`` forms included, ``device`` for any other ``//?/`` or ``//./``
+    form, ``drive`` for any other Windows path with a drive, else ``local``."""
+    # Windows reads the prefix in any case. ntpath splits //./UNC/server as a device drive
+    # ``//./UNC`` with no separator after it, so the separator is added before comparing.
+    drive = path.drive.upper() + "\\"
+    if drive.startswith(("\\\\?\\UNC\\", "\\\\.\\UNC\\")):
+        return "UNC"
+    if drive.startswith(("\\\\?\\", "\\\\.\\")):
+        return "device"
+    if drive.startswith("\\\\"):
+        return "UNC"
+    return "drive" if path.drive else "local"
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:

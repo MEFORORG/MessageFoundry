@@ -410,7 +410,6 @@ _SIGN_IN_OFF_VALUES = [
     ("login_rate_limit_per_ip", 0),
     ("login_rate_limit_global", 0),
     ("login_rate_limit_window_seconds", 0.0),
-    ("login_rate_limit_window_seconds", -1.0),
     ("lockout_minutes", 0),
     ("lockout_minutes", -5),
     ("lockout_threshold", LOCKOUT_THRESHOLD_CEILING + 1),
@@ -437,9 +436,13 @@ _LOOSER_THAN_DEFAULT = [
     ("phi_read_rate_limit_per_actor", 121),
     ("phi_read_rate_limit_per_actor", 1_000_000_000),
     ("phi_read_rate_limit_window_seconds", 0.0),
-    ("phi_read_rate_limit_window_seconds", -1.0),
     ("phi_read_rate_limit_window_seconds", 59.0),
     ("phi_read_rate_limit_window_seconds", 1e-6),
+    ("monitoring_read_rate_limit_enabled", False),
+    ("monitoring_read_rate_limit_per_actor", 0),
+    ("monitoring_read_rate_limit_per_actor", 601),
+    ("monitoring_read_rate_limit_window_seconds", 59.0),
+    ("monitoring_read_rate_limit_window_seconds", 1e-6),
     ("admin_write_rate_limit_enabled", False),
     ("admin_write_rate_limit_per_actor", 0),
     ("admin_write_rate_limit_per_actor", 13),
@@ -452,7 +455,6 @@ _LOOSER_THAN_DEFAULT = [
     ("mfa_verify_min_elapsed_seconds", 0.5),
     ("mfa_verify_min_elapsed_seconds", 1e-6),
     ("max_sessions_per_user", 0),
-    ("max_sessions_per_user", -1),
     ("max_sessions_per_user", 6),
     ("max_sessions_per_user", 1_000_000_000),
     # Vault BACKLOG #2600 step 4: the step-up window, the TOTP skew and the temporary-password life.
@@ -475,15 +477,14 @@ _LOOSER_THAN_DEFAULT = [
 #: (field, value at or stricter than its shipped default). None is named. The defaults are listed
 #: too, so a direction flipped to ">=" or "<=" reds here.
 _STRICTER_OR_DEFAULT = [
-    # A negative count refuses more. A NaN or infinite window is refused at load (vault BACKLOG
-    # #2466), so it is in _NON_FINITE_WINDOWS below and not here.
+    # A negative count or window is refused at load (BACKLOG #5318), and a NaN or infinite window
+    # too (vault BACKLOG #2466), so neither has a row here; the refusals are pinned in
+    # test_settings_load_bounds.py and _NON_FINITE_WINDOWS below.
     ("login_rate_limit_per_ip", 10),
     ("login_rate_limit_per_ip", 9),
     ("login_rate_limit_per_ip", 1),
-    ("login_rate_limit_per_ip", -1),
     ("login_rate_limit_global", 60),
     ("login_rate_limit_global", 59),
-    ("login_rate_limit_global", -1),
     ("login_rate_limit_window_seconds", 60.0),
     ("login_rate_limit_window_seconds", 61.0),
     ("lockout_minutes", 15),
@@ -497,12 +498,18 @@ _STRICTER_OR_DEFAULT = [
     ("lockout_max_minutes", 1441),
     ("phi_read_rate_limit_per_actor", 120),
     ("phi_read_rate_limit_per_actor", 119),
-    ("phi_read_rate_limit_per_actor", -1),
     # The all-users PHI-read count ships OFF, so no value of it is looser.
     ("phi_read_rate_limit_global", 0),
     ("phi_read_rate_limit_global", 1),
     ("phi_read_rate_limit_window_seconds", 60.0),
     ("phi_read_rate_limit_window_seconds", 61.0),
+    ("monitoring_read_rate_limit_per_actor", 600),
+    ("monitoring_read_rate_limit_per_actor", 599),
+    # The all-users monitoring-read count ships OFF, so no value of it is looser.
+    ("monitoring_read_rate_limit_global", 0),
+    ("monitoring_read_rate_limit_global", 1),
+    ("monitoring_read_rate_limit_window_seconds", 60.0),
+    ("monitoring_read_rate_limit_window_seconds", 61.0),
     ("admin_write_rate_limit_per_actor", 12),
     ("admin_write_rate_limit_per_actor", 11),
     # A negative admin-write count is refused at load (BACKLOG #3293), so it has no row here.
@@ -869,7 +876,6 @@ def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, val
         ("oidc_jwks_min_refetch_seconds", 3600, False),  # no longer than the default TTL
         ("oidc_jwks_min_refetch_seconds", 299, True),
         ("oidc_jwks_min_refetch_seconds", 0, True),  # no amplification bound at all
-        ("oidc_jwks_min_refetch_seconds", -1, True),
         ("oidc_jwks_min_refetch_seconds", 3601, True),  # a withdrawn key verifies longer
         ("oidc_flow_ttl_seconds", 300, False),
         ("oidc_flow_ttl_seconds", 30, False),
@@ -881,10 +887,8 @@ def test_a_reconciler_knob_is_not_named_while_no_reconciler_runs(field: str, val
         ("oidc_max_age_seconds", 86_400, True),  # the load refuses anything above
         # Only ever lowers a session's end below what the token and the absolute cap allow.
         ("oidc_session_max_hours", None, False),
-        ("oidc_session_max_hours", 0, False),
         ("oidc_session_max_hours", 1, False),
         ("oidc_session_max_hours", 1000, False),
-        ("oidc_session_max_hours", -1, False),
     ],
 )
 def test_an_oidc_knob_is_named_only_in_its_looser_direction(
@@ -935,11 +939,10 @@ def test_the_breaker_direction_is_the_consumers() -> None:
 
 
 def test_a_password_floor_of_zero_says_there_is_none() -> None:
-    """At 0 or less ``PasswordPolicy`` refuses nothing for length, so the entry says off, not
-    shorter. Still no configured value in either text."""
+    """At 0 ``PasswordPolicy`` refuses nothing for length, so the entry says off, not shorter.
+    Still no configured value in either text. A negative floor is refused at load (BACKLOG #5318)."""
     off = _risk(AuthSettings(password_min_length=0), "password_min_length")
     assert off is not None and "NO length floor" in off
-    assert off == _risk(AuthSettings(password_min_length=-3), "password_min_length")
     shorter = _risk(AuthSettings(password_min_length=8), "password_min_length")
     assert shorter is not None and "shorter than the default of 15" in shorter
     assert "NO length floor" not in shorter
@@ -1032,6 +1035,16 @@ _NUMERIC_AUTH_NAMED: dict[str, tuple[Any, object, str]] = {
         59.0,
         "phi_read_rate_limit_window_seconds",
     ),
+    "monitoring_read_rate_limit_per_actor": (
+        AuthSettings,
+        601,
+        "monitoring_read_rate_limit_per_actor",
+    ),
+    "monitoring_read_rate_limit_window_seconds": (
+        AuthSettings,
+        59.0,
+        "monitoring_read_rate_limit_window_seconds",
+    ),
     "admin_write_rate_limit_per_actor": (AuthSettings, 13, "admin_write_rate_limit_per_actor"),
     "admin_write_rate_limit_window_seconds": (
         AuthSettings,
@@ -1045,6 +1058,7 @@ _NUMERIC_AUTH_EXEMPT = {
     "oidc_session_max_hours": "never looser",
     # Ships OFF (0), so no value of it is looser than the default.
     "phi_read_rate_limit_global": "ships off",
+    "monitoring_read_rate_limit_global": "ships off",
 }
 
 
@@ -1157,10 +1171,9 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(off, addresses=1) == 200
     assert admitted(off, addresses=1, ceremony=True) == 200
 
-    for window in (0.0, -1.0):
-        no_window = AuthSettings(login_rate_limit_window_seconds=window)
-        assert admitted(no_window, addresses=1) == 200
-        assert admitted(no_window, addresses=1, ceremony=True) == 200
+    no_window = AuthSettings(login_rate_limit_window_seconds=0.0)
+    assert admitted(no_window, addresses=1) == 200
+    assert admitted(no_window, addresses=1, ceremony=True) == 200
 
     no_per_ip = AuthSettings(login_rate_limit_per_ip=0)
     assert admitted(no_per_ip, addresses=1) == 60  # only the all-clients limit holds
@@ -1170,10 +1183,11 @@ async def test_each_limiter_off_value_reaches_the_built_limiters(engine: Engine)
     assert admitted(no_global, addresses=50) == 200  # a spread spray is never refused
 
     # The values the registry does NOT name, because each refuses more: none may admit more than
-    # the default does.
-    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1) <= 10
-    assert admitted(AuthSettings(login_rate_limit_per_ip=-1), addresses=1, ceremony=True) <= 10
-    assert admitted(AuthSettings(login_rate_limit_global=-1), addresses=50) <= 60
+    # the default does. A negative count is refused at load (BACKLOG #5318), so the smallest
+    # working count stands in.
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1), addresses=1) <= 10
+    assert admitted(AuthSettings(login_rate_limit_per_ip=1), addresses=1, ceremony=True) <= 10
+    assert admitted(AuthSettings(login_rate_limit_global=1), addresses=50) <= 60
 
 
 #: The two [auth] windows that were bare floats (vault BACKLOG #2466), and the values no float
@@ -1199,10 +1213,10 @@ def test_a_non_finite_window_from_the_environment_is_refused(field: str, text: s
 
 
 @pytest.mark.parametrize("field", _BARE_WINDOWS)
-@pytest.mark.parametrize("value", [0.0, -1.0, 1e-6, 3600.0, 86400.0])
+@pytest.mark.parametrize("value", [0.0, 1e-6, 3600.0, 86400.0])
 def test_a_finite_window_still_loads(field: str, value: float) -> None:
-    """The control for the refusals around it: a finite value up to the cap loads. A window of 0 or
-    less stays the named off value it was."""
+    """The control for the refusals around it: a finite value from 0 up to the cap loads. A window
+    of 0 stays the named off value it was; a negative one is refused (BACKLOG #5318)."""
     assert getattr(AuthSettings(**{field: value}), field) == value  # type: ignore[arg-type]
 
 
@@ -1428,10 +1442,7 @@ def _oidc(**over: object) -> AuthSettings:
     [
         (512, False),  # the default
         (511, False),
-        (1, False),
-        # FlowCache refuses at len >= cap, so 0 or less refuses EVERY flow: stricter, not off.
-        (0, False),
-        (-1, False),
+        (1, False),  # the least the load accepts (BACKLOG #5318): 0 refused every flow
         (513, True),
         (1_000_000_000, True),  # the value the vault measured as silently lifting the cap
     ],
@@ -1758,6 +1769,90 @@ def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
     )
     assert "warn_days = 29, shorter than the default of 30" in named["cert_monitor.warn_days"]
     assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
+
+
+def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
+    """BACKLOG #2008, #3301: a slow rescan delays a reminder, and a very large value used to load
+    with nothing named. The default, and a faster cadence, name nothing; with the reminder off the
+    interval is not named on top of the warn_days entry."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=1e9),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=86_401.0),
+        )
+    )
+    assert (
+        "check_interval_seconds = 1000000000.0, longer than the default of 43200"
+        in named["cert_monitor.check_interval_seconds"]
+    )
+    assert (
+        "check_interval_seconds = 86401.0, longer than the default of 86400"
+        in named["secret_rotation.check_interval_seconds"]
+    )
+    # The after-the-deadline clause only where the interval reaches warn_days + 1 days.
+    assert "after the deadline itself" in named["cert_monitor.check_interval_seconds"]
+    assert "after the deadline itself" not in named["secret_rotation.check_interval_seconds"]
+    # The lead counts whole days rounded down, so the window opens warn_days + 1 days before the
+    # deadline: 15 days, 1_296_000 s, for warn_days = 14. The clause prints from exactly that value,
+    # and a second less prints none.
+    clause = (
+        ", which is at least the 15 days between the warn window opening and the deadline, "
+        "since warn_days = 14 counts whole days, so that reminder can come after the deadline "
+        "itself"
+    )
+    for interval, printed in ((1_296_000.0, True), (1_295_999.0, False)):
+        entry = dict(
+            _pairs(
+                cert_monitor=CertMonitorSettings(warn_days=14, check_interval_seconds=interval),
+                backup=BackupSettings(),
+                rotation=SecretRotationSettings(),
+            )
+        )["cert_monitor.check_interval_seconds"]
+        assert (clause in entry) is printed, entry
+        assert ("after the deadline" in entry) is printed, entry
+    # No "; " inside an entry: the serve warning joins whole entries with it.
+    assert not any("; " in named[k] for k in named if k.endswith("check_interval_seconds"))
+    keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
+    for cert, rotation in ((43_200.0, 86_400.0), (60.0, 3_600.0)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=cert),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=rotation),
+        )
+        assert not any(k in on for k in keys), on
+    off = _names(
+        cert_monitor=CertMonitorSettings(warn_days=0, check_interval_seconds=1e9),
+        backup=BackupSettings(),
+        rotation=SecretRotationSettings(warn_days=0, check_interval_seconds=1e9),
+    )
+    assert not any(k in off for k in keys), off
+    assert "cert_monitor.warn_days" in off and "secret_rotation.warn_days" in off
+
+
+@pytest.mark.parametrize("section", [CertMonitorSettings, SecretRotationSettings])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_reminder_interval_that_is_not_a_finite_positive_number_is_refused(
+    section: type[CertMonitorSettings] | type[SecretRotationSettings], value: float
+) -> None:
+    """BACKLOG #2008: see the check_interval_seconds validator in settings.py for why NaN is
+    refused; infinity would sleep forever."""
+    with pytest.raises(ValueError, match="finite number > 0"):
+        section(check_interval_seconds=value)
+
+
+def test_a_reminder_interval_one_step_past_its_default_does_not_print_as_the_default() -> None:
+    """repr round-trips, as the [auth] limits print theirs."""
+    value = math.nextafter(43_200.0, math.inf)
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=value),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(),
+        )
+    )
+    assert f"= {value!r}, longer" in named["cert_monitor.check_interval_seconds"]
+    assert "= 43200, longer" not in named["cert_monitor.check_interval_seconds"]
 
 
 def _rules(*rules: dict[str, object]) -> AlertsSettings:
@@ -4148,6 +4243,12 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "password_require_lowercase",
         "password_require_digit",
         "password_require_symbol",
+        # HARDENINGS, each shipped OFF (vault BACKLOG #5511): turning one on checks the hop's CRL
+        # file against the server's whole chain, not only the leaf, so a flip tightens. Neither
+        # loads alone: each needs the hop's CRL file and CA file, so this loop's lone flip could
+        # not build it either.
+        "ad_tls_crl_check_chain",
+        "oidc_tls_crl_check_chain",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
         # Not reported through THIS field: it is the desugared copy of [security].require_mfa, which
         # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure

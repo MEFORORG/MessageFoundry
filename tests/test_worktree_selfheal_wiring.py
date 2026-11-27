@@ -20,7 +20,9 @@ session's own worktree.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -108,9 +110,10 @@ def test_the_backstop_reads_the_gates_allowlist(home: Path, drifted: Path) -> No
 def test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent(
     home: Path, drifted: Path
 ) -> None:
-    """This script is installed as a COPY, so an older installed copy can outlive a newer allowlist and
-    vice versa. Falling back keeps a version skew from silently turning the backstop off -- the exact
-    class of failure that left rule 4 inert."""
+    """This script is installed as a COPY, so a box can carry only the legacy allowlist. Falling back
+    keeps that one skew from silently turning the backstop off. It does not cover the reverse skew; the
+    next test measures that. It also means deleting the gate's allowlist leaves the backstop armed
+    while a legacy file lists a root (docs/SESSION-DRIFT-CONTROLS.md, G8)."""
     (home / ".claude-hooks" / "worktree-gate.repos.txt").write_text(
         f"{drifted}\n", encoding="utf-8"
     )
@@ -119,9 +122,34 @@ def test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent(
     assert head_of(drifted) == "main", "the legacy fallback was not read -- no repair happened"
 
 
+def test_once_the_gates_allowlist_exists_a_legacy_only_root_loses_the_backstop(
+    home: Path, drifted: Path
+) -> None:
+    """The reverse skew, which the fallback does not cover (docs/SESSION-DRIFT-CONTROLS.md, G8). Once
+    the gate's file exists, even naming no root, the legacy file is never read, so a root only the
+    legacy file lists is not repaired and nothing says so. An empty gate file, as here, is the state
+    ``install-gate.ps1 -Uninstall -Repo`` leaves when it narrows to zero roots, which is why its
+    warning may not call that the same state as ``-Uninstall``. The previous test is the control: the
+    same legacy file, with no gate file, is read."""
+    (home / ".claude" / "hooks" / "worktree-gate.repos.txt").write_text(
+        "# nothing governed\n", encoding="utf-8"
+    )
+    (home / ".claude-hooks" / "worktree-gate.repos.txt").write_text(
+        f"{drifted}\n", encoding="utf-8"
+    )
+    r = run_selfheal(home, cwd=drifted)
+    assert r.returncode == 0, r.stderr
+    assert head_of(drifted) == "drifted", "the legacy file was read although the gate's file exists"
+    assert r.stdout.strip() == "", (
+        f"the backstop said something about the skipped root:\n{r.stdout}"
+    )
+
+
 def test_no_allowlist_anywhere_is_a_clean_no_op(home: Path, drifted: Path) -> None:
     """The kill switch: no allowlist and the backstop touches nothing, without erroring. This is also the
-    control for the two tests above -- if the repair happened here too, they would prove nothing."""
+    control for the two repair tests, test_the_backstop_reads_the_gates_allowlist and
+    test_the_legacy_allowlist_still_works_when_the_shared_one_is_absent -- if the repair happened here
+    too, they would prove nothing."""
     r = run_selfheal(home, cwd=drifted)
     assert r.returncode == 0, r.stderr
     assert head_of(drifted) == "drifted", "an ungoverned repo was repaired anyway"
@@ -220,8 +248,9 @@ def test_the_selfheal_installer_completes_with_USERPROFILE_unset(tmp_path: Path)
     the fallback in install-selfheal.ps1 left the CLAUDECODE test green. The uncovered path is the one
     that matters in real use, since an operator runs this from a plain terminal with no CLAUDECODE set.
 
-    Fully isolated: -HookPath and -ConfigDir both land in tmp, and the allowlist is pre-created so the
-    seeding branch (which would read the real home) never runs. Nothing outside tmp is written.
+    -HookPath and -ConfigDir both land in tmp. The installer no longer creates an allowlist (BACKLOG
+    #7613); it only tests whether the gate's allowlist exists under the resolved home, so nothing outside
+    tmp is written.
     """
     cfg = tmp_path / "cfg"
     cfg.mkdir()
@@ -296,3 +325,306 @@ def test_the_default_hook_path_resolves_without_USERPROFILE(tmp_path: Path) -> N
     assert (fake_home / ".claude-hooks" / "worktree-selfheal.ps1").is_file(), (
         "the hook should have been copied under the resolved home"
     )
+
+
+# ------------------------------------------- the settings write, the wiring check, the seeded copy
+#
+# BACKLOG #7612 and #7613. Every run below points USERPROFILE and HOME at a temporary home and passes
+# -HookPath and -ConfigDir under tmp, so nothing reads or writes the real ~/.claude.
+
+
+def run_installer(
+    home: Path, cfg: Path, hook_path: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    hp = hook_path if hook_path is not None else home / ".claude-hooks" / "worktree-selfheal.ps1"
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALLER),
+            "-ConfigDir",
+            str(cfg),
+            "-HookPath",
+            str(hp),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Path:
+    c = tmp_path / "cfg"
+    c.mkdir()
+    return c
+
+
+def _session_start(cfg: Path) -> list[dict[str, object]]:
+    data = json.loads((cfg / "settings.json").read_text(encoding="utf-8-sig"))
+    groups: list[dict[str, object]] = data["hooks"]["SessionStart"]
+    return groups
+
+
+def test_an_exec_form_hook_counts_as_already_wired(home: Path, cfg: Path) -> None:
+    """A hook naming the script in ``args`` rather than ``command`` is the same wiring. Checking only
+    ``command`` appended a second group, so every session would run the backstop twice."""
+    original = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "pwsh",
+                            "args": ["-NoProfile", "-File", "C:/x/worktree-selfheal.ps1"],
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    (cfg / "settings.json").write_text(json.dumps(original), encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert "already wired" in r.stdout
+    assert len(_session_start(cfg)) == 1, "an exec-form hook was wired a second time"
+
+
+def test_a_successful_install_preserves_keys_and_leaves_no_stray_file(
+    home: Path, cfg: Path
+) -> None:
+    (cfg / "settings.json").write_text(json.dumps({"model": "x", "hooks": {}}), encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    data = json.loads((cfg / "settings.json").read_text(encoding="utf-8-sig"))
+    assert data["model"] == "x"
+    hooks = _session_start(cfg)[0]["hooks"]
+    assert isinstance(hooks, list)
+    assert "-NonInteractive" in str(hooks[0]["command"]), "the hook's pwsh could prompt on stdin"
+    leftovers = sorted(p.name for p in cfg.iterdir() if p.name != "settings.json")
+    assert leftovers == ["settings.json.bak-selfheal"], f"stray files: {leftovers}"
+
+
+def test_an_invalid_result_leaves_settings_json_byte_identical(home: Path, cfg: Path) -> None:
+    """The new text is parsed BEFORE settings.json is touched. A ConvertFrom-Json shim, defined in the
+    calling scope so the script resolves it ahead of the cmdlet, fails the parse of the new text only,
+    and records whether settings.json already held the new wiring at that moment. origin/main wrote
+    first and rolled back after, so the marker is the witness of the order, not just the end state."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    marker = cfg.parent / "written-before-validate.txt"
+    shim = (
+        "function ConvertFrom-Json { param([Parameter(ValueFromPipeline)]$InputObject) "
+        "process { if (\"$InputObject\" -match 'worktree-selfheal') { "
+        f"if (Select-String -LiteralPath '{settings}' -SimpleMatch 'worktree-selfheal' -Quiet) "
+        f"{{ Set-Content -LiteralPath '{marker}' -Value x }}; throw 'injected parse failure' }} "
+        "$InputObject | Microsoft.PowerShell.Utility\\ConvertFrom-Json } }"
+    )
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{shim}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode != 0, "an invalid result was written"
+    assert "injected parse failure" in (r.stderr + r.stdout), "the shim never fired"
+    assert not marker.exists(), "settings.json was written before the new text was validated"
+    assert settings.read_bytes() == original, "settings.json changed"
+    assert not (cfg / "settings.json.bak-selfheal").exists()
+
+
+def test_a_failed_read_back_restores_the_backup(home: Path, cfg: Path) -> None:
+    """origin/main read the written file back and restored the backup if that failed; this keeps it.
+    The shim passes the pre-write parse of the new text and fails the second one, the read-back."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    shim = (
+        "$global:n = 0; function ConvertFrom-Json { param([Parameter(ValueFromPipeline)]$InputObject) "
+        "process { if (\"$InputObject\" -match 'worktree-selfheal') { $global:n++; "
+        "if ($global:n -ge 2) { throw 'injected read-back failure' } } "
+        "$InputObject | Microsoft.PowerShell.Utility\\ConvertFrom-Json } }"
+    )
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{shim}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode != 0, "a failed read-back was reported as success"
+    assert "injected read-back failure" in (r.stderr + r.stdout), "the shim never fired"
+    assert settings.read_bytes() == original, "the backup was not restored"
+
+
+# Writes a truncated settings.json, then throws: an interrupted Set-Content. Other paths pass through.
+_FAILING_SET_CONTENT = (
+    "function Set-Content { param($LiteralPath, $Value, $Encoding) "
+    "if ($LiteralPath -like '*settings.json') { "
+    "Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value '{\"trunc' "
+    "-Encoding utf8; throw 'injected write failure' } "
+    "Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value $Value "
+    "-Encoding $Encoding }"
+)
+
+
+def run_installer_with_prelude(
+    home: Path, cfg: Path, prelude: str
+) -> subprocess.CompletedProcess[str]:
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{prelude}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+
+
+def _fired(r: subprocess.CompletedProcess[str]) -> bool:
+    """pwsh wraps a long error across lines behind a ``|`` gutter and colours it, so compare with
+    ANSI escapes, gutters and all whitespace removed."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", r.stderr + r.stdout).replace("|", "")
+    return "injectedwritefailure" in "".join(text.split())
+
+
+def test_a_failed_write_restores_this_runs_backup(home: Path, cfg: Path) -> None:
+    """A throw from Set-Content itself, after it truncated the file, restores the backup this run
+    made."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    r = run_installer_with_prelude(home, cfg, _FAILING_SET_CONTENT)
+    assert r.returncode != 0, "a failed write was reported as success"
+    assert _fired(r), "the shim never fired"
+    assert settings.read_bytes() == original, "this run's backup was not restored"
+
+
+def test_a_failed_write_never_restores_a_stale_backup(home: Path, cfg: Path) -> None:
+    """No settings.json at the start, and a .bak-selfheal from an earlier run. A failed write must
+    not bring that stale content back as settings.json, must not leave the truncated file, and must
+    leave the stale backup as it was."""
+    stale = b'{"model": "stale-from-an-earlier-run"}\n'
+    backup = cfg / "settings.json.bak-selfheal"
+    backup.write_bytes(stale)
+    r = run_installer_with_prelude(home, cfg, _FAILING_SET_CONTENT)
+    assert r.returncode != 0, "a failed write was reported as success"
+    assert _fired(r), "the shim never fired"
+    assert not (cfg / "settings.json").exists(), "a stale backup or a truncated write was left"
+    assert backup.read_bytes() == stale, "the stale backup was changed"
+
+
+@pytest.mark.parametrize("bad", ["a$b", "a`b", 'a"b'])
+def test_a_hook_path_the_shell_would_rewrite_is_refused(
+    home: Path, cfg: Path, tmp_path: Path, bad: str
+) -> None:
+    """The path is embedded in a double-quoted shell command. A ``$`` or backtick there would be
+    expanded by the shell that runs the hook, and a quote would end the argument, so the wired command
+    would name a different file. Refused before anything is written, rather than escaped on a guess
+    about which shell runs it."""
+    if os.name == "nt" and '"' in bad:
+        pytest.skip("a Windows path cannot contain a double quote")
+    hp = tmp_path / bad / "worktree-selfheal.ps1"
+    r = run_installer(home, cfg, hook_path=hp)
+    assert r.returncode != 0, "a HookPath the shell would rewrite was wired"
+    assert "HookPath" in (r.stderr + r.stdout)
+    assert not (cfg / "settings.json").exists()
+    assert not hp.parent.exists(), "it must refuse before creating the hook directory"
+
+
+def test_the_installer_does_not_create_the_legacy_allowlist(home: Path, cfg: Path) -> None:
+    """BACKLOG #7613. The backstop reads the gate's allowlist first and the legacy one only as a
+    fallback. A copy seeded into ~/.claude-hooks would outlive ``install-gate.ps1 -Uninstall`` and keep
+    the backstop armed after the gate's allowlist is gone, so the installer must not create one."""
+    (home / ".claude" / "hooks" / "worktree-gate.repos.txt").write_text("C:/P\n", encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert not (home / ".claude-hooks" / "worktree-gate.repos.txt").exists(), "legacy copy seeded"
+
+
+def test_with_no_allowlist_the_installer_writes_no_template(home: Path, cfg: Path) -> None:
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert not (home / ".claude-hooks" / "worktree-gate.repos.txt").exists(), "template seeded"
+    assert "install-gate.ps1" in r.stdout, "the operator is not told the backstop is off"
+
+
+def test_an_existing_legacy_allowlist_is_left_alone(home: Path, cfg: Path) -> None:
+    legacy = home / ".claude-hooks" / "worktree-gate.repos.txt"
+    legacy.write_text("C:/Kept\n", encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert legacy.read_text(encoding="utf-8") == "C:/Kept\n"
+    assert "reads the legacy" in r.stdout, "the operator is told the backstop is off when it is not"
+
+
+def test_the_note_reads_the_home_legacy_file_not_the_hook_dir(
+    home: Path, cfg: Path, tmp_path: Path
+) -> None:
+    """The backstop's fallback is ~/.claude-hooks/worktree-gate.repos.txt whatever -HookPath says, so
+    a file beside a non-default HookPath must not be reported as the one it reads."""
+    hook_dir = tmp_path / "elsewhere"
+    hook_dir.mkdir()
+    (hook_dir / "worktree-gate.repos.txt").write_text("C:/Stray\n", encoding="utf-8")
+    r = run_installer(home, cfg, hook_path=hook_dir / "worktree-selfheal.ps1")
+    assert r.returncode == 0, r.stderr
+    assert "guards nothing" in r.stdout, r.stdout
+
+
+def test_a_tilde_config_dir_still_installs(home: Path, tmp_path: Path) -> None:
+    """A ``~``-relative ConfigDir worked on origin/main and must keep working. An intermediate version
+    of this branch broke it by writing through .NET, which does not resolve PowerShell's ``~``."""
+    (home / "cfg").mkdir()
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"Set-Location -LiteralPath '{tmp_path}'; "
+            f"(Get-PSProvider FileSystem).Home = '{home}'; "
+            f"& '{INSTALLER}' -ConfigDir '~/cfg' -HookPath '{home / '.claude-hooks' / 'w' / 'worktree-selfheal.ps1'}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert (home / "cfg" / "settings.json").is_file()

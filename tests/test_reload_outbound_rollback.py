@@ -191,9 +191,11 @@ def _record_closes(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> l
     closed: list[Any] = []
     real_close = runner._close_replaced
 
-    async def record(name: str, replaced: Any, failures: list[tuple[str, str]]) -> None:
+    async def record(
+        name: str, replaced: Any, failures: list[tuple[str, str]], **kwargs: Any
+    ) -> None:
         closed.append(replaced)
-        await real_close(name, replaced, failures)
+        await real_close(name, replaced, failures, **kwargs)
 
     monkeypatch.setattr(runner, "_close_replaced", record)
     return closed

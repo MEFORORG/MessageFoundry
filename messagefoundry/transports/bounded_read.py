@@ -838,8 +838,8 @@ def is_never_proxied_host(host: str | None) -> bool:
     :class:`LoopbackDirectProxyHandler`.
 
     Pass the host as ``urlsplit(url).hostname`` gives it, which is how the guards read it. A missing
-    or empty host is not on the box. The shared predicate reads ``""`` as loopback, but the guards
-    refuse a URL that names no host before they ask it (``transports.rest._hop_guard_host``).
+    or empty host is not on the box, and the guards refuse a URL that names no host before they ask
+    (``transports.rest._hop_guard_host``).
     """
     if not host:
         return False

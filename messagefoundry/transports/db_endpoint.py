@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-from messagefoundry.hostlist import port_or_zero
+from messagefoundry.hostlist import port_or_zero, split_generic_server
 
 #: The port the SQL Server preset's connection string uses when ``port`` is not set.
 SQLSERVER_DEFAULT_PORT = 1433
@@ -68,35 +68,14 @@ def _preset_port(value: object) -> int | None:
     return port if 1 <= port <= 65535 else None
 
 
-def split_generic_server(server: str) -> tuple[str, str]:
-    """Split a generic-dialect ``server`` into its host and the text after a port separator, which
-    is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
-
-    ``host:port`` and ``[v6]:port`` are split. A bare IPv6 literal carries more than one colon and
-    is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
-    of hosts, so the text before it need not be the only host dialled. Both callers deal with a
-    comma before they get here: the egress reading refuses it, and :func:`generic_hop_endpoint`
-    reads it as its docstring says."""
-    host = server.strip()
-    in_server = ""
-    if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
-        close = host.find("]")
-        if close != -1:
-            host, rest = host[1:close], host[close + 1 :]
-            in_server = rest[1:] if rest.startswith(":") else ""
-    elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
-        host, _, in_server = host.partition(":")
-    return host.strip(), in_server.strip()
-
-
 def _exact_split(text: str) -> tuple[str, str] | None:
     """:func:`split_generic_server` of ``text``, or ``None`` unless ``text`` is a host,
     ``host:port`` or ``[v6]:port`` written exactly, with a usable port where it carries one.
 
     Anything else, at least ``[::1]remote``, ``[::1]:5432x``, ``127.0.0.1 : 5432`` and ``[]``,
     gets ``None``, so no text the split would drop can sit behind a loopback host. An empty host
-    from a non-empty ``text`` is refused because the loopback check reads an empty host as on-box,
-    while the driver is handed the text, not an empty one."""
+    from a non-empty ``text`` gets ``None`` too, so a refusal names the text the driver is handed
+    rather than an empty host."""
     host, in_server = split_generic_server(text)
     written = (f"[{host}]" if text.startswith("[") else host) + (
         f":{in_server}" if in_server else ""

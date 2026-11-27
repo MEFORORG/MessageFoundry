@@ -295,6 +295,49 @@ suite("liveDebug invocationsForFile", () => {
     assert.strictEqual(only.length, 1);
     assert.strictEqual(only[0].file, "/cfg/A.py");
   });
+
+  // Called through a widened signature so this suite still compiles against the two-parameter
+  // invocationsForFile it replaced, which had no base: that is how its failing-before reading was
+  // taken (BACKLOG #5835).
+  const forFile = invocationsForFile as (
+    entries: LiveTraceEntry[],
+    fsPath: string,
+    base: string,
+  ) => TraceInvocation[];
+
+  test("a relative trace path resolves against the given base, not the process cwd (BACKLOG #5835)", () => {
+    const entries = [traceEntry({ invocations: [inv({ file: "cfg/A.py" }), inv({ file: "cfg/B.py" })] })];
+    const ws = path.resolve("/b622-ws");
+    assert.notStrictEqual(ws, process.cwd(), "the base must differ from the cwd, or this proves nothing");
+    const only = forFile(entries, path.join(ws, "cfg", "A.py"), ws);
+    assert.strictEqual(only.length, 1);
+    assert.strictEqual(only[0].file, "cfg/A.py");
+  });
+
+  // Uri.fsPath lower-cases the drive letter while Python keeps the case it was given. Windows only,
+  // because fileKey folds case only where path.sep is a backslash; off Windows the match is
+  // case-sensitive, a case-insensitive macOS volume included.
+  (process.platform === "win32" ? test : test.skip)(
+    "on Windows a drive-letter or segment case difference still names the active file (BACKLOG #5835)",
+    () => {
+      const entries = [
+        traceEntry({
+          invocations: [
+            inv({ file: "D:\\b622-ws\\Config\\A.py" }),
+            inv({ file: "D:/B622-WS/config/a.py" }),
+            inv({ file: "D:\\b622-ws\\config\\B.py" }),
+            // Both limbs at once: relative to the base, and differing in case from the editor path.
+            inv({ file: "Config\\a.PY" }),
+          ],
+        }),
+      ];
+      const only = forFile(entries, "d:\\b622-ws\\config\\A.py", "d:\\b622-ws");
+      assert.deepStrictEqual(
+        only.map((i) => i.file),
+        ["D:\\b622-ws\\Config\\A.py", "D:/B622-WS/config/a.py", "Config\\a.PY"],
+      );
+    },
+  );
 });
 
 suite("LiveDebugController with a mocked traced-dryrun spawn", () => {

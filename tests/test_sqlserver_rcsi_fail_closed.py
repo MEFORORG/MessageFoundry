@@ -65,8 +65,9 @@ class _ProbeCursor:
         return self._row
 
     async def close(self) -> None:
-        # BACKLOG #5666: an open closes its bounded state-read cursor before the ALTERs. The
-        # stand-in hands the same cursor back, so its recorded statements stay in one list.
+        # BACKLOG #5666: an open closes a cursor before an ALTER whose limit differs from the
+        # cursor's. The stand-in hands the same cursor back, so its recorded statements stay in
+        # one list.
         pass
 
 

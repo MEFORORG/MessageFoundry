@@ -25,6 +25,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, isExecGated, messageSetsDir, runJson, workspaceDir } from "./cli";
 import { findElements, isConfigFile } from "./editorToolbar";
+import { fileKey } from "./pathIdentity";
 import {
   buildLiveLenses,
   maskedMessagesOf,
@@ -226,13 +227,21 @@ export function inlineValuesFor(invocations: TraceInvocation[], reveal: boolean)
   return out.sort((a, b) => a.line - b.line);
 }
 
-/** Collect every invocation across the run whose defining file is `fsPath` (the active module). */
-export function invocationsForFile(entries: LiveTraceEntry[], fsPath: string): TraceInvocation[] {
-  const target = path.resolve(fsPath);
+/**
+ * Collect every invocation across the run whose defining file is `fsPath` (the active module). A
+ * relative trace path is resolved against `base`, the folder the CLI ran in (the workspace), and on
+ * Windows the match ignores case, since `Uri.fsPath` lower-cases the drive letter (BACKLOG #5835).
+ */
+export function invocationsForFile(
+  entries: LiveTraceEntry[],
+  fsPath: string,
+  base: string = workspaceDir() ?? process.cwd(),
+): TraceInvocation[] {
+  const target = fileKey(base, fsPath);
   const out: TraceInvocation[] = [];
   for (const e of entries) {
     for (const inv of e.invocations) {
-      if (inv.file && path.resolve(inv.file) === target) {
+      if (inv.file && fileKey(base, inv.file) === target) {
         out.push(inv);
       }
     }
@@ -810,7 +819,11 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
       clear();
       return;
     }
-    const invs = invocationsForFile(this.entries, editor.document.uri.fsPath);
+    const invs = invocationsForFile(
+      this.entries,
+      editor.document.uri.fsPath,
+      this.workspace() ?? process.cwd(),
+    );
     const inline = inlineValuesFor(invs, this.shownRunRevealed);
     const values: vscode.DecorationOptions[] = [];
     const warns: vscode.DecorationOptions[] = [];

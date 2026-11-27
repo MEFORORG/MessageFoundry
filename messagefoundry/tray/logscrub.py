@@ -37,11 +37,12 @@ import logging
 
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.redaction import (
+    clamp_untrusted,
     prepare_log_record,
+    redact,
     redact_binary_carriage,
-    redact_untrusted,
 )
-from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.secretscrub import mask_private_key_blocks_then, scrub_credentials
 
 __all__ = ["TrayLogScrubFilter"]
 
@@ -53,7 +54,13 @@ _CONTINUATION_PREFIX = "    | "
 def _scrub_text(text: str) -> str:
     """Redact PHI, mask credentials, then replace a carriage body. Control characters are left for
     the caller."""
-    return redact_binary_carriage(scrub_credentials(redact_untrusted(text)))
+    # The PRIVATE KEY block mask sits between the clamp and the PHI pass, as on the engine chain
+    # (BACKLOG #5550): that pass rewrites a block's markers, so nothing after it finds the block.
+    return redact_binary_carriage(
+        scrub_credentials(
+            mask_private_key_blocks_then(clamp_untrusted(text), redact, scrub_credentials)
+        )
+    )
 
 
 def _scrub_block(text: str) -> str:

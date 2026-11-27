@@ -3,10 +3,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a pull request whose CLA verdict the vendored action would get wrong (BACKLOG #5644, #5645).
 
-WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/dist/index.js``:
+WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/dist/index.js``. That
+bundle is a PATCHED FORK of upstream v2.6.1 since 2026-11-23 (owner ruling "Fork, patch,
+re-provenance"; BACKLOG #5644 item 2, #5645 item 2). The action's README lists the patches; the two bullets marked PATCHED
+below are them, and the other two describe upstream behaviour the fork keeps:
 
-  * ``getCommitters`` asks GraphQL for ``commits(first: 100)`` ONCE, with an empty cursor, and never
-    reads ``hasNextPage``, so a commit past the hundredth is never looked at.
+  * ``getCommitters`` asks GraphQL for ``commits(first: 100)`` and, PATCHED, follows ``hasNextPage``
+    to the end of the list. Upstream read one page with an empty cursor and never followed it.
+    GitHub's list stops at 250 commits (see the measurement below), so neither the action nor this
+    script checks an author first seen past commit 250.
   * ``extractUserFromCommit`` attributes each commit to ``author.user || committer.user || author ||
     committer``. A commit whose author email links to no account is therefore attributed to its
     COMMITTER's account when that one is linked, and to the raw git ``author.name`` only when
@@ -16,26 +21,72 @@ WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/di
     and drops id ``41898282``. That id is ``github-actions[bot]``, NOT ``web-flow`` (19864447,
     which ``tests/fixtures/branch_main.json`` records).
   * ``checkAllowList`` drops every committer whose ``name`` matches an allowlist entry, by string
-    equality or, for an entry holding ``*``, an UNANCHORED regular expression. For a commit nobody
+    equality or, for an entry holding ``*``, a regular expression that is, PATCHED, anchored to the
+    whole name (upstream's was unanchored, so ``bot*`` matched ``evilbot-x``). For a commit nobody
     is linked to, that name is free text the pull request's author chose.
 
 So a commit authored and committed under unlinked emails, with the git name set to an allowlisted
 login, is dropped as allowlisted and never needs a signature. This script applies two rules to
-EVERY commit, paging on ``hasNextPage``:
+EVERY commit it can read, paging on ``hasNextPage``:
 
   1. A commit whose AUTHOR is linked to no GitHub account is refused, whatever its committer or
      git name. The CLA binds the author, and an unlinked author can never be shown to have signed
      (owner ruling 2026-11-13). Measured before the ruling: every commit on merged PRs 2909 and
      2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
      author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
-     either that is neither null nor an object, is a reply in the wrong shape and a fault.
-  2. A linked author first seen past the action's one page is refused only when absent from the
-     signature file the action keeps (below). The action's list is built as the action builds it,
-     from the FIRST PAGE only, first commit seen under each key.
+     either that is neither null nor an object, is a reply in the wrong shape and a fault. At
+     least one exception warns and passes instead: a commit GraphQL reported an error inside,
+     its committer included (the partial-error case below).
+  2. A linked author first seen past the first page (as many commits as GitHub returned
+     first, at most 100) is refused only when
+     absent from the signature file the action keeps (below). The first page's keys are built as
+     the action builds its list, first commit seen under each key. Rule 2 was written for the
+     upstream action, which read that page only. The patched action now lists such an author
+     itself and asks them to sign, so rule 2 duplicates the action's own demand there rather than
+     adding to it; it is kept. It clears once the signature file holds the author's id. This
+     pre-check runs before the action step that writes that id, so the run on which the author
+     signs still refuses, and a later run (a recheck comment or a push) clears.
 
 It faults in at least these cases: the pull request's head moved while it read, it read fewer
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
 not be read.
+
+TWO CASES BACKLOG #5645 item 1 names:
+
+  * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
+    ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
+    nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
+    author. One whose path stays inside that commit's ``committer`` leaves the author read: the
+    nullable committer stops null propagation there (BACKLOG #5644 added item 1). A linked
+    author there is judged under rule 2 past the first page, since a non-null account is no
+    nulled field. An author there that reads as unlinked or null is NOT refused under rule 1 but
+    is a fault that warns and passes (owner ruling W7-R11, 2026-11-26: "warn when unproven,
+    refuse only when proven"; vault branch ``w7-owner-rulings-20261126``, file
+    ``docs/security/ASVS-OWNER-RULINGS-2026-11-26-W7.md``): the same failure may have nulled it
+    with only the committer's path reported, and this read cannot rule that out. THAT IS A
+    FAIL-OPEN HOLE IN RULE 1. At least these unlinked authors pass this script on a read that
+    carries such an error and can then pass the vendored action unsigned, if its own read is
+    clean: one whose committer is a signed or allowlisted account, or ``github-actions[bot]``,
+    which the action drops; and one whose git name is allowlisted, under an unlinked committer.
+    Each try is bounded by the action's own read: the bundle's GraphQL client throws
+    ``GraphqlError`` on a reply carrying any ``errors`` (read in ``dist/index.js``, not run), so
+    only an error the action's read does not also hit gets through. That is a chance per run,
+    not a cap: a push or a recheck comment runs both reads again. On the first page, such a commit is left out of the first page's
+    keys, with a fault, whether its author is linked or not, as before that item. On any page, a
+    commit with a committer-only error that came back with no commit object, or with no readable
+    ``oid``, contradicts the premise and is unjudged whole. The other commits on the page are
+    judged, so a refusal they prove stands. An error with no such path still faults the whole
+    page, keeping the pages read before it.
+  * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
+    ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
+    ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
+    is judged: a read of another head proves nothing about this one. Only that case is re-read. A
+    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if it is complete and its commits do
+    not include that head, or cannot show that they do, a fault is added beside the verdict, so a
+    pass is not silent. A read cut short carries its own fault and is not checked for the head. A
+    head that moves after the first page is not re-read: the pages before the move, which are of
+    ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment event) nothing
+    is re-read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -45,8 +96,9 @@ does, so a GitHub outage, bad input or a bug in this script cannot wedge every p
 revert included. Exit 2 is NOT a fault: it is what the interpreter returns when it cannot open the
 script, so a renamed or deleted script fails the check instead of switching it off. The runner runs
 this with its system ``python3``, so the script keeps to Python 3.12 syntax;
-tests/test_cla_precheck.py parses it at that grammar. It does not patch the vendored bundle; the
-provenance gate forbids that.
+tests/test_cla_precheck.py parses it at that grammar. It does not itself change the vendored
+bundle. The bundle's patches are recorded in ``scripts/security/build_cla_action_provenance.py``,
+whose gate refuses any change to the bundle outside them.
 
 THE SIGNATURE FILE (rule 2) holds ``signedContributors`` ids, read over REST from the base
 repository's signature branch. A file GitHub answers 404 for holds no signatures, as the action
@@ -56,11 +108,31 @@ It CANNOT see a spoofed AUTHOR email. GitHub links a commit to an account by its
 author email set to an allowlisted account's address reads as that account, here and in the action
 alike. Only commit signature verification separates the two, and neither checks it.
 
-UNMEASURED: whether GitHub caps a pull request's commit connection (its REST listing stops at 250)
-and, if it does, whether ``totalCount`` reports the capped or the real count. Until it is measured a
-read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13) and warns and passes. If
-``totalCount`` reports the CAPPED count, the read is not short, so commits past the cap go unchecked
-with NO warning at all.
+MEASURED 2026-11-23 (first by the patched-fork change's code review, then repeated by its Builder), with ``gh api graphql`` against a
+public pull request of 4096 commits (home-assistant/core 189294): the GraphQL commit connection
+returned 100, 100 and 50 commits, then ``hasNextPage`` false, while ``totalCount`` reported 4096 on
+every page. So GitHub stops the list at 250 and ``totalCount`` reports the real count. One pull
+request was read, so this is a reading, not a documented contract. A read short of ``totalCount``
+stays a FAULT that warns and passes (owner rulings 2026-11-13, "Wire, fail-open on fault", and
+2026-11-23 on BACKLOG #5645 item 1, "Warn and pass"). SO AN AUTHOR FIRST SEEN PAST COMMIT 250 IS NOT
+CHECKED, by this script or by the action: on such a pull request the ``cla`` check warns and can
+pass for an author who never signed.
+
+UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
+how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
+head after them leaves the run a fault that warns and passes. A commit list that trails a current
+``headRefOid`` is not waited for: it is judged, so after a force-push it can
+refuse a commit the pull request no longer holds.
+
+UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
+commit node. The GraphQL specification implies it: an error's path names the field that raised it,
+and null propagation reaches only that field's ancestors. A nulled ``author.user`` that no error
+path reaches reads as an unlinked author and is refused; that is how a commit no error names is
+judged, beside an errored one or not (the owner's delegated ruling of 2026-11-23, decision
+d20261123T150935451-0e46cc: "a refusal it proves fails"). A commit with an error path inside
+it, its ``committer`` included, is not refused on that premise: there an unlinked or null
+author is a fault that warns and passes (owner ruling W7-R11), as such a commit was before
+BACKLOG #5644 added item 1. Engine PR 3323 had refused the committer case.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -69,17 +141,23 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   GITHUB_REPOSITORY   ``owner/name``
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
-  CLA_HEAD_SHA        optional; the head commit the run judges. A different head is a fault.
+  CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
+                      head is re-read, then a fault; a head that moves on a later page is not
+                      re-read.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
   CLA_SIGNATURES_BRANCH the action's ``branch``
 
-EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation; 3 a fault
-caught by this script (bad input, network, a reply in the wrong shape, a short read, or an exception
-raised inside ``run``). At least one other path exits 1 with no refusal annotation: an error before
-``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
-The workflow tells these apart by the annotation, not the code alone.
+EXIT CODES: 0 nothing refused and no fault; 1 refused, with a ``CLA pre-check refused``
+annotation, whatever fault is reported beside it; 3 a fault caught by this script with nothing
+refused, at least: bad input, network, a reply in the wrong shape, a short read, a head still
+stale after the re-reads, a commit list that does not include ``CLA_HEAD_SHA`` or cannot show that
+it does, a commit with a GraphQL error inside it (for one inside its ``committer`` alone, the
+partial-error case above says which are faults), or an exception raised inside ``run``. At least
+one other path exits 1 with no refusal annotation: an error before ``main`` runs, such as at
+import. The interpreter itself exits 2 when it cannot open the script. The workflow tells these
+apart by the annotation, not the code alone.
 """
 
 from __future__ import annotations
@@ -91,6 +169,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -111,8 +190,16 @@ ACTIONS_BOT_ID = 41898282
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
 DEFAULT_API_URL = "https://api.github.com"
 
-# The cursor is nullable: GitHub reads a null `after` as "from the start". The action's empty-string
-# cursor works only because it never asks for a second page.
+# Seconds to wait before each re-read when the head read is not the head the run judges. That
+# GitHub's GraphQL view trails the push event, and by how much, is unmeasured (module docstring).
+HEAD_RETRY_DELAYS = (5.0, 10.0)
+
+# Where a commit node sits in the reply, as a GraphQL error ``path`` names it.
+_NODES_PATH = ("repository", "pullRequest", "commits", "nodes")
+
+# The cursor is nullable: GitHub reads a null `after` as "from the start". The action declares its
+# cursor non-null and passes an empty string for the first page, which GitHub also reads as the
+# start (the 2026-11-23 measurement in the module docstring used that form).
 QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
@@ -153,6 +240,10 @@ class PrecheckFault(Exception):
     partial: PullRequestRead | None = None
 
 
+class _StaleHead(PrecheckFault):
+    """The first page's head is not the head the run judges, so the read stopped there."""
+
+
 @dataclass(frozen=True)
 class Attribution:
     """Who the vendored action would say made one commit, and whether anyone is linked."""
@@ -168,8 +259,17 @@ class PullRequestRead:
     commits: list[Mapping[str, Any]]
     total: int
     head: str
-    #: How many commits the first page held. The action reads that page and no other.
+    #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
+    #: Indexes into ``commits`` that a GraphQL error points inside, other than those in
+    #: ``committer_tainted``. They are not judged.
+    tainted: frozenset[int] = frozenset()
+    #: Indexes, none in ``tainted``, whose errors all point inside the commit's ``committer`` and
+    #: whose commit came back with a readable 40-hex ``oid``; ``evaluate`` relies on that oid.
+    #: Their committer is not read. A linked author is judged under rule 2 past the first page and
+    #: left unkeyed on it; an unlinked or null one is a fault, not a rule 1 refusal (owner ruling
+    #: W7-R11).
+    committer_tainted: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -208,8 +308,10 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
 
     A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
     chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
-    null person there would throw in the action: that is a fault here, and the commit keys nothing
-    in the action's view.
+    null person there would throw in the action. A null committer there is a fault here; the commit
+    keys nothing among the first page's keys. ``evaluate`` never calls this for a null author:
+    rule 1 refuses that commit first, or, where GraphQL reported an error inside its committer,
+    records it as a fault instead.
     """
     author = _person(commit, "author")
     if author is None:
@@ -259,14 +361,19 @@ def _rule_one(commit: Mapping[str, Any]) -> str | None:
 
 
 def matches_allowlist(name: str, patterns: Iterable[str]) -> bool:
-    """Mirror ``isUserNotInAllowList``: equality, or an UNANCHORED regex for an entry with ``*``.
+    """Mirror ``isUserNotInAllowList``: equality, or for an entry with ``*`` a regex anchored to the
+    whole name, as the patched action anchors it (BACKLOG #5644 item 2).
 
     An empty entry is kept, as the action keeps it, so a doubled comma matches an empty name.
+    ``fullmatch`` stands for JavaScript's ``^...$`` without the ``m`` flag: neither lets a match
+    end before a trailing newline, which Python's ``$`` alone would.
     """
     for raw in patterns:
         pattern = raw.strip()  # the action trims each entry here, so the mirror does too
         if "*" in pattern:
-            if re.search(_JS_DOT_STAR.join(re.escape(part) for part in pattern.split("*")), name):
+            if re.fullmatch(
+                _JS_DOT_STAR.join(re.escape(part) for part in pattern.split("*")), name
+            ):
                 return True
         elif pattern == name:
             return True
@@ -278,23 +385,68 @@ def parse_allowlist(text: str) -> list[str]:
     return [entry.strip() for entry in text.split(",")]
 
 
-def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> PullRequestRead:
+def fetch_commits(
+    transport: Transport, owner: str, name: str, number: int, expected_head: str = ""
+) -> PullRequestRead:
     """Every commit of the pull request, paging until ``hasNextPage`` is false.
 
     A page that claims more but gives no new cursor is a fault, and so is a head that moves between
     pages, because the pages would then describe two different pull requests. A list short of
-    ``totalCount`` is returned as it is, for ``evaluate`` to refuse.
+    ``totalCount`` is returned as it is, for ``evaluate`` to record as a fault. With
+    ``expected_head`` set, a first page of another head raises :class:`_StaleHead` at once.
     """
     commits: list[Mapping[str, Any]] = []
-    state: dict[str, Any] = {"head": None, "first_page": None}
+    state: dict[str, Any] = {
+        "head": None,
+        "first_page": None,
+        "tainted": set(),
+        "committer_tainted": set(),
+    }
     try:
-        return _fetch_pages(transport, owner, name, number, commits, state)
+        return _fetch_pages(transport, owner, name, number, expected_head, commits, state)
     except PrecheckFault as exc:
         if commits and state["head"] is not None and state["first_page"] is not None:
-            exc.partial = PullRequestRead(
-                list(commits), len(commits), state["head"], state["first_page"]
-            )
+            exc.partial = _snapshot(list(commits), len(commits), state)
         raise
+
+
+def _snapshot(
+    commits: list[Mapping[str, Any]], total: int, state: Mapping[str, Any]
+) -> PullRequestRead:
+    tainted = frozenset(state["tainted"])
+    return PullRequestRead(
+        commits,
+        total,
+        state["head"],
+        state["first_page"],
+        tainted,
+        frozenset(state["committer_tainted"]) - tainted,
+    )
+
+
+def _errored_nodes(errors: object) -> tuple[set[int], set[int]]:
+    """The commit-node indexes a GraphQL ``errors`` list points inside: those an error may have
+    nulled anything in, and those an error points inside the ``committer`` of. An index can be in
+    both; the first set wins.
+
+    An error that does not name one node by its ``path`` could have touched anything on the page,
+    so it faults the page instead.
+    """
+    if not isinstance(errors, list):
+        raise PrecheckFault("GraphQL returned an error")
+    indexes: set[int] = set()
+    committer_only: set[int] = set()
+    for error in errors:
+        path = error.get("path") if isinstance(error, Mapping) else None
+        if not isinstance(path, list) or len(path) < 5 or tuple(path[:4]) != _NODES_PATH:
+            raise PrecheckFault("GraphQL returned an error")
+        index = path[4]
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise PrecheckFault("GraphQL returned an error")
+        # `committer` is nullable, so null propagation from inside it stops there (BACKLOG #5644
+        # added item 1), on the same unmeasured premise as every partial error (module docstring).
+        (committer_only if tuple(path[5:7]) == ("commit", "committer") else indexes).add(index)
+    return indexes, committer_only
 
 
 def _fetch_pages(
@@ -302,6 +454,7 @@ def _fetch_pages(
     owner: str,
     name: str,
     number: int,
+    expected_head: str,
     commits: list[Mapping[str, Any]],
     state: dict[str, Any],
 ) -> PullRequestRead:
@@ -311,8 +464,14 @@ def _fetch_pages(
     first_page: int | None = None
     while True:
         reply = transport(QUERY, {"owner": owner, "name": name, "number": number, "cursor": cursor})
-        if reply.get("errors"):
-            raise PrecheckFault("GraphQL returned an error")
+        if head is None and expected_head:
+            # Before the errors list, so a lagging first page is re-read whatever else it holds.
+            first_head = _dig(reply, "data", "repository", "pullRequest", "headRefOid")
+            if isinstance(first_head, str) and first_head != expected_head:
+                raise _StaleHead("the pull request's head is not CLA_HEAD_SHA")
+        errors = reply.get("errors")
+        # A partial error: the data beside it still holds the commits no error points inside.
+        errored, committer_errored = _errored_nodes(errors) if errors else (set(), set())
         try:
             pull_request = reply["data"]["repository"]["pullRequest"]
             page_head = pull_request["headRefOid"]
@@ -323,15 +482,38 @@ def _fetch_pages(
             raise PrecheckFault("the GraphQL reply holds no pull request commits") from exc
         if not isinstance(nodes, list) or not isinstance(page_info, Mapping):
             raise PrecheckFault("the GraphQL reply's commit nodes or pageInfo have the wrong shape")
-        if not isinstance(page_head, str) or (head is not None and page_head != head):
+        if not isinstance(page_head, str):
+            raise PrecheckFault("the GraphQL reply holds no pull request head")
+        if head is not None and page_head != head:
             raise PrecheckFault("the pull request's head moved while its commits were being read")
         head = page_head
-        page: list[Mapping[str, Any]] = []
-        for node in nodes:
+        if any(index >= len(nodes) for index in errored | committer_errored):
+            raise PrecheckFault(
+                "GraphQL returned an error for a commit node the page does not hold"
+            )
+        # A committer-only error on a node that came back with no commit object, or with no
+        # readable oid (non-null, and outside the committer), contradicts the premise the carve-out
+        # rests on, so that node is unjudged whole, as before the carve-out, and its siblings are
+        # still judged.
+        for index in list(committer_errored):
+            node = nodes[index]
             commit = node.get("commit") if isinstance(node, Mapping) else None
+            if not isinstance(commit, Mapping) or not _SHA.fullmatch(str(commit.get("oid", ""))):
+                committer_errored.discard(index)
+                errored.add(index)
+        page: list[Mapping[str, Any]] = []
+        for index, node in enumerate(nodes):
+            commit = node.get("commit") if isinstance(node, Mapping) else None
+            if index in errored:
+                # GraphQL nulls what it could not resolve, up to the node itself: keep the slot,
+                # unjudged, so the first page's length and the other commits stay as read.
+                page.append(commit if isinstance(commit, Mapping) else {})
+                continue
             if not isinstance(commit, Mapping):
                 raise PrecheckFault("a commit node holds no commit object")
             page.append(commit)
+        state["tainted"].update(len(commits) + index for index in errored)
+        state["committer_tainted"].update(len(commits) + index for index in committer_errored)
         commits.extend(page)  # whole pages only, so a partial read never holds half a page
         if first_page is None:
             first_page = len(nodes)
@@ -349,7 +531,16 @@ def _fetch_pages(
             raise PrecheckFault("a page reports more commits but gives no new cursor to read them")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-    return PullRequestRead(commits, total, head, first_page)
+    return _snapshot(commits, total, state)
+
+
+def _dig(value: object, *keys: str) -> object:
+    """``value[k1][k2]...``, or None where a step is missing or not an object."""
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 def _total_count(connection: Mapping[str, Any]) -> int:
@@ -394,19 +585,32 @@ def evaluate(
 
     rule_one: list[str] = []
     rule_two: list[str] = []
-    distinct = len({str(commit.get("oid", "")) for commit in read.commits})
-    # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
-    # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
+    # An unjudged commit's oid may be the field GraphQL nulled: one that still reads as a commit
+    # id counts as itself, and any other counts once by its slot.
+    oids: set[str] = set()
+    for index, commit in enumerate(read.commits):
+        oid = str(commit.get("oid", ""))
+        oids.add(f"slot {index}" if index in read.tainted and not _SHA.fullmatch(oid) else oid)
+    distinct = len(oids)
+    # A FAULT, not a refusal (owner rulings 2026-11-13 and 2026-11-23): GitHub stops the connection
+    # at 250 commits while totalCount reports them all (measured; module docstring), so refusing
+    # would fail every larger PR closed. The commits past the stop are not checked.
     if complete and distinct != read.total:
         faults.append(
             f"read {distinct} distinct commits where the pull request has {read.total}; the "
             "unread commits are not checked"
         )
     # One slot per commit, None for a malformed one, so the first-page slice below never shifts a
-    # second-page commit into the action's view.
+    # second-page commit among the first page's keys.
     slots: list[Attribution | None] = []
     for index, commit in enumerate(read.commits):
         oid = commit.get("oid", "")
+        if index in read.tainted:
+            # GraphQL could not resolve part of it, and a nulled user reads as an unlinked author.
+            where = f"commit {oid}" if oid else f"the commit at position {index + 1}"
+            faults.append(f"{where}: GraphQL reported an error inside it; not judged")
+            slots.append(None)
+            continue
         try:
             refusal = _rule_one(commit)
         except PrecheckFault as exc:
@@ -414,43 +618,90 @@ def evaluate(
             slots.append(None)
             continue
         if refusal is not None:
-            # Judged before the key below, so a commit whose committer cannot be read is refused.
+            if index in read.committer_tainted:
+                # Unproven, so a fault that warns and passes (owner ruling W7-R11; module
+                # docstring, partial-error case). It keys nothing: on page one the action would
+                # key an unlinked author's commit under its committer, which the error hid. A
+                # null author has no key anywhere (below), so none is missing.
+                key = (
+                    "; its key is missing from the first page's keys"
+                    if index < read.first_page and commit["author"] is not None
+                    else ""
+                )
+                faults.append(
+                    f"commit {oid}: GraphQL reported an error inside its committer, and its "
+                    f"author reads as unlinked or null, which that failure may have caused; not "
+                    f"refused{key}"
+                )
+                slots.append(None)
+                continue
+            # Judged before the key below, so a commit whose committer cannot be read, other than
+            # through a GraphQL error inside it (above), is refused.
             rule_one.append(refusal)
-            # Past the action's view, rule 2 judges linked authors only, so no rule reads this
+            # Past the first page, rule 2 judges linked authors only, so no rule reads this
             # commit's key, and an unreadable committer here is not a fault. A null author, which
             # the schema allows, has no key anywhere: the action would throw on it.
             if index >= read.first_page or commit["author"] is None:
                 slots.append(None)
                 continue
+        if index < read.first_page and index in read.committer_tainted:
+            # Only a linked author gets here (an unlinked or null one is a fault above). Its key,
+            # its login, is not hidden by the error, but the commit is left unkeyed with a fault
+            # (PR 3323 hold) so rule 2 judges that author's later-page commits as it did before
+            # BACKLOG #5644 added item 1, when such a commit was unjudged whole.
+            faults.append(
+                f"commit {oid}: GraphQL reported an error inside its committer; its key is "
+                "missing from the first page's keys"
+            )
+            slots.append(None)
+            continue
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            # Only an unlinked author on the action's page gets here, so its key, the committer's
-            # account the action would file it under, is then missing from the action's view.
-            faults.append(f"commit {oid}: {exc}; its key is missing from the action's view")
+            # Only an unlinked author on the first page gets here, so its key, the committer's
+            # account the action would file it under, is then missing from the first page's keys.
+            faults.append(f"commit {oid}: {exc}; its key is missing from the first page's keys")
             slots.append(None)
-    # The action's committer list: the FIRST page only, one key per `login || name`. A linked
+    # The first page's keys this read could form, one per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
-    seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
+    first_slots = slots[: read.first_page]
+    first_page_keys = {slot.name for slot in first_slots if slot is not None}
+    # A first-page commit this read could not key (an error inside it, a malformed author or
+    # committer) has an unknown key, and a null-author one, on which the action throws, has
+    # none. A refusal below still holds, since an unsigned author owes a signature wherever the
+    # action sees them, but its reason counts only the commits keyed. It names keys, not people:
+    # an author may be a first-page committer, or carry another key there, and still be absent
+    # under this key.
+    keyed = sum(1 for slot in first_slots if slot is not None)
+    if keyed == len(first_slots):
+        where = "none of them carries"
+    else:
+        where = f"none of the {keyed} of them this read could key carries"
+    unsigned = (
+        "the CLA signature file holds no signature for that account"
+        if signatures is not None
+        else "no CLA signature file was given to check that account against"
+    )
     checked: set[int] = set()  # linked accounts already judged under rule 2
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
             continue  # rule 1 judged it above
-        if who.name in seen_by_action or who.database_id in checked:
+        if who.name in first_page_keys or who.database_id in checked:
             continue
         if who.database_id is None:
             # Linked, but with no integer id: the signature file cannot be checked for it, so
             # rule 2 cannot be judged, and skipping it in silence would read as a pass.
             faults.append(f"commit {who.oid}: its linked author has no integer databaseId")
             continue
-        # Rule 2: a linked author the action never reads, unless it would skip them anyway.
+        # Rule 2: a linked author first seen past the first page, unless the action would skip
+        # them anyway.
         checked.add(who.database_id)
         skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
         if not skipped and has_signed(who) is False:
             rule_two.append(
-                f"commit {who.oid} is past the {read.first_page} commits the action reads, its "
-                f"author {who.name!r} appears in none of them, and the CLA signature file holds "
-                "no signature for that account"
+                f"commit {who.oid} is past the first {read.first_page} commits of this pull "
+                f"request, {where} its author's key {who.name!r} (the login, or else the git name, "
+                f"the action files a commit under), and {unsigned}"
             )
     # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
     refusals = [
@@ -576,14 +827,66 @@ def _https_url(env: Mapping[str, str], key: str, default: str) -> str:
     return url
 
 
+def read_judged_head(
+    transport: Transport,
+    owner: str,
+    name: str,
+    number: int,
+    expected_head: str,
+    sleep: Callable[[float], None],
+) -> tuple[PullRequestRead, bool, str | None]:
+    """Read the pull request, re-reading while its first page shows another head.
+
+    Returns the read, whether it is complete, and a fault to report beside its verdict, if any.
+    With ``expected_head`` set, a first page of another head is read again after each wait in
+    ``HEAD_RETRY_DELAYS``, and is a fault that judges nothing once the waits run out. A complete
+    read of that head whose commits do not include it is judged, with a fault.
+    """
+    delays = iter(HEAD_RETRY_DELAYS)
+    while True:
+        try:
+            read = fetch_commits(transport, owner, name, number, expected_head)
+        except _StaleHead as exc:
+            delay = next(delays, None)
+            if delay is None:
+                raise PrecheckFault(
+                    f"{exc} after {len(HEAD_RETRY_DELAYS)} re-reads; this run is stale"
+                ) from exc
+            sleep(delay)
+            continue
+        except PrecheckFault as exc:
+            # A page failed after whole pages were kept. Those pages still prove what they prove.
+            if exc.partial is None:
+                raise
+            return exc.partial, False, str(exc)
+        if expected_head and not any(c.get("oid") == expected_head for c in read.commits):
+            # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
+            unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
+            if unreadable:
+                return (
+                    read,
+                    True,
+                    (
+                        "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
+                        f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
+                        "pull request's commits include it is unknown"
+                    ),
+                )
+            # The read may have stopped short of the head, so this names what it returned.
+            return read, True, "the commits this read returned do not include CLA_HEAD_SHA"
+        return read, True, None
+
+
 def run(
     env: Mapping[str, str],
     transport: Transport | None = None,
     signatures: Signatures | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> int:
     """Read the environment, check every commit, print annotations, and return the exit code.
 
-    ``transport`` and ``signatures`` replace the network for tests; both default to GitHub.
+    ``transport``, ``signatures`` and ``sleep`` replace the network and the clock for tests; they
+    default to GitHub and ``time.sleep``, looked up at call time.
     """
     try:
         repository = _REPOSITORY.fullmatch(env.get("GITHUB_REPOSITORY", ""))
@@ -618,16 +921,9 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        try:
-            read = fetch_commits(transport, owner, name, number)
-            complete, read_fault = True, None
-        except PrecheckFault as exc:
-            # A later page failed. The pages already read still prove what they prove.
-            if exc.partial is None:
-                raise
-            read, complete, read_fault = exc.partial, False, str(exc)
-        if expected_head and read.head != expected_head:
-            raise PrecheckFault("the pull request's head is not CLA_HEAD_SHA; this run is stale")
+        read, complete, read_fault = read_judged_head(
+            transport, owner, name, number, expected_head, sleep or time.sleep
+        )
         verdict = evaluate(read, allowlist, signatures, complete=complete)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")

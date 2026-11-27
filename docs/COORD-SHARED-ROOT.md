@@ -107,8 +107,8 @@ What this changes:
    `Read-CoordText`. The Python twin, `read_text` in `coord_root.py`, serves the claim and ledger
    gates, which only read. `tests/test_coord_smb_retry.py` tests each one against a second process
    that holds the file with no sharing. Each test has a control: the plain call must fail.
-   **Not covered, at least:** `alloc.ps1` still rewrites `alloc/<kind>/.floor-highwater` in place.
-   `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
+   `alloc.ps1` replaces `alloc/<kind>/.floor-highwater` through a temp file and a rename, with
+   `Move-CoordFileReplace`. **Not covered, at least:** `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
    report reads each handoff with its own capped read. `mail-claim.ps1` keeps its own claim-by-rename
    protocol, and the drain's citation walk fails closed on a held file without retrying. The wiki
    inbox (`wiki/`) and `wiki-cycle/` are read and written by korus scripts, which use neither
@@ -206,8 +206,16 @@ PreToolUse hook that waits on it would stall every tool call in every session on
 | Hooks that read (announce, mail drain, roster, collision gate) | Skip with a one-line note. Never block the tool call. |
 
 One shared resolver does the probe: a TCP connect to port 445 with a 1.5 s timeout, then the file
-call. It caches a "down" verdict per process for 60 s, so a dead share costs one timeout, not one
-per hook.
+call. It caches a "down" verdict for 60 s in `<LOCAL>/coord-root-down.json`, keyed by the server
+and read by both the PowerShell and the Python resolver, so a dead share costs one timeout per
+minute per clone, not one per hook process.
+
+A device-path root is refused: any spelling made of two separators, then `?` or `.`, then a
+separator or nothing, such as `\\?\X:\p`, `//?/X:/p`, `\\?\UNC\srv\share\p` or a bare `\\.`. It is
+refused at least in `MEFOR_COORD_ROOT`, in `root.toml`, in the probe, and in `coord-migrate.ps1`'s
+`-Source` and `-Target`, before any probe, file call or down-cache write. Use the plain spelling instead: `X:\p` or `\\srv\share\p`. `Get-CoordDeviceRootRefusal` in
+`scripts/coord/coord-root.ps1` says why. `worktree_gate.ps1` reads the configured spelling itself,
+without the resolver.
 
 ## Atomicity over SMB
 

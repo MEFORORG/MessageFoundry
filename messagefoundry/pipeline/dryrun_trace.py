@@ -49,7 +49,13 @@ site keeps them unchanged).
   The invocation therefore carries ``"lazy_result": true``: message-level ``sends``/``handlers`` stay
   byte-identical to the untraced run, and the consumer can say *"this body was not traced"* instead of
   rendering an apparently inert handler beside ``trace_ok: true`` (ADR 0072 §6 gate 1; the honest-
-  degradation rule of ADR 0089 §4).
+  degradation rule of ADR 0089 §4). **Handler half, wider (ADR 0072 amendment 2026-11-24, BACKLOG
+  #6823):** a Handler's ``lazy_result`` marks any iterable return whose exact type is not
+  ``list``/``tuple``/``set``/``frozenset`` (``str``/``bytes``/``bytearray`` aside). It means only that
+  the per-invocation ``sends`` were not read; such a body may still carry line events.
+* *Bounded capture.* An invocation keeps at most :data:`_MAX_EVENTS` line events and
+  :data:`_MAX_WRITES` ``msg`` writes. Past either it carries ``"truncated": true``; past the second
+  also ``"writes_truncated": true``, and later writes on every line are dropped (BACKLOG #6824).
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -62,13 +68,15 @@ to stdout — never written to a persisted file.
 from __future__ import annotations
 
 import inspect
+import math
 import sys
-from collections.abc import Iterator
+import threading
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
 from types import CodeType, FrameType
-from typing import Any
+from typing import Any, cast
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.fhir_lookup import FhirLookupError
@@ -78,7 +86,7 @@ from messagefoundry.config.wiring import (
     Payload,
     RouterFn,
     Send,
-    handler_result_items,
+    accepts_verdict,
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run
@@ -90,6 +98,10 @@ __all__ = ["trace_dry_run"]
 # marked ``truncated``). A long string local / write value is likewise capped so a body can't be dumped
 # in full even under --show-phi.
 _MAX_EVENTS = 5000
+# Message writes are capped per invocation on their own, because a helper the Handler calls is not
+# line-traced: all its writes land on one Handler line, so the event cap alone never bounds them.
+# Semantics: :meth:`_Recorder.record_write` (BACKLOG #6824).
+_MAX_WRITES = 5000
 _MAX_VALUE_LEN = 120
 
 
@@ -101,12 +113,30 @@ def _safe_value(value: object, show_phi: bool) -> Any:
 
     Without ``show_phi`` every value collapses to ``"REDACTED"`` (values are message-derived, hence PHI).
     With it, scalars pass through and any other object is ``repr``'d; both are length-capped so a full
-    message body can never be dumped."""
+    message body can never be dumped. A NaN/Infinity float becomes a tagged string and an over-cap int is
+    truncated like a string, because ``json.dumps`` would otherwise write a token RFC 8259 rejects or,
+    past the interpreter's int-to-str digit limit, raise (BACKLOG #6822). The numeric checks go by
+    ``type()`` and call no hook a subclass defines, so the observer never runs user code there."""
     if not show_phi:
         return "REDACTED"
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or type(value) is bool:
         return value
-    if isinstance(value, str):
+    cls = type(value)
+    if issubclass(cls, float) and isinstance(value, float):  # isinstance only narrows for mypy
+        # math.isnan/isinf/copysign read the C double directly; a comparison would call __gt__.
+        if math.isnan(value):
+            return "<float: nan>"
+        if math.isinf(value):
+            return "<float: inf>" if math.copysign(1.0, value) > 0 else "<float: -inf>"
+        return value
+    if issubclass(cls, int):
+        try:
+            text = int.__repr__(value)
+        except ValueError:  # past sys.get_int_max_str_digits(): json.dumps would raise the same
+            return "<int: too large>"
+        if len(text) <= _MAX_VALUE_LEN:
+            return value
+    elif isinstance(value, str):
         text = value
     else:
         try:
@@ -138,25 +168,58 @@ def _safe_snapshot(frame: FrameType) -> dict[str, Any]:
 def _sends_from(result: object) -> list[str]:
     """Outbound names in a Handler's raw return (``Send``/``SetState``/an iterable/``None``) — mirrors
     the ``Send`` half of :func:`messagefoundry.pipeline.dryrun._partition`, name-only (no payload = no
-    PHI). It shares that function's materialization rule so the trace does not drift from what actually
-    delivers now that any non-``str`` iterable fans out (BACKLOG #341).
+    PHI). It reports a subset of what that function delivers, never a substitute (ADR 0072 gate 1b).
 
-    **One deliberate divergence: a one-shot iterator is never consumed.** A generator Handler is
+    **It never walks a return it cannot prove re-iterable.** A generator Handler is
     reported as no sends rather than drained here, because this hook is a *pure observer* — exhausting
     the generator would leave ``_partition`` nothing to partition, so the traced run would deliver 0
     where the untraced run delivers N. Under-reporting is the only safe option; it is symmetric with
     :func:`_routed_from`'s long-standing gap for a generator Router, but on the Handler half **this
     change opened it**: before BACKLOG #341 a generator Handler delivered nothing at all, so reporting
     no sends was exact rather than a degradation. The caller marks the invocation ``lazy_result`` so
-    the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1)."""
+    the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1).
+
+    "Not an ``Iterator``" is not "safe to walk" either (BACKLOG #6823): see
+    :data:`_ROUTED_CONTAINERS`. Only those exact builtin types are walked, since a subclass may
+    override ``__iter__``; any other iterable is reported as no sends and declared by
+    :func:`_handler_return_is_untraceable`. A re-iterable shape outside that set, such as a
+    ``deque``, therefore under-reports too."""
     if result is None:
         return []
-    if isinstance(result, Iterator):
+    if _is_exact_container(result):
+        items: Iterable[object] = cast("Iterable[object]", result)
+    elif _handler_return_is_untraceable(result):
         return []
-    items = handler_result_items(result)
-    if items is None:
-        items = [result]
+    else:
+        items = [result]  # a single value, as `handler_result_items` treats a non-iterable
     return [it.to for it in items if isinstance(it, Send)]
+
+
+#: What ``handler_result_items`` treats as a single value although it is ``Iterable``. Kept in step
+#: with that function's carve-out, which ``_partition`` applies.
+_HANDLER_SINGLE_VALUES = (str, bytes, bytearray)
+
+
+def _is_exact_container(result: object) -> bool:
+    """True when ``result``'s exact type is one of :data:`_ROUTED_CONTAINERS`.
+
+    Identity, not ``type(result) in ...``: membership compares with ``==``, which would run a user
+    metaclass ``__eq__`` inside this observer."""
+    t = type(result)
+    return t is list or t is tuple or t is set or t is frozenset
+
+
+def _handler_return_is_untraceable(result: object) -> bool:
+    """True when :func:`_sends_from` declines to walk this Handler return, so the record is incomplete.
+
+    Drives ``lazy_result`` for the Handler half: an ``Iterable`` that ``_partition`` materializes as
+    a container and whose exact type is not in :data:`_ROUTED_CONTAINERS`. At least a generator, a
+    custom single-pass iterable and a builtin-container subclass are such returns."""
+    return (
+        isinstance(result, Iterable)
+        and not isinstance(result, _HANDLER_SINGLE_VALUES)
+        and not _is_exact_container(result)
+    )
 
 
 #: Router-return containers this observer will walk: re-iterable, and walking one consumes nothing.
@@ -234,8 +297,10 @@ class _Recorder:
         self.sends: list[str] = []
         self.routed_to: list[str] = []
         self.truncated = False
-        # The invocation returned a one-shot iterator (a generator Router/Handler): its body has not
-        # run yet, so this record has no line events and its sends/routed_to are not measurable here.
+        self.writes_truncated = False
+        # The return was not walked, so this record's sends/routed_to are not measurable here. For a
+        # generator the body has not run yet either, so there are no line events; a Handler's other
+        # unwalked iterables (BACKLOG #6823) may still have them. See `record_return`.
         self.lazy_result = False
         # trace state
         self.frame: FrameType | None = None
@@ -244,6 +309,7 @@ class _Recorder:
         self._last_ts: float | None = None
         self._snap_before: dict[str, Any] = {}
         self._writes_by_line: dict[int, list[dict[str, Any]]] = {}
+        self._write_count = 0  # writes kept, pending or emitted, against _MAX_WRITES
 
     # tracer callbacks ---------------------------------------------------------
 
@@ -293,6 +359,22 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
+        # Past the event cap no line is finalized, so a write kept then would only be held: a long
+        # mutating loop would grow this recorder without bound (BACKLOG #6824). A write with no
+        # latched frame is keyed to the def line, where a later finalize may still emit it (a
+        # wrapper writing before a one-line target runs), so it is kept, against _MAX_WRITES.
+        if len(self.events) >= _MAX_EVENTS:
+            self.truncated = True
+            return
+        if self._write_count >= _MAX_WRITES:
+            # Also `truncated`, so the record never reads as complete. The IDE reads only that key,
+            # and only in its test bench, which shows its event-cap message (coverage may
+            # under-report) even when only writes were capped. Its inline write views read neither
+            # flag.
+            self.writes_truncated = True
+            self.truncated = True
+            return
+        self._write_count += 1
         line = self.frame.f_lineno if self.frame is not None else (self.def_line or 0)
         self._writes_by_line.setdefault(line, []).append(
             {"path": path, "value": _safe_value(value, self.show_phi)}
@@ -301,21 +383,22 @@ class _Recorder:
     # terminal classification --------------------------------------------------
 
     def record_return(self, result: object) -> None:
-        if self.kind in ("router", "handler"):
-            # A generator function returns WITHOUT running its body, so this record is structurally
-            # incomplete (no line events, no measurable sends/routed_to) — declare that rather than
-            # let a consumer read an empty record as "this handler did nothing". Set for BOTH halves:
-            # the Router gap is long-standing, the Handler gap was opened by BACKLOG #341 widening
-            # `_partition` so a generator Handler now delivers.
-            self.lazy_result = isinstance(result, Iterator)
+        # A generator function returns WITHOUT running its body, so this record is structurally
+        # incomplete (no line events, no measurable sends/routed_to) — declare that rather than let a
+        # consumer read an empty record as "this handler did nothing". Set for BOTH halves: the Router
+        # gap is long-standing, the Handler gap was opened by BACKLOG #341 widening `_partition` so a
+        # generator Handler now delivers.
         if self.kind == "router":
             # Widen the declaration for the Router half: `_routed_from` walks an allowlist, so a
             # single-pass custom iterable or a `__getitem__`-only sequence is equally untraced and
-            # must say so. The Handler half keeps the Iterator test -- `_sends_from` still routes
-            # through `handler_result_items`, which has its own rule.
-            self.lazy_result = self.lazy_result or _router_return_is_untraceable(result)
+            # must say so.
+            self.lazy_result = isinstance(result, Iterator) or _router_return_is_untraceable(result)
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
+            # The Handler half walks the exact types in the same allowlist (BACKLOG #6823), so a
+            # single-pass custom iterable or container subclass is untraced, not "sent nothing". The
+            # predicate also covers a generator, so the flag and `_sends_from` share one rule.
+            self.lazy_result = _handler_return_is_untraceable(result)
             self.sends = _sends_from(result)
         # An "accepts" predicate (ADR 0084) returns a bool — it has neither routed_to nor sends, and its
         # verdict is reported at message level (`accepts_declined`). Named explicitly so it isn't quietly
@@ -361,6 +444,8 @@ class _Recorder:
         }
         if self.truncated:
             out["truncated"] = True
+        if self.writes_truncated:
+            out["writes_truncated"] = True
         if self.lazy_result:
             out["lazy_result"] = True
         return out
@@ -416,10 +501,12 @@ class _Tracer:
         return self._run("handler", fn, name, payload)
 
     def trace_accepts(self, pred: HandlerAccepts, name: str, payload: Payload) -> bool:
-        """Trace an ``accepts=`` predicate (ADR 0084) and record a decline. A pure observer like the
-        other two: the verdict is returned unchanged and a raise propagates, so the traced routing
-        decision stays byte-identical to the untraced one."""
-        verdict = bool(self._run("accepts", pred, name, payload))
+        """Trace an ``accepts=`` predicate (ADR 0084) and record a decline. It returns the verdict as
+        a bool, read by :func:`accepts_verdict` as the untraced path reads it, so the traced routing
+        decision stays the same as the untraced one. A raise propagates. A verdict
+        ``accepts_verdict`` refuses raises its ``TypeError`` here, before any decline is recorded
+        (BACKLOG #5514)."""
+        verdict = accepts_verdict(name, self._run("accepts", pred, name, payload))
         if not verdict:
             self.accepts_declined.append(name)
         return verdict
@@ -466,22 +553,44 @@ def _recording_write(
     *,
     as_data: bool,
 ) -> None:
+    # Recorded before the write, so a write that raises still shows on the line that failed.
     rec = _active_recorder.get()
     if rec is not None:
         rec.record_write(path, value)
     _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
+# ``Message._write`` is class-global, so concurrent traces (one per thread) share one patch. A
+# count under a lock installs it on the first entry and restores it on the last exit; without it
+# the first trace to finish restored the original under the others, which then silently recorded
+# no writes (BACKLOG #6825).
+_patch_lock = threading.Lock()
+_patch_holders = 0
+
+
 @contextmanager
 def _patched_message_writes() -> Iterator[None]:
     """Record ``msg.set(...)`` / ``msg[...] = ...`` / ``msg.set_data(...)`` writes for the active
-    recorder, then restore the original method. A no-op passthrough whenever no recorder is active, so
-    it never perturbs the mutation itself."""
-    Message._write = _recording_write  # type: ignore[method-assign]
+    recorder, then restore the original method once no trace still needs it. A no-op passthrough
+    whenever no recorder is active, so it never perturbs the mutation itself."""
+    global _patch_holders
+    held = False
     try:
+        # Inside the try, which narrows the window in which an interrupt leaks the count; it does
+        # not close it (between the increment and `held = True`, or in the release). A leaked count
+        # leaves the patch installed for the life of the process.
+        with _patch_lock:
+            if _patch_holders == 0:
+                Message._write = _recording_write  # type: ignore[method-assign]
+            _patch_holders += 1
+            held = True
         yield
     finally:
-        Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
+        if held:
+            with _patch_lock:
+                _patch_holders -= 1
+                if _patch_holders == 0:
+                    Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
 
 
 def trace_dry_run(
@@ -491,6 +600,7 @@ def trace_dry_run(
     inbound: str | None = None,
     show_phi: bool = False,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Dry-run ``raw`` against ``registry`` with the execution tracer installed; return the trace JSON.
 
@@ -503,11 +613,21 @@ def trace_dry_run(
     ``dryrun --trace`` would silently preview a different posture than plain ``dryrun`` and break the
     byte-identical contract above. The *library* default is ``True``, as the engine's is (BACKLOG #5794,
     ADR 0104 §8.1 as amended); the ``dryrun`` CLI passes its resolved
-    ``[pipeline].snapshot_on_send`` to both paths (#230)."""
+    ``[pipeline].snapshot_on_send`` to both paths (#230).
+
+    ``reference_view`` is passed straight through too, as :func:`dry_run` takes it: ``None`` builds
+    the reference sets on this call, and a caller tracing many messages against one graph builds
+    :func:`~messagefoundry.pipeline.dryrun.dry_run_reference_view` once and passes it, so each file
+    is read once (BACKLOG #6820)."""
     tracer = _Tracer(show_phi=show_phi)
     with _patched_message_writes():
         result = dry_run(
-            registry, raw, inbound=inbound, tracer=tracer, snapshot_on_send=snapshot_on_send
+            registry,
+            raw,
+            inbound=inbound,
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     disposition = result.disposition.value
     return {

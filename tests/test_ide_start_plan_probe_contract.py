@@ -9,12 +9,19 @@ answers apart by two fragments of the engine's refusal text, declared in
 text, so a rewording here would leave the mocha suite green while the IDE misread the engine: every
 Start would report a refusal, or worse, provision over a store that needs nothing.
 
-This file closes that gap. It reads the fragments and the probe username out of the TypeScript, runs
-the probe the IDE runs with ``messagefoundry.serviceConfig`` at its default -- the same argv, no
-``--db``, no ``--service-config``, no terminal -- and checks each answer carries the
-fragment the IDE looks for, in the ``--json`` error object on stdout, the only place the IDE reads
-an answer from. Both arms set the IDE's condition, stdin not a terminal, explicitly, so the result
-does not depend on how pytest was started.
+This file closes that gap. It reads the two fragments out of the TypeScript. The probe argv it runs
+is ``probeDefault`` in ``ide/src/test/fixtures/provision-admin-argv.json``, the probe with
+``messagefoundry.serviceConfig`` at its default: no ``--db``, no ``--service-config``. It hands that
+list, minus the interpreter options and ``-m messagefoundry``, to the engine's ``main`` in-process,
+in a temporary working directory, with no terminal. At least one arm runs it with no store in
+that directory, and others seed a store there first. Each checks the answer carries the fragment
+the IDE looks for, in the ``--json`` error object on stdout, the only place the IDE reads an answer
+from. Each arm that runs the probe sets the IDE's condition, stdin not a terminal, explicitly, so
+the result does not depend on how pytest was started.
+
+Whether ``probeDefault`` is the argv the IDE builds, and what this file leaves to the mocha
+suites there, is in the docstring of
+``test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants``.
 """
 
 from __future__ import annotations
@@ -36,14 +43,31 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.store import MessageStore
 from scripts.security.js_lexer import blank_js_comments
+from tests.test_ide_provision_admin_argv import FIXTURE as ARGV_FIXTURE
+from tests.test_ide_provision_admin_argv import _cli_args
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
+_WIZARD = _MODEL.with_name("connectionWizardModel.ts")
 
 
-def _ts_string_const(name: str) -> str:
-    """The value of ``export const <name> = "...";`` in the IDE's control model."""
-    m = re.search(rf'export const {name} = "([^"]+)";', _MODEL.read_text(encoding="utf-8"))
+def _code_view(text: str) -> str:
+    """TypeScript with its comments blanked and its whitespace collapsed, for the source pins."""
+    return " ".join(blank_js_comments(text).split())
+
+
+# A declaration of ``name`` in the code view: a function, const, let or var of that name.
+_DECLARES = r"\b(?:function|const|let|var)\s+{name}\b"
+
+
+def _ts_string_const(name: str, text: str | None = None) -> str:
+    """The value of ``export const <name> = "...";`` in the IDE's control model (or ``text``), with
+    comments blanked so a comment quoting the constant cannot supply it. Whitespace is NOT
+    collapsed here, unlike ``_code_view``: the value is read byte for byte, so a doubled space or a
+    tab inside the literal changes it."""
+    raw = _MODEL.read_text(encoding="utf-8") if text is None else text
+    code = blank_js_comments(raw)
+    m = re.search(rf'export const {name} = "([^"]+)";', code)
     assert m, f"{name} is not a plain string constant in {_MODEL.name}"
     return m.group(1)
 
@@ -53,28 +77,148 @@ def _no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
 
 
-def _probe_argv() -> list[str]:
-    """The argv ``buildAdminProbeInvocation`` builds, after ``python -m messagefoundry``."""
+def _ts_string_list(name: str, text: str | None = None) -> list[str]:
+    """The elements of ``export const <name>: readonly string[] = [...];`` in the IDE's control model
+    (or ``text``), comments blanked. The body must be comma-separated double-quoted string literals
+    with no backslash or newline inside, and nothing else. At least a single-quoted or template
+    literal, a spread, an identifier and a literal holding an escape such as ``\\u002D`` fail the
+    assertion here instead of being skipped or misread; the parametrized negative control below
+    shows each."""
+    raw = _MODEL.read_text(encoding="utf-8") if text is None else text
+    m = re.search(
+        rf"export const {name}: readonly string\[\] = \[([^\]]*)\];", blank_js_comments(raw)
+    )
+    assert m, f"{name} is not a plain string-array constant in {_MODEL.name}"
+    body = m.group(1)
+    literal = r'"[^"\\\n]*"'
+    assert re.fullmatch(rf"\s*(?:{literal}\s*(?:,\s*{literal}\s*)*,?\s*)?", body), (
+        f"{name} holds an element that is not a double-quoted string literal: [{body}]"
+    )
+    return re.findall(r'"([^"]*)"', body)
+
+
+def _expected_probe_argv(text: str | None = None) -> list[str]:
+    """The whole default probe argv, from the TypeScript constants: the interpreter options,
+    ``-m messagefoundry``, then the probe account and ``--json``. The email is trimmed, as the
+    builder trims it."""
     return [
+        *_ts_string_list("INTERPRETER_OPTIONS", text),
+        "-m",
+        "messagefoundry",
         "provision-admin",
-        f"--username={_ts_string_const('PROBE_USERNAME')}",
-        f"--email={_ts_string_const('PROBE_EMAIL')}",
+        f"--username={_ts_string_const('PROBE_USERNAME', text)}",
+        f"--email={_ts_string_const('PROBE_EMAIL', text).strip()}",
         "--json",
     ]
 
 
-def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
-    """If the TypeScript stops building this argv, the three tests below stop describing the IDE.
+def _probe_argv() -> list[str]:
+    """The fixture's ``probeDefault``, the argv ``buildAdminProbeInvocation`` builds with
+    ``messagefoundry.serviceConfig`` at its default, minus the interpreter options and
+    ``-m messagefoundry``, which ``_cli_args`` strips against its own hardcoded ``PREFIX``."""
+    return _cli_args(ARGV_FIXTURE["probeDefault"])
 
-    The IDE adds ``--service-config`` only when ``messagefoundry.serviceConfig`` is set and not
-    blank; this file's probe runs with the setting at its default, where ``serviceConfigFlag`` adds
-    nothing. Comments are blanked first, so a comment quoting the argv cannot satisfy the pin, and
-    the pin ends at the array's close, so an element added after the flag reds it. The array is
-    handed to ``cliArgv`` (BACKLOG #5409), so its body is pinned too: the interpreter options,
-    then ``-m messagefoundry``, then this array, and nothing after it.
+
+def test_the_shared_fixture_default_probe_is_the_argv_built_from_the_typescript_constants() -> None:
+    """The fixture's ``probeDefault`` equals, whole, the argv built from the TypeScript constants.
+
+    What reds this test includes at least: an ``INTERPRETER_OPTIONS`` element changed, added,
+    removed or reordered, or a changed ``PROBE_USERNAME`` or ``PROBE_EMAIL``, with the fixture
+    left as it is; an ``INTERPRETER_OPTIONS`` element that is not a double-quoted string literal,
+    which ``_ts_string_list`` refuses; and the fixture's ``probe`` entry drifting from
+    ``probeDefault``. A deliberate ``INTERPRETER_OPTIONS`` change also reds the copies of today's
+    values hardcoded in this file and ``PREFIX`` in ``tests/test_ide_provision_admin_argv.py``,
+    which move by hand.
+
+    The one account of what this file leaves to the mocha suites: it reads no builder output. The
+    source pin in ``test_the_probe_argv_here_is_the_one_the_ide_builds`` matches text anywhere in
+    ``engineControlModel.ts``, not inside a particular function body. It reds an element added
+    inside the pinned ``cliArgv`` array or to the probe's ``[...inv.args, "--json"]``. It does not
+    red an element added at a builder's return in another spelling, such as
+    ``args: [...args, "--db=x"]`` or a ``.concat``, or a real body changed while a copy of the
+    pinned text stays elsewhere in the file. The mocha suites that compare the builders' whole
+    output catch those, at least ``provision-admin-argv.test.ts`` and ``engine-control.test.ts``.
+    They run in the ``ide build`` job; that job's header in ``.github/workflows/ci.yml`` says
+    whether it gates a merge."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    assert ARGV_FIXTURE["probeDefault"] == _expected_probe_argv(raw)
+    # Negative control: a moved TypeScript constant reds the comparison, so the expected argv is
+    # read from the TypeScript and not from the fixture.
+    for decl, moved in (
+        ('export const PROBE_USERNAME = "probe";', 'export const PROBE_USERNAME = "probe2";'),
+        (
+            'export const PROBE_EMAIL = "probe@example.invalid";',
+            'export const PROBE_EMAIL = "probe2@example.invalid";',
+        ),
+        ('"-P", "-X", "disable-remote-debug"]', '"-I", "-P", "-X", "disable-remote-debug"]'),
+    ):
+        assert raw.count(decl) == 1, decl
+        assert ARGV_FIXTURE["probeDefault"] != _expected_probe_argv(raw.replace(decl, moved)), moved
+    # The fixture's probe with serviceConfig set is probeDefault with only the flag added, before
+    # --json, so the two entries cannot drift apart.
+    probe, default = ARGV_FIXTURE["probe"], ARGV_FIXTURE["probeDefault"]
+    assert _is_default_plus_flag(probe, default)
+    # Negative control: an extra element, the flag after --json, a reordered element and a second
+    # flag each fail the same check.
+    flag_at = probe.index(next(a for a in probe if a.startswith("--service-config=")))
+    for drifted in (
+        [*probe[:-1], "--db=other.db", "--json"],
+        [*probe[:flag_at], "--json", probe[flag_at]],
+        [probe[1], probe[0], *probe[2:]],
+        [*probe[:-1], probe[flag_at], "--json"],
+    ):
+        assert not _is_default_plus_flag(drifted, default), drifted
+
+
+def _is_default_plus_flag(with_flag: list[str], default: list[str]) -> bool:
+    """``with_flag`` is ``default`` with exactly one ``--service-config=`` element added, right
+    before the closing ``--json``."""
+    flag = [a for a in with_flag if a.startswith("--service-config=")]
+    return (
+        len(flag) == 1
+        and [a for a in with_flag if a not in flag] == default
+        and with_flag[-2:] == [*flag, "--json"]
+    )
+
+
+@pytest.mark.parametrize(
+    "moved",
+    [
+        '\'-I\', "-P", "-X", "disable-remote-debug"]',
+        '...EXTRA_OPTIONS, "-P", "-X", "disable-remote-debug"]',
+        '"-P", "-X", "disable-remote-debug", `-I`]',
+        '"-P", "-X", EXTRA_OPTION, "disable-remote-debug"]',
+        '"-P", "-X", "disable-remote-debug", "\\u002DI"]',
+    ],
+    ids=["single-quoted", "spread", "template", "identifier", "escaped"],
+)
+def test_an_interpreter_option_the_list_reader_cannot_read_reds_it(moved: str) -> None:
+    """Negative control for ``_ts_string_list``: an element it cannot read as a double-quoted string
+    literal fails the read instead of being skipped, so the comparison above cannot pass on a list
+    that dropped it."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    decl = '"-P", "-X", "disable-remote-debug"]'
+    assert raw.count(decl) == 1, decl
+    # Control: the unmutated list reads, as the three options.
+    assert _ts_string_list("INTERPRETER_OPTIONS", raw) == ["-P", "-X", "disable-remote-debug"]
+    with pytest.raises(AssertionError, match="not a double-quoted string literal"):
+        _ts_string_list("INTERPRETER_OPTIONS", raw.replace(decl, moved))
+
+
+def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
+    """If the TypeScript stops building this argv, the tests below that run the probe stop describing the IDE.
+
+    The probe forwards the ``serviceConfig`` it is handed, which the mocha suite pins as undefined
+    with ``messagefoundry.serviceConfig`` at its default; this file's probe runs there, where
+    ``serviceConfigFlag`` (an alias of ``connectionWizardModel.ts``'s ``serviceConfigArgs``) is
+    handed undefined and adds nothing. Comments are blanked first in both files, so a comment
+    quoting the code cannot satisfy a pin (a string literal still could), and the pin ends at the
+    array's close, so an element added after the flag reds it. The array is handed to ``cliArgv``
+    (BACKLOG #5409), so its body is pinned too: the interpreter options, then ``-m messagefoundry``,
+    then this array, and nothing after it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
-    src = " ".join(blank_js_comments(raw).split())
+    src = _code_view(raw)
     # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
     assert "Each value is bound with" in raw
     assert "Each value is bound with" not in src
@@ -91,11 +235,31 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
         "function cliArgv(module: string, args: readonly string[]): string[] { "
         'return [...INTERPRETER_OPTIONS, "-m", module, ...args]; }' in src
     )
-    assert (
-        "function serviceConfigFlag(serviceConfig: string | undefined): string[] { "
-        "return serviceConfig === undefined ? [] :" in src
+    assert len(re.findall(_DECLARES.format(name="cliArgv"), src)) == 1, "a second cliArgv"
+    # serviceConfigFlag is an alias of connectionWizardModel's serviceConfigArgs, so follow it there:
+    # the alias and its import here, and the body there, where undefined (this probe) adds nothing.
+    # serviceConfigArgs appears only in the import, unrenamed in either direction, and the alias;
+    # serviceConfigFlag is declared once, by the alias, and is otherwise only called. These catch at
+    # least a const or function shadow, a parameter of that name and a local serviceConfigArgs.
+    assert re.search(
+        r"import \{[^}]*(?<!\bas )\bserviceConfigArgs\b(?! as\b)[^}]*\} "
+        r'from "\./connectionWizardModel";',
+        src,
     )
-    assert "username: PROBE_USERNAME, email: PROBE_EMAIL" in src
+    assert "const serviceConfigFlag = serviceConfigArgs;" in src
+    assert len(re.findall(r"\bserviceConfigArgs\b", src)) == 2, "only the import and the alias"
+    assert len(re.findall(_DECLARES.format(name="serviceConfigFlag"), src)) == 1, "a second one"
+    assert len(re.findall(r"\bserviceConfigFlag\b(?!\()", src)) == 1, "a non-call mention"
+    wizard_raw = _WIZARD.read_text(encoding="utf-8")
+    wizard = _code_view(wizard_raw)
+    # Control: the wizard has comments, and comment blanking removed them from the code view.
+    assert "/**" in wizard_raw
+    assert "/**" not in wizard
+    assert (
+        "export function serviceConfigArgs(serviceConfig: string | undefined): string[] { "
+        "return serviceConfig === undefined ? [] :" in wizard
+    )
+    assert "serviceConfig: opts.serviceConfig, username: PROBE_USERNAME, email: PROBE_EMAIL" in src
     assert '[...inv.args, "--json"]' in src
 
 
@@ -169,3 +333,29 @@ def test_a_store_run_only_by_directory_administrators_answers_with_the_no_termin
     error = json.loads(capsys.readouterr().out)["error"]
     assert _ts_string_const("NO_TERMINAL_REFUSAL") in error
     assert _ts_string_const("ADMIN_EXISTS_REFUSAL") not in error
+
+
+def test_a_whitespace_change_inside_the_fragment_is_read_and_reds_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Negative control for the constant reader: a doubled space inside ``NO_TERMINAL_REFUSAL``
+    changes what the IDE matches on, so the reader must return the changed value and the
+    fragment check above must fail against it. A reader that collapsed whitespace would hand back
+    the original value and pass wrongly."""
+    raw = _MODEL.read_text(encoding="utf-8")
+    original = _ts_string_const("NO_TERMINAL_REFUSAL")
+    assert " " in original
+    mutated_value = original.replace(" ", "  ", 1)
+    decl = f'export const NO_TERMINAL_REFUSAL = "{original}";'
+    assert raw.count(decl) == 1
+    mutated = raw.replace(decl, f'export const NO_TERMINAL_REFUSAL = "{mutated_value}";')
+    assert _ts_string_const("NO_TERMINAL_REFUSAL", mutated) == mutated_value
+
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_terminal(monkeypatch)
+    assert main(_probe_argv()) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    # The real fragment is in the answer and the mutated one is not, so the check would red.
+    assert original in error
+    assert mutated_value not in error

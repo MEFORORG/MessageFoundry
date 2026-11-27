@@ -10,9 +10,11 @@
 // a rule is remove + re-add. A change lands in the file immediately but the engine reads `[alerts]`
 // at startup, so it takes effect on the next engine restart (not via Promote/reload) — the UI says so.
 import * as vscode from "vscode";
-import { runJson, serviceConfig, workspaceDir, writerPathSetting } from "./cli";
+import { readerPathEscapesByLink, runJson, serviceConfigSetting, workspaceDir, writerPathSetting } from "./cli";
+import { serviceConfigArgs } from "./connectionWizardModel";
+import { readerLinkEscapeNotice } from "./workspaceContainment";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
-import { alertEditorScript } from "./alertEditorWebview";
+import { ALERT_COOLDOWN_MAX_DAYS, ALERT_COOLDOWN_MAX_SECONDS, alertEditorScript } from "./alertEditorWebview";
 
 const EVENT_TYPES = [
   "any",
@@ -91,8 +93,16 @@ async function refresh(current: vscode.WebviewPanel): Promise<void> {
   if (!ws) {
     return;
   }
+  // The file is handed to the CLI, so a value that leaves the workspace through a link is refused
+  // here as the writers below refuse it (BACKLOG #5411, #8237 item 24).
+  const setting = serviceConfigSetting();
+  if (readerPathEscapesByLink(setting)) {
+    const message = readerLinkEscapeNotice("serviceConfig", "The alert rules were not read.");
+    postToWebview(current.webview, { command: "error", message });
+    return;
+  }
   try {
-    const rules = await runJson<Rule[]>(["alert", "list", "--service-config", serviceConfig()], ws);
+    const rules = await runJson<Rule[]>(["alert", "list", ...serviceConfigArgs(setting.value)], ws);
     postToWebview(current.webview, { command: "rules", rules });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -112,7 +122,7 @@ async function add(rule: NewRule, current: vscode.WebviewPanel): Promise<void> {
   }
   try {
     await runJson(
-      ["alert", "add", "--service-config", file, "--data", JSON.stringify(rule)],
+      ["alert", "add", ...serviceConfigArgs(file), `--data=${JSON.stringify(rule)}`],
       ws,
     );
   } catch (e) {
@@ -145,7 +155,7 @@ async function remove(index: number, current: vscode.WebviewPanel): Promise<void
   }
   try {
     await runJson(
-      ["alert", "remove", "--service-config", file, "--index", String(index)],
+      ["alert", "remove", ...serviceConfigArgs(file), `--index=${index}`],
       ws,
     );
   } catch (e) {
@@ -217,8 +227,8 @@ function formHtml(webview: vscode.Webview): string {
   </div>
   <div class="row">
     <div><label for="severity">Severity</label><select id="severity"></select></div>
-    <div><label for="cooldown_seconds">Cooldown (s)</label><input id="cooldown_seconds" type="number" min="0.001" placeholder="(global re-alert)" />
-      <div class="hint">Re-alert interval for matching events; blank = global default.</div></div>
+    <div><label for="cooldown_seconds">Cooldown (s)</label><input id="cooldown_seconds" type="number" min="0.001" max="${ALERT_COOLDOWN_MAX_SECONDS}" placeholder="(global re-alert)" />
+      <div class="hint">Re-alert interval for matching events, more than 0 and at most ${ALERT_COOLDOWN_MAX_DAYS} days; blank = global default.</div></div>
   </div>
   <label for="transports">Transports</label>
   <select id="transports">

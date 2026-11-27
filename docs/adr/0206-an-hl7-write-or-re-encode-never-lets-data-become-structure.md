@@ -122,13 +122,18 @@ open points settled below.
 - **The lens's Copy Field.** The Steps view inserts Copy Field in the native idiom (ADR 0089), which
   was the very shape rule 3 names. Its insert now emits `msg.set_data(...)` when the source is a
   literal component or subcomponent path, and the recognizer reads both `msg.set` and `msg.set_data`
-  copies back as `copy_field`. A source given as an expression cannot be classified there and keeps
-  `msg.set`; the lint cannot see that one either. A `msg.set_data` call that is not a copy reads as a
+  copies back as `copy_field`. A source given as an expression that holds only a string literal is
+  classified as that string is; any other expression, a module name included, cannot be classified
+  there and keeps `msg.set`, and the lint cannot see that one either. A literal whole-field source
+  into a literal component or subcomponent, with no other parameter, is inserted as the
+  `copy_field` call instead, because either native write would escape the field's escape sequences
+  a second time (BACKLOG #5821). A `msg.set_data` call that is not a copy reads as a
   `code` row, because `set_field` means `set`, except for the Set Field template described at the
   end of this point. An edit of a copy row's `src` or `dst` re-picks the
   write the same way, so a source edited from a leaf to a whole field goes back to `set`, and one
   edited the other way goes to `set_data`. At a literal leaf destination the two writes are the same,
-  so there the method is left as written. A re-pick that would push the line past the column limit
+  so there the method is left as written, except that an edit ending with a literal whole-field
+  source into a literal leaf destination, with no other argument, is refused. A re-pick that would push the line past the column limit
   is refused, since the lens never wraps a line itself. ADR 0106's palette table still shows the old shape as
   the record of that decision; `docs/STEPS-PALETTE.md` shows the new one. *Added in the final repair
   round:* a native Set Field whose value is a template is picked the same way. The write is

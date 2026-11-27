@@ -60,6 +60,7 @@ from messagefoundry.api.tls_client_cert import (
 )
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.config.settings import (
     ApiSettings,
     AuthSettings,
@@ -1643,7 +1644,7 @@ def test_serve_warns_not_refuses_posture_b_on_loopback_behind_declared_proxy(
     # The gate used to require `not is_loopback`, so the RECOMMENDED topology (engine on 127.0.0.1,
     # proxy on the same host facing the network) never consulted it at all — the discouraged direct
     # NIC bind got the check and the recommended one did not. Now the DECLARATION triggers it, but the
-    # loopback arm WARNS and still starts: refusing would hard-stop working deployments on upgrade.
+    # loopback arm WARNS and still starts; _serve's comment on the declared-proxy gate says why.
     _posture_b_toml(tmp_path, intra="none", floor=None, loopback=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     err = capsys.readouterr().err
@@ -3108,7 +3109,8 @@ def test_serve_context_refuses_a_client_ca_file_the_issuer_index_cannot_match(
 ) -> None:
     # OpenSSL silently stops loading the file at an empty block, so the CA after it is never
     # trusted. An index naming it would admit a client that sends it as its intermediate, so the
-    # build refuses, naming the setting (BACKLOG #4948).
+    # build refuses, naming the setting (BACKLOG #4948). Since BACKLOG #5229 the anchor check
+    # refuses such a file first, as a load by path does.
     cert, key = _self_signed(tmp_path)
     root = _new_ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     inter = _new_ca(_dn((NameOID.COMMON_NAME, "Inter CA")), root)
@@ -3123,7 +3125,7 @@ def test_serve_context_refuses_a_client_ca_file_the_issuer_index_cannot_match(
         tls_client_cert_identities={"CN=Inter CA": {"CN:svc.internal": "0" * 32}},
     )
     with pytest.raises(
-        ValueError, match=r"\[api\]\.tls_client_ca_file: .*does not load 1 CA certificate"
+        TrustAnchorError, match=r"\[api\]\.tls_client_ca_file: the TLS library stops reading"
     ):
         build_api_ssl_context(api, enforcing=False)
 

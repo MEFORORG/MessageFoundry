@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 23 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 24 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -514,12 +514,13 @@ reach one:
 
 ## 5. Native library calls
 
-23 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+24 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
-- File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`,
+  and `win32_sid.py`, the SID calls the first two share
 - Config edit owner check: `config/atomic_edit.py`, which calls at least `advapi32`'s
   `ConvertStringSidToSidW`, on a SID string
 - Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
@@ -763,7 +764,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
 | An HTTP 400 on the Transit audit MAC hop | The body of an HTTP 400 answering the audit chain's check of a stored row MAC (Transit `verify`, BACKLOG #2720), from whatever answers on that hop: at least Vault or OpenBao at `MEFOR_STORE_VAULT_ADDR`, or a proxy or firewall in front of it. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. What is read, and which error each outcome raises, is in at least `verify_audit_hmac`, `_refuses_only_version`, `_names_no_version_reason` and `_reply_errors`, which parses the body and holds the size bound it shares with the data-key decrypt (vault BACKLOG #6707). | `store/crypto_transit.py` |
 | An HTTP 400 on the Transit data-key decrypt | The `errors` list of an HTTP 400 answering a decrypt of the store's data key, and the per-value `error` text of a 2xx batch reply (a batch Vault refuses is asked for value by value, and its body is not read), from whatever answers at `MEFOR_STORE_VAULT_ADDR`, a proxy or firewall in front of Vault included. Every entry of that list is read and compared, and the refusal counts as a tag refusal only when every entry is an AEAD authentication failure text. For a single decrypt, that reading decides at least whether the refusal is a cell tag failure or the cipher's plain refusal, and so whether the cell is audited and alerted, its row withheld from a list and its in-flight handoff dead-lettered rather than re-pended. So whatever answers on that hop can dead-letter the messages it is asked about. A batch result's per-value `error` changes only the class of the error the cipher-cell walk records, and so the class name its reason line shows, never containment, audit or alert. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`, so the engine holds a body up to that bound; for a body hvac did not parse, only the JSON parse is skipped past `_REPARSED_BODY_MAX_CHARS`. The read is in at least `_reply_errors`, `_names_aead_failure`, `_is_aead_failure_text` and `TransitCipher._decrypt_batch` (BACKLOG #5650). | `store/crypto_transit.py` |
-| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of the store's data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
+| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of stored values under the store's Transit data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
 | A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
 | A Kerberos sign-in token | The token a browser sends for Windows single sign-on, in its `Authorization: Negotiate` header. The API route decodes its base64, as the web console's `routes/sso.py` does, and pyspnego decodes the token. Kerberos sign-in is off unless configured. | `api/auth_routes.py`, `auth/ldap.py` |
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
@@ -772,9 +773,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 | A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
-| The off-box audit tee line | An audit record's fields, which carry outside text such as a typed sign-in name, and its `detail`, which can carry an exception's text. For the C0 field scrub (vault BACKLOG #3045), the tee parses the `detail` and modelled sink readings of the tee line as JSON in some cases. The `emit_audit_tee` and `_tee_line` docstrings state the rules. | `store/audit_tee.py` |
-| The app-log tail in a support bundle | The newest `.log` or `.txt` file (`_LOG_SUFFIXES`) directly under `[logging].log_dir` that `_log_candidates` does not pass over, read for the `app-log.txt` member of the zip `messagefoundry support-bundle` writes. The code does not check who wrote the file. The settings refuse at load a `[logging].file` inside `log_dir`, as the `file` row of [`[logging]`](CONFIGURATION.md#logging) says. Under NSSM the newest file can be at least the supervisor's capture of stdout, its capture of stderr, or a rotated capture, and any other file there with a log suffix can be newer. A capture can hold text no engine log filter saw; stream 1 of [`PHI.md`](PHI.md#logging-inventory-1611--1623) lists such text among its residuals. The log also carries outside text the engine logged, at least the text the off-box audit tee row above names. `_read_log_file` reads a bounded span from the end of the file (`_LOG_TAIL_MAX_BYTES`, whose comment gives the exact read) and, when the bound cuts into the file, finds the first line break in it to drop the cut line. When the cut leaves nothing but line breaks, the member is still written, holding the `MF-BUNDLE-LOG-003` code (`_diagnostic`) in place of a tail. `_log_tail` passes every string it returns through `redact_log_text`. That is a best-effort confidentiality pass, not a defence against hostile input: values survive it, and [`PHI.md`](PHI.md) stream 14 states the residual. | `support/bundle.py` |
-| The app-log tail `GET /logs/tail` serves | The newest `.log` or `.txt` file directly under `[logging].log_dir`, which can hold what the support-bundle row above says. `_read_log_tail` picks it with its own listing, which follows a symbolic link and does not refuse a hard link, so it can read a file `_log_candidates` passes over. It reads the whole file, with no bound, splits it with `split_log_lines` and passes each line it serves through `redact_log_record`. The route needs the `logs:view` permission. | `api/app.py` |
+| The off-box audit tee line | An audit record's fields, which carry outside text such as a typed sign-in name, and its `detail`, which can carry an exception's text. For the C0 field scrub (vault BACKLOG #3045), the tee parses the `detail` and modelled sink readings of the tee line as JSON in some cases. To withhold a `recovery_wrap` value, it also parses at least the `detail` of an `audit.key_epoch` row, which only the engine writes, whose text holds that name and is no longer than the redaction window, and JSON text held in it that holds the name. The `emit_audit_tee`, `_tee_line` and `_withhold_detail` docstrings state the rules. | `store/audit_tee.py` |
+| The app-log tail in a support bundle | The newest `.log` or `.txt` file (`_LOG_SUFFIXES`) directly under `[logging].log_dir` that `_log_candidates` does not pass over, read for the `app-log.txt` member of the zip `messagefoundry support-bundle` writes. The code does not check who wrote the file. The settings refuse at load a `[logging].file` inside `log_dir`, as the `file` row of [`[logging]`](CONFIGURATION.md#logging) says. Under NSSM the newest file can be at least the supervisor's capture of stdout, its capture of stderr, or a rotated capture, and any other file there with a log suffix can be newer. A capture can hold text no engine log filter saw; stream 1 of [`PHI.md`](PHI.md#logging-inventory-1611--1623) lists such text among its residuals. The log also carries outside text the engine logged, at least the text the off-box audit tee row above names. `_read_log_file` reads a bounded span from the end of the file (`_LOG_TAIL_MAX_BYTES`, whose comment gives the exact read) and, when the bound cuts into the file, finds the first line break in it to drop the cut line. When the cut leaves nothing but line breaks, the member is still written, holding the `MF-BUNDLE-LOG-003` code (`_diagnostic`) in place of a tail. Before it cuts the tail to its last lines, `_log_tail` masks PRIVATE KEY body lines across the lines of the read window, after the cut line is dropped (`mask_key_body_lines`, whose docstring lists at least the body lines that still print). `_log_tail` passes every string it returns through `redact_log_text`. That is a best-effort confidentiality pass, not a defence against hostile input: values survive it, and [`PHI.md`](PHI.md) stream 14 states the residual. | `support/bundle.py` |
+| The app-log tail `GET /logs/tail` serves | The newest `.log` or `.txt` file directly under `[logging].log_dir`, which can hold what the support-bundle row above says. `_read_log_tail` picks it with its own listing, which follows a symbolic link and does not refuse a hard link, so it can read a file `_log_candidates` passes over. It reads the whole file, with no bound, splits it with `split_log_lines`, drops the off-box tee's audit copies for a reader who may not see them, masks PRIVATE KEY body lines across the page and the lines before it back to where a block covering the page could begin (`key_body_mask_from`, `mask_key_body_lines`), and passes each line it serves through `redact_log_record`. The route needs the `logs:view` permission. | `api/app.py` |
 
 **Parse sites left out, and why.**
 
@@ -861,6 +862,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
 | It reads the characters of the Test Bench Debug program's text, which the extension holds itself, to name the program's file by a checksum (BACKLOG #5409) | `testBenchDebugProgram.ts` |
+| It lower-cases the first letter of a promote notification sentence, which always starts with its own words | `promoteOutcome.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 
@@ -1084,7 +1086,7 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 `messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
 folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
 a small Python program into its own global storage folder, under `testbench-debug`, and has the
-debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
+debugger run that program. At least debugpy 1.8.0 and 1.8.21 put that folder at `sys.path[0]`, so a module
 placed there shadows any module of that name the debuggee has not yet imported, the installed
 `messagefoundry` package and the standard library included. The folder is not pruned, and nothing
 checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).
@@ -1166,12 +1168,13 @@ full list. No harness module imports `ctypes`, or an archive or compression libr
 is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
 sends it, through the engine's own bounded inflate helper.
 
-**Process starts.** 7 harness modules start a process, each from an argument list:
+**Process starts.** 8 harness modules start a process, each from an argument list:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
 | `__main__.py` | `git rev-parse HEAD` | Stamping a load report with the commit it ran at | argument list |
 | `acceptance/runner.py` | `pytest`, under the harness's own interpreter | `python -m harness.acceptance`, unless `--no-pytest` is given | argument list |
+| `e2e_smoke.py` | A probe of the harness's own interpreter that asks where it imports `messagefoundry` from, then `messagefoundry serve` | `python -m harness.e2e_smoke`, the end-to-end smoke | argument list |
 | `load/failover.py` | `messagefoundry serve`, once per engine node | A run that starts its own engine, at least the failover and connection-scale runs | argument list |
 | `load/shardcert.py` | `messagefoundry serve --shard`, and the harness again as a sender or a sink | The engine-shard certification runs | argument list |
 | `load/connscale/batchbox.py` | The harness again, as `connscale-remote` | A batch drive split over several sender processes | argument list |
@@ -1188,11 +1191,15 @@ them. At least five things are open:
   Windows may find a copy in the working directory before the one on `PATH`.
 - Each Python child starts as `python -m <module>` with no `-P`. So the child's working directory
   comes first on its import path, unless the caller's environment sets `PYTHONSAFEPATH`. A file
-  there named like a module the child imports would load in its place. One start differs: the
-  provisioning child runs `load/rigadmin.py` by file path with `-P`.
-- No start takes its environment from `messagefoundry/childenv.py`, and
+  there named like a module the child imports would load in its place. At least two starts differ:
+  the provisioning child runs `load/rigadmin.py` by file path with `-P`, and `e2e_smoke.py` starts
+  its probe and its engine with `-P -X disable-remote-debug`, the `CHILD_INTERPRETER_FLAGS` of
+  `messagefoundry/childenv.py`.
+- No start takes its environment from `messagefoundry/childenv.py`'s builders, and
   `tests/test_child_process_environment.py` does not read the harness. So the check that holds
-  every engine start to that module does not reach a harness start. Some harness tests do check
+  every engine start to that module does not reach a harness start. For its engine's environment,
+  `e2e_smoke.py` uses only that module's `outside_engine_namespace`, to drop the caller's engine
+  variables before it adds its own. Some harness tests do check
   what one child is handed, at least `tests/test_rig_admin.py` for the provisioning child and the
   `rigadmin run` child.
 - `rigadmin run` signs in, then starts the command its caller names with `--token=<session>`
@@ -1206,7 +1213,10 @@ node at least these, unless the run sets them itself: `MEFOR_SECURITY_ENFORCEMEN
 passes `--allow-insecure-bind` when the run binds the inbound listener off loopback. Some runs go
 further. `load/multishard.py` and `load/shardcert.py` set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`
 and `MEFOR_ALLOW_INSECURE_TLS=1` for their engines on every platform, whatever the run's own
-environment says. These suit a synthetic load graph. An engine started this way would not protect
+environment says. `e2e_smoke.py` sets the same three `MEFOR_SECURITY_*` relaxations,
+`MEFOR_SECURITY_REQUIRE_MFA=false`, and on Windows `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1`, for the
+engine it starts on whatever graph `--config` names, the sample graph by default. It drops every
+`MEFOR_*` variable the caller set, so a run cannot keep the enforcing posture. These suit a synthetic load graph. An engine started this way would not protect
 real messages, so never point one at them.
 
 **Import by name.** 2 harness modules import a module named at run time:

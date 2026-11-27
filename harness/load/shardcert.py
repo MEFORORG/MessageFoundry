@@ -770,8 +770,21 @@ def fidelity_note(
 ) -> str | None:
     """The operator-facing reason a rung is VOID for the ceiling, or ``None`` when it is admissible. Says
     WHOSE fault it was in words — and, where the cause was NOT measured, says THAT instead of guessing."""
-    if fidelity is RungFidelity.ADMISSIBLE:
+    if offered > 0 and fidelity is RungFidelity.ADMISSIBLE:
         return None
+    # Keyed on the INPUT, not the verdict, so that no verdict can reach a division by offered below.
+    if offered == 0:
+        return (
+            f"FIDELITY UNKNOWN — this rung planned zero messages (offered=0 sent={sent} acked={acked}), "
+            "for example because rate x hold rounded to zero, so it has no plan to be faithful to and "
+            "establishes no rate. It is VOID for the ceiling. Raise the rate or the hold and re-run"
+        )
+    unknown = (
+        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
+        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
+    )
+    if offered < 0 or fidelity is RungFidelity.UNKNOWN:
+        return unknown
     short = f"sent {sent} of {offered} offered ({sent / offered:.1%} < {_FIDELITY_SENT_FLOOR:.0%})"
     causes = f"deferred: backpressure={deferred_backpressure} schedule={deferred_schedule}"
     if fidelity is RungFidelity.DRIVE_SHORTFALL:
@@ -805,10 +818,8 @@ def fidelity_note(
             "finding, and a DIFFERENT one from a lane/claim wall: the bind is at INTAKE (ingress/routed are "
             "hard-1 per-lane pools keyed on the INBOUND connection — check G, not L)"
         )
-    return (
-        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
-        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
-    )
+    # Fail-closed for a verdict added later: falling off the end would return None, which reads ADMISSIBLE.
+    return unknown
 
 
 #: WHY a ceiling was suppressed, keyed by the NOT-DRIVEN fidelity that suppressed it. Only the not-driven
@@ -1572,6 +1583,15 @@ async def _queue_breakdown(env: Mapping[str, str]) -> QueueBreakdown:
 # --- the bench ---------------------------------------------------------------
 
 
+def _store_view_rounded_up(summed: int, n_shards: int) -> int:
+    """The summed in-pipeline gauge over ``n_shards`` engine shards, rounded UP (BACKLOG #5950).
+
+    Engine shards read the store one after another, so the last rows can show on only some of them,
+    and a floor division would read that nonzero residual as 0, which is the drained value. A
+    negative value is returned as a floor division leaves it, because rounding it up could make 0."""
+    return summed // n_shards if summed < 0 else -(-summed // n_shards)
+
+
 async def _sample_in_pipeline_peak(
     urls: list[str], stop: asyncio.Event, out: list[int], *, interval: float = 0.5
 ) -> None:
@@ -1589,7 +1609,7 @@ async def _sample_in_pipeline_peak(
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                depth = sample.in_pipeline // n_shards
+                depth = _store_view_rounded_up(sample.in_pipeline, n_shards)
                 if depth > out[0]:
                     out[0] = depth
             with contextlib.suppress(TimeoutError):
@@ -1997,7 +2017,9 @@ async def run_shardcert(
         engine_dead=(final.dead if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
-        in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
+        in_pipeline_final=(
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        ),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
@@ -2153,6 +2175,30 @@ class ShardCertStepRecord:
     def _acked_waived(self) -> bool:
         """The something-acknowledged bar does not apply: a ceiling rung whose offer never reached the engine."""
         return self.ceiling and self.fidelity.not_driven and self.sent <= 0
+
+    @property
+    def correctness_broken(self) -> bool:
+        """The report's FAIL test: :attr:`correctness_ok` failed, and not merely because this rung planned
+        zero messages (BACKLOG #5861). On such a rung the lane term is vacuous: the pacer still emits its
+        first-tick message, so one message on one lane is the normal shape. The acknowledged term applies
+        only if something was sent, and the loss term is vacuous only if nothing moved at all, because a
+        paced message that went unacknowledged or was lost is a real fault. An unrecorded ``-1`` is not
+        evidence of a break here. Any positive fault count still is."""
+        if self.offered != 0:
+            return not self.correctness_ok
+        nothing_moved = (
+            max(self.achieved_intake, self.sent, self.delivered, self.in_pipeline_peak) <= 0
+        )
+        return not _invariants_held(
+            acked=self.achieved_intake,
+            require_acked=self.sent > 0,
+            lossless=self.no_loss or nothing_moved,
+            lane_inversions=self.lane_inversions,
+            duplicates_ok=self.lane_repeats == 0,
+            engine_dead=max(self.engine_dead, 0),
+            dead_total=max(self.dead_total, 0),
+            stranded_nonterminal=max(self.stranded_nonterminal, 0),
+        )
 
     def correctness_faults(self) -> list[str]:
         """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
@@ -2448,8 +2494,9 @@ class ShardCertLadderReport:
     ceiling_rate: float | None = None
     #: WHY there is no ``ceiling_rate`` despite the climb stopping (see :data:`_CEILING_VOID_REASONS`):
     #: ``"drive_shortfall"`` (the rig ran out), ``"offer_shortfall"`` (the plan never reached the wire and
-    #: the CAUSE WAS NOT MEASURED) or ``"fidelity_unknown"`` (the gate's inputs were not recorded). All three
-    #: exit 2 — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
+    #: the CAUSE WAS NOT MEASURED), ``"fidelity_unknown"`` (the gate's inputs were not recorded) or
+    #: ``"zero_offered"`` (the plan held no messages). All four exit 2 unless the rung also broke correctness
+    #: — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
     #: admissible (or engine-bound, which KEEPS its rate) or the climb never stopped.
     ceiling_void_reason: str | None = None
     #: BACKLOG #5576: the climb stopped because a rung's store reset failed (:class:`StoreResetFailed`).
@@ -2475,8 +2522,15 @@ class ShardCertLadderReport:
         """A correctness FAIL (exit 1): a measured rung broke an invariant, or nothing was measured and
         no setup abort explains why. A climb a failed reset stopped before its first rung is SETUP."""
         if self.records:
-            return not self._records_ok
+            return any(r.correctness_broken for r in self.records)
         return self.aborted_reason is None
+
+    @property
+    def zero_offered_rates(self) -> list[float]:
+        """The rates of the rungs that planned zero messages (BACKLOG #5861). Read at the verdict, so a
+        zero-offered record fails closed by whatever route it reached this report. An unrecorded ``-1``
+        is a different fault and is not counted here."""
+        return [r.aggregate_rate for r in self.records if r.offered == 0]
 
     @property
     def ceiling_pool_bound(self) -> bool:
@@ -2506,11 +2560,13 @@ class ShardCertLadderReport:
         ``ceiling_rate`` null (see :attr:`ceiling_void_reason`).
 
         ARTIFACT 2 adds the POOL: a ceiling measured on a rung that tripped the pre-registered store-pool
-        tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either."""
+        tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either. A rung that
+        planned zero messages (:attr:`zero_offered_rates`) established no rate either."""
         return (
             self.ceiling_void_reason is not None
             or self.ceiling_pool_bound
             or self.aborted_reason is not None
+            or bool(self.zero_offered_rates)
         )
 
     @property
@@ -2526,8 +2582,8 @@ class ShardCertLadderReport:
         if self._broken:
             return "FAIL"
         # An aborted climb outranks POOL_BOUND, as in the two-box report: the climb never finished, so no
-        # ceiling it names (pool-bound or not) is the run's answer.
-        if self.aborted_reason is not None:
+        # ceiling it names (pool-bound or not) is the run's answer. A zero-offered rung outranks it too.
+        if self.aborted_reason is not None or self.zero_offered_rates:
             return "SETUP_DEGRADED"
         # POOL_BOUND is called out by name, not folded into SETUP_DEGRADED: "the pool was the wall" is a
         # specific, actionable finding (raise --store-pool-size and re-run), and the whole point of ARTIFACT
@@ -2741,7 +2797,13 @@ class ShardCertLadderReport:
                 "  ceiling: NONE — the climb ABORTED before it found one "
                 f"({self.aborted_reason}). Fix the store and re-run."
             )
-        elif self.ceiling_void_reason is not None:
+        elif self.zero_offered_rates and not self._broken:
+            rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
+            lines.append(
+                f"  ceiling: NONE — the rung(s) at {rates} msg/s planned zero messages, so they "
+                "establish no rate. Raise the rate or the hold and re-run."
+            )
+        elif self.ceiling_void_reason is not None and not self.zero_offered_rates:
             # NEVER print a rate here: the rung that stopped the climb was not evidence about the engine.
             lines.append(
                 f"  ceiling: NONE PUBLISHED — the climb stopped on a rung that FAILED FIDELITY "
@@ -2891,6 +2953,14 @@ async def run_shardcert_ladder(
         # ARTIFACT 2: the pool tripwire, RECORDED at the rung that tripped it (it gates `ceiling_pool_bound`).
         if rec.pool.tripped and rec.pool.trip_reason is not None:
             report.notes.append(f"{rate:g} msg/s: {rec.pool.trip_reason}")
+        if rec.offered == 0 and not rec.correctness_broken:
+            # BACKLOG #5861: stopped here so neither branch below can name this rung a correctness break.
+            report.ceiling_void_reason = "zero_offered"
+            report.notes.append(
+                f"CLIMB STOPPED at {rate:g} msg/s: the rung planned zero messages, a setup fault and "
+                "not an engine result"
+            )
+            break
         if rec.ceiling:
             # ARTIFACT 4 — THE CEILING IS ADMISSIBILITY-GATED. `_is_ceiling` fires on
             # `achieved_intake < offered * (1 - _INTAKE_TOL)`, and that is EXACTLY what a DRIVE SHORTFALL
@@ -3689,7 +3759,9 @@ async def run_shardcert_engine(
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
-        in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
+        in_pipeline_final = (
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        )
         # On an abort the store's stranded/dead are a teardown artifact, not a measurement — do not read them
         # (they would only re-confirm the fabricated collapse). A genuine failed drain still reads them.
         if rung_aborted:

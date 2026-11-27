@@ -22,10 +22,12 @@ What each group asserts:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import inspect
 import io
+import textwrap
 import time
 from pathlib import Path
 from typing import Any
@@ -384,6 +386,69 @@ async def test_a_rotation_burst_is_charged_PER_BATCH_not_only_at_close(
         await rotated.close()
 
 
+#: Names whose appearance marks a function as encrypting. At least: the cipher's ``encrypt``;
+#: ``encrypt_many`` (vault BACKLOG #6706), which seals a batch through it; ``_reencrypt_value`` and
+#: ``reseal_unless_tag_failure`` (BACKLOG #5610), the tagged-cell loops' decrypt-then-encrypt; and
+#: the stores' ``_enc`` and its async wrappers ``_aenc`` and ``_aencrypt`` (BACKLOG #3929). A helper
+#: that encrypts under another name, such as ``_event_stmt``, is not followed.
+_ENCRYPT_NAMES = frozenset(
+    {
+        "encrypt",
+        "encrypt_many",
+        "_reencrypt_value",
+        "reseal_unless_tag_failure",
+        "_enc",
+        "_aenc",
+        "_aencrypt",
+        "seal_chunks",  # the at-open seal's page (BACKLOG #6706)
+    }
+)
+
+
+def _names_an_encrypt(src: str) -> bool:
+    """Whether ``src`` names an encrypt anywhere in its code, called or not.
+
+    BACKLOG #3929 runs the cipher off the loop through ``cipher_call``, which takes the callable
+    uncalled, as an argument or inside a lambda or ``functools.partial``; a token for a call cannot
+    see that, so this reads every name and attribute instead. Docstrings and comments are not code."""
+    for node in ast.walk(ast.parse(textwrap.dedent(src))):
+        if isinstance(node, ast.Attribute) and node.attr in _ENCRYPT_NAMES:
+            return True
+        if isinstance(node, ast.Name) and node.id in _ENCRYPT_NAMES:
+            return True
+    return False
+
+
+def test_the_encrypt_reader_sees_each_call_shape_and_skips_prose() -> None:
+    """Positive and negative control for :func:`_names_an_encrypt`, the guard's encrypt reader."""
+    seen = (
+        "x = self._cipher.encrypt(v, aad=a)",
+        "x = encrypt_many(c, vs)",
+        "x = await cipher_call(self._cipher, encrypt_many, c, vs)",
+        "x = await cipher_call(self._cipher_for(k), self._enc, v, aad=a)",
+        "x = await cipher_call(self._cipher, lambda: self._enc(v, aad=a))",
+        "x = await cipher_call(self._cipher, call=self._cipher.encrypt)",
+        "x = await cipher_call(self._cipher, functools.partial(self._enc, v))",
+        "x = await self._aencrypt(v)",
+        "x = await self._aenc(v, aad=a)",
+        "x = self._reencrypt_value(v)",
+        "x = reseal_unless_tag_failure(c, v)",
+        "async for chunk, vs in seal_chunks(\n"
+        "        self._cipher, t, c, rows, aad_cols=a, local_whole_page=True\n"
+        "    ):\n"
+        "        pass",
+    )
+    for line in seen:
+        assert _names_an_encrypt(f"def f(self):\n    {line}\n"), line
+    unseen = (
+        'def f(self):\n    """Calls self._cipher.encrypt( on each row."""\n    x = self._dec(v)\n',
+        "def f(self):\n    # self._enc(v) used to run here\n    x = self._cipher.decrypt(v)\n",
+        "def f(self):\n    x = self._encrypted_count\n",
+    )
+    for src in unseen:
+        assert not _names_an_encrypt(src), src
+
+
 def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> None:
     """OMISSION GUARD — the class of defect, not one instance of it.
 
@@ -403,18 +468,7 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
                 src = inspect.getsource(fn)
             except OSError:  # pragma: no cover — source is always available in-tree
                 continue
-            # encrypt_many (vault BACKLOG #6706) seals a batch through the same single-value encrypt.
-            # reseal_unless_tag_failure (BACKLOG #5610) is the tagged-cell loops' decrypt-then-encrypt.
-            encrypts = any(
-                tok in src
-                for tok in (
-                    ".encrypt(",
-                    "encrypt_many(",
-                    "_reencrypt_value(",
-                    "reseal_unless_tag_failure(",
-                )
-            )
-            if "while True" not in src or not encrypts:
+            if "while True" not in src or not _names_an_encrypt(src):
                 continue
             checked.append(f"{cls.__name__}.{name}")
             assert "_charge_bound_batch()" in src, (
@@ -432,7 +486,9 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
     # The enumeration itself must not silently go empty (a rename would make the guard vacuous). The
     # floor was 20 until BACKLOG #1169 folded each backend's on-open sealing loops into ONE
     # `_seal_surface` per backend (seven functions became three); every one of the three is required.
-    assert len(checked) >= 16, checked
+    # Raised from 16 to 19, the count enumerated when BACKLOG #3929 replaced the encrypt reader, so
+    # a reader that goes blind to a pass fails here rather than only at the sealers.
+    assert len(checked) >= 19, checked
     sealers = {c for c in checked if c.endswith("._seal_surface")}
     assert sealers == {
         "MessageStore._seal_surface",
@@ -741,9 +797,6 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
     Asserted on statement order because the fault IS an ordering one: a behavioural test would have to
     stand up a whole engine, drain it, and still would not say why it broke.
     """
-    import ast
-    import textwrap
-
     from messagefoundry.pipeline import engine as engine_mod
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(engine_mod.Engine.stop)))

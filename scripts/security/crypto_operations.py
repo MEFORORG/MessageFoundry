@@ -87,9 +87,12 @@ seen:
   bound without a module-level statement (at least a submodule of the same name, or a
   ``globals()`` or ``sys.modules`` write) still reads as served, so a call the hook never
   answers can be confirmed;
-* A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
-  variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
-  judgment would close it.
+* A union token is confirmed by its callee before ``[`` at one of its own sites, a file and a
+  line, not by its label. So an out-of-scope label variant on a line that also holds an in-scope
+  call of the same callee stays confirmed, and so does an in-scope call whose algorithm label
+  only an out-of-scope binding gives (``hmac.new(k, m, hashlib.md5)`` in a function whose
+  ``hashlib`` is a local first-party import, in a file that also imports the stdlib ``hashlib``
+  in another scope).
 * A provider ``via`` token is marked out of scope when the module's only direct operation is out
   of scope, though the call reaches crypto in scope.
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
@@ -960,6 +963,18 @@ def _value_labels(value: ast.expr | None, m: ParsedModule) -> list[str]:
         return [f" {value.value}"]
     if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Invert):
         return [f" ~{inner.strip()}" if inner else "" for inner in _value_labels(value.operand, m)]
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "int"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        # ``~int(FLAG)`` clears FLAG alone where ``~FLAG`` also clears every bit the IntFlag does
+        # not name (vault BACKLOG #5511), so the two keep distinct tokens, each naming the flag.
+        return [
+            f" int({inner.strip()})" if inner else "" for inner in _value_labels(value.args[0], m)
+        ]
     labels = [f" {q.rpartition('.')[2]}" for q in m.resolve(value)]
     return list(dict.fromkeys(labels)) or [""]
 

@@ -72,6 +72,9 @@ def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_WARNED_AT_OPEN", {})
     # raising=False: the negative controls run this file against a head without the memo.
     monkeypatch.setattr(ta, "_STORE_CONTENT_RECORDED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_FIRST_CHECKED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_REFUSED", {}, raising=False)
+    monkeypatch.setattr(ta, "_STORE_PIN_RELEASE_REFUSED", set(), raising=False)
 
 
 def _settings_specs(auth: AuthSettings, api: ApiSettings | None = None) -> list[AnchorSpec]:
@@ -268,7 +271,7 @@ def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.Monke
     # This call's OUTPUT decides whether a TLS trust anchor is owner-only, so it must name icacls by
     # absolute path: CreateProcess resolves an unqualified name through a search path that reaches the
     # caller's working directory, and a planted icacls.exe printing a clean DACL would turn a
-    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._secure_file,
+    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._grant_read,
     # which writes a DACL rather than reading one.
     from messagefoundry import service_status
 
@@ -2253,7 +2256,7 @@ def _with_headers(headers: bytes) -> bytes:
 
 def _begin_past_a_long_line(end_line: bytes) -> Any:
     """Code review round 2's measured bypasses of a line-based check. The BEGIN sits after 254
-    bytes of one line, where OpenSSL reads it and anchor_cadata's own line loop does not, and the
+    bytes of one line, where OpenSSL reads it and that earlier line-based check did not, and the
     line after it looked like an END line to that check. With the real load, each shape did not
     return within 15 seconds."""
     second = _real_ca("second-ca")[0].replace(_BEGIN_CERT, b"")  # the body and its END line
@@ -2295,6 +2298,8 @@ class _NoTlsLoad:
 
     PROTOCOL_TLS_CLIENT = ssl.PROTOCOL_TLS_CLIENT
     SSLError = ssl.SSLError
+    OPENSSL_VERSION = ssl.OPENSSL_VERSION  # anchor_cadata reads both before it builds a context
+    OPENSSL_VERSION_INFO = ssl.OPENSSL_VERSION_INFO
 
     @staticmethod
     def SSLContext(_protocol: object) -> Any:
@@ -2368,15 +2373,25 @@ def test_an_encryption_header_above_the_first_begin_still_passes() -> None:
         pytest.param(True, False, id="after the last END"),
     ],
 )
-def test_an_encryption_header_on_a_non_ascii_comment_line_passes(before: bool, after: bool) -> None:
-    """The check reads the text the load would get, and a non-ASCII comment line is not in it, so
-    the header name on one does not refuse, wherever the line sits. The ASCII case between two
-    blocks does: see the "comment between blocks" row above."""
+def test_an_encryption_header_on_a_non_ascii_comment_line_reads_as_on_an_ascii_one(
+    before: bool, after: bool
+) -> None:
+    """The check reads the text the load would get, which keeps every line with a non-ASCII byte as
+    ``?`` (BACKLOG #5229). So a header name on a non-ASCII comment line refuses after the first
+    BEGIN, as on an ASCII one (the "comment between blocks" row above), and passes above it."""
     first = _real_ca("crl-test-ca")[0] if before else b""
     last = _real_ca("second-ca")[0] if after else b""
     data = first + b"caf\xc3\xa9 Proc-Type: 4,ENCRYPTED\n" + last
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
-    assert ta.anchor_cadata(data, spec) == (first + last).decode()
+    if not before:
+        assert (
+            ta.anchor_cadata(data, spec)
+            == (first + b"caf?? Proc-Type: 4,ENCRYPTED\n" + last).decode()
+        )
+        return
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    assert ta.ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
@@ -2474,8 +2489,8 @@ def test_a_private_key_block_in_an_anchor_refuses(
             lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
             id="label in a comment after the last END",
         ),
-        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
-        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
+        # The check reads the raw bytes. Here the label's BEGIN and END lines both hold non-ASCII
+        # bytes, which an earlier version dropped from the cadata= text, and the label still refuses.
         pytest.param(
             lambda: (
                 _real_ca("crl-test-ca")[0]
@@ -3696,6 +3711,119 @@ async def test_a_store_pin_swap_past_the_pin_cap_writes_changed(
     await run_anchor_preflight(specs, store, enforcing=True)
     events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
     assert "changed" in events, events
+
+
+def _another_sqlserver_pin(tmp_path: Path) -> bytes:
+    """A second server certificate's bytes, made apart from the pin file the test swaps."""
+    other = tmp_path / "other"
+    other.mkdir()
+    return _sqlserver_pin(other).read_bytes()
+
+
+def _off_hop_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "differs from the pin this engine process first checked" in r.getMessage()
+    ]
+
+
+async def test_a_store_pin_swap_warns_off_hop_when_the_store_answers_with_the_new_fingerprint(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3714 step 9 (a): a server the swapped pin admits can answer the baseline read
+    with the new fingerprint, so the store-backed compare writes no ``changed`` row. The in-process
+    baseline still logs the swap, and keeps logging it at each check, since it does not move. Red
+    on origin/main 895925f2d3a, which has no in-process baseline and logs nothing here. The
+    control: the unchanged file logs no such warning."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    caplog.set_level("WARNING", logger=ta.__name__)
+    pin = _sqlserver_pin(tmp_path)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    assert _off_hop_warnings(caplog) == []  # the control
+    pin.write_bytes(_another_sqlserver_pin(tmp_path))
+    swapped = ta.anchor_fingerprint(pin)
+
+    async def answers_with_the_new_fingerprint(_store: Any, _label: str) -> Any:
+        return ta._Baseline(ta.Fingerprint(ta.ANCHOR_DIGEST, swapped), False)
+
+    monkeypatch.setattr(ta, "_last_fingerprint", answers_with_the_new_fingerprint)
+    for _ in range(2):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    events = [r["event"] for r in await _rows(store, "store_sqlserver_pin")]
+    assert "changed" not in events, events  # the store-backed compare was answered away
+    warned = _off_hop_warnings(caplog)
+    assert len(warned) == 2, warned
+    assert swapped in warned[0] and "[store].ssl_root_cert" in warned[0]
+
+
+async def test_a_refused_store_pin_never_becomes_the_in_process_baseline(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review round-5c1e8a07b2 finding 3: a first preflight that refuses the pin, here for a
+    private key in it, sets no baseline, so the corrected file that passes next is the baseline and
+    logs no off-hop warning. Red when the baseline is set before the refusal."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    caplog.set_level("WARNING", logger=ta.__name__)
+    pin = _sqlserver_pin(tmp_path)
+    good = pin.read_bytes()
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))  # settings check the file
+    pin.write_bytes(good + _marked_key_block("PRIVATE" + " KEY"))
+    with pytest.raises(TrustAnchorError):
+        await run_anchor_preflight(specs, store, enforcing=True)
+    assert not ta._STORE_PIN_FIRST_CHECKED
+    pin.write_bytes(good)
+    await run_anchor_preflight(specs, store, enforcing=True)
+    assert _off_hop_warnings(caplog) == []
+    baseline = ta._STORE_PIN_FIRST_CHECKED
+    assert baseline == {("store_sqlserver_pin", str(pin)): ta.anchor_fingerprint(pin)}
+
+
+async def test_the_store_open_sets_the_in_process_baseline(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3714 step 9 (a): the store open records the pin bytes it checked as the
+    baseline, a later open of a swapped file does not move it, and the settings preflight that
+    follows compares with it, so a swap between the open and the first preflight is logged. Red on
+    origin/main 895925f2d3a, where the open records nothing."""
+    from messagefoundry.store.sqlserver import check_pinned_certificate
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    pin = _sqlserver_pin(tmp_path)
+    settings = StoreSettings.model_validate(
+        {
+            "backend": "sqlserver",
+            "server": "db.example",
+            "database": "mefor",
+            "username": "mefor",
+            "ssl_root_cert": str(pin),
+        }
+    )
+    first = ta.anchor_fingerprint(pin)
+    check_pinned_certificate(settings)
+    pin.write_bytes(_another_sqlserver_pin(tmp_path))
+    check_pinned_certificate(settings)
+    baseline = ta._STORE_PIN_FIRST_CHECKED
+    assert baseline == {("store_sqlserver_pin", str(pin)): first}
+    caplog.set_level("WARNING", logger=ta.__name__)
+    specs = _store_specs(backend="sqlserver", ssl_root_cert=str(pin))
+    await run_anchor_preflight(specs, store, enforcing=True)  # its first preflight
+    (warned,) = _off_hop_warnings(caplog)
+    assert first in warned
 
 
 async def test_an_oversized_postgres_store_ca_is_refused_with_its_row(

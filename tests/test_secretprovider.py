@@ -13,6 +13,7 @@ credential, and never with the secret value in the message. It also proves the t
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any
 
@@ -23,6 +24,7 @@ from messagefoundry.config.secretprovider import (
     EnvSecretProvider,
     SecretProvider,
     SecretProviderError,
+    log_import_failure,
     resolve_connector_secret,
     resolve_secret_provider,
 )
@@ -169,6 +171,241 @@ def test_env_provider_refusal_never_repeats_the_reference(
 def test_unknown_provider_name_fails_closed() -> None:
     with pytest.raises(SecretProviderError, match="unknown"):
         resolve_secret_provider(SecretsSettings(provider="nope"))
+
+
+#: Synthetic text a broken import might carry: a path and a marker string. Neither may reach
+#: the refusal's own text.
+_BROKEN_IMPORT_TEXT = "DLL load failed: C:/synthetic/site-packages/_sdk.pyd marker zz0451"
+
+
+#: Errors a present-but-broken import can raise, each built fresh per raise.
+_BROKEN_IMPORTS = [
+    pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
+    pytest.param(
+        lambda: ImportError(f"cannot import name 'Client' ({_BROKEN_IMPORT_TEXT})"),
+        id="missing-symbol",
+    ),
+    pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
+    pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
+    pytest.param(lambda: SyntaxError(_BROKEN_IMPORT_TEXT), id="syntax-error"),
+    pytest.param(lambda: ValueError(_BROKEN_IMPORT_TEXT), id="value-error"),
+]
+
+
+@pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
+def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
+) -> None:
+    caplog.set_level(logging.WARNING)
+    # Vault BACKLOG #6709 item 1: an SDK that is installed but broken raises a plain ImportError (or
+    # another error from the module's top-level code), not ModuleNotFoundError. The
+    # dispatch must refuse with SecretProviderError, naming the extra and the error's type, and
+    # must not repeat the error's text, in its own text or through a chain.
+    raised: list[BaseException] = []
+
+    def _import(_name: str) -> Any:
+        error = make_error()
+        raised.append(error)
+        raise error
+
+    monkeypatch.setattr("messagefoundry.config.secretprovider.importlib.import_module", _import)
+    with pytest.raises(SecretProviderError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    text = str(caught.value)
+    assert "[secrets].provider='vault'" in text
+    assert "messagefoundry[vault]" in text
+    assert f"import failed: {type(raised[0]).__name__}" in text
+    assert "synthetic" not in text and "0451" not in text and "Client" not in text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    _assert_one_class_only_warning(
+        caplog, type(raised[0]).__name__, "messagefoundry.config.secretprovider"
+    )
+
+
+def _assert_one_class_only_warning(
+    caplog: pytest.LogCaptureFixture, type_name: str, logger_name: str
+) -> None:
+    """Round-3 finding 2 on BACKLOG #6709: the dropped cause is logged at WARNING, by its class,
+    with none of its text (a path, a source line or a secret). Counted on ``logger_name`` only,
+    so a WARNING from another module neither satisfies nor breaks the count (#6709 items 9, 12)."""
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and r.name == logger_name]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert type_name in message
+    assert "synthetic" not in message and "0451" not in message and "Client" not in message
+    assert warnings[0].exc_info is None
+
+
+@pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
+def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
+) -> None:
+    # Vault BACKLOG #6709: the vault provider imports hvac lazily, at its first read, so a broken
+    # hvac fails there rather than at the dispatch. That import must refuse the same way.
+    import builtins
+
+    real_import = builtins.__import__
+    type_name = type(make_error()).__name__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise make_error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    caplog.set_level(logging.WARNING)
+    with pytest.raises(SecretProviderError) as caught:
+        provider.resolve("mefor/ad")
+    text = str(caught.value)
+    # A broken hvac is told apart from a missing one: it names the class and says reinstall.
+    assert f"hvac is installed but did not import ({type_name})" in text
+    assert "reinstall 'messagefoundry[vault]'" in text
+    assert "synthetic" not in text and "0451" not in text and "Client" not in text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    _assert_one_class_only_warning(caplog, type_name, "messagefoundry.config.secretprovider_vault")
+
+
+@pytest.mark.parametrize(
+    ("missing", "remedy"),
+    [
+        pytest.param("hvac", "install 'messagefoundry[vault]'", id="hvac-itself-missing"),
+        # Round-3 finding 3 on BACKLOG #6709: a missing hvac submodule is a broken install of an
+        # hvac that is present, so pip's install would do nothing; it must say reinstall.
+        pytest.param("hvac.v1", "reinstall 'messagefoundry[vault]'", id="hvac-submodule-missing"),
+    ],
+)
+def test_vault_lazy_hvac_import_tells_missing_from_broken_by_module_name(
+    monkeypatch: pytest.MonkeyPatch, missing: str, remedy: str
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    with pytest.raises(SecretProviderError) as caught:
+        provider.resolve("mefor/ad")
+    text = str(caught.value)
+    assert remedy in text
+    if missing == "hvac":
+        assert "reinstall" not in text
+
+
+@pytest.mark.parametrize(
+    ("module", "logged"),
+    [
+        pytest.param("hvac.v1", "module 'hvac.v1'", id="dotted-name-logged"),
+        pytest.param("C:/synthetic/zz0451", None, id="path-shaped-name-withheld"),
+    ],
+)
+def test_log_import_failure_names_a_plain_module_and_withholds_any_other(
+    caplog: pytest.LogCaptureFixture, module: str, logged: str | None
+) -> None:
+    # Vault BACKLOG #6709 item 7: the logged module name had no test.
+    caplog.set_level(logging.WARNING)
+    log_import_failure("label", ImportError("synthetic", name=module))
+    (record,) = [r for r in caplog.records if r.name == "messagefoundry.config.secretprovider"]
+    message = record.getMessage()
+    if logged is None:
+        assert "module" not in message and "zz0451" not in message
+    else:
+        assert logged in message
+
+
+def test_an_error_from_an_external_providers_build_propagates_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The build part of vault BACKLOG #6709 was withdrawn to main: the dispatch calls
+    # build_provider bare, so an error from a provider's construction propagates unchanged, its
+    # text (here a path and a marker) included. That is a known open hazard, pinned as main's shape
+    # until that part is built, not as the intended contract.
+    error = ValueError(_BROKEN_IMPORT_TEXT)
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _boom)
+    with pytest.raises(ValueError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value is error
+
+
+def test_an_external_providers_own_refusal_from_its_build_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise SecretProviderError("the provider's own refusal")
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(SecretProviderError, match="^the provider's own refusal$"):
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+
+
+def test_a_hop_refusal_from_an_external_providers_build_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Engine PR 3321 hold item 2: the callers that print a hop refusal in its own words read it
+    # raw, and the dispatch lets it propagate from build_provider unchanged, as on main.
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    refusal = InsecureHopRefused("synthetic hop refusal")
+
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise refusal
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(InsecureHopRefused) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value is refusal
+
+
+def test_an_error_caused_by_a_hop_refusal_from_a_build_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As above, for an error whose cause is the hop refusal, which `verify` reads as a cause.
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    error = ValueError("synthetic")
+    error.__cause__ = InsecureHopRefused("synthetic hop refusal")
+
+    def _refuse(*_a: Any, **_k: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(secretprovider_vault, "build_provider", _refuse)
+    with pytest.raises(ValueError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_from_the_lazy_hvac_import_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack while hvac imports is refused like any
+    # other broken hvac, as on main, rather than escaping raw past callers that catch only
+    # SecretProviderError.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    with pytest.raises(
+        SecretProviderError, match=rf"did not import \({error.__name__}\)"
+    ) as caught:
+        provider.resolve("mefor/ad")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 # --- vault backend: mocked KV ------------------------------------------------
@@ -370,8 +607,9 @@ def test_secret_provider_is_runtime_checkable() -> None:
 # The AD LDAP consumer has a fail-closed-through-the-real-consumer test
 # (test_ldap_authenticator_unresolvable_reference_fails_closed); these give the two SMTP consumers
 # the same coverage. Both notifier_from_settings and security_notifier_from_settings call
-# resolve_connector_secret first, so a bad [alerts].email_password_secret reference must propagate
-# SecretProviderError BEFORE any transport is built (no blank-credential sink). No production change.
+# resolve_connector_secret before they build the SMTP side, so a bad
+# [alerts].email_password_secret reference must propagate SecretProviderError (no blank-credential
+# sink).
 
 
 def test_notifier_unresolvable_reference_fails_closed() -> None:
@@ -397,6 +635,35 @@ def test_security_notifier_unresolvable_reference_fails_closed() -> None:
     assert provider.calls == ["mefor/smtp#password"]
 
 
+def test_notifier_webhook_refusal_is_not_hidden_by_a_secret_store_outage() -> None:
+    # Vault BACKLOG #3533 item 18: the webhook URL's checks that log nothing run before the SMTP
+    # password is read, so a store that cannot resolve the reference does not hide the cleartext
+    # webhook's refusal.
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    def settings(url: str) -> AlertsSettings:
+        return _smtp_settings(email_password_secret="mefor/smtp#password", webhook_url=url)
+
+    provider = _FakeProvider({})
+    # Settings load refuses this URL first (item 14), so the section is built with model_construct
+    # to reach the notifier's own refusal, before the SMTP secret read.
+    cleartext = AlertsSettings.model_construct(
+        **{
+            **settings("https://hooks.example/x").model_dump(),
+            "webhook_url": "http://hooks.example/x",
+        }
+    )
+    with pytest.raises(ValueError, match="cleartext http"):
+        notifier_from_settings(cleartext, secret_provider=provider, posture=_NOT_ENFORCING)
+    assert provider.calls == []
+    # The control: with an https URL the read is reached, and its failure is what refuses.
+    with pytest.raises(SecretProviderError):
+        notifier_from_settings(
+            settings("https://hooks.example/x"), secret_provider=provider, posture=_NOT_ENFORCING
+        )
+    assert provider.calls == ["mefor/smtp#password"]
+
+
 def test_notifiers_reference_without_provider_fail_closed() -> None:
     # A [alerts].email_password_secret reference with no [secrets].provider is a misconfiguration —
     # both notifier entrypoints must fail closed rather than silently fall back to the (blank) literal.
@@ -408,3 +675,25 @@ def test_notifiers_reference_without_provider_fail_closed() -> None:
         notifier_from_settings(settings)  # secret_provider defaults to None
     with pytest.raises(SecretProviderError, match="email_password"):
         security_notifier_from_settings(settings)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack while the provider module imports is
+    # refused like any other broken import, by class and with no chain, rather than escaping raw
+    # past __main__'s provisioning step, which catches only SecretProviderError.
+    import importlib
+
+    real_import = importlib.import_module
+
+    def _import(name: str, *args: Any) -> Any:
+        if name == "messagefoundry.config.secretprovider_vault":
+            raise error()
+        return real_import(name, *args)
+
+    monkeypatch.setattr("messagefoundry.config.secretprovider.importlib.import_module", _import)
+    with pytest.raises(SecretProviderError, match=f"import failed: {error.__name__}") as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None

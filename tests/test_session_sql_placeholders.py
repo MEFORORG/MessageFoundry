@@ -61,7 +61,7 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "supersede_session": lambda s: s.supersede_session(_HASH, now=_NOW),
     # Vault BACKLOG #3028: nothing is revoked, so the walk reads the lineage once and stops.
     "supersede_session_lineage": lambda s: s.supersede_session(
-        _HASH, now=_NOW, lineage_since=_NOW - 360
+        _HASH, now=_NOW, lineage_seconds=360
     ),
     "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW, audit=no_audit_row),
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(
@@ -128,10 +128,25 @@ _LIVE_SESSION = (
 _GLOBAL_EPOCH_READ = f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"
 #: ``create_session``'s account read, which the fakes answer with an unbound account at epoch 0: a
 #: missing account is refused before the INSERT (BACKLOG #2733), which would leave it unchecked.
-_ACCOUNT_COLUMNS = ("oidc_issuer", "oidc_subject", "session_epoch")
+#: The last three are the eligibility columns ``require_sign_in_eligible`` reads (BACKLOG #5653).
+_ACCOUNT_COLUMNS = (
+    "oidc_issuer",
+    "oidc_subject",
+    "session_epoch",
+    "disabled",
+    "locked_until",
+    "second_step_locked_until",
+)
 _ACCOUNT_READ = f"SELECT {', '.join(_ACCOUNT_COLUMNS)} FROM users"
 #: The account row the fakes answer that read with; ``None`` answers it with no row.
-_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0)
+_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0, 0, None, None)
+#: ``create_session``'s unlocked epoch read before it seals (BACKLOG #5653), answered from
+#: ``_ACCOUNT_ROW``'s epoch and a global epoch of 0.
+_EPOCH_READ = "SELECT session_epoch, "
+
+
+def _epoch_row() -> tuple[Any, ...] | None:
+    return None if _ACCOUNT_ROW is None else (_ACCOUNT_ROW[2], 0)
 
 
 def _reads_session_row(sql: str) -> bool:
@@ -153,6 +168,8 @@ class _MssqlCursor:
         self._last = sql
         if _reads_session_row(sql):
             self.description = [(c,) for c in _SESSION_COLUMNS]
+        elif sql.startswith(_EPOCH_READ):
+            self.description = [("session_epoch",), ("global_epoch",)]
 
     async def fetchall(self) -> list[Any]:
         if _reads_session_row(self._last):
@@ -161,6 +178,9 @@ class _MssqlCursor:
             return [(0,)]
         if self._last.startswith(_ACCOUNT_READ):
             return [] if _ACCOUNT_ROW is None else [_ACCOUNT_ROW]
+        if self._last.startswith(_EPOCH_READ):
+            row = _epoch_row()
+            return [] if row is None else [row]
         return self._other_rows()
 
     def _other_rows(self) -> list[Any]:
@@ -452,6 +472,9 @@ class _PgConn:
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
         if sql.startswith(_ACCOUNT_READ) and _ACCOUNT_ROW is not None:
             return dict(zip(_ACCOUNT_COLUMNS, _ACCOUNT_ROW, strict=True))
+        epoch = _epoch_row() if sql.startswith(_EPOCH_READ) else None
+        if epoch is not None:
+            return dict(zip(("session_epoch", "global_epoch"), epoch, strict=True))
         return None
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
@@ -555,3 +578,113 @@ async def test_create_session_inserts_only_for_an_account_it_found(
     assert await _CALLS["create_session"](store) is account_found
     inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
     assert len(inserts) == (1 if account_found else 0), seen
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize(
+    ("row", "refused"),
+    [
+        ((None, None, 0, 0, None, None), False),
+        ((None, None, 0, 1, None, None), True),
+        ((None, None, 0, 0, _NOW + 60, None), True),
+        ((None, None, 0, 0, None, _NOW + 60), True),
+        ((None, None, 0, 0, _NOW - 60, _NOW - 60), False),
+    ],
+)
+async def test_create_session_eligibility_reads_each_column_by_position(
+    monkeypatch: pytest.MonkeyPatch, backend: str, row: tuple[Any, ...], refused: bool
+) -> None:
+    """BACKLOG #5653: with ``require_sign_in_eligible`` each server backend refuses a disabled row
+    and one holding either live lock, with no INSERT, and inserts for a lapsed lock. SQL Server
+    reads the columns by position, so each column is set alone."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setitem(globals(), "_ACCOUNT_ROW", row)
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    issued = await store.create_session(
+        token_hash=_HASH,
+        user_id="u",
+        expires_at=_NOW + 60,
+        now=_NOW,
+        auth_mechanism="kerberos",
+        require_federated_subject=(None, None),
+        require_sign_in_eligible=True,
+    )
+    assert issued is not refused
+    inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert len(inserts) == (0 if refused else 1), seen
+
+
+_SEAL_MARK = "-- seal_session_async"
+_LOCKED_ACCOUNT_READ = re.compile(r"FOR (SHARE|UPDATE)|WITH \((HOLDLOCK|UPDLOCK), ROWLOCK\)")
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("guarded", [False, True])
+async def test_create_session_seals_before_its_locked_read(
+    monkeypatch: pytest.MonkeyPatch, backend: str, guarded: bool
+) -> None:
+    """BACKLOG #5653: the seal, an HTTP call under a Vault Transit sealer, is made before the
+    account's row is locked, so no lock or pooled connection is held across it; the INSERT follows
+    the locked read. The marker is recorded where the store calls the seal."""
+    import importlib
+
+    module = importlib.import_module(f"messagefoundry.store.{backend}")
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    real = module.seal_session_async
+
+    async def recording_seal(sealer: Any, record: Any) -> Any:
+        seen.append((_SEAL_MARK, ()))
+        return await real(sealer, record)
+
+    monkeypatch.setattr(module, "seal_session_async", recording_seal)
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    assert await store.create_session(
+        token_hash=_HASH,
+        user_id="u",
+        expires_at=_NOW + 60,
+        now=_NOW,
+        auth_mechanism="kerberos",
+        require_federated_subject=(None, None) if guarded else None,
+        require_sign_in_eligible=guarded,
+    )
+    statements = [sql for sql, _ in seen]
+    seal = statements.index(_SEAL_MARK)
+    locked = next(i for i, s in enumerate(statements) if _LOCKED_ACCOUNT_READ.search(s))
+    insert = next(
+        i for i, s in enumerate(statements) if s.lstrip().startswith("INSERT INTO sessions")
+    )
+    assert statements.count(_SEAL_MARK) == 1
+    assert seal < locked < insert, statements
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("guarded", [False, True])
+async def test_create_session_raises_on_an_epoch_raised_on_every_attempt(
+    monkeypatch: pytest.MonkeyPatch, backend: str, guarded: bool
+) -> None:
+    """BACKLOG #5653: when every locked read finds a session epoch above the one the seal covers,
+    each server backend raises ``SessionMintContended``, never ``False``, which reads as the
+    account refusing the session, and writes no INSERT. The unlocked read is answered with an
+    epoch one below the locked read's, as a revoke between the two would leave it. RED on the head
+    that returned ``False``."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS, SESSION_MINT_EPOCH_RAISED
+
+    monkeypatch.setitem(globals(), "_ACCOUNT_ROW", (None, None, 1, 0, None, None))
+    monkeypatch.setitem(globals(), "_epoch_row", lambda: (0, 0))
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    with pytest.raises(SessionMintContended) as contended:
+        await store.create_session(
+            token_hash=_HASH,
+            user_id="u",
+            expires_at=_NOW + 60,
+            now=_NOW,
+            auth_mechanism="kerberos",
+            require_federated_subject=(None, None) if guarded else None,
+            require_sign_in_eligible=guarded,
+        )
+    assert contended.value.cause == SESSION_MINT_EPOCH_RAISED
+    assert contended.value.attempts == SESSION_MINT_ATTEMPTS
+    assert not [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert sum(sql.startswith(_EPOCH_READ) for sql, _ in seen) == SESSION_MINT_ATTEMPTS

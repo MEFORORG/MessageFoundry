@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Iterator
+import re
+import threading
+from collections.abc import AsyncIterator, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,10 +47,12 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
     WiringError,
+    accepts_verdict,
     load_config,
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import route_message, route_only
+from messagefoundry.pipeline.dryrun_trace import trace_dry_run
 from messagefoundry.pipeline.sandbox import (
     SandboxError,
     SandboxMode,
@@ -908,6 +912,180 @@ def _reads_a_proxy(msg: Any) -> bool:
     return bool(_PROXY.enabled)
 
 
+# --- BACKLOG #5514, engine PR 2997's left list: edges the walk did not follow ---
+
+
+class _Readers:
+    """A config class holding the accessor, and a helper that reads it, as class attributes."""
+
+    getter = staticmethod(state_get)
+    helper = staticmethod(_helper_reads_state)
+    harmless = staticmethod(_sync_pred)
+
+
+class _Holder:
+    reader: Any
+
+
+_held = _Holder()
+_held.reader = _helper_reads_state
+_harmless_held = _Holder()
+_harmless_held.reader = _sync_pred
+
+
+def _reads_a_class_attribute(msg: Any) -> bool:
+    return _Readers.getter("ns", "k", default=None) is not None
+
+
+def _calls_a_class_attribute(msg: Any) -> bool:
+    return bool(_Readers.helper(msg))
+
+
+def _calls_an_instance_attribute(msg: Any) -> bool:
+    return bool(_held.reader(msg))
+
+
+def _calls_a_harmless_attribute(msg: Any) -> bool:
+    return bool(_Readers.harmless(msg)) and bool(_harmless_held.reader(msg))
+
+
+class _Service:
+    """A bound method whose accessor is on ``self``, not in the method's own code."""
+
+    def __init__(self, getter: Any) -> None:
+        self.getter = getter
+
+    def accepts(self, msg: Any) -> bool:
+        return self.getter("ns", "k", default=None) is not None
+
+
+class _CallableService(_Service):
+    def __call__(self, msg: Any) -> bool:
+        return self.accepts(msg)
+
+
+class _SelfReferencing:
+    """A method that reads itself off ``self``: the walk must end, not bind it again forever."""
+
+    def accepts(self, msg: Any) -> bool:
+        return self.accepts is not None
+
+
+_GETTERS = (state_get,)
+_BY_NAME = {"state": _helper_reads_state}
+_HARMLESS: list[Any] = [_sync_pred]
+_HARMLESS.append(_HARMLESS)  # a container holding itself must end the walk too
+
+
+def _calls_from_a_tuple(msg: Any) -> bool:
+    return _GETTERS[0]("ns", "k", default=None) is not None
+
+
+def _calls_from_a_dict(msg: Any) -> bool:
+    return bool(_BY_NAME["state"](msg))
+
+
+def _calls_from_a_harmless_list(msg: Any) -> bool:
+    return bool(_HARMLESS[0](msg))
+
+
+_static_alias = staticmethod(state_get)
+
+
+def _calls_a_staticmethod_alias(msg: Any) -> bool:
+    return _static_alias("ns", "k", default=None) is not None
+
+
+@pytest.mark.parametrize(
+    ("pred", "accessor"),
+    [
+        (_reads_a_class_attribute, "state_get"),
+        (_calls_a_class_attribute, "state_get"),
+        (_calls_an_instance_attribute, "state_get"),
+        (_Service(state_get).accepts, "state_get"),
+        (_Service(response_get).accepts, "response_get"),
+        (_CallableService(state_get), "state_get"),
+        (_calls_from_a_tuple, "state_get"),
+        (_calls_from_a_dict, "state_get"),
+        (_calls_a_staticmethod_alias, "state_get"),
+    ],
+    ids=[
+        "class_attribute",
+        "class_attribute_helper",
+        "instance_attribute",
+        "bound_method_self",
+        "bound_method_self_response",
+        "callable_instance_self",
+        "tuple",
+        "dict",
+        "staticmethod_alias",
+    ],
+)
+def test_a_run_scoped_read_behind_an_attribute_container_or_self_fails_validate(
+    tmp_path: Path, pred: Any, accessor: str
+) -> None:
+    """Engine PR 2997 left these edges unfollowed: class and instance attributes, a bound method's
+    ``__self__``, module-level containers, and a ``staticmethod`` whose ``__wrapped__`` ends at
+    the accessor itself. Each now refuses at validate."""
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    with pytest.raises(WiringError, match="run-scoped state") as exc:
+        reg.validate()
+    assert accessor in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        _calls_a_harmless_attribute,
+        _Service(lambda *a, **k: None).accepts,
+        _calls_from_a_harmless_list,
+        _SelfReferencing().accepts,
+    ],
+    ids=["harmless_attributes", "harmless_self", "harmless_list", "self_referencing"],
+)
+def test_a_harmless_attribute_container_or_self_still_validates(tmp_path: Path, pred: Any) -> None:
+    """The control for the test above: the same shapes reaching no accessor still validate."""
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = pred
+    reg.validate()
+
+
+_EQ_CALLS: list[object] = []
+
+
+class _ComparingMeta(type):
+    """A metaclass whose ``__eq__`` is author code: the walk's container test must never run it."""
+
+    def __eq__(cls, other: object) -> bool:
+        _EQ_CALLS.append(other)
+        return False
+
+    __hash__ = type.__hash__
+
+
+class _Comparing(metaclass=_ComparingMeta):
+    pass
+
+
+_COMPARING = _Comparing()
+
+
+def _reads_a_comparing_global(msg: Any) -> bool:
+    return _COMPARING is not None
+
+
+def test_the_container_test_runs_no_metaclass_eq(tmp_path: Path) -> None:
+    """The walk matches a container by exact type. An equality test (``kind in (tuple, ...)``)
+    would run a reached object's metaclass ``__eq__``, author code, during validate; an identity
+    test runs none (BACKLOG #5514)."""
+    _EQ_CALLS.clear()
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_a_comparing_global
+    reg.validate()
+    assert _EQ_CALLS == []
+
+
 @pytest.mark.parametrize(
     "pred",
     [
@@ -990,3 +1168,355 @@ def test_a_walk_that_raises_is_a_configuration_problem(tmp_path: Path) -> None:
         reg.validate()
     assert "RuntimeError" in str(exc.value)
     assert "proxy not ready" not in str(exc.value)
+
+
+# --- BACKLOG #5514: a plain predicate that RETURNS an awaitable or a generator ---
+# The static check refuses an `async def` predicate, but a plain function that returns a coroutine or
+# a generator passes it. Read as a truth value, that object is True, so the handler would accept every
+# message. The verdict is refused at run time instead, as a router-stage error.
+
+
+async def _verdict_coro() -> bool:
+    return False
+
+
+def _returns_coroutine(msg: Any) -> Any:
+    return _verdict_coro()
+
+
+def _verdict_gen() -> Iterator[bool]:
+    yield False
+
+
+def _returns_generator(msg: Any) -> Any:
+    return _verdict_gen()
+
+
+async def _verdict_agen() -> AsyncIterator[bool]:
+    yield False
+
+
+class _Awaitable:
+    """An awaitable that is not a coroutine, such as a Future-like object."""
+
+    def __await__(self) -> Iterator[None]:
+        yield None
+
+
+# The refusal leaves the verdict unclosed (the predicate may share it), so a coroutine a predicate made
+# draws Python's "never awaited" warning when it is collected. The traced path collects it later, in
+# the cyclic collector, which can run during another test of this module.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:coroutine '_verdict_coro' was never awaited:RuntimeWarning"
+)
+
+_STATIC_PASSING_VERDICTS = [
+    pytest.param(_returns_coroutine, id="coroutine"),
+    pytest.param(_returns_generator, id="generator"),
+    pytest.param(lambda m: _verdict_agen(), id="async-generator"),
+    pytest.param(lambda m: _Awaitable(), id="awaitable"),
+    pytest.param(lambda m: filter(None, []), id="filter-iterator"),
+    pytest.param(lambda m: re.finditer("ESC", str(m)), id="finditer"),
+]
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+def test_an_awaitable_or_iterator_verdict_passes_validate_but_raises(
+    tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})  # the static check does not see it
+    with pytest.raises(TypeError, match="accepts= predicate for handler 'h' returned an object"):
+        route_only(reg, reg.inbound["IB"], ADT)
+
+
+# --- PR 3177 hold (c): the refusal must not consume or close a verdict the predicate may share ---
+
+
+def test_a_shared_generator_is_still_usable_after_the_refusal(tmp_path: Path) -> None:
+    def counter() -> Generator[int]:
+        n = 0
+        while True:
+            n += 1
+            yield n
+
+    shared = counter()
+    assert next(shared) == 1
+    reg = _reg(tmp_path, accepts={"h": lambda m: shared})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
+        route_only(reg, reg.inbound["IB"], ADT)
+    assert trace_dry_run(reg, ADT, inbound="IB")["disposition"] == MessageStatus.ERROR.value
+    # Neither path advanced it or closed it: the next value is the one after the test's own read.
+    assert next(shared) == 2
+    shared.close()
+
+
+def test_a_shared_coroutine_can_still_be_awaited_after_the_refusal(tmp_path: Path) -> None:
+    shared = _verdict_coro()
+    reg = _reg(tmp_path, accepts={"h": lambda m: shared})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type coroutine"):
+        route_only(reg, reg.inbound["IB"], ADT)
+    assert asyncio.run(shared) is False  # a closed coroutine raises RuntimeError here
+
+
+def test_a_started_generator_is_refused_without_running_its_finally(tmp_path: Path) -> None:
+    ran: list[str] = []
+
+    def gen() -> Generator[bool]:
+        try:
+            yield False
+        finally:
+            ran.append("finally")
+
+    g = gen()
+    next(g)
+    reg = _reg(tmp_path, accepts={"h": lambda m: g})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
+        route_only(reg, reg.inbound["IB"], ADT)
+    assert ran == []  # the test still holds it, so the refusal did not finalize it
+    g.close()
+    assert ran == ["finally"]
+
+
+def test_an_unshared_refused_generator_is_finalized_before_route_only_returns(
+    tmp_path: Path,
+) -> None:
+    # The refusal keeps no reference to the verdict, so a generator nothing else holds is collected
+    # at once, on the calling thread, not wherever the TypeError dies.
+    ran: list[str] = []
+
+    def gen() -> Generator[bool]:
+        try:
+            yield False
+        finally:
+            ran.append(threading.current_thread().name)
+
+    def pred(msg: Any) -> Any:
+        g = gen()
+        next(g)
+        return g
+
+    reg = _reg(tmp_path, accepts={"h": pred})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator") as exc:
+        route_only(reg, reg.inbound["IB"], ADT)
+    # While the exception, and so its traceback, is still alive.
+    assert ran == [threading.current_thread().name]
+    del exc
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+def test_an_awaitable_or_iterator_verdict_raises_on_the_traced_path(
+    tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})
+    out = trace_dry_run(reg, ADT, inbound="IB", show_phi=True)
+    assert out["disposition"] == MessageStatus.ERROR.value
+    assert out["handlers"] == []
+    assert "returned an object" in (out["error"] or "")
+    assert out["accepts_declined"] == []  # a refused verdict records no decline
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+async def test_an_awaitable_or_iterator_verdict_dead_letters(
+    store: MessageStore, tmp_path: Path, pred: Any
+) -> None:
+    ran: list[str] = []
+
+    def h(m: Any) -> Send:
+        ran.append("h")
+        return Send("OB", str(m))
+
+    reg = _reg(tmp_path, handlers={"h": h}, accepts={"h": pred})
+    item = await _claimed(store)
+    await RegistryRunner(
+        reg, store, egress=EgressSettings(deny_by_default=False)
+    )._process_ingress_item("IB", item)
+    assert await _routed_rows(store, item.message_id) == []
+    status, rows = await _router_stage_state(store, item.message_id)
+    assert status == MessageStatus.ERROR.value
+    assert rows == [(Stage.INGRESS.value, OutboxStatus.DEAD.value)]
+    assert ran == []
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+async def test_an_awaitable_or_iterator_verdict_is_a_content_error_on_the_fused_twin(
+    store: MessageStore, tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
+    fake_pool = _FakeSyncPool()
+    store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
+    runner._fuse_route_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="t-fuse")
+    item = OutboxItem(
+        id="ing-1",
+        message_id="m-1",
+        channel_id="IB",
+        destination_name=None,
+        payload=ADT,
+        attempts=1,
+        stage=Stage.INGRESS.value,
+    )
+    try:
+        result = await runner._fused_route_and_handoff("IB", reg.inbound["IB"], item)
+    finally:
+        runner._fuse_route_executor.shutdown(wait=True)
+    assert isinstance(result.route_exc, TypeError)  # CONTENT, not INFRA
+    assert result.handed_off is False and result.names == []
+    assert fake_pool.acquired == 0
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"), [(True, ["h"]), (False, []), (1, ["h"]), ("", []), (None, [])]
+)
+def test_a_plain_verdict_is_unchanged(tmp_path: Path, verdict: object, expected: list[str]) -> None:
+    reg = _reg(tmp_path, accepts={"h": lambda m: verdict})
+    assert route_only(reg, reg.inbound["IB"], ADT) == expected
+    assert trace_dry_run(reg, ADT, inbound="IB")["handlers"] == expected
+
+
+class _SizedIterator:
+    """An iterator whose class defines ``__len__``: it has a truth value of its own."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __iter__(self) -> _SizedIterator:
+        return self
+
+    def __next__(self) -> int:
+        raise StopIteration
+
+    def __len__(self) -> int:
+        return self.n
+
+
+@pytest.mark.parametrize(("n", "expected"), [(0, []), (1, ["h"])])
+def test_an_iterator_with_its_own_truth_value_is_read_by_it(
+    tmp_path: Path, n: int, expected: list[str]
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": lambda m: _SizedIterator(n)})
+    assert route_only(reg, reg.inbound["IB"], ADT) == expected
+
+
+_SANDBOX_AWAITABLE_GRAPH = """
+import re
+
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+
+async def _coro():
+    return False
+
+
+def _gen():
+    yield False
+
+
+async def _agen():
+    yield False
+
+
+inbound("IB_T", MLLP(port=19513), router="r")
+outbound("OB_T", MLLP(host="127.0.0.1", port=19514))
+
+
+@router("r")
+def r(msg):
+    return ["h_" + msg["MSH-3"]]
+
+
+@handler("h_coro", accepts=lambda m: _coro())
+def h_coro(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_gen", accepts=lambda m: _gen())
+def h_gen(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_agen", accepts=lambda m: _agen())
+def h_agen(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_filter", accepts=lambda m: filter(None, []))
+def h_filter(msg):
+    return Send("OB_T", str(msg))
+
+
+class _Awaitable:
+    def __await__(self):
+        yield None
+
+
+@handler("h_awaitable", accepts=lambda m: _Awaitable())
+def h_awaitable(msg):
+    return Send("OB_T", str(msg))
+
+
+@handler("h_finditer", accepts=lambda m: re.finditer("ESC", str(m)))
+def h_finditer(msg):
+    return Send("OB_T", str(msg))
+"""
+
+
+def test_an_awaitable_or_iterator_verdict_raises_in_the_sandbox_child(tmp_path: Path) -> None:
+    (tmp_path / "graph.py").write_text(_SANDBOX_AWAITABLE_GRAPH, encoding="utf-8")
+    registry = load_config(tmp_path)
+    ic = registry.inbound["IB_T"]
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
+        inbound="IB_T",
+        config_dir=str(tmp_path),
+        env=None,
+        graph=None,
+    )
+    try:
+        # The six shapes of _STATIC_PASSING_VERDICTS, each across the process boundary.
+        for kind in ("coro", "gen", "agen", "filter", "awaitable", "finditer"):
+            raw = ADT.replace("|S|F|", f"|{kind}|F|")
+            hname = f"h_{kind}"
+            # "sandbox failed accepts" is the parent's text for an error the CHILD reported, so the
+            # refusal ran across the process boundary rather than in the parent.
+            with pytest.raises(
+                SandboxError,
+                match=f"sandbox failed accepts '{hname}'.*'{hname}' returned an object",
+            ):
+                route_only(registry, ic, raw, sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+
+
+# --- BACKLOG #5514 follow-up: the refusal text carries author-controlled class names ---
+
+
+def _crlf_awaitable() -> object:
+    return type("Evil\r\nINJECTED line", (), {"__await__": lambda self: iter(())})()
+
+
+def _crlf_iterator() -> object:
+    return type(
+        "Evil\r\nINJECTED line", (), {"__iter__": lambda self: self, "__next__": lambda self: 0}
+    )()
+
+
+@pytest.mark.parametrize("make", [_crlf_awaitable, _crlf_iterator], ids=["awaitable", "iterator"])
+def test_a_crafted_class_name_reaches_the_refusal_text_escaped(make: Any) -> None:
+    with pytest.raises(TypeError) as exc:
+        accepts_verdict("h", make())
+    text = str(exc.value)
+    assert "\r" not in text and "\n" not in text
+    assert "Evil" in text and "INJECTED line" in text  # escaped, not dropped
+
+
+def test_the_refusal_text_does_not_demand_a_strict_bool() -> None:
+    # None, an int, a str and re.Match are still read by their truth value, so "it must return a
+    # bool" would be false; the text names the rule the code applies.
+    with pytest.raises(TypeError) as exc:
+        accepts_verdict("h", filter(None, []))
+    assert "must return a bool" not in str(exc.value)
+    assert "truth value is the verdict" in str(exc.value)
+    assert accepts_verdict("h", re.search("x", "x")) is True
+    assert accepts_verdict("h", None) is False

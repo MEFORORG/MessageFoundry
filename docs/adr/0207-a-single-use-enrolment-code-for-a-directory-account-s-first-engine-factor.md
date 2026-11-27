@@ -1069,3 +1069,13 @@ default `require_mfa` the floor already refused those actions, so only the off p
   THEN THE SYSTEM SHALL leave TOTP off and spend nothing in that ceremony. Where that factor was
   bound by a path that asks no code, the code stays unspent.
   → `tests/test_directory_enrolment_code.py`
+
+## Amendment (2026-11-24, BACKLOG #1149): session termination is refused to every factorless pending session
+
+This ADR refuses session termination to a factorless directory session and says the route
+comments claiming "a no-factor user must remain able to revoke" no longer hold for that session
+class. BACKLOG #1149 widened the refusal: under `[security].require_mfa` every MFA-pending session
+is refused `session_terminate`, `save_ends_own_sessions` and `revoke_all_sessions`, local or
+directory, factor or not, and those comments and the `docs/SECURITY.md` passages this ADR lists
+were changed with it. At least the route rows for the terminate routes in `docs/SECURITY.md` still
+read only "password-only step-up". The text above is kept as it was accepted.

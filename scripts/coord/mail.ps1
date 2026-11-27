@@ -110,6 +110,7 @@
     pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To C:\path\to\worktree -Body "the ADR number is 0161"
     pwsh -NoProfile -File scripts\coord\mail.ps1 -List
     pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
+    pwsh -NoProfile -File scripts\coord\mail.ps1 -Expiring -WithinHours 24
 #>
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
@@ -132,9 +133,14 @@ param(
     # RAISED 720 -> 4320 (12h -> 72h) on 2026-08-11, because 12h was measured to be SHORTER THAN THE GAP
     # IT HAD TO SURVIVE. The delivery points are SessionStart and Stop, so a recipient that is closed --
     # or idle -- overnight receives nothing until someone opens it. At 720 an ordinary overnight gap
-    # expired the mail, and EXPIRY IS SILENT IN BOTH DIRECTIONS: the recipient is never told a message
-    # existed, and the sender is never told it went unread. That is the only place in this transport
-    # where a message is genuinely LOST rather than merely late, and it was reachable by doing nothing.
+    # expired the mail. Expiry is the only place in this transport where a message is genuinely LOST
+    # rather than merely late, and it was reachable by doing nothing.
+    #
+    # CORRECTED (BACKLOG #1386): this said expiry is silent in both directions. Since BACKLOG #1228
+    # it is not always: the recipient is told a swept id only if the sweeping drain emits output, as
+    # at least a drain that shows mail or one at SessionStart does. The sender learns from the
+    # 'expired-unshown' receipt, when that write succeeds, after the loss, or before it from
+    # -Expiring, below.
     #
     # 72h is chosen to span a weekend, which is the longest gap a working session is expected to sit
     # through. It does NOT abandon the staleness argument above -- a three-day-old instruction is still
@@ -144,6 +150,12 @@ param(
     [Parameter(ParameterSetName = 'Send')][ValidateSet('note', 'handoff', 'alert', 'broadcast')][string]$Kind = 'note',
 
     [Parameter(ParameterSetName = 'List', Mandatory)][switch]$List,
+    # The caller's OWN sent mail still in a recipient's inbox (not consumed) whose TTL falls within
+    # -WithinHours, past-TTL-but-unswept included. The warning BEFORE expiry (BACKLOG #1386). It is
+    # sender-side on purpose: the recipient that loses mail is an idle one, and it runs no drain.
+    # NOT Mandatory, for the reason given at $Send: -WithinHours alone would bind this set and prompt.
+    [Parameter(ParameterSetName = 'Expiring')][switch]$Expiring,
+    [Parameter(ParameterSetName = 'Expiring')][ValidateRange(1, 8760)][int]$WithinHours = 24,
     [Parameter(ParameterSetName = 'Status', Mandatory = $false)][switch]$Status,
     [switch]$Json,
     # Overridable so tests exercise the real logic against a fixture instead of the live queue.
@@ -163,6 +175,9 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
 # Send-set arguments without -Send: refuse by name, before anything is read or written. See $Send.
 if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
     throw "Send arguments were given without -Send. Nothing was sent. Add -Send and re-run."
+}
+if ($PSCmdlet.ParameterSetName -eq 'Expiring' -and -not $Expiring) {
+    throw "-WithinHours was given without -Expiring. Nothing was read. Add -Expiring and re-run."
 }
 
 # --- Location ------------------------------------------------------------------------------------
@@ -410,12 +425,20 @@ function Get-BoxShownCount {
             if ($p) { [void]$live.Add($p.Stem) }
         }
     }
-    $n = 0
+    return @(Get-BoxShownMarkerStems -Root $Root -Key $Key | Where-Object { $live.Contains($_) }).Count
+}
+
+function Get-BoxShownMarkerStems {
+    # The message stem of every shown marker this channel minted in a box, one entry PER MARKER, so a
+    # message shown to two sessions appears twice. The one reading of shown/, for Get-BoxShownCount and
+    # -Expiring; a file whose name this channel did not mint is left out, as the drain leaves it alone.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Key)
+    $dir = Join-Path $Root "box/$Key/shown"
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.marker -File -EA SilentlyContinue)) {
         $mp = Split-ShownMarkerName -Name $f.Name
-        if ($mp -and $live.Contains($mp.Stem)) { $n++ }
+        if ($mp) { $mp.Stem }
     }
-    return $n
 }
 
 # --- Entry points --------------------------------------------------------------------------------
@@ -589,8 +612,9 @@ if ($Send) {
         throw (
             "-ToSessionId '$ToSessionId' is not a harness session id, so the drain would compare it " +
             "against the reading session's id, never match, and leave the message in the inbox until " +
-            "it expired -- with neither end told. A harness session id is a bare UUID; an id carrying " +
-            "a namespace prefix such as 'local_' belongs to a different id space. Send with -To " +
+            "it expired unshown. A harness session id is a " +
+            "bare UUID; an id carrying a namespace prefix such as 'local_' belongs to a different id " +
+            "space. Send with -To " +
             "<worktree path> and omit -ToSessionId unless you have the harness id."
         )
     }
@@ -599,9 +623,25 @@ if ($Send) {
     # move that did not happen is reported instead of assumed -- a broadcast that aborted on target 1
     # would hide targets 2..N, and one that swallowed the failure would put the defect back at the
     # reporting layer. Every target gets its own row and its own status.
-    # One row per recipient. A path is keyed through ConvertTo-BoxKey; a seat id already IS the key.
+    # One row per recipient. A path is keyed through Resolve-BoxPath and ConvertTo-BoxKey, the drain's
+    # own two steps, so a subdirectory of a worktree addresses the box its session reads (BACKLOG
+    # #7581); a seat id already IS the key.
     $rows = @()
-    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path $t); Cwd = $t } }
+    # Two targets in one worktree (a broadcast reaching a root session and a subdirectory session)
+    # share one box, so the second is skipped rather than queue the same message twice.
+    $keysSeen = [System.Collections.Generic.HashSet[string]]::new()
+    # A broadcast never queues into the sender's OWN box: a peer elsewhere in the sender's worktree
+    # shares it, and the sender's own drain would show and consume the copy. The roster's cwd
+    # comparison above cannot see that, since the two cwds differ.
+    if ($To -ieq 'all') { $null = $keysSeen.Add((ConvertTo-BoxKey -Path (Resolve-BoxPath -Path (Get-Location).Path))) }
+    $folded = @()
+    foreach ($t in $targets) {
+        $k = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $t)
+        if ($keysSeen.Add($k)) { $rows += [pscustomobject]@{ To = $t; Key = $k; Cwd = $t } }
+        else { $folded += "$t (box $k)" }
+    }
+    # Said, so a target that got no copy of its own is not silent.
+    foreach ($f in $folded) { [Console]::Error.WriteLine("mail.ps1: no separate copy for $f, which shares a box already addressed or the sender's own.") }
     foreach ($s in $seatTargets) {
         $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
         $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
@@ -647,16 +687,137 @@ if ($Send) {
         # answer, which is worse than silence because it looks like the check was performed.
         Write-Host "  Read that file to see what became of it. disposition 'shown-consumed' or"
         Write-Host "  'shown-held' means it was rendered; 'expired-unshown' means it reached its TTL"
-        Write-Host "  first and NOBODY EVER SAW IT; no file at all means no drain has run yet, OR the"
+        Write-Host "  before any session consumed it; no file at all means no drain has run yet, OR the"
         Write-Host "  receipt is older than the drain's retention window and has been swept."
         # THE SECOND HALF OF THAT LAST LINE IS NOT HEDGING. The drain sweeps receipts/ of files past
         # RETAIN_DAYS, so an absent receipt stopped meaning one thing the day that sweep shipped. A
         # sender reading the old sentence a week later would conclude their message was never drained,
         # which is a false statement rather than a missing one -- the failure the sweep's own guards
         # exist to prevent, one file over. Read it within the window, or not at all.
+        #
+        # The warning BEFORE 'expired-unshown' (BACKLOG #1386). A receipt can only report the loss.
+        Write-Host "  Before that: mail.ps1 -Expiring lists your own mail still in an inbox near its TTL."
         Write-Host ""
     }
     if (@($written | Where-Object { $_.Status -ne 'queued' }).Count -gt 0) { exit 1 }
+    exit 0
+}
+
+function Test-SentFromHere {
+    # Whether a message's from block names this worktree on this PC. EXACT after raising a
+    # subdirectory to its worktree root, never a prefix test: every worktree path here extends the
+    # primary checkout's, so a prefix match would hand the primary every worktree's mail. The host is
+    # judged by coord-root.ps1's one rule, Test-CoordRecordIsHere. A match is a claim, not provenance.
+    # $Raised caches Resolve-BoxPath per sender cwd, which can call git, across one pass.
+    param($Message, [Parameter(Mandatory)][string]$BoxNorm, [Parameter(Mandatory)][hashtable]$Raised)
+    $from = $Message.from
+    if ($from -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $fromCwd = [string]$from.cwd
+    if (-not $fromCwd.Trim() -or -not (Test-CoordRecordIsHere $from)) { return $false }
+    $norm = ConvertTo-BoxKeyPath -Path $fromCwd
+    if ($norm -ceq $BoxNorm) { return $true }
+    if (-not $norm.StartsWith("$BoxNorm\", [StringComparison]::Ordinal)) { return $false }
+    if (-not $Raised.ContainsKey($norm)) { $Raised[$norm] = ConvertTo-BoxKeyPath -Path (Resolve-BoxPath -Path $fromCwd) }
+    return ($Raised[$norm] -ceq $BoxNorm)
+}
+
+function ConvertTo-ExpiringUtc {
+    # ConvertFrom-Json has already turned the ISO stamp this sender writes into a DateTime. Anything
+    # else is a stamp this sender did not write: it is counted as undated here rather than read with
+    # a second copy of the drain's parser (ConvertTo-MailExpiryUtc in mail-drain.ps1), which is the
+    # copy that decides.
+    param($Value)
+    if ($Value -isnot [DateTime]) { return $null }
+    if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
+    return $Value.ToUniversalTime()
+}
+
+function Get-PrintableField {
+    # A message-supplied field made safe to print on one line. A minimal copy of the drain's Get-Fold
+    # (mail-drain.ps1), which lives in a hook this file cannot dot-source: control characters and line
+    # breaks become spaces, anything else outside printable ASCII becomes '?', whitespace collapses,
+    # and the result is capped. Without it a to.cwd holding a newline would print its own line.
+    param($Text, [int]$Cap = 240)
+    $t = ([string]$Text) -replace '[\p{C}]', ' '
+    $t = ($t -replace '[^\x20-\x7E]', '?' -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Cap) { $t = $t.Substring(0, $Cap - 3) + '...' }
+    return $t
+}
+
+if ($Expiring) {
+    # THE WARNING BEFORE EXPIRY (BACKLOG #1386). Every box's inbox is read for mail this worktree
+    # sent that is still there, so not consumed. HELD mail is listed too, flagged: a message a session
+    # was shown but has not consumed (a shown marker or a receipt, which the drain writes when it
+    # renders) is still swept at its TTL, and its receipt then reads 'expired-unshown'. Mail mid-claim
+    # in claiming/ is being consumed and is skipped.
+    $now = [DateTime]::UtcNow
+    $horizon = $now.AddHours($WithinHours)
+    $here = (Get-Location).Path
+    $boxNorm = ConvertTo-BoxKeyPath -Path (Resolve-BoxPath -Path $here)
+    $raised = @{}
+    $receiptDir = Join-Path $root 'receipts'
+    $near = @()
+    $beyond = 0
+    $undated = 0
+    $boxRoot = Join-Path $root 'box'
+    $boxDirs = if (Test-Path -LiteralPath $boxRoot) { @(Get-ChildItem -LiteralPath $boxRoot -Directory -EA SilentlyContinue) } else { @() }
+    foreach ($d in $boxDirs) {
+        # Read only once this box holds mail of ours, which most boxes do not.
+        $shownStems = $null
+        foreach ($row in @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'inbox')) {
+            # A name this channel did not mint is never shown by the drain, so it is not mail at all.
+            $parts = Split-MailFileName -Name (Split-Path $row.File -Leaf)
+            if (-not $parts -or $null -eq $row.Message) { continue }
+            if (-not (Test-SentFromHere -Message $row.Message -BoxNorm $boxNorm -Raised $raised)) { continue }
+            if ($null -eq $shownStems) {
+                $shownStems = [System.Collections.Generic.HashSet[string]]::new(
+                    [string[]]@(Get-BoxShownMarkerStems -Root $root -Key $d.Name), [StringComparer]::OrdinalIgnoreCase)
+            }
+            $held = $shownStems.Contains($parts.Stem) -or
+                (Test-Path -LiteralPath (Join-Path $receiptDir "$($parts.Stem).json"))
+            $exp = ConvertTo-ExpiringUtc $row.Message.expiresUtc
+            if ($null -eq $exp) { $undated++; continue }
+            if ($exp -gt $horizon) { $beyond++; continue }
+            # Not $to: PowerShell names are case-insensitive, so that is the [string]$To parameter, and
+            # assigning the to block to it coerces the object to text.
+            $addressee = $row.Message.to
+            $near += [pscustomobject]@{
+                Id          = $parts.Stem
+                ToBox       = $d.Name
+                ToCwd       = if ($addressee) { [string]$addressee.cwd } else { '' }
+                ToSessionId = if ($addressee) { [string]$addressee.sessionId } else { '' }
+                Kind        = [string]$row.Message.kind
+                ExpiresUtc  = $exp.ToString('o')
+                MinutesLeft = [int][Math]::Floor(($exp - $now).TotalMinutes)
+                PastTtl     = ($exp -lt $now)
+                Held        = $held
+            }
+        }
+    }
+    $near = @($near | Sort-Object ExpiresUtc)
+    if ($Json) {
+        ([pscustomobject]@{
+                Worktree = $here; WithinHours = $WithinHours; Near = $near
+                BeyondWindow = $beyond; Undated = $undated
+                MailRoot = $root; AsOfUtc = $now.ToString('o')
+            } | ConvertTo-Json -Depth 5) | Write-Output
+        exit 0
+    }
+    Write-Host ""
+    Write-Host "Mail sent from $here, still in an inbox (not consumed), expiring within $WithinHours h (as of $($now.ToString('o'))):"
+    if ($near.Count -eq 0) { Write-Host "  (none)" }
+    foreach ($n in $near) {
+        $when = if ($n.PastTtl) { "PAST ITS TTL; a drain of that box, if one ever runs, sweeps it as expired-unshown" }
+        else { "expires in $($n.MinutesLeft) min" }
+        $state = if ($n.Held) { "  shown but HELD, not consumed; still swept at its TTL" } else { "  not yet shown" }
+        $sid = if ($n.ToSessionId) { "  only for session $(Get-PrintableField $n.ToSessionId 80)" } else { '' }
+        Write-Host ("  {0}  ->  {1}  {2}{3}{4}" -f $n.Id, (Get-PrintableField $n.ToCwd), $when, $state, $sid)
+    }
+    Write-Host "  $beyond more expire later than that; $undated carry an expiry this script did not write, or none."
+    Write-Host "  The recipient may be idle: an idle seat runs no drain. Re-send by another channel, or"
+    Write-Host "  re-send with a longer -TtlMinutes, if the hand-off still matters. A sender field is"
+    Write-Host "  whatever the writer chose, so a row here is a claim, not provenance."
+    Write-Host ""
     exit 0
 }
 
@@ -671,9 +832,10 @@ if ($List) {
                 Seen     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'seen').Count
                 Done     = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'done').Count
                 # EXPIRY IS OTHERWISE VISIBLE FOR ONE TURN AND THEN GONE (BACKLOG #1228). The drain
-                # sweeps a message past its TTL into expired/ and says so once, in the render of the
-                # turn that swept it. After that no surface names it: the sender's receipt says
-                # queued, the recipient was never told, and both counts above stay whole. A message
+                # sweeps a message past its TTL into expired/ and says so at most once, in the render
+                # of the turn that swept it, and only if that drain emits output. After that the
+                # sender's 'expired-unshown' receipt names it to a sender who reads that file, while
+                # both counts above stay whole. A message
                 # that expired unshown is the one outcome this channel most needs to be able to
                 # report, so it must be countable after the fact and not only as it happens.
                 Expired  = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'expired').Count
@@ -703,15 +865,23 @@ if ($List) {
 
 # -Status (default): this worktree's own box.
 $here = (Get-Location).Path
-$key = ConvertTo-BoxKey -Path $here
+# The box the drain reads from here: a subdirectory is raised to its worktree root (BACKLOG #7581).
+$boxPath = Resolve-BoxPath -Path $here
+$key = ConvertTo-BoxKey -Path $boxPath
 # The box under the old path-only key, read only. The drain moves the inbox names this channel
 # minted into $key, so only those are counted as waiting; claiming/ and stranded/ stay where they are,
 # and are counted here because no sweep of this box reaches them.
-$legacyKey = ConvertTo-LegacyBoxKey -Path $here
-$legacyInbox = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'inbox' |
-        Where-Object { Split-MailFileName -Name (Split-Path $_.File -Leaf) }).Count
-$legacyClaiming = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'claiming').Count
-$legacyStranded = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'stranded').Count
+$legacyKey = ConvertTo-LegacyBoxKey -Path $boxPath
+# Every older key the drain reads from here, which for a subdirectory includes its own pre-#7581 key,
+# so a claimed or stranded message left there is still counted.
+$legacyInbox = 0; $legacyClaiming = 0; $legacyStranded = 0
+$oldKeys = @(Get-BoxReadKeys -Path $here -Resolved $boxPath)
+foreach ($oldKey in $oldKeys) {
+    $legacyInbox += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'inbox' |
+            Where-Object { Split-MailFileName -Name (Split-Path $_.File -Leaf) }).Count
+    $legacyClaiming += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'claiming').Count
+    $legacyStranded += @(Get-BoxMessages -Root $root -Key $oldKey -Sub 'stranded').Count
+}
 $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
@@ -751,7 +921,7 @@ if ($Json) {
             Claiming = $claiming.Count; Stranded = $stranded.Count
             Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
-            LegacyKey = $legacyKey; LegacyInbox = $legacyInbox
+            LegacyKey = $legacyKey; OldKeys = $oldKeys; LegacyInbox = $legacyInbox
             LegacyClaiming = $legacyClaiming; LegacyStranded = $legacyStranded
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output
@@ -772,14 +942,20 @@ Write-Host "               turn boundary after OFF is removed."
 Write-Host ("Next drain shows: at least {0} of {1} (caps: {2} messages / {3} bytes); {4} deferred to later drains." -f `
         $fits, $inbox.Count, $MAIL_CAP_MESSAGES, $MAIL_CAP_TOTAL_BYTES, [Math]::Max(0, $inbox.Count - $fits))
 Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not finished"
-Write-Host "Expired:       $($expired.Count) swept past their TTL. NOBODY WAS TOLD -- expiry is silent to"
-Write-Host "               the sender and to the recipient, so a non-zero count here is the only place"
-Write-Host "               a message that died unread is named after the turn that swept it."
+# CORRECTED (BACKLOG #1386): this said NOBODY WAS TOLD, silent to the sender and to the recipient.
+# Since BACKLOG #1228 that is not always so; what each end is told is stated in the lines below.
+Write-Host "Expired:       $($expired.Count) swept past their TTL before they were consumed. This box's session"
+Write-Host "               is told a swept id only if the sweeping drain emits output, as at least a"
+Write-Host "               drain that shows mail or one at SessionStart does. The sender learns from the"
+Write-Host "               'expired-unshown' receipt, when that write succeeds."
+Write-Host "Sent mail:     this view is mail sent TO you. For your own sent mail still in an inbox near"
+Write-Host "               its TTL, run mail.ps1 -Expiring."
 if ($legacyInbox + $legacyClaiming + $legacyStranded -gt 0) {
-    Write-Host "Legacy box:    $legacyKey, the old path-only key. $legacyInbox waiting, which each drain"
-    Write-Host "               tries to move into this box; a count that does not fall means a move is"
-    Write-Host "               failing. $legacyClaiming claimed and $legacyStranded stranded there, which"
-    Write-Host "               nothing moves: read them under box\$legacyKey\ by hand."
+    Write-Host "Legacy box:    $($oldKeys -join ', '), the older keys (path-only, or this subdirectory's own)."
+    Write-Host "               $legacyInbox waiting, which each drain tries to move into this box; a count"
+    Write-Host "               that does not fall means a move is failing. $legacyClaiming claimed and"
+    Write-Host "               $legacyStranded stranded there, which nothing moves: read them under"
+    Write-Host "               box\<key>\ by hand."
 }
 Write-Host "As of:         $([DateTime]::UtcNow.ToString('o'))"
 

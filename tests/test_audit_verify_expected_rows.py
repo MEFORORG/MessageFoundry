@@ -12,6 +12,7 @@ a Transit round trip, so a walk per pair would multiply them.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -241,6 +242,9 @@ def test_a_pair_may_be_a_list_and_below_1_is_refused(tmp_path: Path) -> None:
 def test_parse_audit_row_pair_shares_the_anchor_head_rule() -> None:
     head = "A" * 64
     assert store_mod.parse_audit_row_pair(f" 7:{head} ") == (7, head.lower())
+    mac = "vault:v1:" + base64.b64encode(b"\x03" * 32).decode("ascii")
+    assert store_mod.parse_audit_row_pair(f"7:{mac}") == (7, mac)
+    # Opaque, not held to the Transit MAC's shape, as the anchor rule (vault BACKLOG #5987).
     assert store_mod.parse_audit_row_pair("7:vault:v1:abc") == (7, "vault:v1:abc")
     for bad in ("7:", "0:" + head, "7:" + "a" * 12, "7:zz", "seven:" + head):
         with pytest.raises(store_mod.AuditRowPairError) as exc:

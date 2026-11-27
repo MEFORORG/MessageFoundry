@@ -856,7 +856,12 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
             # poller reads the flag while the stop is still queued (BACKLOG #2967). So the worker
             # blocks until the loop has run the stop, and a bound that expires raises here rather
             # than letting the split go on. On the loop thread nothing could run the stop, so the
-            # wait would stall the shared loop for the whole bound; fail at once instead.
+            # wait would stall the shared loop for the whole bound; fail at once instead. That
+            # failure is raised inside the hand-off, which _poll_once catches and logs, so an inline
+            # split turns this test red through the WARNING assertion below rather than here (vault
+            # BACKLOG #3766 item 22). Ordering the stop in a wrapper of asyncio.to_thread would also
+            # work; patching the split keeps the handshake on the batch's own job (item 6). The
+            # to_thread wrapper below only records which threads ran this poll's jobs.
             assert threading.get_ident() != loop_thread, "the split ran on the loop thread"
             asyncio.run_coroutine_threadsafe(_set_stop(), loop).result(timeout=30)
             holds_at_split.append(holds)
@@ -909,17 +914,46 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     markers = ("BACKLOG #2967 capture marker, before", "BACKLOG #2967 capture marker, after")
     # Every RemoteFileSource logs through the one module logger, so its name alone would also take a
     # line another source logged meanwhile, from its own poller task, and fail this test for it. A
-    # record logged on another task is not this poll's. One with no task is kept, since this poll's
-    # worker threads log with none (vault BACKLOG #3766 item 9).
+    # record logged on another task is not this poll's (vault BACKLOG #3766 item 9). One with no
+    # task is kept from the loop thread, where a callback logs with none, and from a thread that
+    # ran one of this poll's asyncio.to_thread jobs, since its worker threads log with none; a
+    # line from any other thread is dropped (item 30). A pooled thread can serve both, so a line
+    # another source logged on one of ours is still kept.
     poll_task = asyncio.current_task()
     assert poll_task is not None
-    our_tasks = (None, poll_task.get_name())
+    our_threads: set[int] = set()
+    to_thread = asyncio.to_thread
+
+    async def _tracked_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        if asyncio.current_task() is not poll_task:
+            return await to_thread(func, *args, **kwargs)
+
+        def run() -> Any:
+            our_threads.add(threading.get_ident())
+            return func(*args, **kwargs)
+
+        return await to_thread(run)
+
+    # remotefile calls asyncio.to_thread through the module, so the patch is on asyncio itself.
+    monkeypatch.setattr(asyncio, "to_thread", _tracked_to_thread)
 
     def ours(r: logging.LogRecord) -> bool:
-        return r.name == connector_log.name and r.taskName in our_tasks
+        if r.name != connector_log.name:
+            return False
+        if r.taskName is None:
+            return r.thread == loop_thread or r.thread in our_threads
+        return r.taskName == poll_task.get_name()
 
     connector_log.warning(markers[0])
     await src._poll_once()
+    # The wrapper fired, or ours() would drop every worker-thread line and the check pass on nothing.
+    assert our_threads, "no asyncio.to_thread job of this poll was seen"
+    # The item 30 control: a line from a thread that ran none of this poll's jobs, as another
+    # source's worker would log, logs with no task and must not read as this poll's failure.
+    other = threading.Thread(target=connector_log.warning, args=("another source's worker line",))
+    other.start()
+    other.join()
+    assert any(r.getMessage() == "another source's worker line" for r in caplog.records)
     connector_log.warning(markers[1])
     assert len(caplog.records) >= 2, "the capture missed a marker: it cannot see the connector"
     # The markers are logged on this task, so they pass through the same filter as the failures.
@@ -1043,6 +1077,85 @@ def test_a_copy_whose_destination_is_edited_to_a_whole_field_writes_with_set_dat
     # At a leaf destination the two writes are the same, so an edit there leaves the method alone.
     out = rewrite_source(source, {**edit, "params": {"dst": "NK1-3.1"}})
     assert 'msg.set("NK1-3.1", msg.field("PID-5.1") or "")' in out
+
+
+@pytest.mark.parametrize(
+    ("line", "params"),
+    [
+        # A leaf source edited to a whole field, into a leaf destination.
+        ('msg.set("NK1-2.1", msg.field("PID-5.1") or "")', {"src": "PID-5"}),
+        ('msg.set_data("NK1-2.1", msg.field("PID-5.1") or "")', {"src": "PID-5"}),
+        # A whole-field destination edited to a leaf, from a whole-field source.
+        ('msg.set("NK1-2", msg.field("PID-5") or "")', {"dst": "NK1-2.1"}),
+        # Spelled as constant expressions rather than plain strings.
+        ('msg.set("NK1-2", msg.field("PID-5") or "")', {"dst": {"expr": '"NK1-2.1"'}}),
+        ('msg.set("NK1-2.1", msg.field("PID-5.1") or "")', {"src": {"expr": '"PID-5"'}}),
+    ],
+)
+def test_a_copy_edit_into_a_whole_field_to_leaf_copy_is_refused(
+    line: str, params: dict[str, object]
+) -> None:
+    # BACKLOG #5821, PR 3036 open finding 3. A native write of a whole field's raw text into a
+    # component escapes its escape sequences a second time, so the edit is refused rather than
+    # written. NEGATIVE CONTROL: on 2af9ed8bed each edit wrote msg.set or msg.set_data
+    # ("NK1-2.1", msg.field("PID-5") or "").
+    source = LENS_SOURCE + f"    {line}\n"
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    with pytest.raises(LensRewriteError, match="escape"):
+        rewrite_source(source, {**edit, "params": params})
+
+
+def test_the_refused_whole_field_to_leaf_copy_inserts_as_the_action_call() -> None:
+    # The refusal's remedy works: the same copy inserted is the copy_field call, which decodes once.
+    source = LENS_SOURCE + '    msg.set("NK1-2", msg.field("PID-5") or "")\n'
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    with pytest.raises(LensRewriteError, match="copy-field row"):
+        rewrite_source(source, {**edit, "params": {"dst": "NK1-2.1"}})
+    assert '    copy_field(msg, "PID-5", "NK1-2.1")\n' in _lens_insert_copy("PID-5", "NK1-2.1")
+
+
+@pytest.mark.parametrize(
+    ("src", "dst"),
+    [({"expr": '"PID-5"'}, "NK1-2.1"), ("PID-5", {"expr": '"NK1-2.1"'})],
+)
+def test_a_constant_expression_whole_field_to_leaf_insert_is_the_action_call(
+    src: str | dict[str, str], dst: str | dict[str, str]
+) -> None:
+    # BACKLOG #5821, PR 3036 open finding 3, "Same for a constant-string {"expr": ...} src/dst".
+    # NEGATIVE CONTROL: on 2af9ed8bed the insert was msg.set("NK1-2.1", msg.field("PID-5") or "").
+    out = _lens_insert_copy(src, dst)  # type: ignore[arg-type]
+    assert "copy_field(msg, " in out
+    assert "msg.set" not in out
+    ast.parse(out)
+    rows = _copy_rows(out)
+    assert len(rows) == 1
+
+
+def test_a_constant_expression_leaf_source_inserts_with_set_data() -> None:
+    # Review round-5745f9d775: a leaf source spelled as a constant expression writes as the plain
+    # string does. NEGATIVE CONTROL: on ba226f46ad it wrote msg.set, so decoded separators in
+    # PID-3.1 became structure in PV1-19.
+    out = _lens_insert_copy({"expr": '"PID-3.1"'}, "PV1-19")
+    assert "msg.set_data(" in out
+
+
+def test_an_over_deep_expression_source_is_a_lens_refusal() -> None:
+    # Review round-5745f9d775: the classifier must not let a parser MemoryError escape, so the
+    # caller still gets its LensRewriteError. NEGATIVE CONTROL: on ba226f46ad MemoryError escaped.
+    with pytest.raises(LensRewriteError):
+        _lens_insert_copy({"expr": "-" * 200000 + "1"}, "NK1-2.1")
+
+
+def test_a_copy_edit_that_keeps_a_whole_field_destination_is_not_refused() -> None:
+    # The refusal is the whole-field-to-leaf case only: a whole field into a whole field is a copy
+    # of the structure as it is.
+    source = LENS_SOURCE + '    msg.set("NK1-2", msg.field("PID-5") or "")\n'
+    row = _copy_rows(source)[0]
+    edit = {"op": "set_params", "line_start": row["line_start"], "line_end": row["line_end"]}
+    out = rewrite_source(source, {**edit, "params": {"dst": "NK1-3"}})
+    assert 'msg.set("NK1-3", msg.field("PID-5") or "")' in out
 
 
 def test_a_copy_re_pick_that_would_pass_the_column_limit_is_refused() -> None:

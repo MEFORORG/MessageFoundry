@@ -38,6 +38,7 @@ find = '''
             message_type=fields.message_type,
             source_type=src,
             summary=fields.summary,
+            metadata=metadata,
             attachment_refs=attachment_refs or None,
         )
 '''
@@ -51,6 +52,7 @@ replace = '''
                 message_type=fields.message_type,
                 source_type=src,
                 summary=fields.summary,
+                metadata=metadata,
                 attachment_refs=attachment_refs or None,
             )
         except Exception:

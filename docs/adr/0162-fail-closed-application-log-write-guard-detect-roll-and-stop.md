@@ -470,7 +470,16 @@ delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
 `/status` signal for it are not built. When the sink refuses the notice, the two stages decide, as
 for any write failure. When the formatter cannot format the notice either, the sink is recorded
 unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
-stage 2 then decides the stop as for any other stage-2 failure. `_GuardedSinkMixin.handleError` and `_report_format_faults` in
+stage 2 then decides the stop as for any other stage-2 failure. (Added 2026-11-25.) A line
+holding a character a strict stream has no byte for is not handled (BACKLOG #5813, open), whether
+it is a record that formats or the stand-in notice, whose logger name can hold one: the write
+raises `UnicodeEncodeError`, and when the roll re-resolves to the same stream the re-write fails
+too, so the sink is recorded unwritable as for a broken sink, and stage 2 decides the stop. The
+stage-1 roll notice is still written to that sink first. `serve` sets its stdout and stderr to
+replace such a character where the stream allows it (`console_streams.harden_console_streams`);
+a stream left strict is not covered. `tests/test_remote_debug_guard.py` pins the unwritable
+outcome for a strict cp1252 stdout.
+`_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 
 **Part of the side-by-side check is now committed.**

@@ -32,6 +32,7 @@ from messagefoundry.pipeline.reference_sync import (
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import database
+from tests._fake_dbapi_driver import DriverError
 
 _EGRESS = EgressSettings(deny_by_default=False)
 _BASE: dict[str, Any] = {
@@ -55,7 +56,7 @@ class _RefusingRaw(_Raw):
 
     def __setattr__(self, attr: str, value: Any) -> None:
         if attr == "timeout" and value:
-            raise RuntimeError("HYC00", "[HYC00] optional feature not implemented")
+            raise DriverError("HYC00", "[HYC00] optional feature not implemented")
         object.__setattr__(self, attr, value)
 
 
@@ -154,7 +155,7 @@ async def test_a_timed_out_statement_fails_as_its_own_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = _patch_pool(monkeypatch, [("A", "1")])
-    pool.conn.cur.execute_error = RuntimeError("HYT00", "[HYT00] Query timeout expired SYN-DETAIL")
+    pool.conn.cur.execute_error = DriverError("HYT00", "[HYT00] Query timeout expired SYN-DETAIL")
     with pytest.raises(ReferenceStatementTimedOut, match="statement_timeout=30s") as info:
         await _load_database_source(dict(_BASE), _EGRESS, name="codes")
     assert "SYN-DETAIL" not in str(info.value)
@@ -165,8 +166,8 @@ async def test_another_driver_error_is_not_read_as_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = _patch_pool(monkeypatch, [("A", "1")])
-    pool.conn.cur.execute_error = RuntimeError("42S02", "[42S02] Invalid object name")
-    with pytest.raises(RuntimeError, match="42S02"):
+    pool.conn.cur.execute_error = DriverError("42S02", "[42S02] Invalid object name")
+    with pytest.raises(DriverError, match="42S02"):
         await _load_database_source(dict(_BASE), _EGRESS, name="codes")
 
 
@@ -185,7 +186,7 @@ async def test_a_cursor_refusing_the_timeout_fails_as_the_refusal_class(
     pool = _patch_pool(monkeypatch, [("A", "1")])
 
     async def refuse_cursor() -> _Cursor:
-        raise RuntimeError("HY092", "[HY092] invalid attribute")
+        raise DriverError("HY092", "[HY092] invalid attribute")
 
     monkeypatch.setattr(pool.conn, "cursor", refuse_cursor)
     with pytest.raises(ReferenceStatementTimeoutRefused) as info:
@@ -197,8 +198,8 @@ async def test_a_hyt00_with_no_timeout_set_is_not_read_as_this_setting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = _patch_pool(monkeypatch, [("A", "1")])
-    pool.conn.cur.execute_error = RuntimeError("HYT00", "[HYT00] timeout")
-    with pytest.raises(RuntimeError, match="HYT00"):
+    pool.conn.cur.execute_error = DriverError("HYT00", "[HYT00] timeout")
+    with pytest.raises(DriverError, match="HYT00"):
         await _load_database_source({**_BASE, "statement_timeout": 0}, _EGRESS, name="codes")
 
 

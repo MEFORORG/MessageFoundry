@@ -16,6 +16,7 @@ and object ids.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import sys
@@ -137,9 +138,12 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
             return found
 
         monkeypatch.setattr(store, "get_user_by_directory_object_id", held)
+        # The body outside the per-account directory sign-in queue (BACKLOG #5653): in one process the queue
+        # runs the two in turn, so this drives the race two engine shards still have.
+        unqueued = inspect.unwrap(AuthService._complete_ad_login)
         first, second = await asyncio.gather(
-            service._complete_ad_login(_principal(), None, mfa_verified=True),
-            service._complete_ad_login(_principal(), None, mfa_verified=True),
+            unqueued(service, _principal(), None, mfa_verified=True),
+            unqueued(service, _principal(), None, mfa_verified=True),
         )
         assert arrived == 2, "the barrier must have held both logins at the read"
         assert first.ok and second.ok
@@ -154,6 +158,10 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
         row = await store.get_user_by_username("pfielding")
         assert row is not None and row.directory_object_id == _OBJECT_ID
         assert await _failed_reasons(store) == []
+        # BACKLOG #6589: the loser's birth row rolled back with its refused INSERT, so one birth
+        # is recorded, naming the row both sign-ins landed on.
+        [born] = await store.list_audit(action="auth.ad_user_created")
+        assert json.loads(born["detail"])["user_id"] == row.id
     finally:
         await store.close()
 
@@ -475,7 +483,9 @@ def test_the_cli_reports_an_unnamed_integrity_refusal_as_a_refused_write(
     )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
-    assert error.startswith("the store refused one of this command's writes")
+    assert error.startswith(
+        "the store refused a write before this command's first account write landed"
+    )
     assert "cannot open the store" not in error
 
 
@@ -506,7 +516,9 @@ def test_the_cli_reports_a_server_backends_integrity_refusal_as_a_refused_write(
     )
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
-    assert error.startswith("the store refused one of this command's writes")
+    assert error.startswith(
+        "the store refused a write before this command's first account write landed"
+    )
 
 
 # Driver-shaped text, one per backend family. Each fragment names schema or a key value the CLI must
@@ -567,7 +579,9 @@ def test_the_cli_refused_write_names_the_class_and_never_the_driver_text(
     captured = capsys.readouterr()
     assert rc == 1
     error = json.loads(captured.out)["error"] if as_json else captured.err.rsplit("error: ", 1)[1]
-    assert error.startswith(f"the store refused one of this command's writes ({class_name})")
+    assert error.startswith(
+        f"the store refused a write before this command's first account write landed ({class_name})"
+    )
     for fragment in _DRIVER_FRAGMENTS:
         assert fragment not in captured.out, fragment
         assert fragment not in captured.err, fragment

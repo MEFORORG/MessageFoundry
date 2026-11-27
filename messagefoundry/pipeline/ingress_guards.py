@@ -24,8 +24,9 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
 **The two callers still differ in at least these places.** The HL7 parse step, which each caller
-runs itself: the stored ``parse error`` text differs, and the dry-run catches only ``HL7PeekError``
-where the listener catches every peek-read fault. The detach's refusals of an escaped ``OBX-5.5``
+runs itself: the stored ``parse error`` text for an ``HL7PeekError`` differs, since the listener
+renders it through ``safe_exc`` and the dry-run does not. Both catch every peek-read fault
+(``PEEK_READ_FAULTS``) and store the same ``peek read failed`` text for one (BACKLOG #6821). The detach's refusals of an escaped ``OBX-5.5``
 document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a received document
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
@@ -588,7 +589,8 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
     decode, so it passes through (HL7 still gets its line endings collapsed).
 
     Every failure to decode is the ``decode``-phase :class:`IngressGuardError` (BACKLOG #2431): bytes
-    the charset refuses, and, as its :class:`IngressCodecUnusable` subclass, a name naming no text
+    the charset refuses, a decoded text holding a surrogate code point, which strict UTF-8 cannot
+    encode (BACKLOG #1619; a ``str`` ``raw`` is held to this too), and, as its :class:`IngressCodecUnusable` subclass, a name naming no text
     codec (``LookupError``) or one that refuses every conversion (``undefined``). So a listener
     records each as an ``ERROR`` row and NAKs, rather than letting it escape into the transport with
     no row."""
@@ -600,10 +602,17 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
     encoding = ingress_encoding(ic)
     try:
         if ic.content_type is ContentType.HL7V2:
-            return normalize(raw, encoding=encoding, errors="strict")
-        return raw.decode(encoding) if isinstance(raw, bytes) else raw
+            text = normalize(raw, encoding=encoding, errors="strict")
+        else:
+            text = raw.decode(encoding) if isinstance(raw, bytes) else raw
     except (UnicodeError, LookupError) as exc:
         refused = _decode_refusal(encoding, exc)
+    else:
+        surrogate = _lone_surrogate_at(text)
+        if surrogate is None:
+            return text
+        # The body's own fault, whatever the codec, so never IngressCodecUnusable.
+        raise IngressGuardError(_surrogate_refusal(encoding, surrogate), phase="decode")
     # Told apart by probing the NAME, not by the error's type: a usable codec such as ``idna`` can
     # raise a bare UnicodeError for one body, which is that body's fault.
     if _is_text_codec(encoding):
@@ -620,6 +629,31 @@ class IngressCodecUnusable(IngressGuardError):
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason, phase="decode")
+
+
+#: A UTF-16 surrogate code point, which strict UTF-8 cannot encode.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _lone_surrogate_at(text: str) -> int | None:
+    """The position of the first surrogate code point in ``text``, or ``None`` (BACKLOG #1619).
+
+    At least ``utf-7`` decodes bytes to one with no error (``+2D8-`` is U+D83F). The SQLite store
+    writes text as strict UTF-8, which refuses one, so such a body would fail the ingress write and
+    its own ``ERROR`` row alike; :func:`decode_body` refuses it as undecodable instead. An ASCII body
+    is skipped without a scan."""
+    if text.isascii():
+        return None
+    found = _SURROGATE_RE.search(text)
+    return None if found is None else found.start()
+
+
+def _surrogate_refusal(encoding: str, position: int) -> str:
+    """The ``decode``-phase reason for a decoded surrogate. It names a position, never a character."""
+    return (
+        f"decode error ({encoding}): the decoded text holds a surrogate code point at position "
+        f"{position}, which strict UTF-8 cannot encode"
+    )
 
 
 def _decode_refusal(encoding: str, exc: Exception) -> str:
@@ -658,8 +692,8 @@ def decode_ingress(raw: str | bytes, ic: InboundConnection) -> str:
 
     :func:`decode_body` then :func:`check_decoded`, the same two calls the live listener makes, so the
     dry-run and the engine share the sequence rather than a copy of it. A ``str`` ``raw`` skips the
-    charset guard and still gets the NUL, frame-byte and size guards: the dry-run entry points accept text, and the
-    transport-fed listener never does.
+    charset guard and still gets the surrogate refusal and the NUL, frame-byte and size guards: the
+    dry-run entry points accept text, and the transport-fed listener never does.
 
     The codec name is resolved the listener's way too, inside :func:`decode_body`, so an absent or
     ``None`` declaration decodes as ``utf-8`` on both and, for a ``bytes`` body, a name naming no

@@ -1272,7 +1272,7 @@ async def test_the_cold_seed_abort_adds_its_text_before_the_check(
 
         coord = drmod.DrCoordinator(
             store,
-            DrSettings(enabled=True),
+            DrSettings(enabled=True, seed_archive="seed.mfbak"),
             store_settings=StoreSettings(path=str(tmp_path / "msg.db")),
             activate_profile=noop,
             deactivate_profile=noop,

@@ -26,20 +26,27 @@ import asyncio
 import datetime
 import fnmatch
 import html
+import http.client
 import json
 import logging
 import smtplib
 import string
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar, cast
 
+from messagefoundry.config.alert_webhook import (
+    alert_host_allowed as alert_host_allowed,  # re-exported: __main__ and the tests import it here
+)
+from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
@@ -62,6 +69,7 @@ from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
+    UNREACHED_ROLLUP_SOURCE,
     config_changed_detail,
     crl_expiry_detail,
     crl_reload_refused_detail,
@@ -117,6 +125,17 @@ _MAX_QUEUE = 1000
 # It bounds only the sends: aclose()'s wait for control tasks is not bounded by it.
 _DRAIN_CANCEL_GRACE_SECONDS = 0.05
 
+# Vault BACKLOG #3100 item 14: the instance-key prefix of a rollup of unreachable directory
+# accounts, which opens an instance per set of accounts and has no inverse. Each new set is a new
+# key, so on a flapping directory the per-key cooldown and occurrence entries would grow without
+# bound. For these keys only, the notifier keeps both entries for the most recently emitted
+# _ROLLUP_KEYS_KEPT keys and drops those of the least recent (NotifierAlertSink._keep_rollup). A
+# key dropped that way pages on its next emit at the base escalation tier, as after a restart,
+# while the durable tier keeps its highest. Bounded by count, not by cooldown, so no rollup's
+# throttle or escalation changes until that many other sets have paged since it.
+_ROLLUP_KEY_PREFIX = f"ad_reconcile_aborted:{UNREACHED_ROLLUP_SOURCE}:"
+_ROLLUP_KEYS_KEPT = 1024
+
 
 class _AlertStateStore(Protocol):
     """The narrow alert-state slice (ADR 0044, #56) the sink uses — a structural subset of the store's
@@ -139,7 +158,11 @@ class _AlertStateStore(Protocol):
     ) -> int: ...
 
     async def list_active_alert_instances(
-        self, *, limit: int = ..., allowed_channels: Sequence[str] | None
+        self,
+        *,
+        limit: int = ...,
+        allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = ...,
     ) -> Sequence[Any]: ...
 
 
@@ -353,7 +376,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     Subclasses implement :meth:`_handle` for the per-item work. It runs inside the background task,
     must push any blocking I/O off the loop (``asyncio.to_thread``), and must be **best-effort** — it
     swallows its own errors and never raises, since an exception out of ``_handle`` would kill the
-    drain loop. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
+    drain loop. It calls the ``delivered`` callback it is given once the item is delivered, which
+    takes the item off :attr:`undelivered`; a second call for the same item does nothing.
+    Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
     concurrently inside its :meth:`_handle` (BACKLOG #5907), and a cancel of the drain task is
     bounded as :meth:`NotifierAlertSink._cut_sends` says. A cancel does not stop a worker thread a
     send started with ``asyncio.to_thread``, so that runs on to its own timeout.
@@ -363,7 +388,13 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     def __init__(self, *, max_queue: int = _MAX_QUEUE) -> None:
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
-        # Queued or in flight, so a drain that is cut can say how many items it never delivered.
+        # Queued, in flight, or handled without being delivered (BACKLOG #5907 step 4). api.app's
+        # startup unwind (_unwind_failed_start) logs an alert notifier's count after its close; it
+        # is handed no security notifier. At least api.app's managed shutdown, its open_store
+        # failure path and __main__'s offline alert feed close an alert notifier without reading
+        # the count. CORRECTED 2026-11-23 (BACKLOG #8350 item 2): this read "Read at least by
+        # api.app's startup unwind, which logs it after its close", which did not say that other
+        # closes leave it unread.
         self._undelivered = 0
 
     def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
@@ -383,8 +414,10 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
 
     @property
     def undelivered(self) -> int:
-        """How many items are queued or being handled, a count only (BACKLOG #5907). An item whose
-        handling was cancelled stays counted."""
+        """How many items were queued and not yet reported delivered, a count only (BACKLOG
+        #5907): an item leaves it when :meth:`_handle` calls its ``delivered`` callback. What
+        counts as delivered, and when a call can still come, is each subclass's :meth:`_handle`,
+        for alerts :meth:`NotifierAlertSink._handle`."""
         return self._undelivered
 
     def start(self) -> None:
@@ -405,12 +438,25 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             item = await self._queue.get()
             if item is None:
                 return
-            await self._handle(item)
-            self._undelivered -= 1
+            await self._handle(item, self._one_shot_delivered())
+
+    def _one_shot_delivered(self) -> Callable[[], None]:
+        """The ``delivered`` callback for one item: its first call takes the item off
+        :attr:`undelivered`, and any later call does nothing."""
+        counted = False
+
+        def delivered() -> None:
+            nonlocal counted
+            if not counted:
+                counted = True
+                self._undelivered -= 1
+
+        return delivered
 
     @abc.abstractmethod
-    async def _handle(self, item: _T) -> None:
-        """Process one queued item (best-effort, blocking I/O off-loop). Must not raise."""
+    async def _handle(self, item: _T, delivered: Callable[[], None]) -> None:
+        """Process one queued item (best-effort, blocking I/O off-loop), calling ``delivered``
+        once it is delivered. Must not raise."""
 
 
 class AlertTransport(Protocol):
@@ -419,10 +465,15 @@ class AlertTransport(Protocol):
     Each event's sends run concurrently, one child task per transport the rule selected (BACKLOG
     #5907), so a send must not rely on a sibling's having run first; each gets its own shallow copy
     of the event.
-    A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
-    alert, logged, and the siblings go on. A send must end promptly once cancelled: on a drain
-    cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
-    ``aclose()``.
+    A send returns once its channel took the alert and raises when it did not, since
+    :meth:`NotifierAlertSink._handle` counts a send that returned before a drain cancel reached it
+    as delivered (BACKLOG #5907 step 4): a send that swallows its own failure reads as delivered.
+    A send that raises ``CancelledError`` before a drain cancel reached it, as
+    :meth:`NotifierAlertSink._handle` decides that, loses that transport's alert, logged, and the
+    cancel ends that send's child task, not its siblings or the drain. A send must end promptly
+    once cancelled: on a drain cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS`
+    is left running, past ``aclose()``. A send the drain's cancel reached never counts as
+    delivered, whether it raises or returns.
 
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
     the transport's own default); ``context`` (#138) carries the extra non-PHI template values the
@@ -584,15 +635,30 @@ _WEBHOOK_WAYS_ACROSS = (
 )
 
 #: The alerts SMTP login's OWN way across its revocation refusal (BACKLOG #2193). ``[tls].crl_file``
-#: does reach this hop's context, through the trust anchor :func:`send_plain_email` resolves, so it
-#: is offered beside the ``[alerts]`` pair; a connection's attestation is not, as this is no
-#: connection.
+#: reaches this hop's context through the trust anchor :func:`send_plain_email` resolves, but
+#: only where the caller handed the sink a ``[tls]`` policy, so it is offered beside the
+#: ``[alerts]`` pair only then; a connection's attestation is not, as this is no connection.
+#: Each remedy is written out in full, so a grep for the sentence a refusal printed finds it.
 _ALERT_SMTP_WAYS_ACROSS = (
     "Configure [tls].crl_file so the engine checks a CRL on this hop (it is instance-wide: every "
     "non-loopback hop it reaches then needs its issuer's CRL in that file, or its handshake "
     "fails), or set [alerts].email_tls_revocation_attested = true with an "
     "[alerts].email_tls_revocation_attested_reason. Or remove [alerts].email_username and the "
     "password to send unauthenticated, which takes no revocation guard."
+)
+
+#: The same refusal's way across where the sink was built with no ``[tls]`` policy (BACKLOG
+#: #5527): ``[tls].crl_file`` cannot reach this hop's context then, whatever the file says, so
+#: setting it is not offered as a remedy on its own.
+_ALERT_SMTP_WAYS_ACROSS_NO_POLICY = (
+    "This sink was built with no [tls] policy, so [tls].crl_file does not reach this hop. "
+    "Set [alerts].email_tls_revocation_attested = true with an "
+    "[alerts].email_tls_revocation_attested_reason, or build the sink with the instance [tls] "
+    "policy (trust_anchor_policy where the sink or its notifier factory is called, or "
+    "tls_settings for an app) and a [tls].crl_file holding the relay issuer's CRL (it is "
+    "instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
+    "or its handshake fails). Or remove [alerts].email_username and the password to send "
+    "unauthenticated, which takes no revocation guard."
 )
 
 
@@ -637,39 +703,6 @@ def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) ->
     return True
 
 
-def alert_host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
-    """Whether the ``[alerts]`` egress allowlist ``allowed_hosts`` admits ``host``.
-
-    The one test the build and every send of the webhook and the SMTP relay apply, and the one the
-    serve gate's security-channel check reads (BACKLOG #5088), so no two of them can disagree on
-    which host is listed. Hosts compare without case.
-
-    An empty allowlist admits every host: that is the settings' documented ``[]`` = any, and an
-    environment value that splits to no host, such as ``""`` or ``","``, yields it too. A non-empty
-    one admits only a host it lists, and an empty host is never listed, so ``[""]``, which names no
-    host, refuses every one rather than matching a URL with no host."""
-    if not allowed_hosts:
-        return True
-    candidate = host.lower()
-    return bool(candidate) and candidate in (h.lower() for h in allowed_hosts)
-
-
-def _refuse_off_allowlist_webhook(url: str, allowed_hosts: Sequence[str]) -> None:
-    """Refuse a webhook URL whose host ``[alerts].webhook_allowed_hosts`` does not admit.
-
-    Run at the build and at every POST. Names the host, never the URL: the path carries the
-    webhook's token (BACKLOG #1793)."""
-    host = urllib.parse.urlsplit(url).hostname or ""  # urlsplit lower-cases the host
-    if not host and allowed_hosts:
-        # The remedy is the URL, not the allowlist, so say that. With no allowlist the https
-        # revocation guard's hop_url_host refuses the same URL at the build.
-        raise ValueError("[alerts].webhook_url names no host")
-    if not alert_host_allowed(host, allowed_hosts):
-        raise ValueError(
-            f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
-        )
-
-
 def _refuse_off_allowlist_smtp_host(host: str, allowed_hosts: Sequence[str]) -> None:
     """Refuse an ``[alerts]`` SMTP relay that ``[alerts].smtp_allowed_hosts`` does not admit.
 
@@ -691,7 +724,7 @@ def _refuse_webhook_revocation(
 ) -> None:
     """Apply the ADR 0173 revocation-hop guard to the https alert webhook (BACKLOG #2193 slice (d)).
 
-    The POST carries the webhook's path token, which Slack and Teams treat as the credential, over
+    The POST can carry the webhook's path token, which Slack and Teams treat as the credential, over
     https the engine verifies. Stdlib ssl checks no OCSP or CRL there, so a revoked but unexpired
     certificate would be accepted with no refusal and no record.
 
@@ -710,12 +743,13 @@ def _refuse_webhook_revocation(
     if urllib.parse.urlsplit(url).scheme.lower() != "https":
         return
     RevocationHopGuard.capture(
-        # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
-        # refused before this runs (refuse_url_credentials).
-        host=hop_url_host(url, cell="[alerts].webhook_url"),
+        # The host urllib dials, percent-decoded as urllib decodes it (vault BACKLOG #3533 item
+        # 14): "[::1%3a2]" dials ::1:2, not ::1 in zone "3a2". A userinfo URL, which could make a
+        # parser disagree with it, is refused before this runs (refuse_url_credentials).
+        host=urllib.parse.unquote(hop_url_host(url, cell="[alerts].webhook_url")),
         cell="[alerts] webhook POST (verified TLS, no revocation check)",
         description=(
-            "carries the alert webhook's path token over verified https but performs no "
+            "can carry the alert webhook's path token over verified https and performs no "
             "certificate revocation checking"
         ),
         attested=_attested_with_a_reason(attested, attested_reason, flag=_WEBHOOK_ATTESTATION),
@@ -766,6 +800,8 @@ def _refuse_alert_smtp_revocation(
     the engine verifies. Stdlib ssl checks no OCSP or CRL, so a revoked but unexpired relay
     certificate would be accepted with no refusal and no record. The owner ruling of 2026-10-27
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
+    ``[tls].crl_file`` reaches the hop only where the caller passes ``trust_anchor_policy``, so
+    the refusal offers it only then (BACKLOG #5527).
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
     credential. The decline does not rest on what the body holds, and an alert body is not PHI-free
@@ -803,7 +839,11 @@ def _refuse_alert_smtp_revocation(
             trust_anchor_policy=trust_anchor_policy,
         ),
         posture=_alert_hop_posture(posture),
-        ways_across=_ALERT_SMTP_WAYS_ACROSS,
+        ways_across=(
+            _ALERT_SMTP_WAYS_ACROSS
+            if trust_anchor_policy is not None
+            else _ALERT_SMTP_WAYS_ACROSS_NO_POLICY
+        ),
         attested_reason=attested_reason,
         connection=None,  # the alerts sink and the security notifier, not a connection
         declaration=f"[alerts].{_EMAIL_ATTESTATION}",
@@ -823,43 +863,12 @@ class WebhookTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
-        # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
-        # escape, in every posture (vault BACKLOG #3533 item 5): every POST carries the path token
-        # the webhook service issues, the hop's credential, as every AI broker call carries its key.
-        # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
-        #
-        # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
-        # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
-        # runs first so no later message can reach one. This sink is built outside the connector gate,
-        # so the transports' own construction refusal never saw this URL. Imported lazily to keep this
-        # module's import cost unchanged for the far commoner non-webhook sinks.
-        from messagefoundry.transports.rest import (
-            enforce_outbound_length_limits,
-            refuse_url_credentials,
-        )
-
-        refuse_url_credentials(
-            url, "[alerts].webhook_url", use="the path token the webhook service issues"
-        )
-        scheme = urllib.parse.urlsplit(url).scheme.lower()
-        # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
-        if scheme == "http":
-            raise ValueError(
-                "[alerts].webhook_url over cleartext http would send the webhook's path token in "
-                "clear; refused, with no escape, in every posture — use https"
-            )
-        if scheme != "https":
-            raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
-        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
-        # at every POST refuses the start instead. Before the revocation guard, which reads no
-        # allowlist, so that guard never judges a host the egress policy forbids.
-        _refuse_off_allowlist_webhook(url, allowed_hosts)
-        # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
-        # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
-        # added between here and the wire.
-        enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+        # The posture-free checks, stated once in config/alert_webhook.py, which settings load
+        # runs too (vault BACKLOG #3533 item 14). It returns the value it judged, with the
+        # whitespace it strips gone; the revocation guard, each POST and the dial read that value.
+        url = refuse_unbuildable_webhook_url(url, allowed_hosts)
         # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
-        # refuses the start, as at #5088 above, rather than failing every POST.
+        # refuses the start, as the #5088 allowlist check does, rather than failing every POST.
         _shared_no_redirect_opener()
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
@@ -890,39 +899,49 @@ class WebhookTransport:
         # (bandit B310). The URL is operator-configured, but an https-only check is cheap
         # defense-in-depth so a typo'd or hostile config can't turn an alert POST into a local-file
         # read. With the scheme provably https here, the Request nosec is justified.
-        split = urllib.parse.urlsplit(self.url)
-        if split.scheme.lower() != "https":
-            raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
-        _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
+        url = refuse_unbuildable_webhook_url(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to https above
-            self.url,
+            url,  # the value the screen judged, as its contract says
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         # Bounded so the drain cannot be turned into a memory exhaustion by a webhook host that
-        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily for the
-        # same reason as the length gate above.
+        # answers an alert POST with an arbitrarily large body (ASVS 15.2.2). Imported lazily.
         from messagefoundry.transports.bounded_read import drain_2xx_reply
 
-        # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
-        with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
-            # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
-            # so completeness is not checked: the POST has already been accepted by this point, and
-            # failing the drain on a short reply would report an alert as undelivered when the host
-            # took it. The byte bound still applies -- an unbounded drain is a memory exhaustion
-            # whether or not anyone reads the bytes.
-            #
-            # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
-            # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide by
-            # who reads the body", to this sink. Nothing reads this body. The label is fixed, so
-            # the WARNING does not carry the configured host.
-            drain_2xx_reply(resp, connector="alert webhook")
+        # Defence in depth (vault BACKLOG #3533 item 14): http.client's InvalidURL quotes the
+        # request target, whose path can carry the webhook's token. The screen above refuses the
+        # shapes known to raise it, and any other is re-raised with fixed text, outside the
+        # handler, so no chain link holds the original either.
+        unsendable = False
+        try:
+            # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST
+            # (15.3.2).
+            with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
+                # Drain (bounded) so the connection can be reused/closed cleanly. The body is
+                # discarded, so completeness is not checked: the POST has already been accepted by
+                # this point, and failing the drain on a short reply would report an alert as
+                # undelivered when the host took it. The byte bound still applies -- an unbounded
+                # drain is a memory exhaustion whether or not anyone reads the bytes.
+                #
+                # An over-cap body after a 2xx counts as delivered, with a WARNING: owner ruling
+                # 2026-10-12 (#3040 item 1), which extends the owner ruling of 2026-10-05, "decide
+                # by who reads the body", to this sink. Nothing reads this body. The label is
+                # fixed, so the WARNING does not carry the configured host.
+                drain_2xx_reply(resp, connector="alert webhook")
+        except http.client.InvalidURL:
+            unsendable = True
+        if unsendable:
+            raise http.client.InvalidURL(
+                "[alerts].webhook_url could not be sent by http.client; the URL is not repeated "
+                "here, since its path can carry the webhook's token"
+            )
 
 
 #: The name the alerts SMTP hop logs under. The security notifier registers its verification-off
@@ -1382,6 +1401,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # pick the escalation tier. In-memory + per-node (advisory, like _last_sent); reset on auto-resolve
         # + operator resolve (the durable count/escalation_tier is the cross-restart record).
         self._occurrences: dict[str, int] = {}
+        # Vault BACKLOG #3100 item 14: the rollup keys (_ROLLUP_KEY_PREFIX) whose _last_sent and
+        # _occurrences entries are kept, least recently emitted first (_keep_rollup).
+        self._rollup_keys: OrderedDict[str, None] = OrderedDict()
         # BACKLOG #1741: the state each connection_started cleared, per key, in the order its durable
         # resolve was scheduled, kept until that resolve lands or fails (_resolve_settled).
         self._pending_clears: dict[str, list[_ClearedState]] = {}
@@ -1392,10 +1414,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_tasks: set[asyncio.Task[None]] = set()
         # BACKLOG #5907: send tasks a cut drain left still running past its grace.
         self._left_sends: set[asyncio.Task[None]] = set()
+        # BACKLOG #5907: how many sends were still running when a drain cancel reached them, over
+        # the sink's life (sends_cut).
+        self._sends_cut = 0
         # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
         self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
-        # raising. None, as `serve` leaves it, changes nothing.
+        # raising before a drain cancel reached it. None, as `serve` leaves it, changes nothing.
         self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
@@ -2094,7 +2119,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
         """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
         returns without raising: the relay accepted every recipient, or the webhook answered 2xx
-        (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
+        (vault BACKLOG #3849). A send a drain cancel reached before it returned is not told, as
+        :meth:`_handle` says. The offline ``provision-admin`` uses it to tell a page that went out
         from one the notifier only accepted. Called on the event loop as each send returns, in no
         set order across transports; an observer that raises is logged and never stops the drain."""
         self._delivery_observer = observer
@@ -2132,16 +2158,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Seed the in-memory suspend cache from durable ``alert_instance.suspended_until`` at startup, so
         a suspend set before this process started is honored without waiting for the condition to re-fire.
         A no-op when no store is wired. Best-effort — a store error is swallowed (the notify path is
-        unaffected). Only still-future windows are loaded; an already-elapsed window is ignored."""
+        unaffected). Only still-future windows are loaded; an already-elapsed window is ignored.
+
+        It reads only the live instances suspended past now, so the store's cap of 1000 is not spent
+        on unsuspended ones, as rollups of unreachable accounts, which have no inverse, can be
+        (vault BACKLOG #3100 item 14)."""
         store = self._store
         if store is None:
             return
+        now = time.time()
         try:
-            rows = await store.list_active_alert_instances(limit=1000, allowed_channels=None)
+            rows = await store.list_active_alert_instances(
+                limit=1000, allowed_channels=None, suspended_until_after=now
+            )
         except Exception:
             log.warning("alert suspend-cache prime failed", exc_info=True)
             return
-        now = time.time()
         for a in rows:
             until = getattr(a, "suspended_until", None)
             if until is not None and until > now:
@@ -2252,6 +2284,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #81: schedule-aware decide is time-dependent, so pass the wall clock.
         decision = self._rules.decide(event, now_wall)
         key = f"{_instance_type(event)}:{event['connection']}"
+        if key.startswith(_ROLLUP_KEY_PREFIX):
+            self._keep_rollup(key)
         # #81 (ADR 0133): occurrence-driven escalation. The in-memory occurrence count mirrors the store's
         # `count` (both bump once per emit); apply the highest tier the count has crossed. tier is persisted
         # to alert_instance.escalation_tier via _record_state below.
@@ -2352,6 +2386,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         event["_rule_id"] = decision.rule_id or ""
         event["_cooldown_seconds"] = cooldown
         self._enqueue(event, dropped=f"{event['type']} for {event['connection']!r}")
+
+    def _keep_rollup(self, key: str) -> None:
+        """Mark a rollup key as the most recently emitted, and drop the cooldown and occurrence
+        entries of the least recent beyond :data:`_ROLLUP_KEYS_KEPT` (vault BACKLOG #3100 item 14;
+        :data:`_ROLLUP_KEY_PREFIX` says why). A suspend entry stays: an operator's act, or the
+        startup prime's bounded read, adds one, not an emit."""
+        self._rollup_keys[key] = None
+        self._rollup_keys.move_to_end(key)
+        while len(self._rollup_keys) > _ROLLUP_KEYS_KEPT:
+            oldest, _ = self._rollup_keys.popitem(last=False)
+            self._last_sent.pop(oldest, None)
+            self._occurrences.pop(oldest, None)
 
     # --- durable alert-state side observer (ADR 0044, #56) -------------------
 
@@ -2630,8 +2676,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         was never started. A close cancelled while its sentinel waits on a full queue cancels the
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
         leave the drain running after the store closed; a send that outlives the drain's grace is
-        still left running (:meth:`_cut_sends`). Only this sink does that: an undelivered alert is
-        counted by :attr:`undelivered`, while a security notice's loss must reach its audit row."""
+        still left running (:meth:`_cut_sends`). A cut close of the security notifier cancels
+        its drain too, and then starts recording, where it has an audit sink, each notice the cut
+        left unsent (BACKLOG #6832); a write that meets the closed store is lost."""
         drain = self._task
         try:
             await super().aclose()
@@ -2701,7 +2748,25 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
 
-    async def _handle(self, event: dict[str, Any]) -> None:
+    @property
+    def sends_cut(self) -> int:
+        """How many sends were still running when a drain cancel reached them, over the sink's
+        life (BACKLOG #5907): a count only, read at least by api.app's startup unwind."""
+        return self._sends_cut
+
+    async def _handle(self, event: dict[str, Any], delivered: Callable[[], None]) -> None:
+        """Send the event to each transport its rule selected (BACKLOG #5907).
+
+        The rule for :attr:`undelivered` (step 4): the alert leaves it when a selected transport's
+        send returns before the drain's cancel reaches that send, at the first such return in
+        time, the point at which the delivery observer is told, whatever its siblings do or when.
+        A sibling that failed fast and one the drain's cancel cut count alike. A send the cancel
+        reached does not count, whether it then raised or swallowed the cancel and returned,
+        since nothing tells a send that took the alert from one that gave up. So a send left
+        running past the cut's grace never takes the alert off, and a send through
+        ``asyncio.to_thread``, as at least :class:`WebhookTransport`'s and
+        :class:`EmailTransport`'s are, ends at once on the cancel while its worker thread runs on,
+        and a delivery that thread then makes is not counted."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
@@ -2715,15 +2780,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             "cooldown_seconds": event.pop("_cooldown_seconds", None),
         }
 
-        # The task handling this event, and its cancel count on entry. Each send runs in a child
-        # task made below, and a transport can cancel that child itself with
-        # current_task().cancel(), so only a rise in the drain's own count marks the drain's cancel.
-        drain = asyncio.current_task()
-        assert drain is not None  # _handle runs only on the drain task
-        baseline = drain.cancelling()
-
-        def drain_cancelled() -> bool:
-            return drain.cancelling() > baseline
+        # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
+        # passes the cancel on: none of them counts as delivered, whatever it then does. The
+        # line is drawn when a CancelledError reaches deliver's handler, not when the send first
+        # meets the cancel: one that reaches it before _cut_sends has put the send here is logged
+        # as that transport's loss, whoever requested it, and still ends the send. A send still
+        # running when _cut_sends runs, one that awaits a cleanup after meeting its own cancel
+        # included, is put here first, and its CancelledError then reads as the drain's.
+        reached: set[asyncio.Task[None]] = set()
+        # The sends whose own cancel deliver has already logged.
+        logged_cancel: set[asyncio.Task[None] | None] = set()
 
         async def deliver(transport: AlertTransport) -> None:
             # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
@@ -2733,32 +2799,66 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             try:
                 await transport.send(sent, recipients=recipients, context=context)
             except asyncio.CancelledError:
-                if drain_cancelled():
-                    raise  # the drain's own cancel, which must reach every send
-                # The send ended cancelled on its own: that transport lost the alert, so say so at
-                # once, and leave the siblings and the drain running. No exc_info: a cancel's
-                # message is whatever its caller passed, and the traceback prints the chain it was
-                # raised in, so either can carry alert text this line keeps out (CLAUDE.md
-                # section 9).
-                log.warning(
-                    "alert transport %s was cancelled for %s/%r",
-                    transport.name,
-                    event.get("type"),
-                    event.get("connection"),
-                )
-                return
-            except Exception:
+                me = asyncio.current_task()
+                if me not in reached:
+                    # A cancel the drain's cut did not pass on: that transport lost the alert, so
+                    # say so at once, once (the loop after the wait skips a send named here). The
+                    # cancel still goes on, as every cancel must: the child ends cancelled, which
+                    # leaves its siblings and the drain running. No exc_info: a cancel's message
+                    # is whatever its caller passed, and the traceback prints the chain it was
+                    # raised in, so either can carry alert text this line keeps out (CLAUDE.md
+                    # section 9).
+                    logged_cancel.add(me)
+                    log.warning(
+                        "alert transport %s was cancelled for %s/%r",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                    )
+                raise
+            except Exception as exc:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
                 # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
+                if transport.name == "webhook":
+                    # The webhook's URL is its credential, and a send's exception text can quote
+                    # it (an http.client InvalidURL does), so this line names the class, and for
+                    # an HTTPError its integer status code, with no message and no exc_info
+                    # (vault BACKLOG #3533 item 14).
+                    failure = type(exc).__name__
+                    if isinstance(exc, urllib.error.HTTPError) and type(exc.code) is int:
+                        failure = f"{failure} {exc.code}"
+                    log.warning(
+                        "alert transport %s failed for %s/%r: %s",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                        failure,
+                    )
+                else:
+                    # The other transports' exceptions were made safe to log with their text
+                    # and traceback (vault BACKLOG #2884, #3011), which name what went wrong.
+                    log.warning(
+                        "alert transport %s failed for %s/%r",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                        exc_info=True,
+                    )
+                return
+            if asyncio.current_task() in reached:
+                # The drain's cancel reached this send, which swallowed it and returned: whether
+                # its channel took the alert is unknown, so it does not count. A transport name
+                # only, as on the cut's own line.
                 log.warning(
-                    "alert transport %s failed for %s/%r",
+                    "alert transport %s returned after the drain's cancel reached it; "
+                    "not counted as delivered",
                     transport.name,
-                    event.get("type"),
-                    event.get("connection"),
-                    exc_info=True,
                 )
                 return
+            # Here rather than from each child's outcome, since a send that cancels its own task
+            # leaves the child cancelled whether or not it returned.
+            delivered()
             observer = self._delivery_observer
             if observer is not None:
                 try:
@@ -2772,20 +2872,30 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stop.)
         chosen = [t for t in self._transports if targets is None or t.name in targets]
         if not chosen:
+            # Not reached through notifier_from_settings today: it builds no sink without a
+            # transport, its cross-check refuses a rule naming an unconfigured one, and _emit
+            # enqueues nothing for an empty transport list. A sink built by hand can get here.
+            log.warning(
+                "alert %s/%r selected no configured transport and was not sent",
+                event.get("type"),
+                event.get("connection"),
+            )
             return
-        sends = [asyncio.create_task(deliver(t)) for t in chosen]
+        sends = [asyncio.create_task(deliver(t), name=t.name) for t in chosen]
         try:
             await asyncio.wait(sends)
         except asyncio.CancelledError:
-            await self._cut_sends(sends)
+            await self._cut_sends(sends, reached)
             raise
         escaped: list[BaseException] = []
         for transport, task in zip(chosen, sends, strict=True):
             if task.cancelled():
-                # The drain was not cancelled, so this is a child that ended cancelled outside the
-                # send's own handler: at least a send that cancelled its own task and returned
-                # before the cancel landed, or an observer that raised CancelledError. Say so
-                # rather than drop it; the drain goes on.
+                if task in logged_cancel:
+                    continue  # deliver named this cancel already
+                # The drain was not cancelled, and deliver did not log this cancel: at least a
+                # send that cancelled its own task and returned before the cancel landed, or an
+                # observer that raised CancelledError. Say so rather than drop it; the drain goes
+                # on.
                 log.warning(
                     "alert transport %s ended cancelled after its send for %s/%r",
                     transport.name,
@@ -2797,10 +2907,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if escaped:
             raise escaped[0]  # what deliver let out, raised once every send has ended
 
-    async def _cut_sends(self, sends: list[asyncio.Task[None]]) -> None:
+    async def _cut_sends(
+        self, sends: list[asyncio.Task[None]], reached: set[asyncio.Task[None]]
+    ) -> None:
         """The drain was cancelled during an event's sends (BACKLOG #5907): pass the cancel on to
         each, every repeat of it too, and wait at most :data:`_DRAIN_CANCEL_GRACE_SECONDS` for
-        them to end. A send still running then is left, held and counted in one WARNING."""
+        them to end. The sends still running at the cancel go into ``reached`` first, which keeps
+        each from counting as delivered (:meth:`_handle`); their transports are named in one
+        WARNING, which says nothing of how each send then ends, and a send still running after the
+        grace is left, held and counted in another."""
+        reached.update(task for task in sends if not task.done())
+        running = [task.get_name() for task in sends if task in reached]  # named by _handle
+        self._sends_cut += len(running)
+        if running:
+            # Transport names only, nothing of the alert, as the left-send line below is a count.
+            log.warning(
+                "alert transport(s) %s still sending when the drain was cancelled",
+                ", ".join(running),
+            )
         for task in sends:
             task.cancel()
             task.add_done_callback(self._settle_cut_send)
@@ -2980,8 +3104,13 @@ def notifier_from_settings(
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
         # BACKLOG #5088: before the SMTP password is read, so a relay the allowlist forbids costs no
         # secret-store read for it, and a store that is down cannot hide the relay's refusal. The
-        # build repeats it. The webhook reads no secret, so its check stays in its build.
+        # build repeats it.
         _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
+    if alerts.webhook_url:
+        # Vault BACKLOG #3533 item 18: the same reason, for the webhook's checks that log nothing.
+        # The build repeats them. The webhook itself is still built after the read, so its
+        # revocation guard never logs a crossing for a sink the read then stops.
+        refuse_unbuildable_webhook_url(alerts.webhook_url, alerts.webhook_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

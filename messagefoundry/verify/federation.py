@@ -43,15 +43,19 @@ if TYPE_CHECKING:
 _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     (
         "fed.replay.key",
-        "id_token type + key selection (typ -> kid -> JWKS)",
+        "id_token type + key selection (typ -> crit -> kid -> alg pin -> JWKS -> key fits alg)",
         frozenset(
             {
                 "malformed_token",
                 # The typ assertion runs at the top of key selection, so a token declaring a
                 # non-id_token class indicts THIS rung and no other (ASVS 9.2.2).
                 "wrong_token_type",
+                # RFC 7515 section 4.1.11: refused right after the typ assertion, before the kid guard.
+                "unsupported_crit",
                 "unknown_kid",
                 "ambiguous_kid",
+                # The JWKS lookup's bounded wait for a refresh ran out (BACKLOG #6905).
+                "jwks_refresh_busy",
                 "key_rejected",
             }
         ),
@@ -368,8 +372,13 @@ def _idp_opener(
             *_TLS_ROW, Status.FAIL, f"the engine refuses this anchor: {safe_exc_text(exc)}"
         )
     except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
+        # Vault BACKLOG #5511: harden_own_crl_check also refuses the CA file under
+        # [auth].oidc_tls_crl_check_chain, so with that check built the row does not blame the CRL
+        # file alone. The opener builds it only with the anchor. The refusal names the setting.
+        chain = anchor and settings.auth.oidc_tls_crl_check_chain
+        what = "this CRL file or its chain check" if chain else "this CRL file"
         return CheckResult(
-            *_TLS_ROW, Status.FAIL, f"the engine refuses this CRL file: {safe_exc_text(exc)}"
+            *_TLS_ROW, Status.FAIL, f"the engine refuses {what}: {safe_exc_text(exc)}"
         )
     except Exception as exc:
         return CheckResult(*_TLS_ROW, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT))
@@ -458,7 +467,10 @@ _REVOCATION_ROW = ("fed.idp_revocation", "IdP hop revocation guard (token + JWKS
 
 
 def _revocation_row(
-    settings: ServiceSettings, opener: urllib.request.OpenerDirector | None
+    settings: ServiceSettings,
+    opener: urllib.request.OpenerDirector | None,
+    *,
+    chain: bool | None = None,
 ) -> CheckResult:
     """Report what the engine's OIDC revocation guard decides for each leg (BACKLOG #1923).
 
@@ -489,8 +501,10 @@ def _revocation_row(
     from messagefoundry.config.tls_policy import (
         HopDisposition,
         InsecureHopRefused,
+        context_checks_chain_revocation,
         is_loopback_hop_host,
     )
+    from messagefoundry.transports.rest import opener_tls_context
 
     rid, title = _REVOCATION_ROW
     if opener is None:
@@ -505,6 +519,15 @@ def _revocation_row(
     status = Status.PASS
     notes: list[str] = []
     try:
+        # Vault BACKLOG #5511: read off the opener's own context, as each guard's crl_checked is,
+        # so the row words the check the engine built rather than the setting. A caller whose
+        # opener is not the engine's (`check`, built without the anchor and so without the chain
+        # check and its build rules) passes the chain setting instead, and the row then says only
+        # that the setting is on.
+        chain_from_setting = chain is not None
+        if chain is None:
+            context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
+            chain = context is not None and context_checks_chain_revocation(context)
         for guard in idp_revocation_guards(settings.auth, opener, posture):
             leg = f"{guard.cell.split(' (', 1)[0]} at {guard.host}"
             disposition = guard.disposition()
@@ -521,6 +544,17 @@ def _revocation_row(
                 note = (
                     "crosses with NO certificate revocation checking and a logged warning, "
                     "because [security].enforcement is not enforce. Set [auth].oidc_tls_crl_file"
+                )
+            elif guard.crl_checked and chain and chain_from_setting:
+                status = Status.MANUAL
+                note = "has [auth].oidc_tls_crl_check_chain set"
+            elif guard.crl_checked and chain:
+                status = Status.MANUAL
+                note = (
+                    "checks every certificate in its chain against [auth].oidc_tls_crl_file "
+                    "([auth].oidc_tls_crl_check_chain). Confirm the file holds a CRL from each "
+                    "CA in that chain, the root's and each intermediate's: without one, every "
+                    "handshake on it fails with 'unable to get certificate CRL'"
                 )
             elif guard.crl_checked:
                 status = Status.MANUAL
@@ -564,7 +598,9 @@ def idp_revocation_result(settings: ServiceSettings) -> CheckResult:
     With no anchor, this context is the engine's, so the failure is the engine's refusal."""
     built = _idp_opener(settings, anchor=False)
     if not isinstance(built, CheckResult):
-        return _revocation_row(settings, built)
+        # The opener left the chain check out with the anchor (vault BACKLOG #5511), so the row
+        # reads the setting, and says only that it is on.
+        return _revocation_row(settings, built, chain=settings.auth.oidc_tls_crl_check_chain)
     if built.status is Status.FAIL and settings.auth.oidc_tls_ca_cert_file:
         return CheckResult(
             *_REVOCATION_ROW,

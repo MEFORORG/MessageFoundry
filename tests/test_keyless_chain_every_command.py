@@ -120,8 +120,8 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
         ]
     if command == "admin-unlock":
         return ["admin-unlock", "--username", "ops", "--db", str(db), "--json"]
-    if command == "audit-anchor":
-        return ["audit-anchor", "--db", str(db), "--json"]
+    if command in ("audit-anchor", "admin-revoke-sessions"):
+        return [command, "--db", str(db), "--json"]
     if command == "admin-reset-totp":
         return ["admin-reset-totp", "--username", "ops", "--db", str(db), "--json"]
     if command == "admin-set-notify-email":
@@ -148,6 +148,7 @@ _STORE_OPENING_COMMANDS = (
     "admin-unlock",
     "admin-set-notify-email",
     "admin-reset-totp",
+    "admin-revoke-sessions",
     "audit-anchor",
     "audit-verify",
 )
@@ -579,8 +580,15 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
 
 
 #: The commands that route a store key that does not resolve to exit 2. The admin pair joined in
-#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before.
-_KEY_REFUSING_COMMANDS = ["audit-verify", "audit-anchor", "admin-unlock", "admin-set-notify-email"]
+#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before. ``admin-revoke-sessions``
+#: was listed in BACKLOG #5093; it already exited 2 here, through ``_open_store_or_refuse``.
+_KEY_REFUSING_COMMANDS = [
+    "audit-verify",
+    "audit-anchor",
+    "admin-unlock",
+    "admin-set-notify-email",
+    "admin-revoke-sessions",
+]
 
 
 #: The commands `_argv` runs with no --json, so their refusal is a line on stderr.
@@ -611,10 +619,9 @@ def test_a_key_that_does_not_resolve_exits_2(
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = _refusal_text(command, captured.out, captured.err)
-    from messagefoundry.store import base as store_base
-
-    # A fixed text since the eighth hold on engine PR 2818.
-    assert store_base._TRANSIT_BUILD_TEXTS[4] in text, text
+    # The engine built this refusal from the variable's name alone and recorded it, so the
+    # build's fixed-text replacement keeps it, naming what to set (BACKLOG #6010 item 3).
+    assert "MEFOR_STORE_TRANSIT_KEY is not set" in text, text
 
 
 @pytest.mark.parametrize("command", [*_KEY_REFUSING_COMMANDS, "admin-reset-totp", "rotate-key"])

@@ -68,6 +68,21 @@
     released either. A window remains between the file's re-read and claim.ps1's own read; it is
     narrowed, not closed.
 
+    A GONE HOLDER MUST BE SHOWN TO BELONG TO THIS REPOSITORY (BACKLOG #7564). A registry can be shared
+    across repositories -- `mefor.claimsRoot` in claim.ps1, or one coordination root for several
+    clones -- and a claim records no repository. A gone holder's branch is judged against THIS
+    repository's refs, so a sibling repository's claim on a branch name that also exists here could
+    read as landed. The evidence this reads is where the holder lived: the nearest directory above
+    it that still exists must resolve to this repository's git common dir. A holder that lay inside
+    another repository, or outside any, reads UNKNOWN and is never released. While GIT_DIR or
+    GIT_COMMON_DIR is set, a gone holder that reaches the repository check reads UNKNOWN too, because
+    git then answers for that directory instead; STRANDED-REGISTERED and no-branch rows are decided
+    before the check. The -Apply re-check tests it again. It misreads at least two layouts. Another
+    repository's linked worktree placed inside this one's tree reads as this repository's once it is
+    removed, because its .git file goes with it, so that claim can still be judged here. A sibling
+    worktree beside the primary, whose nearest surviving directory is in no repository, reads
+    UNKNOWN and is kept.
+
     The gone-holder pull-request probe passes --repo, from origin's GitHub URL, and --base, the branch
     the reference names, and re-checks the base on each row it gets back. Without a GitHub origin it
     asks nothing and the claim is held.
@@ -315,6 +330,48 @@ if (-not $wtRegistry.Ok) {
 }
 $registered = $wtRegistry.Registered
 $locked = $wtRegistry.Locked
+
+# BACKLOG #7564. This repository's git common dir, the one every worktree of it shares. Unreadable
+# means no gone holder can be tied to it, and Get-GoneHolderOwner then reads every one as unknown.
+$repoCommon = ConvertTo-Norm ([string](& git -C $repo rev-parse --path-format=absolute --git-common-dir 2>$null))
+
+# Whether a GONE holder was a worktree of this repository. Why is "" when the nearest directory above
+# it that still exists resolves to this repository's common dir, otherwise why it could not be tied
+# here; Unrun is set when git could not answer at all, so the -Apply re-check can say it could not run
+# rather than that something changed. A shared registry can hold another repository's claims and a
+# claim names no repository, so this location is what is read; without a match the claim is kept
+# rather than judged against this repository's branches.
+function Get-GoneHolderOwner([string]$Holder) {
+    $r = [pscustomobject]@{ Why = ""; Unrun = $false }
+    # With either set, git answers for that repository whatever -C names, so every directory would
+    # match $repoCommon, which came from the same variable.
+    if ($env:GIT_DIR -or $env:GIT_COMMON_DIR) {
+        $r.Why = "GIT_DIR or GIT_COMMON_DIR is set, so git cannot say which repository a directory belongs to"
+        $r.Unrun = $true; return $r
+    }
+    if (-not $repoCommon) { $r.Why = "this repository's git common dir could not be read"; $r.Unrun = $true; return $r }
+    $dir = $Holder
+    while ($true) {
+        $parent = [IO.Path]::GetDirectoryName($dir)
+        if (-not $parent -or $parent -eq $dir) { $r.Why = "no directory above it still exists"; return $r }
+        $dir = $parent
+        if (Test-Path -LiteralPath $dir -PathType Container) { break }
+    }
+    $shown = ConvertTo-Norm $dir
+    $out = @(& git -C $dir rev-parse --path-format=absolute --git-common-dir 2>&1)
+    $code = $LASTEXITCODE
+    # Native stderr arrives as ErrorRecords under 2>&1, so the path git printed is the strings alone.
+    $text = (@($out | Where-Object { $_ -is [string] }) -join "`n").Trim()
+    $err = (@($out | Where-Object { $_ -isnot [string] } | ForEach-Object { [string]$_ }) -join " ").Trim()
+    if ($code -ne 0 -or -not $text) {
+        if ($err -match 'not a git repository') { $r.Why = "'$shown', the nearest directory above it, is in no git repository" }
+        else { $r.Why = "git could not read '$shown', the nearest directory above it (exit $code): $err"; $r.Unrun = $true }
+        return $r
+    }
+    $common = ConvertTo-Norm $text
+    if ($common -ne $repoCommon) { $r.Why = "'$shown', the nearest directory above it, has the git common dir '$common', not this repository's" }
+    return $r
+}
 
 # origin/main is the reference, never local main. Measured 2026-08-16: local main was 24 commits
 # behind origin/main on this clone, and every "not merged" verdict taken against it would have been
@@ -633,6 +690,9 @@ function Test-GoneHolderUnchanged([object]$Row) {
     $fresh = Read-WorktreeRegistry
     if (-not $fresh.Ok) { return New-Recheck -Unrun "git worktree list failed" }
     if ($fresh.Registered.ContainsKey($Row.holder)) { return New-Recheck -Changed "the holder is a registered worktree again" }
+    $owner = Get-GoneHolderOwner $Row.holder
+    if ($owner.Unrun) { return New-Recheck -Unrun "whether the holder is this repository's could not be read: $($owner.Why)" }
+    if ($owner.Why) { return New-Recheck -Changed "the holder can no longer be tied to this repository: $($owner.Why)" }
     $tip = Get-BranchTip $Row.branch
     if (-not $tip) { return New-Recheck -Unrun "the branch '$($Row.branch)' could no longer be read" }
     if ($tip -ne $seen.Tip) { return New-Recheck -Changed "the branch '$($Row.branch)' moved" }
@@ -745,6 +805,14 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     if (-not $branch) {
         $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = ""; verdict = "STRANDED-UNKNOWN"
             why = "claim records no branch, so nothing can be proven about its work" }
+        continue
+    }
+    # BACKLOG #7564: every test below reads THIS repository's refs, which answer nothing about a claim
+    # taken in another repository that shares the registry.
+    $owner = Get-GoneHolderOwner $holder
+    if ($owner.Why) {
+        $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "UNKNOWN"
+            why = "holder gone and deregistered, but nothing ties it to this repository: $($owner.Why) -- a claim records no repository, so its branch is not judged here" }
         continue
     }
 

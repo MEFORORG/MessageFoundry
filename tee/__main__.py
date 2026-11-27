@@ -145,6 +145,19 @@ def _positive_seconds(value: str) -> float:
     return seconds
 
 
+def _positive_int(value: str) -> int:
+    """A positive integer (refuses 0, negatives and non-integers)."""
+    # The message names the rule, not the raw input, so a value pasted into the wrong flag is not
+    # echoed to stderr or a captured log.
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return number
+
+
 def _parse_age(spec: str) -> float:
     """A time cutoff (epoch seconds) for purge/export: a relative age ``Nd``/``Nh``/``Nm`` (days/hours/
     minutes ago) or an absolute UTC date ``YYYY-MM-DD``."""
@@ -223,12 +236,18 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--send-timeout", type=float, default=30.0)
     run.add_argument(
         "--corepoint-attempts",
-        type=int,
+        type=_positive_int,
         default=3,
-        help="quick retries on the Corepoint leg before tripping fail-closed",
+        help="tries on the Corepoint leg, counting the first, before tripping fail-closed"
+        " (a positive integer; 1 means no retry)",
     )
     run.add_argument("--corepoint-retry-delay", type=float, default=1.0)
-    run.add_argument("--mefor-queue-max", type=int, default=1000)
+    run.add_argument(
+        "--mefor-queue-max",
+        type=_positive_int,
+        default=1000,
+        help="bound on the shadow MEFOR queue (a positive integer); the oldest copy is dropped when full",
+    )
     run.add_argument(
         "--stop-grace",
         type=_positive_seconds,
@@ -628,7 +647,9 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
-    flushed to disk, then renamed to ``path``. A failed write leaves no temp file. On Windows the
+    flushed to disk, then renamed to ``path``. A write that raises tries to remove its temp file. At least
+    a failed removal, a killed process or a crash leaves the ``.<name>.*.tmp`` file beside
+    ``path`` (vault BACKLOG #3166, PR 2390 note 18). On Windows the
     0600 mode means nothing and the new file takes its directory's access list. :mod:`tee.store`
     gives the capture DB an owner-only access list on open, but this writer does not; the tee
     imports nothing from ``messagefoundry``, so the engine's ``restricted_file`` is out of reach.
@@ -784,7 +805,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     try:
         Keyer(salt)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        # Names the setting the salt came from; the keyer's message withholds the salt itself.
+        print(f"error: {args.salt_env}: {exc}", file=sys.stderr)
         return 1
 
     # LOAD THE RULES ONCE, HERE, FOR THE SAME REASON: the overlay is a property of the run, and a

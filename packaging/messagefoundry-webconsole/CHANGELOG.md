@@ -29,6 +29,11 @@ this line.**
   code field when the session owes one, the passkey page script sends it in its body, and the
   account page tells a directory user with no factor to ask an Administrator through the site's
   identity check, not by mail or chat.
+- **The nav heart and the status page show a FHIR lookup isolated at start.** The engine names
+  such a lookup in `/status` as `fhir_lookups_failed`. The heart then raises a warn. Its tooltip
+  names the lookup unless another issue takes it first, such as a down-level issue or a failed
+  inbound. `/ui/status` shows a "FHIR lookup start failures" row in the same words. Neither shows
+  for a channel-scoped operator, who gets an empty list. (vault `BACKLOG #3008`)
 - **The sign-in page offers a combined passkey sign-in.** A "Sign in with password and passkey"
   button runs a usernameless passkey ceremony (`POST /ui/login/passkey`, which charges the sign-in
   window first and sets the challenge's handle as an HttpOnly cookie) and submits the assertion with
@@ -76,6 +81,10 @@ this line.**
 
 ### Security
 
+- **A pending session with no second factor is sent to enrol before it can end sessions.** Under
+  `[security].require_mfa`, the two session-terminate POSTs refuse such a session and redirect it
+  to `/ui/account?m=enroll_first`, where it was sent to `/ui/reauth`; the enrolment that binds its
+  first factor satisfies the session. The supported engine seam moved with it. (`BACKLOG #1149`)
 - **A step-up request refused for a new client address spends no budget.** The step-up gates
   (`require_ui_step_up` and its action, re-auth-only and own-sessions variants) asked the
   new-address question after their `require_ui` base had already charged the admin-write budget,
@@ -84,6 +93,21 @@ this line.**
   the search form, where it used to continue to its own POST path, which `/ui/reauth` refuses. The
   layered search's refusal now keeps its `?presets=` query, without which the run answers 400.
   The supported engine seam moved with it. (`BACKLOG #5646`)
+- **The user pages read an account through the engine's seal-checked read.** The detail page, the
+  federated identity screen and its unlink confirmation, the channel-scope save and the
+  notification-address form read the account through `AdminHandlers.checked_user` rather than the
+  store row, so a record that fails its integrity seal answers 423, or offers no suggestion on the
+  notification-address form, with nothing of the row shown, and the failure goes to the engine's
+  rate-limited seal-failure report. The users list names
+  such an account by its id and, for a `users:manage` holder only, offers its delete through a new
+  confirmation page, `GET /ui/users/{user_id}/delete-confirm`, which sends an intact account to
+  its own page. The page says the record could not be verified against its seal, since the 423
+  does not say whether the seal failed or could not be verified. A page shown after a password
+  reset, a factor reset or an enrolment code was issued names the account by its id on the
+  refusals `_shown_name` in `routes/admin.py` names, and on a defect, which is logged at ERROR
+  without its message; its docstring states that rule and what each case logs. The supported
+  engine seam
+  moved with it: `admin.checked_user` is part of it. (`BACKLOG #5559`)
 - **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
   only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more
   than one, as the engine's header path does; an absent header still leaves the handshake to the
@@ -124,6 +148,16 @@ this line.**
   the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
   destination and scope selection across the re-auth, up to the 512-character cap on `next`.
   (vault BACKLOG #3241, added item 2 and step 1)
+- **A console channel denial that names no channel says which operation it refused.** The bulk
+  start, stop and restart, the bulk purge and its confirm page write the `auth.channel_denied`
+  rows that name no channel with `"operation"` in their detail (`connection_control` or
+  `connection_purge`). A row the engine writes for a well-formed name it refuses names that
+  channel and carries no operation. A channel-scoped actor's bulk selection whose name fails the
+  connection-name rule writes a row with no channel, marked `"malformed_name": true`, so it is
+  told apart from the confirm page's refusal; an all-channels actor's writes none. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
+  `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
+  carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
+  digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there
@@ -269,6 +303,32 @@ this line.**
 
 ### Fixed
 
+- **A refused code on a verified session no longer lands as a success does, except at least for a
+  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
+  21).**
+  `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
+  the same landing a success gets, so the refusal showed nothing. It now lands on
+  `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
+  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
+  the notice for a code within the form's length bound: that code is refused unread
+  (`idp_step_up_required`, ADR 0142 Amendment F) and still lands on a bare `/ui`.
+- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
+  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
+  stored credential id that does not decode; before, the decode error escaped as a 500. Every
+  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
+  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
+  of the origin-migration notice its `None` would have shown. The notice sends a holder with
+  another factor to sign in with it and remove the unreadable passkey. One with no other factor
+  is sent first to "Sign in with password and passkey", which names no credential and so may
+  still accept a discoverable passkey whose stored id cannot be read, and to an administrator
+  for an MFA reset only if that fails too. The supported engine seam moved with it:
+  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
+  (`BACKLOG #6886`)
+- **An uploaded-log resend refused for the operator's own username names that cause.** The engine
+  refuses a resend whose acting username is blank or has spaces around it with a 403 carrying
+  `X-Refusal-Code: username_unusable`. The console now shows its own notice for it, not the
+  channel-denial text, which would send the operator after a scope that is not the problem. No seam
+  changes. (BACKLOG #6589)
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page
@@ -299,12 +359,12 @@ this line.**
   that set, an empty one included, is refused with the generic "invalid input". A body that starts
   with a line break keeps it. The seam digest moved because the route's form parser changed, and
   it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
-- **A resubmit with no `eol` field gives a body that starts with MSH CR terminators.** A form
-  the editor did not render, such as a stale page or a hand-built POST, used to resubmit the
-  browser's line breaks. A submitted body that starts with MSH now goes out with CR, whatever the
-  original used, since the parser has no original to read; any other body, an `FHS` or `BHS`
-  batch included, goes out as sent. The seam digest moved again, because
-  the form parser and its new helper changed. (BACKLOG #5930)
+- **A resubmit with no `eol` field gives an HL7 body CR terminators.** A form the editor did not
+  render, such as a stale page or a hand-built POST, used to resubmit the browser's line breaks. A
+  submitted body that starts with MSH, or with a `BHS` or `FHS` batch header in its separator
+  shape, now goes out with CR, whatever the original used, since the parser has no original to
+  read; any other body goes out as sent. The seam digest moved again, because the form parser and
+  its new helper changed. (BACKLOG #5930)
 
 - **TOTP enrolment no longer drops the first code.** Under the default
   `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm

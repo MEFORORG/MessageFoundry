@@ -74,6 +74,13 @@ Some lists have a length of their own. A message export may name at most 100000 
 same ceiling as its `limit`. An events request may filter on at most 32 event kinds. A directory
 group mapping, and a counter-reset request, may carry at most 1000 entries.
 
+Four JSON bodies take their counts only as JSON integers (vault BACKLOG #6700). They are
+`POST /messages/search`, `POST /messages/export`, `POST /uploads/{file_id}/messages/search`, and
+the criteria on `POST /search/presets`. Each `limit`, `offset` or `scan_limit` they take must be a
+JSON integer when sent, and `scan_limit` may also be `null`. Anything else gets a 422. That covers
+at least a string such as `"7"`, a boolean, and a number with a fraction, `7.0` included. The same
+names on a query string are read from text, as every query value is.
+
 **Which words and codes exist is not decided here.** The role names, the permission catalog and the
 status vocabulary belong to the engine. These rules decide only the shape a value may take, so a
 value that could not be a member is refused early and one that merely does not exist gets a 404.
@@ -273,13 +280,27 @@ Where each rule lives:
   one-or-neither routes, a request that sends a non-empty `content` or `field_path`, but neither
   with anything besides whitespace, gets a 400 where the model has not refused it first. A blank one beside a real term counts as not sent,
   so that request is accepted.
-- The console search form: it calls the API's search handler, so a clash gets the same answer.
-  With no criteria at all it shows the empty form and does not search.
+- The console search form: it calls the API's search handler with the criteria it sends, so a
+  clash among those gets the same answer. A posted Field value it leaves unsent cannot clash. The
+  search form and the uploaded-log filter refill their boxes after a run, and when Field path is
+  blank and a Substring is given, a Field value unchanged from the one the page rendered beside a
+  Field path is not sent. A Field value the operator typed or changed is sent,
+  and the API's refusal reaches the page. A page that echoes the criteria back says the value was
+  not sent, unless it held only whitespace. `posted_needle`, in
+  [`messagefoundry_webconsole/routes/_common.py`](../messagefoundry_webconsole/routes/_common.py),
+  holds that rule. With no criteria at all it shows the empty form and does not search. A
+  Field value of only spaces, with no Substring or Field path, counts as no criterion there.
 - Layered search: `_compose_preset_layers`, in
   [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value,
   a `field_path` or a `field_value` saved in a preset. A preset holding a `field_value` with no
   `field_path` counts as one, and the search refuses it with a 400. A `field_value` that is empty or
-  only whitespace does not count.
+  only whitespace does not count, nor does a stored one that is not text, so on a preset with no
+  other content term it is ignored. Each preset that carries a content term is checked as it is
+  found, so a malformed one is refused with its own reason, before a second term is counted. On
+  such a preset a `content`, `field_path`, `field_value` or `target` that is not text is refused
+  with a 400 (BACKLOG #6700). A stored `content` or `field_path` that is empty, only whitespace,
+  zero, false or an empty list does not make a preset carry a term, so where no other term is
+  stored it is ignored.
 - Edit and resubmit, and the statistics reset: each route itself, in the same file.
 - Password change: the API rule is in the route, in
   [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no

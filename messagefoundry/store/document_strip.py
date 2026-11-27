@@ -370,11 +370,12 @@ async def run_strip_pass(
         reported = True
         await report(failures)  # inside the try, so its own failure still logs the WARNING
     except BaseException:
-        # A cancellation (engine stop), or the report failing: the pass then raises, and no
-        # retention audit row records what committed.
+        # A cancellation (engine stop), or the report failing: the pass then raises. Its
+        # interrupted retention audit row, when one is written, names this phase but does not count
+        # what this call committed (BACKLOG #6526), so this line is the only count of it.
         log.warning(
             "document strip failed part way; it had already stripped and committed %d documents "
-            "in %d messages, which no retention audit row records",
+            "in %d messages, which no retention audit row counts",
             documents,
             messages,
         )

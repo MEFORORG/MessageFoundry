@@ -7,6 +7,7 @@ bulk connection controls (bulk-control, reset-many and bulk purge)."""
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -59,7 +60,9 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
     # through the GRANT minted below, which _grant_action_step_up deadlines at
     # now + step_up_max_age_seconds, i.e. already expired. The mint is the CONTROL, not setup: drop
     # it and the POST bounces for want of ANY grant, which it does under any window (BACKLOG #1851).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off: under it this no-factor session is MFA-pending and is sent to enrol before
+    # any window is read (BACKLOG #1149), so the window would not be what refuses.
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     other = await service.login("op", PW)  # the target 2nd session
@@ -90,7 +93,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
     # The revoke-others twin of the per-session test above, and the same correction applies: the
     # negative window bites through the ADR 0077 GRANT's TTL, not through has_recent_step_up, so the
     # _mint_action below is what puts the window under test (BACKLOG #1851). Reasoning: that twin.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off, for the reason the twin above gives (BACKLOG #1149).
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     await service.login("op", PW)  # a 2nd session
@@ -113,7 +117,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
 
 def test_session_terminate_actions_registered_password_only() -> None:
     # Both terminate POSTs are registered auto_retry continuations (so /ui/reauth can re-POST them),
-    # step_up=False (password-only) so a no-factor session is never deadlocked out of revoking.
+    # step_up=False (password-only). A pending session with no factor is still sent to enrol by
+    # /ui/reauth (BACKLOG #1149), which keys on the action rather than on this flag.
     from messagefoundry_webconsole import is_safe_ui_action, lookup_ui_action
 
     assert is_safe_ui_action("/ui/account/sessions/revoke-others") is True
@@ -126,11 +131,25 @@ def test_session_terminate_actions_registered_password_only() -> None:
     assert is_safe_ui_action("/ui/account/sessions/revoke-others/extra") is False  # extra segment
 
 
-async def test_revoke_reauth_only_no_mfa_deadlock(engine: Engine) -> None:
-    # A require_mfa but UNENROLLED cookie session under a stale window: GET /ui/reauth?next=<terminate>
-    # renders the PASSWORD reauth form (200), NOT the enroll_first divert — the step_up=False
-    # registration keeps a no-factor user out of the enroll-loop so they can still revoke.
+async def test_revoke_reauth_sends_a_no_factor_pending_session_to_enrol(engine: Engine) -> None:
+    # BACKLOG #1149: a require_mfa but UNENROLLED cookie session is MFA-pending, and a terminate is
+    # refused to it whatever it proves, so GET /ui/reauth?next=<terminate> sends it to enrol rather
+    # than rendering a password form whose re-proof would mint nothing. It is not deadlocked: the
+    # enrolment it is sent to satisfies the session, after which the terminate works.
     service = AuthService(engine.store, AuthSettings(require_mfa=True, step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/reauth", params={"next": "/ui/account/sessions/revoke-others"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account?m=enroll_first"
+
+
+async def test_revoke_reauth_stays_password_only_when_no_factor_is_owed(engine: Engine) -> None:
+    # The control for the test above: with require_mfa off the same no-factor session owes nothing,
+    # so /ui/reauth renders the PASSWORD form (200, no code field), as before BACKLOG #1149.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -345,6 +364,25 @@ def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> 
     assert "2/3 running (1 stopped)" in html
     assert "failed to start" not in html
     assert "Inbound start failures" not in html
+
+
+def test_status_page_renders_an_isolated_lookup_in_the_hearts_words() -> None:
+    """Vault BACKLOG #3008: the page names an isolated FhirLookup in the heart's own sentence, so a
+    failed inbound that wins the heart's tooltip does not hide the lookup everywhere."""
+    from messagefoundry_webconsole.pages._common import _failed_lookup_reason
+
+    html = _status_html(
+        _sysinfo(
+            50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"], fhir_lookups_failed=["<b>L</b>"]
+        )
+    )
+    assert "FHIR lookup start failures" in html
+    assert "inbound IB_ACME_ADT failed to start" in html
+    # The name is free text, so it goes through the escaping builder like any other value.
+    assert "<b>L</b>" not in html
+    assert _failed_lookup_reason(["&lt;b&gt;L&lt;/b&gt;"]) in html
+    # The control: no isolated lookup, no row.
+    assert "FHIR lookup start failures" not in _status_html(_sysinfo(50 * _GIB))
 
 
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------
@@ -785,6 +823,80 @@ async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
     rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
     assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
     assert all("xxxxx" not in str(dict(row)) for row in rows)
+
+
+async def test_a_malformed_bulk_name_never_reaches_the_engine_helper(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3748 item 7, review: the console hands the engine an empty name, not the
+    caller's text, so the row holds none of it even if the engine helper's own rule check let a
+    name through. The planted weakening makes that check accept everything."""
+    from messagefoundry.api import message_scope
+
+    monkeypatch.setattr(message_scope, "is_connection_name", lambda _value: True)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    long_bad = "bad name " + "q" * 5000
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", long_bad))],
+        )
+        assert r.status_code == 200, r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert len(rows) == 1
+    assert all("qqqqq" not in str(dict(row)) for row in rows)
+
+
+async def test_console_denials_naming_no_channel_name_their_operation(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3748 item 7: a scoped actor's console refusals that name no channel each
+    carry the operation refused, and the malformed bulk selections carry the marker, so the bulk
+    control, the bulk purge and the purge confirm page's rows are told apart."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    await _start_two_out(engine, tmp_path)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "bad name")),
+                # The control: a well-formed name the engine refuses names its channel and carries
+                # no operation.
+                ("sel", _rowkey("destination", "in1", "out1")),
+            ],
+        )
+        assert r.status_code == 200, r.text
+        await _mint_action(c, "/ui/connections/purge-confirm")
+        r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
+        assert r.status_code == 403, r.text
+        r = await _post_pairs(
+            c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "bad name")]
+        )
+        assert r.status_code == 200, r.text
+        assert "not applied: not a valid connection name" in r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert sorted(row["channel_id"] or "" for row in rows) == ["", "", "", "out1"]
+    details = sorted((json.loads(str(row["detail"])) for row in rows), key=str)
+    # The malformed bulk selections are marked, so the bulk purge's is told apart from the confirm
+    # page's refusal, which names no channel by design.
+    assert details == sorted(
+        [
+            {"channel": None, "malformed_name": True, "operation": "connection_control"},
+            {"channel": None, "malformed_name": True, "operation": "connection_purge"},
+            {"channel": None, "operation": "connection_purge"},
+            {"channel": "out1"},
+        ],
+        key=str,
+    )
 
 
 async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(

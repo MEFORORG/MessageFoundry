@@ -187,23 +187,154 @@ def test_a_continuation_or_acknowledgment_segment_gets_no_exemption(extra: str) 
     assert result.unvalidated_segments == ()
 
 
-def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
-    """split_batch cuts only at MSH, so a member can end with its batch's trailers or the next
-    batch's header; those are not refused here."""
+def test_the_envelope_run_that_ends_a_message_keeps_the_exemption() -> None:
+    """Some intake paths hand a message over with its batch's trailers or the next batch's header
+    still on it (``_ENVELOPE`` names at least three), so that run is not refused."""
     result = validate(_MFN_M01 + "\rBTS|2\rBHS|^~\\&\rFTS|1\rFHS|^~\\&")
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
 
 
-def test_a_structure_borrowed_under_the_same_message_code_keeps_the_exemption() -> None:
-    """MSH-9.2 is not compared, so ``MFN^M02^MFN_M01`` is exempted as ``MFN^M01`` is.
+@pytest.mark.parametrize(
+    ("tail", "first"), [("^Z", "unrecognised line 5"), ("ORC", "segment ORC at line 5")]
+)
+def test_a_line_refused_on_its_own_does_not_move_a_trailer_ahead_of_it(
+    tail: str, first: str
+) -> None:
+    """Review round-016ec5b937: a junk or bare line after a correct trailer stays the first refusal
+    named, as on origin/main. NEGATIVE CONTROL: on b15c4544f0 errors[0] named the BTS at line 4."""
+    result = validate(_MFN_M01 + "\rBTS|1\r" + tail)
+    assert not result.ok
+    assert result.errors[0].startswith(first), result.errors
+    assert not any("BTS" in error for error in result.errors)
 
-    This pins the current behaviour the module docstring states: only a borrow under another
-    message code (``ADT^A01^MFN_M01``) loses the exemption."""
-    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", "MFN^M02^MFN_M01")
+
+@pytest.mark.parametrize("extra", ["BHS|^~\\&", "BTS|2", "FHS|^~\\&", "FTS|1"], ids=lambda s: s[:3])
+@pytest.mark.parametrize("after", ["MFE|MAD|2||LOC2^Loc|CE", "ZLC|1"], ids=["MFE", "Z"])
+def test_an_envelope_line_inside_a_message_gets_no_exemption(extra: str, after: str) -> None:
+    """A batch or file header or trailer with a message line after it frames nothing, and the slot
+    carries master-file or query data, so it is refused (BACKLOG #5920 step 2, its envelope half).
+    NEGATIVE CONTROL: on origin/main 33870a40944 each passed, listed in unvalidated_segments."""
+    result = validate(_MFN_M01 + "\r" + extra + "\r" + after)
+    assert not result.ok
+    assert f"segment {extra[:3]} at line 4 has no place in this message's structure" in (
+        result.errors
+    )
+
+
+@pytest.mark.parametrize(
+    "msh_9",
+    [
+        "MFN^M02^MFN_M01",
+        "MFN^M05^MFN_M01",
+        "MFN^^MFN_M01",
+        "MFN^ ^MFN_M01",
+        "MFN^m02^MFN_M01",
+        "MFN^M02 ^MFN_M01",
+        "MFN^XY1^MFN_M01",
+        "MFN^z44^MFN_M01",
+    ],
+)
+def test_a_same_code_borrow_for_an_event_with_its_own_structure_gets_no_exemption(
+    msh_9: str,
+) -> None:
+    """MSH-9.2 is compared (BACKLOG #5920 step 1): MFN_M02 and MFN_M05 are structures of their
+    own, so borrowing MFN_M01's slot for either is refused, as is a borrow whose non-Z event is
+    not in HL7 table 0003 (empty, blank, lower-case, padded or made up), which fails closed."""
+    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
     result = validate(borrowed + "\rORC|NW|ORD1\r" + _PV1)
+    assert not result.ok
+    assert result.errors == [
+        "segment ORC at line 4 has no place in this message's structure (and 1 more)"
+    ]
+    assert result.unvalidated_segments == ()
+
+
+@pytest.mark.parametrize(
+    "msh_9",
+    [
+        "MFN^M01^MFN_M01",
+        "MFN^m01^MFN_M01",
+        "MFN^M01 ^MFN_M01",
+        "MFN^M01",
+        "MFN^M01 ",
+        "MFN^m01",
+        "MFN^ZZZ^MFN_M01",
+        "MFN^Z44 ^MFN_M01",
+        "MFN^M14^MFN_M01",
+        "MFN^A01^MFN_M01",
+    ],
+)
+def test_the_own_structure_or_one_for_an_event_without_one_keeps_the_exemption(
+    msh_9: str,
+) -> None:
+    """Control for the test above: a message with no MSH-9.3 borrows nothing and keeps it,
+    padded or lower-case, as it did before this check; so does the structure MSH-9.1 and MSH-9.2
+    name, padded or lower-case in MSH-9.2, a site-defined Z event (the Z test is on the raw
+    MSH-9.2, so a trailing pad keeps it), and a same-code borrow for a table 0003 event with no
+    ``MFN_<event>`` structure in hl7apy (no MFN_M14, no MFN_A01). The last two are a known
+    limit: the standard gives M14 the MFN_Znn structure, and A01 is an ADT event."""
+    message = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
+    result = validate(message + "\rORC|NW|ORD1\r" + _PV1)
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("ORC", 4), ("PV1", 5))
+
+
+def test_the_structure_lookup_keeps_no_sender_text() -> None:
+    """The MSH-9.2 lookup is cached by version alone, so distinct events add no cache entry."""
+    validate_module._structures_and_events.cache_clear()
+    for n in range(30):
+        validate(_MFN_M01.replace("MFN^M01^MFN_M01", f"MFN^Q{n:02d}^MFN_M01") + "\rORC|NW|1")
+    assert validate_module._structures_and_events.cache_info().currsize == 1
+
+
+@pytest.mark.parametrize(
+    ("msh_9", "version", "body", "line"),
+    [
+        ("QBP^Z44^QBP_Q15", "2.5", "QPD|Z44^Query|Q1\rPID|1||1^^^A||DOE^J\rRCP|I", 3),
+        ("QBP^Z44^QBP_Q11", "2.8", "QPD|Z44^Query|Q1\rPID|1||1^^^A||DOE^J\rRCP|I", 3),
+        (
+            "RSP^Z44^RSP_K11",
+            "2.8",
+            "MSA|AA|1\rQAK|Q1|OK\rQPD|Z44^Query|Q1\rPID|1||1^^^A||DOE^J",
+            5,
+        ),
+    ],
+)
+def test_a_site_defined_z_event_borrowing_a_structure_keeps_the_exemption(
+    msh_9: str, version: str, body: str, line: int
+) -> None:
+    """A Z event borrows a structure by design and table 0003 lists none, so the PID in the
+    "any HL7 segment" slot is passed and listed, as it was before MSH-9.2 was compared."""
+    head = "MSH|^~\\&|A|B|C|D|20260101||" + msh_9 + "|N1|P|" + version + "\r"
+    result = validate(head + body)
+    assert result.ok, result.errors
+    assert result.unvalidated_segments == (("PID", line),)
+
+
+def test_a_z_event_with_a_structure_of_its_own_gets_no_exemption() -> None:
+    """hl7apy's 2.5 has a QBP_Z73 structure, so borrowing QBP_Q15's slot for Z73 is refused, as
+    ``MFN^M02^MFN_M01`` is: the Z test comes after the own-structure lookup."""
+    head = "MSH|^~\\&|A|B|C|D|20260101||QBP^Z73^QBP_Q15|N1|P|2.5\r"
+    result = validate(head + "QPD|Z73^Query|Q1\rPID|1||1^^^A||DOE^J\rRCP|I")
+    assert result.errors == ["segment PID at line 3 has no place in this message's structure"]
+    assert result.unvalidated_segments == ()
+
+
+_PGL = "\rPID|1||1^^^A||DOE^J\rGOL|AD|20260101|G1^Goal|1\rLOC|L1^Loc||C"
+
+
+@pytest.mark.parametrize("msh_9", ["PGL^PC6^PGL_PC6", "PGL^PC7^PGL_PC6"])
+def test_a_structure_serving_several_events_keeps_the_exemption_for_each(msh_9: str) -> None:
+    """PGL_PC6 serves PC6 to PC8, and hl7apy has no PGL_PC7, so the borrow keeps it. hl7apy's
+    2.5 PGL_PC6 has the "any HL7 segment" slot; its 2.5.1 one does not (the control)."""
+    head = "MSH|^~\\&|A|B|C|D|20260101||" + msh_9 + "|N1|P|"
+    result = validate(head + "2.5" + _PGL)
+    assert result.ok, result.errors
+    assert result.unvalidated_segments == (("LOC", 4),)
+    assert validate(head + "2.5.1" + _PGL).errors == [
+        "segment LOC at line 4 has no place in this message's structure"
+    ]
 
 
 _PRR_PC5 = (

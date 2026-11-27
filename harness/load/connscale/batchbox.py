@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import sys
 from collections.abc import Mapping
@@ -66,6 +67,8 @@ from harness.load.connscale.runner import (
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from messagefoundry.terminal_text import escape_for_terminal
+
+log = logging.getLogger(__name__)
 
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
@@ -152,7 +155,8 @@ def env_setting(environ: Mapping[str, str], name: str) -> str | None:
 
 def _rate_limiter_off(environ: Mapping[str, str]) -> bool:
     """Whether ``environ`` turns the engine's sign-in rate limiter off: switched off, or a window
-    of 0 or less. A ``messagefoundry.toml`` the engine also reads is not consulted."""
+    of 0 (the engine's loader refuses a negative one). A ``messagefoundry.toml`` the engine also
+    reads is not consulted."""
     if (env_setting(environ, _RATE_LIMIT_ENABLED_ENV) or "").lower() in _FALSE_WORDS:
         return True
     try:
@@ -176,10 +180,10 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
       silently ends another process's oldest session, and that one's renewal ends the next. So a
       second session a process takes (a step-up re-proof signs in to one of its own) must fit too.
 
-    No limit passes: 0 for any of the three, below 0 for the session cap, and either rate count
-    while ``environ`` turns the rate limiter off. A value that is not a number is left for the
-    engine's loader to refuse. One the loader reads as a whole number, such as ``3.0``, is read
-    here as a number too.
+    No limit passes: 0 for any of the three, and either rate count while ``environ`` turns the
+    rate limiter off. A session cap below 0 passes too, and the engine's loader refuses it. A
+    value that is not a number is left for the engine's loader to refuse. One the loader reads
+    as a whole number, such as ``3.0``, is read here as a number too.
     """
     limiter_off = _rate_limiter_off(environ)
     size = _fleet_sign_in_size(procs)
@@ -971,8 +975,17 @@ async def run_batch_engine(
             # Empty the shared store so THIS cell is apples-to-apples (the pooled/batch handoff never
             # inherits the prior cell's rows — the carryover confound run_connscale fixes per step).
             if reset_store and profile.store_backend is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await _reset_server_store(profile.store_backend, node_env)
+                except Exception as reset_exc:
+                    # Type only: a driver error's text can carry connection details or a stored
+                    # value. The cell still runs, so it can measure on the prior cell's rows.
+                    kind = type(reset_exc).__name__
+                    log.warning("batch cell %s: store reset failed: %s", cell.cell_id, kind)
+                    report.notes.append(
+                        f"CELL {cell.cell_id}: store reset failed ({kind}); the cell continues "
+                        "and may measure on the prior cell's rows"
+                    )
             await node.start()
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
             # Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a 0.0.0.0 listener);
@@ -996,10 +1009,16 @@ async def run_batch_engine(
             # Tell the driver this cell is unusable so it skips + posts DONE (keeps the matrix in
             # lockstep instead of hanging both boxes on a READY that never comes).
             cell_coord.post(BATCH_CELL_READY, {"cell_id": cell.cell_id, "error": info.error})
-            with contextlib.suppress(Exception):
+            try:
                 await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
-            with contextlib.suppress(Exception):
-                await node.stop()
+            except Exception as wait_exc:
+                kind = type(wait_exc).__name__
+                log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
+                report.notes.append(
+                    f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after the "
+                    "cell's startup failed; moving to the next cell"
+                )
+            await _stop_cell_node(node, cell.cell_id, report)
             continue
 
         pid = getattr(node, "pid", None)
@@ -1037,9 +1056,29 @@ async def run_batch_engine(
             )
             await cell_coord.await_message(BATCH_CELL_DONE, timeout=cell_timeout)
         finally:
-            with contextlib.suppress(Exception):
-                await node.stop()
+            await _stop_cell_node(node, cell.cell_id, report)
     return report
+
+
+async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
+    """Stop a cell's engine. A failure is logged and noted by exception type only, and never becomes
+    a cell error: the cell's result is already decided by the time teardown runs (BACKLOG #5857).
+
+    The note reads the process, not the code path: a cell that failed its health or port wait did
+    spawn an engine. ``alive`` sees only the root process's last known state, so neither note
+    claims the whole process tree is gone."""
+    try:
+        await node.stop()
+    except Exception as exc:
+        kind = type(exc).__name__
+        log.warning("batch cell %s: engine stop raised %s", cell_id, kind)
+        report.notes.append(
+            f"CELL {cell_id}: engine stop raised {kind} and its root process still reads as "
+            "RUNNING; check that it exited"
+            if node.alive
+            else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running "
+            "(child processes were not checked)"
+        )
 
 
 # --- the DRIVER half ---------------------------------------------------------

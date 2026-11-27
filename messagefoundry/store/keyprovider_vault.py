@@ -28,12 +28,14 @@ stubs**, so the client is contained as a typed ``Any`` local here — never a re
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.config.secretprovider import log_import_failure
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
@@ -47,6 +49,8 @@ from messagefoundry.store.keyprovider import KeyProviderError, _split_retired
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
+
+_log = logging.getLogger(__name__)
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message so the operator knows
 #: exactly what to install.
@@ -113,18 +117,45 @@ def _token_unset(platform: str | None = None) -> str:
 
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
-    :class:`KeyProviderError` that names the extra — mirrors ``keyprovider.py``'s missing-backend message.
-    ``ImportError`` (not just ``ModuleNotFoundError``) is caught so a partially-broken install also fails
-    closed rather than surfacing a bare import error out of ``open_store``."""
+    :class:`KeyProviderError` that names the extra, as ``secretprovider_vault._import_hvac`` does
+    (vault BACKLOG #6709), except that here a ``MemoryError`` or ``RecursionError`` propagates,
+    where that twin refuses it. Any other ``Exception`` is caught,
+    not only ``ImportError``: importing runs hvac's and its dependencies' top-level code, which can
+    raise an ``OSError`` or another class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads
+    as a missing extra; anything else is a broken install, refused by class with "reinstall" and
+    logged at WARNING by class. The refusal is raised outside the handler with no chain: an import
+    error's text can carry a filesystem path. The key provider and the Transit cipher both build
+    their client through here, so the text names the store's Vault client, not one setting."""
     try:
         # hvac ships no type stubs; the targeted ignore contains that here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
-    except ImportError as exc:
-        raise KeyProviderError(
-            f"[store].key_provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
-            f"importable): install 'messagefoundry[{_EXTRA}]'."
-        ) from exc
-    return hvac
+    except (MemoryError, RecursionError):
+        raise  # the process's own limits, not a broken install (vault BACKLOG #6709 item 11)
+    except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
+            failed = None
+        else:
+            failed = type(exc).__name__
+            log_import_failure(_HVAC_CLIENT, exc, logger=_log)
+    else:
+        return hvac
+    # Recorded (:func:`_recorded_refusal`), so a seam that replaces a provider error with fixed
+    # text keeps these. Each is built from constants and a class name alone.
+    if failed is None:
+        raise _recorded_refusal(
+            f"{_HVAC_CLIENT} requires the optional {_EXTRA!r} extra (hvac not importable): "
+            f"install 'messagefoundry[{_EXTRA}]'."
+        )
+    raise _recorded_refusal(
+        f"{_HVAC_CLIENT}: hvac is installed but did not import "
+        f"({failed if failed.isidentifier() else 'an error'}): "
+        f"reinstall 'messagefoundry[{_EXTRA}]'."
+    )
+
+
+#: Who :func:`_import_hvac`'s refusals and WARNING name: the store's Vault client, which
+#: ``[store].key_provider = "vault"`` and ``[store].cipher_provider = "vault_transit"`` both build.
+_HVAC_CLIENT = "the store's Vault client ([store].key_provider or [store].cipher_provider)"
 
 
 def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
@@ -523,8 +554,13 @@ def require_transit_key_type(
     fix is a new key under ``selector``. ``after_switch`` is appended when that alone is not enough
     for this use, such as a KEK whose wrapped DEK has to move with it.
 
+    ``key_name`` goes into the request path, so it is checked here with
+    :func:`checked_transit_key_name` before the read, whatever the caller already checked (BACKLOG
+    #6010 item 9).
+
     Raises :class:`KeyProviderError` so ``open_store`` propagates it and ``serve`` refuses to start
     (ADR 0019 §4 / ADR 0138 fail-closed), never a degrade to a weaker path."""
+    checked_transit_key_name(key_name, selector=selector)
     response: Any = client.secrets.transit.read_key(name=key_name)
     data = response.get("data") if isinstance(response, Mapping) else None
     raw = data.get("type") if isinstance(data, Mapping) else None
@@ -567,8 +603,9 @@ class VaultKeyProvider:
         # The instance posture the caller holds, for the revocation guard on this hop (vault
         # BACKLOG #2983). `None` counts as enforcing.
         self._posture = posture
-        # BACKLOG #6010: a malformed KEK name refuses here, at construction. `active_key` reads the
-        # name again through the same check, as the capability probe does.
+        # BACKLOG #6010: a malformed KEK name refuses here, at construction. The shipped dispatch
+        # calls `active_key` straight after, which reads and checks the name again, so this adds
+        # nothing there (item 4); it is kept so a provider built and not yet asked refuses too.
         _kek_name()
 
     def active_key(self) -> str | None:
@@ -665,8 +702,11 @@ class VaultKeyProvider:
         # wrong size, or one wrapped as its own base64, refuses here, naming this provider, rather
         # than wherever a caller first decodes it. Matched as text rather than decoded, so the
         # check makes no extra copy of the key. Fixed text: no key material.
+        # Recorded (:func:`_recorded_refusal`), so the key seam's fixed-text replacement keeps this
+        # text rather than "the key source failed" (BACKLOG #6710 item 3). The name in it has
+        # passed :func:`checked_transit_key_name`.
         if _B64_32_BYTES.fullmatch(plaintext) is None:
-            raise KeyProviderError(
+            raise _recorded_refusal(
                 f"[store].key_provider={_EXTRA!r} got a plaintext from Vault transit (key "
                 f"{transit_key!r}) that is not base64 of 32 bytes; {_ENV_WRAPPED_DEK} must wrap "
                 f"exactly the raw 32 DEK bytes, not a key of another length and not its base64."
@@ -719,28 +759,55 @@ _TRANSIT_KEY_NAME = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?")
 _B64_32_BYTES = re.compile(r"[A-Za-z0-9+/]{43}=")
 
 
+def _recorded_refusal(text: str) -> KeyProviderError:
+    """A :class:`KeyProviderError` with ``text``, recorded as built by the engine, so a seam that
+    replaces a provider error with fixed text (``base.resolve_active_key``, ``build_store_cipher``)
+    keeps ``text``, read from the record and never from the instance. Only for a text built from
+    configuration this module has checked, never from a reply or key material."""
+    from messagefoundry.store.base import _recorded
+
+    refusal = KeyProviderError(text)
+    _recorded(refusal, text)
+    return refusal
+
+
+def is_transit_key_name(name: str) -> bool:
+    """Whether ``name`` is in the shape :func:`checked_transit_key_name` admits, for a caller that
+    refuses with its own error class."""
+    return _TRANSIT_KEY_NAME.fullmatch(name) is not None
+
+
 def checked_transit_key_name(name: str, *, selector: str) -> str:
     """``name``, refused unless it is a Transit key name (BACKLOG #6010).
 
     hvac quotes a name into the request path with ``/`` left unescaped, and requests drops ``..``
     segments, so ``a/../../../sys/x`` would reach ``/v1/sys/x`` with the store token, and the
     capability probe would ask about a path the request never takes. ``selector`` names the
-    variable the name came from. The refusal is fixed text and does not echo the name."""
-    if _TRANSIT_KEY_NAME.fullmatch(name) is None:
-        raise KeyProviderError(
-            f"{selector} is not a Vault transit key name: use letters, digits and underscores, "
-            f"with dots or hyphens only between them. Any other name could change which Vault "
-            f"path a request reaches, so it is refused."
+    variable the name came from. The refusal is fixed text and does not echo the name; it is
+    recorded, so the store's fixed-text seams keep it (BACKLOG #6010 item 3)."""
+    if not is_transit_key_name(name):
+        raise _recorded_refusal(
+            f"{selector} is not a Vault transit key name: use ASCII letters, digits and "
+            f"underscores, with dots or hyphens only between them. A slash, or a name of dots "
+            f"alone, could change which Vault path a request reaches, and a name outside the "
+            f"shape Vault gives its key names is refused with it."
         )
     return name
 
 
+def transit_key_name_setting(selector: str) -> str | None:
+    """The Transit key name in the environment variable ``selector``, ``None`` when it is unset
+    or empty, refused by :func:`checked_transit_key_name` when it is malformed. The one read for
+    the KEK name here and for the Transit cipher's data and audit key names."""
+    name = os.environ.get(selector) or None
+    return None if name is None else checked_transit_key_name(name, selector=selector)
+
+
 def _kek_name() -> str | None:
-    """The KEK's Transit key name, ``None`` when unset. One read for :meth:`VaultKeyProvider.active_key`
-    and for :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps
-    under; both go through :func:`checked_transit_key_name`, which refuses a malformed name."""
-    name = os.environ.get(_ENV_TRANSIT_KEY) or None
-    return None if name is None else checked_transit_key_name(name, selector=_ENV_TRANSIT_KEY)
+    """The KEK's Transit key name, ``None`` when unset, read by :func:`transit_key_name_setting`.
+    :meth:`VaultKeyProvider.active_key` and :func:`kek_required_capabilities` both read it here, so
+    the probe asks about the key the provider unwraps under."""
+    return transit_key_name_setting(_ENV_TRANSIT_KEY)
 
 
 def store_vault_token() -> str:

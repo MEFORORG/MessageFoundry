@@ -650,7 +650,13 @@ def _write(tmp_path: Path, module: str) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(module, encoding="utf-8")
-    (tmp_path / "messagefoundry.toml").write_text(_TOML, encoding="utf-8")
+    # The value file is this test's own, empty, so the url line never reads the working
+    # directory's environments/dev.toml.
+    (tmp_path / "messagefoundry.toml").write_text(
+        _TOML + f'\n[environments]\nbase_dir = "{tmp_path.as_posix()}"\n', encoding="utf-8"
+    )
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text("", encoding="utf-8")
     return cfg
 
 
@@ -694,6 +700,144 @@ def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
     report = run_checks(_write(tmp_path, clean), run_lint=False)
     r = next(x for x in report.results if x.name == "url-query-credential")
     assert "no outbound or FhirLookup url carries a credential-like query parameter" in r.detail
+
+
+def _env_url_config(tmp_path: Path, *, value: str | None) -> Path:
+    """A config whose OB_PLAIN url is ``env("plain_url")`` with no default, and settings naming
+    the ``dev`` environment under ``tmp_path``, whose value file holds ``value`` when given."""
+    config = _CONFIG.replace("?sig=SYNTHETIC-4", "?fmt=xml").replace(
+        'outbound("OB_PLAIN", Rest(url="https://p.example.invalid/x?fmt=json"))',
+        'outbound("OB_PLAIN", Rest(url=env("plain_url")))',
+    )
+    config = config.replace("from messagefoundry import ", "from messagefoundry import env, ")
+    cfg = _write(tmp_path, config)
+    if value is not None:
+        (tmp_path / "environments" / "dev.toml").write_text(
+            f'plain_url = "{value}"\n', encoding="utf-8"
+        )
+    return cfg
+
+
+def test_check_reads_an_env_url_against_the_instance_values(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 24: the line reads an ``env()`` URL against the environment values
+    ``build-check`` loads, so one with no ``default=`` is read too. Before, it read defaults only
+    and called this graph clean. The hit names the reading it ran (item 23)."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value="https://p.example.invalid/x?key=SYNTHETIC-13")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_PLAIN (key)" in detail and "SYNTHETIC" not in detail
+    assert "against the 'dev' environment's values" in detail
+
+
+def test_with_no_value_file_the_line_says_it_read_the_overlays_only(tmp_path: Path) -> None:
+    """A missing value file loads as no file, so the line names the overlays, not the file."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value=None)
+    (tmp_path / "environments" / "dev.toml").unlink()
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "against the overlays only, with no 'dev' value file" in detail
+    assert "environment's values" not in detail
+
+
+def test_control_an_env_url_the_values_do_not_hold_is_not_read(tmp_path: Path) -> None:
+    from messagefoundry.checks import run_checks
+
+    cfg = _env_url_config(tmp_path, value=None)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "no outbound or FhirLookup url carries" in detail
+    assert "so one that neither gives" in detail
+
+
+def test_refused_settings_still_list_a_literal_hit(tmp_path: Path) -> None:
+    """The graph half needs no settings, so settings that are refused fall back to the defaults
+    reading and keep listing a literal URL's hit, as the line did before it read any settings."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text('[store]\nbackend = "not-a-backend"\n', encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=toml)
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert r.ok and not r.required
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the settings were refused" in r.detail and "not-a-backend" not in r.detail
+
+
+def test_a_missing_service_config_is_not_called_a_refusal(tmp_path: Path) -> None:
+    """PR 3150 finding 10: a ``--service-config`` path with no file behind it read as "the
+    settings were refused (FileNotFoundError)", though nothing was there to refuse."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "absent.toml")
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the settings file could not be read (FileNotFoundError)" in r.detail
+    assert "refused" not in r.detail
+
+
+def test_values_that_do_not_load_are_named_as_such(tmp_path: Path) -> None:
+    """The settings load and the value file does not: the line names the values, not the
+    settings, and still lists a literal hit."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write(tmp_path, _CONFIG)
+    (tmp_path / "environments" / "dev.toml").write_text("not = [toml\n", encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    r = next(x for x in report.results if x.name == "url-query-credential")
+    assert "OB_KEYED (sig)" in r.detail
+    assert "the environment values did not load (TOMLDecodeError)" in r.detail
+    assert "settings" not in r.detail.split("default= only")[-1]
+
+
+def test_one_check_run_loads_the_environment_values_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR 3150 finding 7: ``build-check`` and this line each loaded the instance's environment
+    values, so one ``check`` run read the value file and the overlays twice. They now share one
+    load; a second run loads again."""
+    from messagefoundry.checks import run_checks
+    from messagefoundry.config import environments
+
+    calls: list[str] = []
+    real = environments.load_environment_values
+
+    def counting(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["environment"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(environments, "load_environment_values", counting)
+    cfg = _env_url_config(tmp_path, value="https://p.example.invalid/x?key=SYNTHETIC-14")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    build = next(x for x in report.results if x.name == "build-check")
+    # build-check got past its own load, so a memo that failed would show a second call.
+    assert not build.skipped and "did not load" not in build.detail, build.detail
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_PLAIN (key)" in detail
+    assert calls == ["dev"]
+    run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    assert calls == ["dev", "dev"]
+
+
+def test_a_hit_from_a_default_says_the_url_was_read_by_its_default(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 23: the hit's detail carries the reading caveat, as the clean
+    detail does, since a hit can come from a ``default=`` the instance overrides."""
+    from messagefoundry.checks import run_checks
+
+    config = _CONFIG.replace(
+        'Rest(url="https://p.example.invalid/x?sig=SYNTHETIC-4")',
+        'Rest(url=env("keyed_url", default="https://p.example.invalid/x?sig=SYNTHETIC-4"))',
+    ).replace("from messagefoundry import ", "from messagefoundry import env, ")
+    cfg = _write(tmp_path, config)
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "messagefoundry.toml")
+    detail = next(x for x in report.results if x.name == "url-query-credential").detail
+    assert "OB_KEYED (sig)" in detail
+    assert "else its default=" in detail
 
 
 # --- once per reload (vault BACKLOG #2910) -----------------------------------------------------

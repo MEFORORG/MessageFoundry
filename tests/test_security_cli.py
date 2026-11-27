@@ -899,6 +899,25 @@ def test_show_reports_the_credential_reminders_turned_off(
     assert "cert_monitor.warn_days" not in [e["switch"] for e in data["loosenings"]]
 
 
+def test_show_reports_a_slow_credential_reminder_rescan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2008: each check_interval_seconds above its default is listed, read through the
+    same whole-file resolution as warn_days. The shipped values are the control."""
+    toml = tmp_path / "mf.toml"
+    keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
+    toml.write_text(
+        "[cert_monitor]\ncheck_interval_seconds = 1e9\n"
+        "[secret_rotation]\ncheck_interval_seconds = 1e9\n",
+        encoding="utf-8",
+    )
+    switches = [e["switch"] for e in _show(toml, capsys)["loosenings"]]
+    assert all(k in switches for k in keys), switches
+    toml.write_text("[cert_monitor]\ncheck_interval_seconds = 43200\n", encoding="utf-8")
+    switches = [e["switch"] for e in _show(toml, capsys)["loosenings"]]
+    assert not any(k in switches for k in keys), switches
+
+
 def test_show_reports_the_backup_cleartext_flag(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

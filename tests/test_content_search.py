@@ -20,8 +20,15 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ValidationError
 
 from messagefoundry.api import create_app
+from messagefoundry.api.models import (
+    MessageExportRequest,
+    MessageSearchRequest,
+    SearchPresetCriteria,
+    UploadedMessageSearchRequest,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -702,7 +709,8 @@ def test_no_get_or_head_route_declares_a_phi_needle_parameter() -> None:
 # --- BACKLOG #6700: the API boundary --------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", [True, "7", 7.5])
+# 7.0 is the case that tells strict from lax: a lax int refused 7.5 already but took 7.0 as 7.
+@pytest.mark.parametrize("bad", [True, "7", 7.5, 7.0])
 async def test_a_json_bool_or_string_scan_limit_is_refused(enc_engine: Engine, bad: Any) -> None:
     """A lax int took JSON ``true`` as 1 and ``"7"`` as 7, so make_spec's type rule never saw them.
     Control: a JSON integer is accepted."""
@@ -721,6 +729,45 @@ async def test_a_json_bool_or_string_scan_limit_is_refused(enc_engine: Engine, b
         assert ok.json()["scan_limit"] == 7
 
 
+@pytest.mark.parametrize("bad", [True, "7", 7.0])
+@pytest.mark.parametrize(
+    ("model", "field"),
+    [
+        (MessageSearchRequest, "limit"),
+        (MessageExportRequest, "limit"),
+        (UploadedMessageSearchRequest, "limit"),
+        (UploadedMessageSearchRequest, "offset"),
+        (SearchPresetCriteria, "limit"),
+    ],
+)
+def test_a_search_body_takes_limit_and_offset_only_as_json_integers(
+    model: type[BaseModel], field: str, bad: Any
+) -> None:
+    """A lax int took JSON ``true`` as 1, ``"7"`` as 7 and ``7.0`` as 7 for ``limit`` and
+    ``offset`` on the search bodies, as it did for ``scan_limit`` (BACKLOG #6700). Control: a JSON
+    integer is accepted."""
+    with pytest.raises(ValidationError):
+        model.model_validate({"content": "JANE", field: bad})
+    assert getattr(model.model_validate({"content": "JANE", field: 7}), field) == 7
+
+
+async def test_a_json_string_limit_is_refused_on_the_search_route(enc_engine: Engine) -> None:
+    """The route answers the model's refusal as a 422 (BACKLOG #6700). Control: an integer is 200."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        r = await c.post(
+            "/messages/search", headers=_auth(token), json={"content": "JANE", "limit": "7"}
+        )
+        assert r.status_code == 422, r.text
+        ok = await c.post(
+            "/messages/search", headers=_auth(token), json={"content": "JANE", "limit": 7}
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["limit"] == 7
+
+
 async def test_a_padded_mrn_needle_still_audits_as_digits(enc_engine: Engine) -> None:
     """make_spec keeps a needle's spaces, so the audit shape is read from the stripped needle: a
     pasted `` 9001`` is still an MRN-shaped lookup."""
@@ -734,3 +781,36 @@ async def test_a_padded_mrn_needle_still_audits_as_digits(enc_engine: Engine) ->
     parsed = json.loads(rows[0]["detail"])
     assert parsed["needle_shape"] == "digits"
     assert "9001" not in rows[0]["detail"]
+
+
+async def test_a_padded_needle_audits_its_unpadded_length(enc_engine: Engine) -> None:
+    """BACKLOG #6700 item 3: the audit's ``needle_len`` was taken on the needle as sent, padding
+    included, while its shape was read stripped. Both now read the stripped needle, for a substring
+    and for a field value. The control: an unpadded needle audits the same length."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        for body in (
+            {"content": " 9001  "},
+            {"content": "9001"},
+            {"field_path": "PID-3", "field_value": "  MRN9001 "},
+            {"field_path": "PID-3", "field_value": "MRN9001"},
+        ):
+            r = await c.post("/messages/search", headers=_auth(token), json=body)
+            assert r.status_code == 200, r.text
+    rows = await enc_engine.store.list_audit(action="message_search")
+    lens = sorted(json.loads(r["detail"])["needle_len"] for r in rows)
+    assert lens == [4, 4, 7, 7]
+
+
+@pytest.mark.parametrize(
+    ("needle", "shape"),
+    [("DOE", "alpha"), ("DOE1", "alnum"), ("9001", "digits"), ("DOE^JANE", "mixed")],
+)
+def test_needle_shape_tells_letters_from_letters_and_digits(needle: str, shape: str) -> None:
+    """BACKLOG #6700 item 18: ``_needle_shape`` tested ``isalnum`` before ``isalpha``, so the
+    ``"alpha"`` branch was unreachable and a surname audited as ``"alnum"``."""
+    from messagefoundry.api.app import _needle_shape
+
+    assert _needle_shape(needle) == shape

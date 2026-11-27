@@ -201,9 +201,16 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     reaps: closing a session whose worker is gone, the prior generation's reap at the top of a
     spawn (a worker that died between dispatches on its own), and the reap after a queued EOF from
     a worker that has exited, which only says the peer died, the check after an answer included
-    unless the answer announced the exit (:attr:`MEMORY_CAP`). A worker that exits right after its
-    boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
-    feed whose workers keep doing so is a crash loop, not a peer that happened to die.
+    unless the answer announced the exit (:attr:`MEMORY_CAP`). There are at least two exceptions,
+    found by :meth:`SandboxSession._live_worker` before a request is written. A worker spawned in
+    the dispatch that exits before its request is recorded as :attr:`EXITED_AFTER_BOOT`, because
+    a feed whose workers keep doing so is a crash loop, not a peer that happened to die. A worker
+    kept from an earlier dispatch that the check right before the write finds exited, by the
+    process or by its queued EOF, is recorded as :attr:`CRASH`, with its WARNING, unless the
+    engine read its EOF before the dispatch's first check began its last pass (vault BACKLOG #3135
+    step 7; :meth:`SandboxSession._died_before_first_check` says when such a worker is still
+    recorded). A queued EOF from a worker still running once the grace is spent is a
+    :attr:`STDOUT_CLOSED` kill wherever it is found, as before.
 
     There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
     cap is the bound. A request the codec cannot encode, or one over the frame cap, is refused before a
@@ -212,11 +219,11 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
     MEMORY_CAP = "memory_cap"
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
-    #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
-    #: refusal against a graph a reload has since replaced gets neither, and this record does not
-    #: outlast it: the reload discards this session. That kill then writes no line of its own,
-    #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
-    #: reaches the runner's internal-error policy.
+    #: and raises the ``sandbox_worker_refused`` alert for this refusal, unless it finds the refusal
+    #: overtaken (``RegistryRunner._sandboxed_dispatch`` says when, BACKLOG #6830), in which case it
+    #: does neither and runs the message again. That kill writes no line of its own, though its
+    #: reap can (see :meth:`SandboxSession._reap`); only the refused dispatch's own error, when it
+    #: is not overtaken, reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
@@ -522,6 +529,18 @@ _STDERR_NOTICE_SECONDS: Final = 60.0
 #: grandchild can hold the pipes open indefinitely, and this runs under the session lock.
 _STDERR_JOIN_SECONDS: Final = 1.0
 
+#: How long a reap waits for the killed worker to exit before it logs that it has not.
+_REAP_WAIT_SECONDS: Final = 5.0
+
+
+def _close_quietly(stream: Any) -> None:
+    """Close a pipe end this side owns and no longer uses. A failed close changes nothing for the
+    worker, so it is logged at DEBUG, by exception type only."""
+    try:
+        stream.close()
+    except OSError as exc:
+        log.debug("could not close a sandbox worker pipe (%s)", type(exc).__name__)
+
 
 class _StderrRelay:
     """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0176).
@@ -573,7 +592,12 @@ class _StderrRelay:
         except OSError:
             pass  # the pipe died with the worker; the kill path reports that, this thread does not
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                # This thread is the stream's only reader, so it closes it once the drain ends,
+                # rather than leave the descriptor to the collector (BACKLOG #6831).
+                _close_quietly(stream)
 
     def feed(self, chunk: bytes) -> None:
         """Accumulate ``chunk`` and emit every complete line (or cap-length run) it completes."""
@@ -665,8 +689,11 @@ _EOF_EXIT_POLL_SECONDS: Final = 0.02
 #: dispatch meets at most a handful of EOFs, so its total wait stays bounded.
 _EOF_EXIT_FLOOR_SECONDS: Final = 0.1
 
-#: How many times :meth:`SandboxSession._live_worker` respawns after a leftover EOF before it
-#: fails the call.
+#: How many counted replacements a dispatch may make before its request is written; one more fails
+#: the call. Not every replacement counts: at least a stray-frame retry and a kept worker the
+#: first check finds exited do not, so a dispatch can boot more workers than this. The bound is
+#: per dispatch, shared by both of its
+#: :meth:`SandboxSession._live_worker` calls, so the call before the write does not restart it.
 _LIVE_WORKER_EOF_RESPAWNS: Final = 2
 
 
@@ -927,7 +954,8 @@ class SandboxWorkerRefused(SandboxError):
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
     bytes are the only difference: the worker ran other bytes than the engine loaded, which a
     session sent the engine's snapshot cannot do (vault BACKLOG #2596). ``graph`` is
-    the engine graph the worker was compared with, so the runner can tell a refusal against a
+    the engine graph object the worker was compared with, a cached refusal's included (BACKLOG
+    #6830: a hit matches by value), so the runner can tell a refusal against a
     graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
     passes the message alone, still builds."""
 
@@ -1006,6 +1034,9 @@ class SandboxSession:
         # The current generation's drain threads (frames on fd 1, stderr on fd 2), joined ONLY on the
         # shutdown path -- see :meth:`close`.
         self._threads: list[threading.Thread] = []
+        # Workers whose request pipe a lookup helper its dispatch gave up on still holds; that
+        # helper closes it, not :meth:`_reap` (BACKLOG #6831).
+        self._stdin_held: set[subprocess.Popen[bytes]] = set()
         # Monotonic per-session worker counter. Part of a relayed line's identity because a pid is NOT
         # a unique generation id: an OS recycles pids (aggressively on Windows), and a stale relay can
         # still be draining a killed child while the next one runs -- two generations' records would
@@ -1021,6 +1052,19 @@ class SandboxSession:
         # What is left of the current dispatch's EOF grace (see _EOF_EXIT_GRACE_SECONDS); each
         # dispatch refills it.
         self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
+        # Per dispatch, each reset by dispatch: whether it has spent its one retry on a stray frame
+        # found before its request, how many workers it has replaced for exiting or closing their
+        # pipe before their request, and the generation it started on (see _live_worker).
+        self._stray_retried = False
+        self._eof_respawns = 0
+        self._dispatch_generation = self._generation
+        # When the current dispatch's first _live_worker call began the pass that handed out its
+        # worker, and when the current worker's frame reader read EOF on its response pipe (empty
+        # until it does; a fresh list per spawn, so a stale reader's stamp lands in a list nothing
+        # reads). Together they tell the second call whether a kept worker it finds dead died
+        # before that pass (see _died_before_first_check).
+        self._first_check_at = float("-inf")
+        self._eof_at: list[float] = []
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -1048,9 +1092,15 @@ class SandboxSession:
         # survive. A no-op on the first spawn and whenever there is no proc.
         self._reap(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
-        if self._refused is not None and self._refused[0] is engine_graph:
+        # Compared by value: the cache means "the same graph", and a graph callable need not return
+        # one object per graph (BACKLOG #6830). A hit only ever refuses, so it cannot let a
+        # mismatched worker up. ``graph`` stays the object the worker was compared with.
+        if self._refused is not None and self._refused[0] == engine_graph:
             raise SandboxWorkerRefused(
-                self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
+                self._refused[1],
+                first=False,
+                content_only=self._refused[2],
+                graph=self._refused[0],
             )
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
         # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
@@ -1091,6 +1141,7 @@ class SandboxSession:
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
+        self._eof_at = []
         self._generation += 1
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
@@ -1124,7 +1175,7 @@ class SandboxSession:
         self._threads = [
             threading.Thread(
                 target=self._reader_loop,
-                args=(proc.stdout, self._responses),
+                args=(proc.stdout, self._responses, self._eof_at),
                 name=f"mf-sandbox-frames-{self._inbound}-{gen}",
                 daemon=True,
             ),
@@ -1139,10 +1190,16 @@ class SandboxSession:
             thread.start()
         # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
         # ``load_snapshot()``, which runs top-level admin config — the earliest untrusted code and the
-        # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
-        # assigning here is race-free: any process the worker later spawns is already in the job. The
-        # drains above do not disturb that argument, which turns on the CHILD's first stdin read and
-        # not on what the parent's threads are doing.
+        # first chance to spawn a grandchild. Until then the worker runs only its own code: it moves
+        # the request pipe off fd 0 (_detach_request_pipe, which starts no process) and parks on its
+        # first read of that pipe's private copy, so any process admin code later spawns is already
+        # in the job. ``proc`` is not always the worker: on Windows, when ``sys.executable`` is a
+        # virtual environment's ``python.exe`` launcher, ``proc`` is the launcher, and it starts
+        # the real interpreter itself, possibly before this assignment. That interpreter still
+        # landed in the job in every run measured (10 of 10 on an unloaded host, 2026-11-24), but
+        # no ordering here guarantees it, and the owner's acceptance does not name that case. The
+        # launcher's other residual, its second inheritable request-pipe handle, is stated with the
+        # owner's acceptance of 2026-11-24 in ADR 0087's step 8 note on AC-10.
         self._job = _assign_kill_on_close_job(proc)
         try:
             _write_frame(proc.stdin, boot)
@@ -1224,21 +1281,38 @@ class SandboxSession:
             self._snapshot = read_trusted_snapshot(self._config_dir)
         return self._snapshot
 
-    def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
+    def _reader_loop(self, stdout: Any, sink: queue.Queue[Any], eof_at: list[float]) -> None:
         """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see
         :func:`_read_frame_or_oversize`). Runs on a daemon thread; a fresh queue per spawn means a stale
-        reader's writes are harmlessly ignored."""
+        reader's writes are harmlessly ignored. Before it queues :data:`_EOF` it appends the time it
+        read the EOF to ``eof_at``, which :meth:`_died_before_first_check` reads."""
         try:
             while True:
                 body = _read_frame_or_oversize(stdout)
                 if body is None:
+                    eof_at.append(time.monotonic())
                     sink.put(_EOF)
                     return
                 sink.put(body)
                 if body is _OVERSIZE:
                     return  # the stream is out of step, so nothing after the header is a frame
-        except OSError:
+        except OSError as exc:
+            # Read as the peer being gone, as a clean EOF is. Stamped before the log line, so a
+            # slow handler cannot delay the stamp _died_before_first_check reads. A reaped worker's
+            # pipe reads EOF, not an error, so this branch is only an unusual reader fault, such as
+            # EIO or a closed handle; it is logged at DEBUG, its level when it was added. The type
+            # name only, since an OSError's text can name a path.
+            eof_at.append(time.monotonic())
+            log.debug(
+                "inbound %r: sandbox frame reader stopped on %s, read as EOF",
+                self._inbound,
+                type(exc).__name__,
+            )
             sink.put(_EOF)
+        finally:
+            # This thread is the stream's only reader, so it closes it on the way out rather than
+            # leave the descriptor to the collector (BACKLOG #6831).
+            _close_quietly(stdout)
 
     def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
         """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
@@ -1285,7 +1359,8 @@ class SandboxSession:
 
     def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
         """Reap ``proc``'s whole tree, recording no kill and writing no kill line (see
-        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`)."""
+        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`),
+        and so can the wait for the worker to exit that follows it."""
         if proc is None:
             return
         # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
@@ -1295,16 +1370,40 @@ class SandboxSession:
         #
         # The same reap EOFs fd 2, so the stderr relay thread ends on its own here exactly as the frame
         # reader does. Neither thread is joined on THIS path (a respawn must not wait on a grandchild
-        # that holds a pipe open, and this runs under the session lock), and neither pipe is closed:
-        # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
-        # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
+        # that holds a pipe open, and this runs under the session lock), and neither of their pipes
+        # is closed here: closing a file object under a mid-read thread raises ``ValueError``, which
+        # is not what either drain's ``except OSError`` catches, so it would escape into
+        # ``threading.excepthook``. Each drain closes its own stream as it ends (BACKLOG #6831). The
         # shutdown-only bounded join lives in :meth:`close`.
         _reap_process_tree(proc, self._job, self._inbound)
         self._job = None
-        try:  # noqa: SIM105
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Not swallowed (BACKLOG #6831): this engine stops waiting on a worker the tree reap
+            # did not end in time. Identity only, no content.
+            log.warning(
+                "inbound %r: sandbox worker pid %d had not exited %.0fs after its process tree was "
+                "reaped, and is not waited on further",
+                self._inbound,
+                proc.pid,
+                _REAP_WAIT_SECONDS,
+            )
+        except OSError as exc:
+            log.warning(
+                "inbound %r: could not wait on sandbox worker pid %d (%s)",
+                self._inbound,
+                proc.pid,
+                type(exc).__name__,
+            )
+        # The engine's end of the request pipe, closed here rather than left to the collector
+        # (BACKLOG #6831). The thread holding the session lock writes it, and so does a lookup
+        # helper while that thread waits on it. A helper its dispatch gave up on may still be inside
+        # a write: that helper closes the pipe itself when it ends, because a close under another
+        # thread's write can free the descriptor number for reuse before that write reaches the
+        # kernel. Any other helper has ended before the reap.
+        if proc.stdin is not None and proc not in self._stdin_held:
+            _close_quietly(proc.stdin)
         if proc is self._proc:
             self._proc = None
 
@@ -1420,7 +1519,7 @@ class SandboxSession:
         self._kill(proc, _UNSOLICITED[when], phase)
         return True
 
-    def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
+    def _live_worker(self, phase: str, *, before_write: bool = False) -> subprocess.Popen[bytes]:
         """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
 
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
@@ -1437,39 +1536,96 @@ class SandboxSession:
         too: a worker that keeps exiting, or closing its pipe, before its request fails the call.
         ADR 0187 *Amendment B* lists at least the cases in which such a message's call fails.
 
-        A worker spawned here and found exited by this check is recorded as
+        :meth:`dispatch` calls this twice, before it encodes the request and again right before it
+        writes it (vault BACKLOG #3135 step 7). The one retry and the respawn bound are the
+        dispatch's, shared by both calls, so the second call can neither retry a second time nor
+        restart the bound.
+
+        A worker spawned in this dispatch and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
-        check asks the process too. It cannot see an exit that comes after it, so a worker that
-        exits as its request is written is recorded under another cause, such as
+        check asks the process too, the second call included, and it counts toward the bound. One
+        whose EOF is queued and that is still running once the grace is spent is recorded as
+        :attr:`KillCause.STDOUT_CLOSED` instead. At the second call (``before_write``), a worker
+        kept from an earlier dispatch and found exited, or whose EOF is queued, is taken to have
+        died during this dispatch, so it is recorded as :attr:`KillCause.CRASH`, or as
+        :attr:`KillCause.STDOUT_CLOSED` when only its EOF is found and it is still running once the
+        grace is spent, and counted, as it would have been had the request been written to it,
+        unless :meth:`_died_before_first_check` says its pipe reached EOF before the first call
+        began its last pass. Then, as at the first call, it died between dispatches and is handled as the first
+        call handles such a worker: an exited one is replaced with no cause and not counted, and a
+        queued EOF reaps it with no cause, or as :attr:`KillCause.STDOUT_CLOSED` if it is still
+        running once the grace is spent, and is counted. The check cannot see an exit that
+        comes after it, so a worker that exits as its request is written is recorded under another
+        cause, such as
         :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
-        stray_seen = False
-        eof_respawns = 0
         while True:
-            fresh = self._proc is None or _has_exited(self._proc)
-            if fresh:
+            # Taken before this pass looks at the worker or the queue, so an EOF stamped before it
+            # was read before the pass began: a death after it can never read as an earlier one.
+            pass_started = time.monotonic()
+            if self._proc is None or _has_exited(self._proc):
+                booted = self._generation != self._dispatch_generation
+                crashed = before_write and not self._died_before_first_check()
+                if self._proc is not None and (booted or crashed):
+                    # Died during this dispatch: a death to record and count, not a silent reap
+                    # in _spawn.
+                    died = KillCause.EXITED_AFTER_BOOT if booted else KillCause.CRASH
+                    self._kill(self._proc, died, phase)
+                    self._count_eof_respawn()
                 self._spawn(phase)
-            exited = KillCause.EXITED_AFTER_BOOT if fresh else None
+            # Booted in this dispatch, by this call or by the dispatch's first one.
+            fresh = self._generation != self._dispatch_generation
+            exited: KillCause | None = None
+            if fresh:
+                exited = KillCause.EXITED_AFTER_BOOT
+            elif before_write and not self._died_before_first_check():
+                exited = KillCause.CRASH
             if self._drop_unsolicited(self._proc, "before", phase, exited=exited):
-                if stray_seen:
+                if self._stray_retried:
                     raise _unsolicited_error("before")
-                stray_seen = True
+                self._stray_retried = True
                 continue
             proc = self._proc
             if proc is not None:
                 # The queue says nothing about a fresh worker whose exit the reader has not yet
                 # queued as an EOF, so ask the process itself, without reaping it.
                 if not (fresh and _has_exited(proc)):
+                    if not before_write:
+                        self._first_check_at = pass_started
                     return proc
                 self._kill(proc, KillCause.EXITED_AFTER_BOOT, phase)
-            eof_respawns += 1
-            if eof_respawns > _LIVE_WORKER_EOF_RESPAWNS:
-                raise SandboxError(
-                    f"sandbox worker for inbound {self._inbound!r} kept exiting, or closing its "
-                    f"pipe, before its request: {eof_respawns} workers in a row"
-                )
+            self._count_eof_respawn()
+
+    def _died_before_first_check(self) -> bool:
+        """Whether the current worker's frame reader read EOF on its response pipe before this
+        dispatch's first :meth:`_live_worker` call began the pass that handed the worker out, so
+        that a death the second call finds predates the request's encode. False when no EOF has
+        been read yet, or it was read later.
+
+        The reader stamps the EOF once its read returns, which is after the pipe closed, and the
+        pass's time is taken before it looks at the worker, so a worker that dies during that pass
+        or while the request is encoded never reads True. Its death is recorded when the second
+        call finds it. When the first call itself finds it, through its queued EOF in that same
+        pass, the first call handles it as it handles any kept worker: a silent reap with no cause
+        recorded and no WARNING, or :attr:`KillCause.STDOUT_CLOSED` if the worker is still running
+        once the grace is spent, and this method is never asked. A worker that
+        died before the pass still reads False, and is recorded as a ``CRASH`` (or
+        ``STDOUT_CLOSED``, as :meth:`_live_worker` says), when the reader read its EOF only after
+        the pass began, for example because the reader thread was not scheduled until then, or read
+        none because another holder kept the pipe open, such as a grandchild that inherited fd 1."""
+        return bool(self._eof_at) and self._eof_at[0] < self._first_check_at
+
+    def _count_eof_respawn(self) -> None:
+        """Count one more worker this dispatch replaced for exiting, or closing its pipe, before its
+        request, and fail the call once the bound is spent (see :meth:`_live_worker`)."""
+        self._eof_respawns += 1
+        if self._eof_respawns > _LIVE_WORKER_EOF_RESPAWNS:
+            raise SandboxError(
+                f"sandbox worker for inbound {self._inbound!r} kept exiting, or closing its "
+                f"pipe, before its request: {self._eof_respawns} workers in a row"
+            )
 
     # -- the lookup broker (mode=isolated, ADR 0147) ----------------------------
 
@@ -1600,17 +1756,36 @@ class SandboxSession:
             except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
                 report(exc)
 
+        # Who closes the request pipe is decided under this lock (see :meth:`_reap`): the helper
+        # if its dispatch gave up on it before it ended, and the reap otherwise.
+        handoff = threading.Lock()
+        ended = False
+
+        def serve_then_release() -> None:
+            nonlocal ended
+            try:
+                serve()
+            finally:
+                with handoff:
+                    ended = True
+                    if abandoned.is_set():
+                        _close_quietly(stdin)
+                        self._stdin_held.discard(proc)
+
         context = contextvars.copy_context()
         helper = threading.Thread(
             target=context.run,
-            args=(serve,),
+            args=(serve_then_release,),
             name=f"mf-sandbox-lookup-{self._inbound}",
             daemon=True,
         )
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
-            abandoned.set()
+            with handoff:
+                if not ended:
+                    self._stdin_held.add(proc)
+                abandoned.set()
             return False
         if fault:
             self._kill(proc, KillCause.LOOKUP_FAULT, phase)
@@ -1802,6 +1977,9 @@ class SandboxSession:
             # pre-stage its answer.
             request_id = secrets.token_hex(16)
             self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
+            self._stray_retried = False
+            self._eof_respawns = 0
+            self._dispatch_generation = self._generation
             # Resolved FIRST, so a session with a cached graph refusal refuses at once rather than
             # encode each message (a reference view can be large) only to refuse it.
             proc = self._live_worker(phase)
@@ -1824,6 +2002,15 @@ class SandboxSession:
                     raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
             except (OSError, SandboxError) as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
+            # The check again, right before the write (vault BACKLOG #3135 step 7): a frame queued
+            # while the request was encoded would otherwise be read in this call's answer slot and
+            # fail a message that never reached the worker. Found here, it is the same case as at
+            # the first call and shares its one retry. Only a frame the reader has already queued is
+            # found, so this narrows the AC-10 window by the time the request takes to encode; it
+            # does not close it. A worker found exited here, or whose EOF is queued, is replaced as
+            # _live_worker says.
+            proc = self._live_worker(phase, before_write=True)
+            assert proc.stdin is not None
             try:
                 _write_frame(proc.stdin, request)
             except (OSError, SandboxError) as exc:

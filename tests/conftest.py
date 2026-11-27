@@ -375,8 +375,11 @@ def _pass_the_anchor_path_check_on_windows() -> Iterator[None]:
     So on win32 only, the name ``trust_anchors`` calls answers ``True``. The check itself is not
     stubbed: ``tests/test_anchor_path.py`` calls ``anchor_path.anchor_path_verdict`` directly, and
     its preflight receipts put the real function back. POSIX ``tmp_path`` is a trusted chain (a sticky
-    ``/tmp`` holding the runner's own directory), so the Linux leg runs the real check in every
-    anchor test. The config-source readers above are scoped to win32 the same way."""
+    ``/tmp`` holding the runner's own directory) on a host whose file systems from ``/`` down are on
+    ``POSIX_TRUSTED_FS``, as on the GitHub-hosted Linux runners, so the Linux leg runs the real check
+    in every anchor test. Where ``/`` is overlay, as in most containers, that check answers
+    indeterminate (vault BACKLOG #8390 item 31), and the anchor tests that run it would fail there.
+    The config-source readers above are scoped to win32 the same way."""
     if sys.platform != "win32":
         yield
         return
@@ -510,6 +513,20 @@ def _quiesce_background_loggers_at_teardown(
     finally:
         # TEARDOWN: drop late emits at the source for the rest of the teardown/next-setup window.
         _quiesce_targets()
+
+
+@pytest.fixture(autouse=True)
+def _no_held_store_pin_refusal() -> None:
+    """Start each test with no SQL Server store pin refusal held and no pin baseline (vault
+    BACKLOG #3714 step 11).
+    The hold is process-global, so one a test sets would otherwise refuse the store connects of
+    a later test on the same worker that names the same pin path. Read only when the module is
+    already imported, so this fixture imports nothing."""
+    anchors = sys.modules.get("messagefoundry.auth.trust_anchors")
+    if anchors is not None:
+        anchors._STORE_PIN_REFUSED.clear()
+        anchors._STORE_PIN_RELEASE_REFUSED.clear()
+        anchors._STORE_PIN_FIRST_CHECKED.clear()  # a release compares with it
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -933,10 +950,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             "`tests` was imported from another checkout, so its list would mark this one's tests"
         )
     names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
+    stray: list[str] = []
     for item in items:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:
             item.add_marker(pytest.mark.tooling)
+        elif item.get_closest_marker("tooling") is not None:
+            stray.append(item.nodeid)
+    # A `tooling` mark from anywhere but the manifest is refused, on every leg and platform. The
+    # engine legs deselect such a test and the tier's test shards, split from the manifest, never
+    # name it, so it would run nowhere with every check green.
+    if stray:
+        raise RuntimeError(
+            "these tests carry the `tooling` mark but are not in tests/tooling_manifest.txt, so no "
+            f"leg would run them; list the file or drop the mark: {sorted(stray)[:5]}"
+        )
     # BACKLOG #4773: the timing quarantine, from tests/timing_quarantine.txt, which states its rules.
     timing_quarantine.mark_quarantined(items, _TESTS_DIR)
 

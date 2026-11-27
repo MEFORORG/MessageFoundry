@@ -286,12 +286,30 @@ function ConvertTo-Stamp($Value) {
     return [string]$Value
 }
 
+# The INSTANT a `claimed` stamp names, for arithmetic (BACKLOG #5871). Never `[datetime]::Parse` the
+# coerced value: PowerShell turns the [datetime] back into an invariant "MM/dd/yyyy" string and Parse
+# reads it under the CURRENT culture, so on a day-first host (en-GB, de-DE) a row whose stamp fell on a
+# local day of 13 or later failed, and an earlier one swapped day and month. A [datetime] from
+# ConvertFrom-Json already holds the instant; one with no offset (Kind Unspecified) is read as this
+# host's local time, as before. A stamp ConvertFrom-Json left as a string is parsed under the
+# INVARIANT culture, never the current one, keeping any offset it names.
+function ConvertTo-ClaimedInstant($Value) {
+    if ($Value -is [datetimeoffset]) { return $Value }
+    if ($Value -is [datetime]) { return [datetimeoffset]::new($Value) }
+    return [datetimeoffset]::Parse([string]$Value, [cultureinfo]::InvariantCulture)
+}
+
+# Whether a claim record is THIS worktree's: the same path, written on THIS machine. The same path on
+# ANOTHER machine is another tree: two PCs sharing a root can each have a D:\Code\... checkout.
+function Test-ClaimIsMine($Claim) {
+    $held = ($Claim.worktree -replace '\\', '/').TrimEnd('/')
+    $me = ($holder -replace '\\', '/').TrimEnd('/')
+    return (($held -ieq $me) -and (Test-CoordRecordIsHere $Claim))
+}
+
 function Get-Mine([string]$Path) {
     $c = Read-CoordText $Path | ConvertFrom-Json
-    $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-    $me = ($holder -replace '\\', '/').TrimEnd('/')
-    # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
-    [pscustomobject]@{ Claim = $c; IsMine = (($held -ieq $me) -and (Test-CoordRecordIsHere $c)) }
+    [pscustomobject]@{ Claim = $c; IsMine = (Test-ClaimIsMine $c) }
 }
 
 # ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
@@ -389,22 +407,59 @@ function Add-HistoryLine([string]$Line) {
 # probe loaded, reported itself Available, and returned zero vetoing sessions for that exact path.
 # Every other outcome, including the probe failing to load at all, stays `present`. A missing
 # answer must cost a refusal, never a licence.
-$script:OccupancyProbe = $null   # $null = not yet tried; $false = unavailable; else the object
+#
+# ONE PROBE PER HOLDER REPOSITORY (BACKLOG #5870). Get-WorktreeOccupancy places a session only inside
+# the worktrees of the repository it was asked about, and -AsWorktree can record a holder in another
+# one, so a single probe of $repo would answer "nobody there" for a holder it never looked at. The
+# cache is keyed by git common dir so one repository's failed probe cannot stand in for another's.
+# Common dir -> $false when the probe was unavailable, else the answer plus the worktrees it lists.
+# The common dir comes from the holder's own .git pointer, which costs no git process: -List can walk
+# hundreds of claims. A path alone is not a safe key, because a stale listing in one repository can
+# name a path that is now a worktree of another.
+#
+# THE CACHE KEY IS CASE-FOLDED AND THE LISTING CHECK IS NOT. Get-OwningGitCommonDir folds case, so on
+# a case-sensitive filesystem two repositories can share a key. The exact check below is what stops
+# one answering for the other: a holder spelled differently from the listing reads `present`. Nothing
+# here can tell whether a case-only difference is the same directory, so it never counts as a match.
+# Only the drive letter folds, because it is case-insensitive on every volume.
+$script:OccupancyProbes = @{}
+$script:OccupancyLoaded = $null   # $null = not looked up yet. Whether occupancy.ps1 loaded cannot change.
 
-function Get-OccupancyOnce {
-    if ($null -ne $script:OccupancyProbe) { return $script:OccupancyProbe }
+function ConvertTo-ExactPathKey([string]$Path) {
+    $p = ($Path -replace '\\', '/').TrimEnd('/')
+    if ($p -match '^[A-Za-z]:') { $p = $p.Substring(0, 1).ToUpperInvariant() + $p.Substring(1) }
+    return $p
+}
+
+function Get-OccupancyForHolder([string]$HeldPath) {
     try {
-        if (-not (Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)) {
-            $script:OccupancyProbe = $false
-            return $false
+        if ($null -eq $script:OccupancyLoaded) {
+            # False first, so a lookup that throws is cached as "not loaded" and stays `present`.
+            $script:OccupancyLoaded = $false
+            $script:OccupancyLoaded = [bool](Get-Command Get-WorktreeOccupancy -EA SilentlyContinue)
         }
-        $occ = Get-WorktreeOccupancy -Repo $repo
-        # `Available` false means the fence could not be built -- an unplaceable record, no repo.
-        # Treat that exactly like a failed probe.
-        $script:OccupancyProbe = if ($occ -and $occ.Available) { $occ } else { $false }
+        if (-not $script:OccupancyLoaded) { return $false }
+        $key = Get-OwningGitCommonDir $HeldPath
+        if (-not $key) { return $false }
+        if (-not $script:OccupancyProbes.ContainsKey($key)) {
+            # Recorded first, so a probe that throws is not re-run for every holder here.
+            $script:OccupancyProbes[$key] = $false
+            $occ = Get-WorktreeOccupancy -Repo $HeldPath
+            # `Available` false means the fence could not be built -- an unplaceable record, no repo.
+            # Treat that exactly like a failed probe.
+            if ($occ -and $occ.Available) {
+                # Ordinal, because a PowerShell @{} would fold case again.
+                $listed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                foreach ($w in @($occ.Worktrees)) { [void]$listed.Add((ConvertTo-ExactPathKey $w.Path)) }
+                $script:OccupancyProbes[$key] = [pscustomobject]@{ Answer = $occ; Listed = $listed }
+            }
+        }
+        $probe = $script:OccupancyProbes[$key]
+        # Zero occupants means something only for a worktree the answer actually lists.
+        if ($probe -and $probe.Listed.Contains((ConvertTo-ExactPathKey $HeldPath))) { return $probe.Answer }
+        return $false
     }
-    catch { $script:OccupancyProbe = $false }
-    return $script:OccupancyProbe
+    catch { return $false }
 }
 
 function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
@@ -420,7 +475,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
         $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
         if ($ct) {
             $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-            $occ = Get-OccupancyOnce
+            $occ = Get-OccupancyForHolder $HeldPath
             if ($occ) {
                 $who = @(Get-WorktreeOccupants -Occupancy $occ -Path $HeldPath)
                 if ($who.Count -eq 0) {
@@ -428,7 +483,7 @@ function Get-HolderLiveness([string]$HeldPath, $Record = $null) {
                 }
                 return [pscustomobject]@{ State = 'occupied'; QuietHours = $quiet; Occupants = $who.Count }
             }
-            # PROBE UNAVAILABLE -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
+            # PROBE UNAVAILABLE, OR ITS ANSWER DOES NOT LIST THIS PATH -> `present`, which keeps its PRE-#1348 meaning exactly: the path is
             # there and that is all this function knows. It still refuses.
             #
             # THIS SPLIT IS A BUG FIX, NOT A TIDY-UP. The first version of #1348 returned `present`
@@ -564,7 +619,7 @@ function Format-LandedLine($Ahead, $HeadTime, $Claimed, $Merged, $Base, [string]
     if ($null -eq $Ahead) { return "evidence: UNKNOWN -- git could not count branch head $Short against $at" }
     # Whole seconds on both sides, and a TIE COUNTS AS BEFORE: %ct has no fraction, and for a commit in
     # the claim's own second the safe reading is "nothing built", not "moved on".
-    $claimedAt = [System.DateTimeOffset]::new(([datetime]$Claimed).ToUniversalTime()).ToUnixTimeSeconds()
+    $claimedAt = (ConvertTo-ClaimedInstant $Claimed).ToUnixTimeSeconds()
     $after = ($HeadTime -gt $claimedAt)
     if ($Ahead -eq 0 -or ($Merged -and $Merged -eq $Base.Tree)) {
         if (-not $after -and $Ahead -eq 0) {
@@ -776,7 +831,6 @@ function Get-LandedEvidenceSet($Holders, [switch]$WithStatus) {
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
-    $me = ($holder -replace '\\', '/').TrimEnd('/')
     Write-Host ""
     Write-Host "Active work claims ($($files.Count)):"
     $rows = foreach ($f in $files) {
@@ -792,7 +846,8 @@ function Show-List {
             continue
         }
         $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-        $mine = if ($held -ieq $me) { "  <-- THIS worktree" } else { "" }
+        # Get-Mine's rule, so another PC's claim at the same path is not marked as ours (BACKLOG #5871).
+        $mine = if (Test-ClaimIsMine $c) { "  <-- THIS worktree" } else { "" }
         # LIVENESS, not age. This used to print "[STALE ~Nh -- release it if that session is gone]" once
         # a claim was 12h old, which measures how long the WORK has run and says nothing about whether
         # anyone is still doing it. Measured 2026-07-31: a claim reported STALE ~21h whose holder had
@@ -801,8 +856,9 @@ function Show-List {
         # to prevent, arrived at by following the tool's own recommendation. A long claim is the normal
         # shape of long work; report what the HOLDER is doing and let the operator decide.
         $age = ""
+        # Its own try: an unreadable stamp costs only the age, never the liveness verdict (BACKLOG #5871).
+        $hrs = try { [int]([datetimeoffset]::UtcNow - (ConvertTo-ClaimedInstant $c.claimed)).TotalHours } catch { '?' }
         try {
-            $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
             $live = Get-HolderLiveness $held $c
@@ -814,10 +870,10 @@ function Show-List {
                     $age = "  [held ${hrs}h; LIVE SESSION in the holder, last committed $($live.QuietHours)h ago]"
                     if ($live.QuietHours -ge 12) { $age += " -- QUIET but OCCUPIED, ask before releasing" }
                 }
-                # The probe could not run -- no Claude config root, or it failed. Says what it knows
+                # The probe gave no answer for this path -- no Claude config root, it failed, or it does not list the path. Says what it knows
                 # and no more: the path is there. It must NOT claim a session it never looked for.
                 'present' {
-                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe could not run]"
+                    $age = "  [held ${hrs}h; holder present, last committed $($live.QuietHours)h ago; OCCUPANCY UNKNOWN -- the session probe gave no answer for this path]"
                 }
                 # THE THIRD STATE, and the listing is the surface that matters (BACKLOG #1348).
                 # -List is what a dispatching seat reads to decide where to spend attention, so a
@@ -881,7 +937,7 @@ if ($Release) {
         Write-Host ""
         Write-Host "REFUSING to release '$Release': it is held by another worktree." -ForegroundColor Yellow
         Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
-        Write-Host "  since  : $($info.Claim.claimed)"
+        Write-Host "  since  : $(ConvertTo-Stamp $info.Claim.claimed)"
         Write-Host "  note   : $($info.Claim.note)"
         # DO NOT recommend -Force without looking. This line used to read "If that session is gone,
         # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
@@ -901,7 +957,7 @@ if ($Release) {
             }
             'present' {
                 Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-                Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+                Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
                 Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
                 Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
                 Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
@@ -1045,6 +1101,25 @@ if ($List) { Show-List; exit 0 }
 $safe = ConvertTo-KeyFile $Take
 $file = Join-Path $claims "$safe.json"
 
+# The record is built BEFORE the CreateNew below, never between it and the write (BACKLOG #7565). From
+# CreateNew until the handle closes the name exists at 0 bytes, and a failure or a kill in that span
+# leaves an empty claim file: no reader can name its holder, and the key stays blocked until someone
+# runs -Release -Force on it. With the record built first, the span holds only the Write and the
+# flush that Dispose performs. A failure in either, or a kill inside the span, can still leave the
+# empty file: this narrows the window and does not close it.
+$claim = [ordered]@{
+    key      = $Take
+    note     = if ($Note) { $Note } else { "(no note)" }
+    branch   = $branch
+    worktree = $holder
+    # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
+    host     = $thisHost
+    claimed  = (Get-Date).ToString("o")
+} | ConvertTo-Json -Compress
+# UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes
+# json.loads raise -- which would be swallowed into "not claimed" and silently disable the gate.
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
+
 try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
     # sibling session got here first, and that throw IS the mutual exclusion.
@@ -1134,11 +1209,11 @@ try {
                 exit 1
             }
             Write-Host ""
-            Write-Host "REFRESHED '$Take' (held since $($info.Claim.claimed))." -ForegroundColor Green
+            Write-Host "REFRESHED '$Take' (held since $(ConvertTo-Stamp $info.Claim.claimed))." -ForegroundColor Green
             Write-Host "  note : $Note"
             exit 0
         }
-        Write-Host "You already hold '$Take' (claimed $($info.Claim.claimed))." -ForegroundColor Green
+        Write-Host "You already hold '$Take' (claimed $(ConvertTo-Stamp $info.Claim.claimed))." -ForegroundColor Green
         Write-Host "  note : $($info.Claim.note)"
         Write-Host "  (pass -Note to update it -- it is what other sessions are shown.)"
         exit 0
@@ -1146,7 +1221,7 @@ try {
     Write-Host ""
     Write-Host "BLOCKED: '$Take' is already claimed by another session." -ForegroundColor Red
     Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
-    Write-Host "  since  : $($info.Claim.claimed)"
+    Write-Host "  since  : $(ConvertTo-Stamp $info.Claim.claimed)"
     Write-Host "  note   : $($info.Claim.note)"
     # THE BLOCKING PATH IS WHERE THIS MATTERS MOST. -List is where you browse; this is where a session
     # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
@@ -1168,7 +1243,7 @@ try {
         }
         'present' {
             Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
-            Write-Host "  OCCUPANCY UNKNOWN: the session probe could not run, so this does NOT say whether"
+            Write-Host "  OCCUPANCY UNKNOWN: the session probe gave no answer for this path, so this does NOT say whether"
             Write-Host "  anyone is in it. Treat that as MORE reason to coordinate, not less."
             Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
             Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
@@ -1202,18 +1277,6 @@ try {
     exit 1
 }
 try {
-    $claim = [ordered]@{
-        key      = $Take
-        note     = if ($Note) { $Note } else { "(no note)" }
-        branch   = $branch
-        worktree = $holder
-        # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
-        host     = $thisHost
-        claimed  = (Get-Date).ToString("o")
-    } | ConvertTo-Json -Compress
-    # UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes
-    # json.loads raise -- which would be swallowed into "not claimed" and silently disable the gate.
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
     $fs.Write($bytes, 0, $bytes.Length)
 } finally {
     $fs.Dispose()

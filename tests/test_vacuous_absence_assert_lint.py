@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -593,16 +594,25 @@ def _scope_sites(
     a guard in the test around it on a value the helper reads from there.
     """
     nodes = _own_nodes(fn)
-    bindings = _bindings(nodes)
+    # The bindings are read only by this scope's absence assertions and by a def nested in it
+    # (directly or in a class), so a scope with neither skips them. Most scopes have neither, and
+    # building bindings was a third of the walk over the real tree.
+    absences = sorted(
+        (
+            (node, name)
+            for node in nodes
+            if isinstance(node, ast.Assert) and (name := _absence_subject(node.test)) is not None
+        ),
+        key=lambda pair: _pos(pair[0]),
+    )
+    nests = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for n in nodes)
+    bindings = _bindings(nodes) if absences or nests else {}
     # Only a guard at the function's own top level is sure to have RUN before the site: one in
     # a loop body runs zero times on an empty input, and one in a `with pytest.raises` block or
     # a nested def may never run at all.
     top_level = tuple(s for s in fn.body if isinstance(s, ast.Assert))
     found: list[Site] = []
-    for node in sorted((n for n in nodes if isinstance(n, ast.Assert)), key=_pos):
-        name = _absence_subject(node.test)
-        if name is None:
-            continue
+    for node, name in absences:
         reaching = _reaching(bindings.get(name, []), _pos(node))
         if reaching is None or reaching.comp is None:
             continue
@@ -627,6 +637,10 @@ def _scope_sites(
     return found, top_level, bindings
 
 
+#: The node kinds a ``def`` can sit under: a statement, an ``except`` clause and a ``match`` case.
+_HOLDS_STATEMENTS = (ast.stmt, ast.excepthandler, ast.match_case)
+
+
 def _sites(source: str) -> list[Site]:
     """Every candidate site in ``source``, guarded or not.
 
@@ -644,6 +658,9 @@ def _sites(source: str) -> list[Site]:
         scope: tuple[tuple[ast.Assert, ...], dict[str, list[_Binding]]] | None,
     ) -> None:
         for child in ast.iter_child_nodes(node):
+            if not isinstance(child, _HOLDS_STATEMENTS):
+                # An expression never holds a statement, so no def can sit under it.
+                continue
             if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 visit(child, inside, enclosing, scope)
                 continue
@@ -680,16 +697,40 @@ def _rel(path: Path) -> str:
     return path.relative_to(_REPO).as_posix()
 
 
+#: The walk over the real tree is split into this many buckets, one test case each. Parsing every
+#: test file in one case ran at the 60 s per-test timeout on a hosted runner, and the thread
+#: timeout kills the xdist worker. A bucket is a stable hash of the relative path, so the split
+#: does not move with file order. Every listed file lands in exactly one bucket by construction;
+#: ``test_the_walk_reaches_the_test_trees`` pins that the buckets hold the whole listing, and each
+#: bucket case pins that its measurement covers exactly its bucket's files.
+_BUCKETS = 8
+_BUCKET_IDS = range(_BUCKETS)
+
+
+def _bucket(rel: str) -> int:
+    # surrogatepass, so a file name holding any lone surrogate still hashes instead of raising.
+    return zlib.crc32(rel.encode("utf-8", "surrogatepass")) % _BUCKETS
+
+
 @functools.cache
-def _measure_all() -> dict[str, tuple[Site, ...]]:
-    return {_rel(p): tuple(_sites(p.read_text(encoding="utf-8"))) for p in _test_files()}
+def _bucket_files() -> tuple[tuple[Path, ...], ...]:
+    """The test files in each bucket, from ONE listing of the tree shared by every bucket case."""
+    out: list[list[Path]] = [[] for _ in _BUCKET_IDS]
+    for p in _test_files():
+        out[_bucket(_rel(p))].append(p)
+    return tuple(tuple(b) for b in out)
 
 
-def _measure() -> dict[str, list[Site]]:
-    """Per file, its UNGUARDED sites; files with none are left out."""
+@functools.cache
+def _measure_bucket(bucket: int) -> dict[str, tuple[Site, ...]]:
+    return {_rel(p): tuple(_sites(p.read_text(encoding="utf-8"))) for p in _bucket_files()[bucket]}
+
+
+def _measure(bucket: int) -> dict[str, list[Site]]:
+    """Per file in the bucket, its UNGUARDED sites; files with none are left out."""
     return {
         rel: unguarded
-        for rel, sites in _measure_all().items()
+        for rel, sites in _measure_bucket(bucket).items()
         if (unguarded := [s for s in sites if not s.guarded])
     }
 
@@ -1119,6 +1160,43 @@ def test_a_nested_helper_counts_the_tests_guard_on_a_value_it_reads(
     assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.check", guarded)]
 
 
+@pytest.mark.parametrize(
+    "opener",
+    [
+        "    try:\n        pass\n    except OSError:\n",
+        "    match files:\n        case _:\n",
+        "    if files:\n        pass\n    else:\n",
+    ],
+)
+def test_a_helper_under_an_except_case_or_else_body_is_a_scope(opener: str) -> None:
+    # The module visit skips expressions; a def under an except clause or a match case must still
+    # be reached, since those nodes are not statements.
+    indent = "        " if "case" not in opener else "            "
+    source = (
+        "def test_x(files):\n"
+        f"{opener}"
+        f"{indent}def helper(fs):\n"
+        f"{indent}    bad = [p for p in fs if p]\n"
+        f"{indent}    assert not bad\n"
+    )
+    assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.helper", False)]
+
+
+def test_a_method_of_a_class_in_a_test_sees_a_rebinding_after_the_guard() -> None:
+    # A scope holding only a class still builds its bindings, or the method below would read the
+    # test's guard as fresh although `files` is rebound after it.
+    source = (
+        "def test_x(files):\n"
+        "    assert files\n"
+        "    class C:\n"
+        "        def check(self):\n"
+        "            bad = [p for p in files if p]\n"
+        "            assert not bad\n"
+        "    files = []\n"
+    )
+    assert [(s.test, s.guarded) for s in _sites(source)] == [("test_x.check", False)]
+
+
 def test_a_recollected_site_keeps_the_guard_of_its_walk() -> None:
     source = (
         "def test_x(files):\n"
@@ -1150,19 +1228,49 @@ def test_a_guard_on_the_rebound_source_itself_guards() -> None:
 # --- the ratchet over the real tree --------------------------------------------------------------
 
 
+#: Each bucket's share of the candidate-site floor, rounded up, so every bucket clearing it means
+#: the whole walk clears ``_MIN_CANDIDATE_SITES``. It also catches one bucket gone blind. It is
+#: stricter than the old whole-walk floor: at landing the walk saw 541 sites, and the thinnest
+#: bucket 41, so renaming site-heavy files out of a thin bucket can trip it before the total does.
+_MIN_BUCKET_SITES = -(-_MIN_CANDIDATE_SITES // _BUCKETS)
+
+
 def test_the_walk_reaches_the_test_trees() -> None:
+    """The tree is walked, and the buckets hold the whole listing, each file once.
+
+    The candidate-site floor moved to ``test_each_bucket_reaches_candidate_sites``, one case per
+    bucket, so select both when rerunning the walk's floors.
+    """
     files = _test_files()
     assert len(files) >= _MIN_TEST_FILES, f"walked {len(files)} test file(s) under {_ROOTS}"
-    seen = sum(len(sites) for sites in _measure_all().values())
-    assert seen >= _MIN_CANDIDATE_SITES, (
-        f"saw {seen} candidate site(s), guarded or not, floor {_MIN_CANDIDATE_SITES}: the scan "
-        f"went blind, or the collect-then-assert-none shape left the tree"
+    buckets = _bucket_files()
+    assert len(buckets) == _BUCKETS, f"{len(buckets)} bucket(s), expected {_BUCKETS}"
+    held = [p for b in buckets for p in b]
+    assert sorted(held) == files, (
+        f"the buckets hold {len(held)} file(s) for {len(files)} walked; "
+        f"left out: {sorted(set(files) - set(held))[:5]}"
     )
 
 
-def test_no_file_gains_an_unguarded_absence_assertion() -> None:
+@pytest.mark.parametrize("bucket", _BUCKET_IDS)
+def test_each_bucket_reaches_candidate_sites(bucket: int) -> None:
+    measured = _measure_bucket(bucket)
+    # The measurement the ratchet reads covers exactly this bucket's files, so the partition the
+    # test above pins is the partition the ratchet judges.
+    assert set(measured) == {_rel(p) for p in _bucket_files()[bucket]}
+    seen = sum(len(sites) for sites in measured.values())
+    assert seen >= _MIN_BUCKET_SITES, (
+        f"bucket {bucket} saw {seen} candidate site(s), guarded or not, floor {_MIN_BUCKET_SITES} "
+        f"(the whole walk's {_MIN_CANDIDATE_SITES} over {_BUCKETS} buckets): the scan went "
+        f"blind, the collect-then-assert-none shape left the tree, or renames moved this "
+        f"bucket's sites to others"
+    )
+
+
+@pytest.mark.parametrize("bucket", _BUCKET_IDS)
+def test_no_file_gains_an_unguarded_absence_assertion(bucket: int) -> None:
     over: list[str] = []
-    for rel, sites in _measure().items():
+    for rel, sites in _measure(bucket).items():
         allowed = _BASELINE.get(rel, 0)
         if len(sites) > allowed:
             shown = "; ".join(f"line {s.line} {s.test}: {s.name}" for s in sites)
@@ -1174,13 +1282,16 @@ def test_no_file_gains_an_unguarded_absence_assertion() -> None:
     )
 
 
-def test_the_baseline_is_exact_and_self_pruning() -> None:
-    measured = {rel: len(sites) for rel, sites in _measure().items()}
+@pytest.mark.parametrize("bucket", _BUCKET_IDS)
+def test_the_baseline_is_exact_and_self_pruning(bucket: int) -> None:
+    measured = {rel: len(sites) for rel, sites in _measure(bucket).items()}
     assert len(_BASELINE) >= 1, "the baseline is empty; delete it and this test together"
+    # A row is judged in the bucket its path hashes to, so a row for a deleted file still lands in
+    # one bucket and reads as stale there.
     stale = sorted(
         f"{rel}: baseline {n}, measured {measured.get(rel, 0)}"
         for rel, n in _BASELINE.items()
-        if measured.get(rel, 0) < n
+        if _bucket(rel) == bucket and measured.get(rel, 0) < n
     )
     assert len(stale) == 0, (
         "these rows allow more sites than the file has; lower or delete them:\n  "

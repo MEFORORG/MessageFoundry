@@ -36,13 +36,14 @@ establishes that the off-loopback security controls are already built; this is p
 |---|---|---|
 | **slim (default)** | `docker build -f docker/Dockerfile -t messagefoundry .` | Core engine + SQLite store. The build's default target. |
 | **`-sqlserver`** | `docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .` | Adds the OS-level Microsoft ODBC Driver 18 + `[sqlserver]` extra — needed **only** for the SQL Server store or the DATABASE / `db_lookup` connectors. |
+| **`-postgres`** | `docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .` | Adds the `[postgres]` extra (`asyncpg`), which the Postgres store needs. The `ha` compose profile and [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) run that store, so they need this variant; the slim default carries no `asyncpg`. |
 
-Both are multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
+Each is multi-stage, runs as **non-root uid 10001**, installs from per-profile **hash-locked**
 requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 step in
-`.github/workflows/security.yml`), and are based on `python:3.14-slim-bookworm`, pinned by digest
+`.github/workflows/security.yml`), and is based on `python:3.14-slim-bookworm`, pinned by digest
 (see the [`Dockerfile`](Dockerfile) header). The pin freezes the base's OS packages, so rebuilding
 an old checkout does not pick up newer Debian fixes; build from a current release. The slim default omits
-PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the variant.
+PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the `-sqlserver` variant.
 
 ## How the image starts the engine
 
@@ -70,7 +71,8 @@ Two things undo this, and the engine refuses or reports each:
   in Kubernetes) can start the engine without the options. Remote debugging is then on unless
   something turns it off, as at least these do: the start passes `-X disable-remote-debug`; or the start passes
   neither `-I` nor `-E`, as the `messagefoundry` console script does, and the container's
-  environment sets `PYTHON_DISABLE_REMOTE_DEBUG`. The interpreter ignores that variable under
+  environment sets `PYTHON_DISABLE_REMOTE_DEBUG` to a non-empty value, such as 1 (some shells
+  delete a variable set to an empty value). The interpreter ignores that variable under
   either option, so an override that keeps `-I` and drops only `-X disable-remote-debug` has it
   on. With it on, under `enforce` the start refusal for it stops the engine unless
   `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on
@@ -84,7 +86,9 @@ Two things undo this, and the engine refuses or reports each:
   reports `startup_directory_writable` when its account can write there.
 
 `GET /security/posture` carries the reading in its `interpreter` block. The `docker-smoke` CI leg
-reads it off a running container and tries the write. What each entry means is in
+is written to read it off a running container and try the write, but until the follow-up in
+[the overlay note under Residuals / gotchas](#residuals--gotchas) lands its engine would refuse at
+start, so no CI job makes either check, and no CI job exercises an enforcing container start. What each entry means is in
 [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
 ## Configuration — bake it in (recommended) or mount it carefully
@@ -115,6 +119,15 @@ docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privile
   -v "$PWD/config:/config:ro" -v mefor-store:/var/lib/mefor ... messagefoundry:<version> serve --config /config --env prod
 ```
 A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be refused** — bake instead.
+A **Docker Desktop for Mac** bind mount reports an owner and mode the Mac does not enforce. The
+key-file check finds a key file, such as the TLS key, not restricted on one that surfaces as a
+mount of at least these types: `virtiofs`, `fakeowner`, and `fuse` with its subtypes such as
+`fuse.grpcfuse`. Under the default `enforce` the engine then refuses to start; under `warn` the
+TLS and connection key-file gates print a warning and it starts. `chown` or `chmod` on the Mac
+does not clear the finding. Bake config in there, and
+put TLS material on a named volume, as the `./tls` comment in [`compose.yaml`](compose.yaml) shows.
+The config-source check reads the owner and mode the container sees, so a config mount that passes
+it on a Mac is not thereby shown to be protected.
 Under **rootless Docker or Podman, or userns-remap**, a host root owner appears inside the container
 as an unprivileged uid and is refused; leave the files owned by your own user there, which maps to
 root inside.
@@ -141,14 +154,16 @@ against one case that matters, described under
   Kubernetes manifests, the `engine` and both `ha` engines carry a block *what an enforcing start
   needs* of commented entries (the alert channel, verified-TLS log forwarding and the retention
   bounds, and for the `ha` engines the store CRL); as shipped `serve --env prod` refuses to start,
-  so uncomment each with your value and put the trust files it names under `./config/pki/`. Each
+  so uncomment each with your value and put the trust files it names under `./config/pki/`, then
+  read [the overlay note under Residuals / gotchas](#residuals--gotchas). Each
   `ha` engine also mounts its own named log-spool volume, live as shipped.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set every `image:` field (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and
   `engine`) to your config-baked image.
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
-  commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
+  commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`
+  (then read [the overlay note under Residuals / gotchas](#residuals--gotchas)), and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
   refuses the pod with `CreateContainerConfigError`, at the first container that reads it. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
@@ -174,6 +189,10 @@ against one case that matters, described under
   `./config/pki/store-ca.pem`; `compose.yaml` says what each file must hold and how to own it. The
   default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
   pair alone, and which host port publishes the pair's MLLP, and when.
+  Build the `runtime-postgres` variant first, beside the slim default and from the same checkout
+  (see *Image variants*): at least the `ha` engines, `schema-provision` and
+  `revocation-attestation-check-ha` run `messagefoundry:postgres`,
+  and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
 
@@ -187,9 +206,11 @@ against one case that matters, described under
   every substituted value, at least this one and the Postgres password, in the file substitution
   reads; the `ha` engines still read their own store password from `secrets.env`). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
-  `docker compose up` and `docker compose --profile ha up` run that check before they start any
-  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. Not
-  every command runs the check: at least `docker compose up --no-deps <engine>` and
+  `docker compose up` and `docker compose --profile ha up` run that check before they start the
+  default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
+  `ha` engines run `messagefoundry:postgres`, so they wait instead on
+  `revocation-attestation-check-ha`, the same check in that image; read its logs for them. Not
+  every command runs either check: at least `docker compose up --no-deps <engine>` and
   `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
   comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;
   the file never sets it for you.
@@ -278,6 +299,27 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
   [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
   means.
+- **An enforcing PHI start would refuse on first deployment where `/` is
+  an overlay mount** (vault BACKLOG #8390 item 31), as it is in nearly every Docker or Kubernetes
+  container, and on any other host whose `/` mounts as overlay. That holds until a follow-up
+  lands: a follow-up ledger row for judging overlay only above a mount boundary when the anchor's
+  own mount is trusted, not yet numbered. At `[security].enforcement = warn` the engine starts, but that
+  dial is not scoped to this check: it downgrades the serve-gate refusals to warnings, at least
+  the cleartext off-box bind, open-egress and single-factor-at-exposure ones, and honours
+  `--allow-insecure-bind` and `MEFOR_ALLOW_INSECURE_TLS` again (`security_loosenings()`, and
+  `enforcement = warn` in [SECURITY-LOOSENING.md](../docs/SECURITY-LOOSENING.md)), so it is no
+  substitute for the follow-up. The rest of this bullet is why. The Linux path check reads the file system type of every
+  directory from `/` down, and does not vouch for overlay (the `POSIX_TRUSTED_FS` comment in
+  `messagefoundry/auth/anchor_path.py` says why). So no anchor there can pass: one whose path
+  others can write is refused as replaceable, and every other answers *could not settle*, even
+  one on a bind-mounted ext4 volume, and moving the file does not clear it. `enforce`
+  refuses it, unless the refusal offers a pin, naming the setting and the file's digest, and you
+  set that pin; check the digest against the CA first. An anchor the engine reads again by path
+  (`loads_verified_bytes=False` in `messagefoundry/auth/trust_anchors.py`) takes no pin escape, so
+  at `enforce` it cannot be used there. That includes `[logging].forward_tls_ca_file`, and an
+  enforcing PHI start needs verified-TLS log forwarding, which needs that file. The deployment
+  steps above that put trust files under `/config/pki/` meet this refusal. Derived from the code,
+  not measured on a running container.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an
@@ -288,4 +330,7 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 The `docker-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds the slim image
 and a baked test image ([`smoke/`](smoke/)), serves it loopback + signed in, sends one synthetic ADT^A01
 over MLLP, asserts it finalizes to **PROCESSED** (not merely RECEIVED), and verifies a graceful
-`docker stop`. It is the engine's first non-Windows runtime gate.
+`docker stop`. It is the engine's first non-Windows runtime gate. Its container's `/` is an
+overlay mount and it starts at `enforce`, so it would read red at the start until the follow-up
+in [the overlay note under Residuals / gotchas](#residuals--gotchas) lands, and its later steps
+check nothing until then.

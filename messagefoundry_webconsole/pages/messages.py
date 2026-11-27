@@ -10,6 +10,7 @@ markup.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, TypedDict
@@ -74,7 +75,8 @@ def _eol_style(raw: str) -> str | None:
 
     A body that mixes styles takes the one most of its breaks use, which rewrites the fewest of
     them; the browser's CRLF would rewrite every one. A tie takes CR, then LF, HL7's terminator
-    first. A body with no line break is CR when it is HL7 (it opens with MSH), since an added
+    first. A body with no line break is CR when it is HL7 (:func:`missing_eol_style` says which
+    leads count: ``MSH``, or a ``BHS`` or ``FHS`` batch header), since an added
     segment must end in CR; otherwise there is no style to restore and None renders no ``eol``
     field."""
     crlf = raw.count("\r\n")
@@ -89,11 +91,22 @@ def missing_eol_style(raw: str) -> str | None:
     """The style to restore a submitted ``raw`` to when its form carried no ``eol`` field, or None
     to keep it as sent.
 
-    The editor leaves the field out only for an original with no line break that is not HL7
-    (:func:`_eol_style`). So a missing field on an HL7 body came from a form the editor did not
-    render, and HL7's own CR terminator applies rather than the browser's CRLF (BACKLOG #5930).
-    Another body keeps its breaks as sent, since nothing says what its original used."""
-    return "cr" if starts_with_msh(raw) else None
+    The editor leaves the field out for an original with no line break that is not HL7
+    (:func:`_eol_style`), and a form it did not render carries none either. Either way, a body
+    submitted as HL7 takes HL7's own CR terminator rather than the browser's CRLF (BACKLOG #5930):
+    one that opens with ``MSH``, or with a ``BHS`` or ``FHS`` batch header, which ends its
+    segments the same way. An operator can edit a one-line non-HL7 original into HL7, and that
+    body takes CR too. This reads the submitted body, not the stored original. Another body keeps
+    its breaks as sent, since nothing says what its original used."""
+    return "cr" if starts_with_msh(raw) or _LEADS_WITH_BATCH_HEADER.match(raw) else None
+
+
+#: A ``BHS`` or ``FHS`` batch header after leading whitespace: the segment id, a field separator
+#: that is not a word or space character, one to five encoding characters of the same kind, then
+#: the separator again, a line break or the end, so ``BHS|^~\&`` with nothing after it counts.
+#: Stricter than ``starts_with_msh``: prose such as ``FHS: 140 bpm`` or ``FHS:140:bpm`` is not read
+#: as a batch, though prose shaped like a header, punctuation only, still is.
+_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)([^\w\s])[^\w\s]{1,5}?(?:\1|[\r\n]|\Z)")
 
 
 def restore_eol(raw: str, eol: str) -> str | None:
@@ -354,12 +367,14 @@ def message_search(
     message_type: str = "",
     control_id: str = "",
     error: str = "",
+    notice: str = "",
     presets: list[Any] | None = None,
 ) -> Markup:
     """The content-search page (a step-up-unlock GET, ADR 0046 #51): search by an HL7 field path
     (``PID-3``) or a raw/summary substring, over the caller's channels. ``results is None`` = the bare
     form (no search yet). Every matched row is a metadata-only summary (server-redacted) linking to the
-    audited detail view — no decrypted body is ever rendered here."""
+    audited detail view — no decrypted body is ever rendered here. ``notice`` says that a refilled
+    leftover was not sent (BACKLOG #6700)."""
     target_options = [
         el("option", label, value=value, selected=value == target or None)
         for value, label in (
@@ -409,6 +424,8 @@ def message_search(
     ]
     if error:
         parts.append(el("p", error, class_="banner"))
+    if notice:
+        parts.append(el("p", notice, class_="muted"))
     if results is not None:
         rows = [
             [

@@ -18,8 +18,9 @@ reason, and the walk must find exactly those; on :class:`Engine` none is exempt.
 What it does not catch, at least: a new operator mutation that takes no ``audit`` at all, or names
 it something else; a ``None``-admitting annotation spelled through an alias; and a caller that
 passes an ``audit`` which never returns a row. None of these is a type the walk can see. The
-runtime half, a ``TypeError`` on an explicit ``None`` before any write (BACKLOG #5069), is pinned on
-every backend by ``tests/_operator_audit_atomic_contract.py``; the shared helpers are pinned here.
+runtime half, a ``TypeError`` on an explicit ``None`` before any write, and on a ``None`` row for a
+result that changed the store (BACKLOG #5069, ``require_mutation_audit``), is pinned on every
+backend by ``tests/_operator_audit_atomic_contract.py``; the shared helpers are pinned here.
 
 The account and approval writes' ``audits`` sequence is held the same way (BACKLOG #5070).
 """
@@ -30,7 +31,9 @@ import ast
 import functools
 import inspect
 import textwrap
+import typing
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import pytest
@@ -42,13 +45,19 @@ from messagefoundry.store.sqlserver import SqlServerStore
 from messagefoundry.store.store import (
     OPERATOR_ORIGINS,
     AuditAppend,
+    InjectAudit,
     MessageOrigin,
     MessageStore,
     OperatorAudit,
+    ReingressOutcome,
+    ResendOutcome,
     if_applied,
+    mutation_changed,
     operator_audits,
     require_ingress_audit,
+    require_mutation_audit,
 )
+from tests._ast_sites import callee_name
 
 #: The protocol, every backend that implements it, and the engine that wraps them.
 CLASSES: tuple[type[Any], ...] = (Store, MessageStore, PostgresStore, SqlServerStore, Engine)
@@ -370,29 +379,89 @@ def test_operator_audits_refuses_a_missing_audit_and_a_bad_return() -> None:
 
 
 def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071): an operator origin needs a callable audit
-    that builds a row; a partner receipt needs none, and an audit it is given must be callable."""
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589): an operator origin needs a callable
+    audit that builds a row and an ``origin_actor`` naming the user; a partner receipt needs
+    neither, and refuses either one it is given."""
     row = AuditAppend("test.inject", actor="test")
     for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):
         with pytest.raises(TypeError, match="BACKLOG #5071"):
-            require_ingress_audit(None, origin)
-        built = require_ingress_audit(lambda _mid: row, origin)
+            require_ingress_audit(None, origin, "op")
+        built = require_ingress_audit(lambda _mid: row, origin, "op")
         assert built is not None and built("m") is row
-        silent = require_ingress_audit(lambda _mid: None, origin)
+        silent = require_ingress_audit(lambda _mid: None, origin, "op")
         assert silent is not None
         with pytest.raises(TypeError, match="returned no row"):
             silent("m")
-    assert require_ingress_audit(None, MessageOrigin.PARTNER) is None
-    assert require_ingress_audit(None, MessageOrigin.REINGRESS) is None
+        # BACKLOG #6589: the operator label names its user, so an inject with no actor is refused.
+        for actor in (None, "", "  ", " op "):
+            with pytest.raises(TypeError, match="needs the origin_actor"):
+                require_ingress_audit(lambda _mid: row, origin, actor)
+    for receipt in (MessageOrigin.PARTNER, MessageOrigin.REINGRESS):
+        assert require_ingress_audit(None, receipt, None) is None
 
     def partner_audit(_mid: str) -> None:
         return None
 
     # An audit with any other origin is an inject that forgot its origin: refused, not run.
     with pytest.raises(TypeError, match="was given an audit with origin 'partner'"):
-        require_ingress_audit(partner_audit, MessageOrigin.PARTNER)
+        require_ingress_audit(partner_audit, MessageOrigin.PARTNER, None)
     with pytest.raises(TypeError, match="BACKLOG #5071"):
-        require_ingress_audit("not-a-callable", MessageOrigin.PARTNER)  # type: ignore[arg-type]
+        require_ingress_audit(
+            "not-a-callable",  # type: ignore[arg-type]
+            MessageOrigin.PARTNER,
+            None,
+        )
+    # So is an actor with any other origin (BACKLOG #6589): only an operator origin names a user.
+    with pytest.raises(TypeError, match="was given an origin_actor with origin 'partner'"):
+        require_ingress_audit(None, MessageOrigin.PARTNER, "op")
+
+
+def test_an_inject_audit_is_typed_to_build_a_row() -> None:
+    """BACKLOG #6589: the engine's inject, and the store's, type their audit as ``InjectAudit``,
+    whose return admits no ``None``, since the store refuses a ``None`` row for an inject. Read
+    from the resolved annotation, so an alias back to ``OperatorAudit[str]`` fails here."""
+    assert typing.get_args(InjectAudit.__value__) == ([str], AuditAppend)
+    engine_audit = typing.get_type_hints(Engine.inject_message)["audit"]
+    assert engine_audit is InjectAudit
+    for cls in (Store, MessageStore, PostgresStore, SqlServerStore):
+        hints = typing.get_type_hints(cls.enqueue_ingress)
+        assert hints["audit"] == InjectAudit | None, cls.__name__
+
+
+def test_the_mutation_audit_refuses_no_row_for_a_change() -> None:
+    """The five mutations' audit (BACKLOG #5069): a ``None`` row is refused for a result that
+    changed the store, and allowed for one that changed nothing. Control: a real row passes."""
+    row = AuditAppend("test.mutation", actor="test")
+
+    def silent(_result: object) -> None:
+        return None
+
+    changed: list[object] = [
+        1,
+        -1,  # a driver's unknown count
+        ResendOutcome("resent", "m", "OB_B", "OB_A", "o1"),
+        ReingressOutcome("resubmitted", "m", "m2", "IB_A"),
+    ]
+    unchanged: list[object] = [
+        0,
+        ResendOutcome("duplicate", "m", "OB_B", "OB_A", "o1"),
+        ReingressOutcome("duplicate", "m", "m2", "IB_A"),
+    ]
+    guarded = require_mutation_audit(silent, "store.test")
+    for result in changed:
+        assert mutation_changed(result), result
+        with pytest.raises(TypeError, match="BACKLOG #5069"):
+            guarded(result)
+        assert require_mutation_audit(lambda _r: row, "store.test")(result) is row
+    for result in unchanged:
+        assert not mutation_changed(result), result
+        assert guarded(result) is None
+    # A result type nothing classified is refused, not read as no change; a bool among them.
+    for unknown in (True, False, "m", None):
+        with pytest.raises(TypeError, match="does not classify"):
+            mutation_changed(unknown)
+    with pytest.raises(TypeError, match="BACKLOG #5069"):
+        require_mutation_audit(None, "store.test")  # type: ignore[arg-type]
 
 
 def test_every_origin_is_classified() -> None:
@@ -403,54 +472,155 @@ def test_every_origin_is_classified() -> None:
     assert set(MessageOrigin) == OPERATOR_ORIGINS | not_operator
 
 
-#: Each backend's operator mutations, and the statement each must open with, exactly.
-_ENTRY_GUARDS = {
-    **{m: f"require_operator_audit(audit, 'store.{m}')" for m in sorted(FLOOR[Store])},
-    "enqueue_ingress": "audit = require_ingress_audit(audit, origin)",
+#: The alert mutations and the connection flag, which take one ``AuditAppend`` (vault BACKLOG
+#: #3217).
+_ALERT_MUTATIONS = (
+    "set_connection_flag",
+    "ack_alert_instance",
+    "resolve_alert_instance",
+    "suspend_alert_instance",
+    "resume_alert_instance",
+)
+
+
+@dataclass(frozen=True)
+class Guard:
+    """The statement a mutation must open with: ``target = func(...)``, its arguments bound to
+    ``func``'s own parameters and each compared as a syntax tree, so the spelling (positional or
+    keyword, quotes, a type annotation on the target) does not matter (BACKLOG #6589)."""
+
+    target: str
+    func: Callable[..., Any]
+    args: Mapping[str, str]
+
+
+#: Each backend's operator mutations, and the guard each must open with.
+_ENTRY_GUARDS: dict[str, Guard] = {
+    **{
+        m: Guard("audit", require_mutation_audit, {"audit": "audit", "mutation": f"'store.{m}'"})
+        for m in sorted(FLOOR[Store])
+    },
+    "enqueue_ingress": Guard(
+        "audit",
+        require_ingress_audit,
+        {"audit": "audit", "origin": "origin", "origin_actor": "origin_actor"},
+    ),
+    **{m: Guard("audit_row", if_applied, {"audit": "audit"}) for m in _ALERT_MUTATIONS},
 }
 
 
-def entry_problem(where: str, source: str, expected: str) -> str | None:
-    """Why the function in ``source`` does not open, after its docstring, with ``expected``."""
+def _same(node: ast.expr, expected: str) -> bool:
+    return ast.dump(node) == ast.dump(ast.parse(expected, mode="eval").body)
+
+
+def guard_problem(stmt: ast.stmt, guard: Guard) -> str | None:
+    """Why ``stmt`` is not ``guard``'s statement, or ``None`` when it is."""
+    shown = ast.unparse(stmt)
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target, value = stmt.targets[0], stmt.value
+    elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        target, value = stmt.target, stmt.value
+    else:
+        return f"starts with {shown!r}, not an assignment to {guard.target}"
+    if not (isinstance(target, ast.Name) and target.id == guard.target):
+        return f"starts with {shown!r}, which does not bind {guard.target}"
+    name = guard.func.__name__
+    if not (isinstance(value, ast.Call) and callee_name(value, bare_only=True) == name):
+        return f"starts with {shown!r}, not a call to {name}"
+    if any(isinstance(a, ast.Starred) for a in value.args) or any(
+        k.arg is None for k in value.keywords
+    ):
+        return f"starts with {shown!r}, whose arguments are unpacked"
+    try:
+        bound = inspect.signature(guard.func).bind(
+            *value.args, **{k.arg: k.value for k in value.keywords if k.arg is not None}
+        )
+    except TypeError as exc:
+        return f"starts with {shown!r}, which does not bind to {name}: {exc}"
+    given = bound.arguments
+    if set(given) != set(guard.args):
+        return f"starts with {shown!r}, passing {sorted(given)} not {sorted(guard.args)}"
+    wrong = [p for p, expected in guard.args.items() if not _same(given[p], expected)]
+    return f"starts with {shown!r}, with the wrong {wrong}" if wrong else None
+
+
+def entry_problem(where: str, source: str, guard: Guard) -> str | None:
+    """Why the function in ``source`` does not open, after its docstring, with ``guard``."""
     fn = ast.parse(textwrap.dedent(source)).body[0]
     assert isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef), where
     body = fn.body
     if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         body = body[1:]
-    first = ast.unparse(body[0])
-    return None if first == expected else f"{where} starts with {first!r}"
+    problem = guard_problem(body[0], guard)
+    return None if problem is None else f"{where} {problem}"
 
 
 @pytest.mark.parametrize("cls", (MessageStore, PostgresStore, SqlServerStore))
 def test_each_mutation_refuses_before_its_first_statement(cls: type[Any]) -> None:
-    """The runtime refusal comes BEFORE any write (BACKLOG #5069, #5071). The contract cannot tell
-    that from the ``operator_audits`` backstop, which raises inside the transaction and rolls the
-    write back with the same message. So this reads each method's syntax tree: its first statement
-    after the docstring must be the guard, exactly, ``enqueue_ingress``'s with its result kept."""
+    """The runtime refusal comes BEFORE any write (BACKLOG #5069, #5071, #6589). The contract cannot
+    tell that from the ``operator_audits`` backstop, which raises inside the transaction and rolls
+    the write back with the same message. So this reads each method's syntax tree: its first
+    statement after the docstring must be its guard, with the guard's result kept."""
     problems = [
         entry_problem(
             f"{cls.__name__}.{method}",
             inspect.getsource(inspect.unwrap(getattr(cls, method))),
-            expected,
+            guard,
         )
-        for method, expected in _ENTRY_GUARDS.items()
+        for method, guard in _ENTRY_GUARDS.items()
     ]
     assert [p for p in problems if p is not None] == []
 
 
 def test_control_a_missing_or_discarded_guard_fails_the_check() -> None:
-    """Control: the check refuses a mutation with no guard, an ingress guard whose result is
-    dropped, and one given the wrong origin, and accepts the real shape."""
-    ingress = _ENTRY_GUARDS["enqueue_ingress"]
-    shapes = {
-        "absent": "now = time.time()",
-        "dropped": "require_ingress_audit(audit, origin)",
-        "wrong origin": "audit = require_ingress_audit(audit, MessageOrigin.PARTNER)",
-        "real": ingress,
-    }
-    template = 'async def f(audit, origin):\n    """Doc."""\n    {}\n'
-    got = {
-        name: entry_problem(name, template.format(line), ingress) for name, line in shapes.items()
-    }
-    assert got["real"] is None
-    assert all(got[name] is not None for name in ("absent", "dropped", "wrong origin"))
+    """Control: the check refuses a mutation with no guard, a guard whose result is dropped, and
+    one given the wrong argument, and accepts the real shape however it is spelled."""
+    template = 'async def f(audit, origin, origin_actor):\n    """Doc."""\n    {}\n'
+
+    def got(lines: Mapping[str, str], guard: Guard) -> dict[str, str | None]:
+        return {n: entry_problem(n, template.format(line), guard) for n, line in lines.items()}
+
+    ingress = got(
+        {
+            "absent": "now = time.time()",
+            "dropped": "require_ingress_audit(audit, origin, origin_actor)",
+            "wrong origin": (
+                "audit = require_ingress_audit(audit, MessageOrigin.PARTNER, origin_actor)"
+            ),
+            "no actor": "audit = require_ingress_audit(audit, origin, None)",
+            "two arguments": "audit = require_ingress_audit(audit, origin)",
+            "elsewhere": "kept = require_ingress_audit(audit, origin, origin_actor)",
+            "real": "audit = require_ingress_audit(audit, origin, origin_actor)",
+            "keywords": (
+                "audit = require_ingress_audit(origin_actor=origin_actor, audit=audit,"
+                " origin=origin)"
+            ),
+            "annotated": "audit: Any = require_ingress_audit(audit, origin, origin_actor)",
+        },
+        _ENTRY_GUARDS["enqueue_ingress"],
+    )
+    assert {n for n, p in ingress.items() if p is None} == {"real", "keywords", "annotated"}
+    # The five mutations' guard: the pre-#5069 line, the wrapped audit computed then dropped, and
+    # another mutation's name, are refused; the keyword and double-quoted spellings are not.
+    mutation = got(
+        {
+            "unwrapped": "require_operator_audit(audit, 'store.replay')",
+            "dropped": "require_mutation_audit(audit, 'store.replay')",
+            "other name": "audit = require_mutation_audit(audit, 'store.reingress')",
+            "real": "audit = require_mutation_audit(audit, 'store.replay')",
+            "keyword": 'audit = require_mutation_audit(audit, mutation="store.replay")',
+        },
+        _ENTRY_GUARDS["replay"],
+    )
+    assert {n for n, p in mutation.items() if p is None} == {"real", "keyword"}
+    # The alert mutations' guard (BACKLOG #6589): the old shape, ``if_applied`` taken at the
+    # append, opens with something else; so does one that drops the result.
+    alert = got(
+        {
+            "at the append": "now = time.time() if now is None else now",
+            "dropped": "if_applied(audit)",
+            "real": "audit_row = if_applied(audit)",
+        },
+        _ENTRY_GUARDS["ack_alert_instance"],
+    )
+    assert {n for n, p in alert.items() if p is None} == {"real"}

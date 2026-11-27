@@ -370,6 +370,10 @@ SITES: dict[str, Site] = {
     "harness/drivers/remotefile.py::RemoteFileDriver._upload": Site(
         2, INTERNAL, "A uuid4 name under the remote directory the operator configured."
     ),
+    "harness/e2e_smoke.py::<module>": Site(3, INTERNAL, _REPO_LITERAL),
+    "harness/e2e_smoke.py::run": Site(
+        4, INTERNAL, "Fixed names in the temp directory the smoke made with mkdtemp."
+    ),
     "harness/fuzz/campaign.py::_Session._write": Site(
         1, INTERNAL, "A name built from the seed, iteration and transport kind, all generated."
     ),
@@ -566,7 +570,7 @@ SITES: dict[str, Site] = {
         1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
-        1,
+        3,
         GUARDED,
         _CODESET_NAME,
         "messagefoundry/config/codeset_edit.py::_validate_name",
@@ -724,6 +728,15 @@ SITES: dict[str, Site] = {
     "messagefoundry/log_spool.py::LogSpool.open": Site(
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
+    "messagefoundry/parsing/x12/_deps.py::_read_map_segment_ids": Site(
+        2,
+        INTERNAL,
+        "The fixed index name, and map names read from that index inside the installed pyx12 "
+        "package, each refused unless a bare file name; no interchange value reaches either.",
+    ),
+    "messagefoundry/parsing/x12/_deps.py::load_x12_map_segment_ids": Site(
+        1, INTERNAL, "The fixed name map under the installed pyx12 package."
+    ),
     "messagefoundry/parsing/xml/schema.py::_bundled_root": Site(
         1, INTERNAL, "A fixed name, schemas, beside the installed xmlschema package's own file."
     ),
@@ -832,14 +845,14 @@ SITES: dict[str, Site] = {
         "Archive member names joined only to compare against the paths the restore writes; the "
         "restore itself gates every name.",
     ),
-    "messagefoundry/pipeline/dr_backup.py::_refuse_existing_destination": Site(
-        1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
-    ),
     "messagefoundry/pipeline/dr_backup.py::_restore_blocking": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_store_names": Site(
+        1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
     ),
     "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(
         1,
@@ -955,8 +968,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/store/custody_host.py::_custody_paths": Site(
         2,
         OPERATOR,
-        "The two fixed custody file names under the directory MEFOR_SECRETS_DIRECTORY names, or "
-        "the operator's [store].path directory.",
+        "The two fixed custody file names under the directory MEFOR_CUSTODY_DIRECTORY or "
+        "MEFOR_SECRETS_DIRECTORY names, or the operator's [store].path directory.",
     ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
@@ -1055,18 +1068,18 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._poll_once": Site(
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._examine": Site(
         1,
         GUARDED,
         _LISTING,
         "messagefoundry/transports/remotefile.py::_is_contained_name",
         called=True,
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
     "messagefoundry/transports/remotefile.py::_FtpClient._list": Site(
         1,
@@ -1117,6 +1130,14 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
         1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."
     ),
+    "messagefoundry/uploads.py::UploadStore._sweep_orphans_sync": Site(
+        1,
+        REVIEWED,
+        "A sidecar name built from the stem of a listed `.blob` name that passed `_FILE_ID_RE`, "
+        "plus the fixed `.meta` suffix. The join is reached only when that sidecar name is not in "
+        "the listing, and the path is passed to the absence check `_sidecar_is_absent` and nowhere "
+        "else. The unlink acts on the listed entry.",
+    ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
     ),
@@ -1162,6 +1183,11 @@ IDE_SITES: dict[str, Site] = {
         " sweepStaleCaseDirs docblocks.",
         "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
+    "ide/src/configEditorModel.ts": Site(
+        4,
+        REVIEWED,
+        "The open document's path and the config-dir setting, resolved only to compare them.",
+    ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
@@ -1181,10 +1207,7 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/hl7schema.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/insertElement.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/liveDebug.ts": Site(
-        4,
-        OPERATOR,
-        "A sample the operator picked from a listing of the samples setting, and paths compared "
-        "for a breakpoint match.",
+        2, OPERATOR, "A sample the operator picked from a listing of the samples setting."
     ),
     "ide/src/newRoute.ts": Site(
         1,
@@ -1193,14 +1216,30 @@ IDE_SITES: dict[str, Site] = {
         "joined onto a config directory workspaceContainment.ts has held inside the workspace.",
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
+    "ide/src/pathFold.ts": Site(
+        1,
+        REVIEWED,
+        "nonAsciiCaseVariant joins the target's own root and its first segments, as the target spells "
+        "them, to name the folder at the workspace's depth, with no I/O. Its callers, "
+        "escapesUnderCaseVariant in workspaceContainment.ts and isWorkspaceFolder in "
+        "securityEditorModel.ts, only read that folder's real path, file id or lstat to compare it "
+        "with the workspace folder; nothing is opened, read, written, moved or deleted through it.",
+    ),
+    "ide/src/pathIdentity.ts": Site(
+        2,
+        OPERATOR,
+        "A file path resolved against a base folder, for an identity key to compare and for a "
+        "diagnostic's file.",
+    ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
-        5,
+        4,
         OPERATOR,
         "Every join runs only after securityConfigTarget has refused an untrusted workspace, so each "
-        "part is the workspace folder or its realpath, the messagefoundry.serviceConfig setting from "
-        "user settings or from a workspace the operator has trusted, or a component of the path "
-        "those two resolve to. Not guarded: the containment and link checks run on the joined path. "
+        "part is the workspace folder, the messagefoundry.serviceConfig setting from user settings "
+        "or from a workspace the operator has trusted, or a component of the path those two "
+        "resolve to, a user value spelled with a non-ASCII case variant of the folder included. "
+        "Not guarded: the containment and link checks run on the joined path. "
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
     "ide/src/sourceControl.ts": Site(
@@ -1238,16 +1277,20 @@ IDE_SITES: dict[str, Site] = {
         "with the fixed name `program.py` inside it. The fifth only names that folder below the "
         "storage root for a log line and opens nothing (BACKLOG #5409).",
     ),
-    "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
-        8,
+        11,
         GUARDED,
         "The containment checks themselves. resolveInsideWorkspace refuses a setting whose spelling, "
         "and then whose real path, relative to the workspace climbs out or is absolute. "
         "containedPathSetting resolves a workspace value only to compare its spelling with the "
         "folder, and drops it when it is outside. committedRelativePath resolves a value only to "
-        "return it relative to the folder, and refuses one outside it by spelling. None opens a file.",
-        "ide/src/workspaceContainment.ts::path.relative(root, target)",
+        "return it relative to the folder, and refuses one outside it by spelling. "
+        "escapesUnderCaseVariant resolves a value spelled outside only by a non-ASCII case, reads "
+        "real paths and file ids to compare the folder it names with the workspace, and joins the "
+        "rest of the value onto the workspace only to run escapesByLink on it again, which ends in "
+        "resolveInsideWorkspace's real-path check. realpathOfNearestExisting appends missing "
+        "components to an existing ancestor's real path. None opens a file.",
+        "ide/src/workspaceContainment.ts::return isWithin(root, target) ? logical : undefined",
     ),
 }
 
@@ -1256,7 +1299,7 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        44,
+        45,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID under the Windows temp folder, under "
         "paths the operator passes or the script derives (repo root, install "
@@ -1264,7 +1307,8 @@ SCRIPT_SITES: dict[str, Site] = {
         "wheel's folder, "
         "the base interpreter's folder and the one above it, "
         "project root, data directory and the folder above it, ProgramData, NSSM directory, temp), "
-        "the data directory's own leaf name with -secrets after it, the leaf name of the engine wheel "
+        "the data directory's own leaf name with -secrets or -custody after it, the leaf name of "
+        "the engine wheel "
         "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
         "named after the service's own images, and the fixed Parameters key under each key the "
         "registry lists below Services.",
@@ -1280,10 +1324,11 @@ SCRIPT_SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the install directory."
     ),
     "scripts/service/uninstall-service.ps1": Site(
-        7,
+        8,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID, under the Windows temp folder or a "
-        "parent the tests pass, and registry keys named after the service's images.",
+        "parent the tests pass, registry keys named after the service's images, and the two "
+        "fixed custody file names under the custody directory the registration names.",
     ),
 }
 

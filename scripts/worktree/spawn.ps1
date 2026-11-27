@@ -39,9 +39,14 @@ if ($Ide) { $newArgs.Ide = $true }
 if ($NoInstall) { $newArgs.NoInstall = $true }
 & (Join-Path $PSScriptRoot 'new.ps1') @newArgs
 
-# Recompute the worktree path the same way new.ps1 does (<repo-parent>\<repo-name>-<Name>).
+# Recompute the worktree path the same way new.ps1 does: <main-parent>\<main-leaf>-<Name>, anchored on
+# the MAIN worktree whichever copy runs (BACKLOG #1894). new.ps1 threw if it could not read it.
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$WorktreePath = Join-Path (Split-Path $RepoRoot -Parent) ((Split-Path $RepoRoot -Leaf) + "-$Name")
+$mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
+    Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
+if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }
+$MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length)).TrimEnd('\', '/')
+$WorktreePath = Join-Path (Split-Path $MainRoot -Parent) ((Split-Path $MainRoot -Leaf) + "-$Name")
 
 if (Get-Command code -ErrorAction SilentlyContinue) {
     Write-Host ""

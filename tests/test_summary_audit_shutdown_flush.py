@@ -112,9 +112,9 @@ async def test_a_flush_failure_does_not_abort_the_teardown(
             engine = app.state.engine
             real_stop.append(engine.stop)
 
-            async def _spy_stop() -> None:
+            async def _spy_stop(**kwargs: Any) -> None:
                 stopped.append(True)
-                await real_stop[0]()
+                await real_stop[0](**kwargs)
 
             monkeypatch.setattr(engine, "stop", _spy_stop, raising=True)
             monkeypatch.setattr(app.state.summary_auditor, "flush", _boom, raising=True)

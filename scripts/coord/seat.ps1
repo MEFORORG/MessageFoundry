@@ -58,8 +58,12 @@
        new name.
 
     2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
-       seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
-       its own hazard; leaving no trace is worse than either. A -Record hook input refused under
+       seats/.writer-errors.txt, and the hook paths (-Record, -Prompt) still exit 0. Exiting
+       non-zero from a Stop hook is its own hazard; leaving no trace is worse than either. The CLI
+       verbs (-Declare, -Close, -BumpEpoch, -ClearHandoff) exit non-zero when the worktree or the
+       shared root does not resolve and when an error reaches the main catch, because a caller
+       waits on each (BACKLOG #7593). A failure caught and recorded part-way through a write, such
+       as an unresolved handoff pointer, still lets the verb finish and exit 0. A -Record hook input refused under
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
        stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
        in, where that checkout and its registry resolve, at most one line per session key and host
@@ -165,6 +169,16 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true' -and $PSCmdlet.ParameterSetName -notin 'R
     exit 3
 }
 
+# The pool epoch marks a CLAUDE account switch. docs/CODEX.md: "Do not use Claude's account-switch or
+# pool-epoch commands for a Codex account." bridge.py refuses the literal argument; this also
+# refuses any other spelling that reaches seat.ps1 under the bridge (BACKLOG #7594). It keys on
+# KORUS_AGENT, which the bridge sets only for its child processes (docs/CODEX.md), so a run from a
+# Codex shell outside the bridge is not recognized here. Nothing is read or written.
+if ($env:KORUS_AGENT -eq 'codex' -and $BumpEpoch) {
+    [Console]::Error.WriteLine('seat.ps1 -BumpEpoch: REFUSED for a Codex session (KORUS_AGENT=codex). The pool epoch marks a Claude account switch; docs/CODEX.md says not to use it for a Codex account. Nothing was read or written.')
+    exit 1
+}
+
 $SCHEMA = 1
 $WRITER = 'seat.ps1/1.0.0'
 
@@ -181,13 +195,17 @@ $script:SharedRoot = $null
 
 function Write-WriterError {
     param([string]$Stage, [string]$Message)
-    # Best-effort by construction: if we cannot even record the failure we must still exit 0, or a
-    # broken writer takes the seat's Stop hook down with it.
+    # Best-effort by construction: if we cannot even record the failure a hook path must still exit
+    # 0, or a broken writer takes the seat's Stop hook down with it.
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
-        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
-        Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
+        # Get-CoordHost, the name every shared record carries, not the inherited $env:COMPUTERNAME;
+        # -LiteralPath, so a '[' in a shared-root path is not read as a wildcard (BACKLOG #7593).
+        # MachineName can throw (mail-claim.ps1 says so); the line must still be written then.
+        $hostName = try { Get-CoordHost } catch { $env:COMPUTERNAME }
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $hostName, $Stage, ($Message -replace '\s+', ' ')
+        Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
 
@@ -489,19 +507,108 @@ function Get-ConfigRootLabel {
 }
 
 function Get-PoolEpoch {
-    param([string]$SeatsDir)
+    # An absent file is epoch 1. A file that is present but unreadable or not an integer is ALSO 1
+    # here, because the record paths stamp poolEpoch on every write, -Record included, and rule 2
+    # forbids a hook path dying over it. -Strict is for -BumpEpoch, which must throw instead: a bump
+    # from a silent 1 would write 2 over an epoch that may be far higher, and every record after it
+    # would read as written before a switch it followed (BACKLOG #7594).
+    param([string]$SeatsDir, [switch]$Strict)
     $f = Join-Path $SeatsDir '.pool-epoch'
-    if (-not (Test-Path -LiteralPath $f)) { return 1 }
+    # Test-Path answers false on an I/O or permission error too, so -Strict decides absence only from
+    # the read's own FileNotFoundException.
+    if (-not $Strict -and -not (Test-Path -LiteralPath $f)) { return 1 }
+    $why = 'it holds no whole number; write the correct epoch into it by hand'
     try {
-        $v = (Read-CoordText $f).Trim()
+        # The expansion, not a [string] cast: an empty file emits nothing, and the cast keeps that null.
+        $v = "$(Read-CoordText $f)".Trim()
         if ($v -match '\A[0-9]+\z') { return [int]$v }
-    } catch { }
+    } catch {
+        if ((Get-CoordInnerException $_.Exception) -is [System.IO.FileNotFoundException]) { return 1 }
+        $why = $_.Exception.Message
+    }
+    if ($Strict) { throw "the pool epoch file $f could not be read, so it was not bumped: $why" }
     return 1
+}
+
+function Invoke-PoolEpochBump {
+    # One read-modify-write under a mutex, replaced atomically. Without the mutex two bumps that read
+    # the same N both write N+1 and one switch is lost (BACKLOG #7594). The mutex is a file created
+    # exclusively BESIDE .pool-epoch, on the shared root, so it serializes bumps from either PC;
+    # lock.ps1's Enter-CoordLock anchors to this checkout's own git dir and would not. Like that one,
+    # it retries a taken name and never steals: on timeout it names the lock and its holder line.
+    # Access denied (a name still pending deletion, or a real denial) fails at once, loudly.
+    param([string]$SeatsDir, [int]$TimeoutSeconds = 10)
+    $f = Join-Path $SeatsDir '.pool-epoch'
+    $lock = "$f.lock"
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open($lock, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            break
+        } catch [System.IO.IOException] {
+            # Only a name that is taken is contention (lock.ps1's rule): a full disk or a bad path
+            # fails at once rather than being reported, after the wait, as a wedged holder.
+            $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
+            if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
+            if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+                $held = '(unreadable)'
+                try { $held = "$(Read-CoordText $lock)".Trim() } catch { }
+                throw "timed out after ${TimeoutSeconds}s waiting for $lock (held by: $held), so the pool epoch was not bumped. Not stealing it; if that bump is not running, delete it by hand."
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $tmp = $null
+    try {
+        $who = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID host=$([Environment]::MachineName) at=$([DateTime]::UtcNow.ToString('o'))")
+        $fs.Write($who, 0, $who.Length)
+        $fs.Dispose()
+        $next = (Get-PoolEpoch -SeatsDir $SeatsDir -Strict) + 1
+        $tmp = Join-Path $SeatsDir ('.pool-epoch.' + [guid]::NewGuid().ToString('n') + '.tmp')
+        Set-Content -LiteralPath $tmp -Value ([string]$next) -Encoding utf8 -EA Stop
+        Move-CoordFileReplace -Source $tmp -Destination $f -ReplaceReadOnly
+        $tmp = $null
+        return $next
+    } finally {
+        try { $fs.Dispose() } catch { }
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue }
+        try { Remove-Item -LiteralPath $lock -Force -EA Stop }
+        catch { [System.Console]::Error.WriteLine("seat.ps1 -BumpEpoch: WARNING: could not remove the mutex $lock, so every later bump will wait on it and time out. Delete it by hand: $($_.Exception.Message)") }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
 # Git-derived facts. Every one is a fact with a time, never a verdict.
 # ---------------------------------------------------------------------------------------------
+
+function Read-GitStatusZ {
+    # `git status --porcelain -z`, verbatim, or $null when git failed. NEVER throws, like Invoke-Git.
+    # A Process rather than `& git` because -z paths are raw UTF-8, and `&` would decode them with
+    # the console's code page and record a non-ASCII name as mojibake.
+    param([string]$Dir)
+    $proc = $null
+    try {
+        # Resolved through PATH first: a bare 'git' here would let CreateProcess search the current
+        # directory, so a git.exe in the worktree being recorded could run.
+        $gitExe = (Get-Command git -CommandType Application -EA Stop | Select-Object -First 1).Source
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($gitExe)
+        # --no-optional-locks: this runs on every Stop, beside a seat that may be committing here.
+        foreach ($a in @('-C', $Dir, '--no-optional-locks', 'status', '--porcelain', '-z')) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Drained asynchronously so a full stderr pipe cannot deadlock the stdout read.
+        $proc.BeginErrorReadLine()
+        $out = $proc.StandardOutput.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { return $null }
+        return $out
+    } catch { return $null }
+    finally { if ($proc) { $proc.Dispose() } }
+}
 
 function Get-GitFacts {
     param([string]$Wt)
@@ -544,11 +651,26 @@ function Get-GitFacts {
     # than reporting the gap.
     $trackedPaths = @()
     $untrackedPaths = @()
-    $st = Invoke-Git -Dir $Wt -GitArgs @('status', '--porcelain')
+    #
+    # NOT THROUGH Invoke-Git, whose Trim would eat the leading space of a first ` M` entry and shift
+    # the column-3 slice one character into the path (BACKLOG #5874). -z also gives each path
+    # unquoted, so a space or a non-ASCII letter is recorded as the file's real name.
+    $st = Read-GitStatusZ -Dir $Wt
+    # $null is a failed read and '' is a clean tree. The record keeps them apart, with null counts
+    # and statusKnown false (BACKLOG #5875). fleet.ps1's briefing does not read that field yet.
+    $statusKnown = $null -ne $st
     if ($st) {
-        foreach ($line in ($st -split "`n" | Where-Object { $_ })) {
-            $p = $line.Substring(3)
-            if ($line.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
+        $entries = $st.Split([char]0)
+        for ($i = 0; $i -lt $entries.Count; $i++) {
+            $entry = $entries[$i]
+            if ($entry.Length -lt 4) { continue }
+            # -z stops git escaping control characters, and these names are printed into a
+            # successor's briefing, so a newline in one must not become a line of its own.
+            $p = $entry.Substring(3) -replace '\p{Cc}', '?'
+            if ($entry.StartsWith('??')) { $untrackedPaths += $p } else { $trackedPaths += $p }
+            # A rename or copy is `XY new`, then its source as a token of its own. One change, so
+            # one path: the new name, which is where the content now is.
+            if ($entry.Substring(0, 2) -cmatch '[RC]') { $i++ }
         }
     }
 
@@ -569,16 +691,18 @@ function Get-GitFacts {
         touched   = $touched
         unpushed  = $unpushed
         dirty     = [ordered]@{
-            count          = $dirtyPaths.Count
+            statusKnown    = $statusKnown
+            count          = if ($statusKnown) { $dirtyPaths.Count } else { $null }
+            # Still arrays when the read failed: fleet.ps1 iterates `untracked`.
             paths          = @($dirtyPaths | Select-Object -First 200)
-            trackedCount   = $trackedPaths.Count
-            untrackedCount = $untrackedPaths.Count
+            trackedCount   = if ($statusKnown) { $trackedPaths.Count } else { $null }
+            untrackedCount = if ($statusKnown) { $untrackedPaths.Count } else { $null }
             # Named, not counted: a replacement seat has to copy these by hand.
             untracked      = @($untrackedPaths | Select-Object -First 200)
         }
         stashSha  = $stash
         # What the stash actually covers, so the reader never over-promises recovery.
-        stashCovers = if ($stash) { 'tracked-only' } elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' } else { 'nothing-clean' }
+        stashCovers = if (-not $statusKnown) { 'unknown' } elseif ($stash) { 'tracked-only' } elseif ($untrackedPaths.Count -gt 0) { 'nothing-untracked-only' } else { 'nothing-clean' }
     }
 }
 
@@ -591,78 +715,126 @@ function Get-GitFacts {
 # So every claim and allocation carries an ATTRIBUTION rather than being silently included or
 # silently dropped. Dropping would be worse: an inherited allocation still sits in this worktree and
 # a human may still need to deal with it. The reader renders the two groups separately.
+#
+# STAMPS STAY TYPED UNTIL THEY ARE COMPARED (BACKLOG #5875). ConvertFrom-Json turns an ISO stamp into
+# a [datetime] whose Kind holds the zone, and a [string] cast then drops it: a UTC wall clock came
+# back as local time, hours off. -DateKind String would avoid that but needs pwsh 7.5, and on an
+# older one the readers' `catch { continue }` would silently drop every record, so this reads the
+# Kind instead, which works on any version.
+function ConvertTo-StampInstant {
+    # The instant a stamp names, or $null when it names none. A stamp with no zone is $null rather
+    # than assumed local, because the shared root is read from PCs in different zones.
+    param($Value)
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return $null }
+        return [DateTimeOffset]::new($Value.ToUniversalTime())
+    }
+    $text = [string]$Value
+    # Anchored to a time, or the year of a date like 11-22-2026 would read as a -20:26 offset.
+    if ($text -notmatch 'T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})\s*\z') { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($text, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        return $parsed
+    }
+    return $null
+}
+
 function Get-Attribution {
-    param([string]$At, [string]$EpisodeStart)
-    if (-not $At -or -not $EpisodeStart) { return 'unknown' }
-    try {
-        if ([DateTimeOffset]::Parse($At).ToUniversalTime() -ge [DateTimeOffset]::Parse($EpisodeStart).ToUniversalTime()) {
-            return 'this-episode'
-        }
-        return 'worktree-inherited'
-    } catch { return 'unknown' }
+    # Deliberately untyped: a [string] parameter would coerce a [datetime] before this body runs.
+    param($At, $EpisodeStart)
+    $atInstant = ConvertTo-StampInstant $At
+    $startInstant = ConvertTo-StampInstant $EpisodeStart
+    if ($null -eq $atInstant -or $null -eq $startInstant) { return 'unknown' }
+    if ($atInstant -ge $startInstant) { return 'this-episode' }
+    return 'worktree-inherited'
+}
+
+function Read-RegistryEntry {
+    # A claim or allocation file's JSON object, or $null for anything else. One bad file must cost
+    # only its own entry: under StrictMode, reading a member of an empty, null, array or scalar
+    # document throws, and outside a per-file try that lost the whole seat record (BACKLOG #5875).
+    # -NoEnumerate keeps a one-element array from passing as the object inside it.
+    param([string]$Path)
+    try { $j = Read-CoordText $Path | ConvertFrom-Json -NoEnumerate -EA Stop } catch { return $null }
+    if ($j -is [System.Management.Automation.PSCustomObject]) { return $j }
+    return $null
+}
+
+function Select-EntryValue {
+    # The first named field holding a non-null value. Indexing Properties, unlike projecting .Name,
+    # stays safe on an object with no members.
+    param($Entry, [string[]]$Names)
+    foreach ($n in $Names) {
+        $p = $Entry.PSObject.Properties[$n]
+        if ($null -ne $p -and $null -ne $p.Value) { return $p.Value }
+    }
+    return $null
+}
+
+function Select-EntryStamp {
+    # The first named field holding a stamp that names an instant. With none, the first non-null
+    # value, so the record still shows what the file said and attribution reads it as unknown.
+    param($Entry, [string[]]$Names)
+    foreach ($n in $Names) {
+        $v = Select-EntryValue $Entry @($n)
+        if ($null -ne (ConvertTo-StampInstant $v)) { return $v }
+    }
+    return Select-EntryValue $Entry $Names
 }
 
 function Get-ClaimsFor {
-    param([string]$Dir, [string]$Wt, [string]$EpisodeStart)
+    param([string]$Dir, [string]$Wt, $EpisodeStart)
     # Claims are claim.ps1's to write. This reads them and attributes by holder worktree only.
     $out = @()
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $out }
     $dir = $Dir
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue)) {
-        try {
-            $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
-        } catch { continue }
-        $holder = $null
-        foreach ($n in @('worktree', 'holderWorktree', 'cwd')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $holder = [string]$j.$n; break }
-        }
+        $j = Read-RegistryEntry $f.FullName
+        if ($null -eq $j) { continue }
+        $holder = [string](Select-EntryValue $j @('worktree', 'holderWorktree', 'cwd'))
         if (-not $holder) { continue }
         # A claim taken on another machine names a path on THAT machine's disk. The same path string
         # here is a different tree, so the claim is not this one's (docs/COORD-SHARED-ROOT.md).
         if (-not (Test-CoordRecordIsHere $j)) { continue }
         $hnorm = $holder.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
         if ($hnorm -ne $norm) { continue }
-        $at = $null
-        foreach ($n in @('claimedAt', 'at', 'created')) {
-            if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
-        }
+        # `claimed` is the field claim.ps1 writes; the others are older or foreign shapes.
+        $claimFields = @('claimed', 'claimedAt', 'at', 'created')
         $out += [ordered]@{
             key         = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-            claimedAt   = $at
-            attribution = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
+            claimedAt   = (Select-EntryStamp $j $claimFields)
+            # `claimed` never moves when a later session re-takes the claim; `refreshed` does, and
+            # a claim this episode re-asserted is this episode's.
+            attribution = (Get-Attribution -At (Select-EntryStamp $j (@('refreshed') + $claimFields)) -EpisodeStart $EpisodeStart)
         }
     }
     return $out
 }
 
 function Get-AllocationsFor {
-    param([string]$Dir, [string]$Wt, [string]$EpisodeStart)
+    param([string]$Dir, [string]$Wt, $EpisodeStart)
     $out = @()
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $out }
     $dir = $Dir
     $norm = $Wt.TrimEnd('\', '/').ToLowerInvariant() -replace '/', '\'
     foreach ($kindDir in @(Get-ChildItem -LiteralPath $dir -Directory -EA SilentlyContinue)) {
         foreach ($f in @(Get-ChildItem -LiteralPath $kindDir.FullName -Filter *.json -EA SilentlyContinue)) {
-            try { $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { continue }
-            $aw = $null
-            foreach ($n in @('worktree', 'allocWorktree', 'cwd')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $aw = [string]$j.$n; break }
-            }
+            $j = Read-RegistryEntry $f.FullName
+            if ($null -eq $j) { continue }
+            $aw = [string](Select-EntryValue $j @('worktree', 'allocWorktree', 'cwd'))
             if (-not $aw) { continue }
             # Same reason as Get-ClaimsFor: another machine's allocation at this path is not this tree's.
             if (-not (Test-CoordRecordIsHere $j)) { continue }
             if ((($aw.TrimEnd('\', '/').ToLowerInvariant()) -replace '/', '\') -ne $norm) { continue }
-            $at = $null
-            foreach ($n in @('claimed', 'allocatedAt', 'at')) {
-                if ($j.PSObject.Properties.Name -contains $n) { $at = [string]$j.$n; break }
-            }
+            $at = Select-EntryStamp $j @('claimed', 'allocatedAt', 'at')
+            $branchValue = Select-EntryValue $j @('branch')
             $out += [ordered]@{
                 kind          = $kindDir.Name
                 number        = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
                 allocWorktree = $aw
                 allocatedAt   = $at
-                allocBranch   = if ($j.PSObject.Properties.Name -contains 'branch') { [string]$j.branch } else { $null }
+                allocBranch   = if ($null -ne $branchValue) { [string]$branchValue } else { $null }
                 attribution   = (Get-Attribution -At $at -EpisodeStart $EpisodeStart)
             }
         }
@@ -1020,7 +1192,7 @@ function Invoke-SeatWorktreeLock {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Main. Everything is wrapped: rule 2 says this exits 0 whatever happens.
+# Main. Everything is wrapped: rule 2 says a hook path exits 0 whatever happens.
 # ---------------------------------------------------------------------------------------------
 
 $exit = 0
@@ -1086,10 +1258,11 @@ try {
 
     if (-not $wt) {
         # Rule 1: no worktree, no key, NO WRITE. There is nowhere legitimate to record this, so it
-        # goes to stderr and the script still exits 0.
+        # goes to stderr, and a hook path still exits 0.
         Write-Error "seat.ps1: could not resolve a rooted existing worktree; nothing written." -EA Continue
-        # -ClearHandoff is a CLI act, not a hook, so its caller is told it did nothing.
-        exit ([int][bool]$ClearHandoff)
+        # Every CLI verb (-Declare, -Close, -BumpEpoch, -ClearHandoff) is a writer its caller waits
+        # on, so it is told it did nothing (BACKLOG #7593). Only the hook paths exit 0.
+        exit ([int]($PSCmdlet.ParameterSetName -notin 'Record', 'Prompt'))
     }
 
     # ONE git call and ONE probe of the shared root. seats/, claims/, alloc/ and handoffs/ all sit on
@@ -1124,20 +1297,27 @@ try {
     }
     if ($hookFault) { Write-WriterError -Stage 'hook-input' -Message $hookFault }
 
-    $boxKey = ConvertTo-BoxKey -Path $wt
+    # The mail keyer's own step (BACKLOG #7581); a toplevel comes back unchanged.
+    $boxPath = Resolve-BoxPath -Path $wt
+    $boxKey = ConvertTo-BoxKey -Path $boxPath
 
     # Rule 3. BEFORE any early return, so a no-op invocation still proves the writer ran.
     try {
         $aliveDir = Join-Path $script:SeatsDir '.writer-alive'
         if (-not (Test-Path -LiteralPath $aliveDir)) { New-Item -ItemType Directory -Path $aliveDir -Force | Out-Null }
-        Set-Content -LiteralPath (Join-Path $aliveDir "$boxKey.txt") `
-            -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+        # Temp then rename (BACKLOG #7594): Set-Content in place truncates first, so a reader could
+        # find the heartbeat empty. A failure is still only recorded, never fatal (rule 2).
+        $alive = Join-Path $aliveDir "$boxKey.txt"
+        $aliveTmp = Join-Path $aliveDir (".$boxKey.txt." + [guid]::NewGuid().ToString('n') + '.tmp')
+        try {
+            Set-Content -LiteralPath $aliveTmp -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+            Move-CoordFileReplace -Source $aliveTmp -Destination $alive -ReplaceReadOnly
+        } catch { Remove-Item -LiteralPath $aliveTmp -Force -EA SilentlyContinue; throw }
     } catch { Write-WriterError -Stage 'writer-alive' -Message $_.Exception.Message }
 
     if ($BumpEpoch) {
-        $f = Join-Path $script:SeatsDir '.pool-epoch'
-        $next = (Get-PoolEpoch -SeatsDir $script:SeatsDir) + 1
-        Set-Content -LiteralPath $f -Value ([string]$next) -Encoding utf8
+        # A throw here reaches the catch below, which exits non-zero for this CLI verb.
+        $next = Invoke-PoolEpochBump -SeatsDir $script:SeatsDir
         Write-Host "pool epoch is now $next"
         exit 0
     }
@@ -1170,7 +1350,7 @@ try {
     # the new key. A legacy record from another host shares this path but is that PC's seat, so it is
     # never adopted.
     $prior = $null
-    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $wt)) ("$($sk.Key).json")
+    $legacyPath = Join-Path (Join-Path $script:SeatsDir (ConvertTo-LegacyBoxKey -Path $boxPath)) ("$($sk.Key).json")
     $priors = @()
     foreach ($p in @($recPath, $legacyPath)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }
@@ -1198,12 +1378,29 @@ try {
         return $Default
     }
 
-    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    # Invariant: this becomes the episode start, and a culture's own calendar would write another
+    # year here (th-TH writes 2569 for 2026), which every later comparison would then believe.
+    $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
     $g = Get-GitFacts -Wt $wt
     $cr = Get-ConfigRootLabel
 
     $lifecycle = Prior 'lifecycle' 'open'
     $lifecycleAt = Prior 'lifecycleAt' $now
+    # Its own field because -Close moves lifecycleAt: measured against that stamp, a handback would
+    # call every claim of the closing episode inherited, which is the case attribution exists for.
+    #
+    # Three cases do not simply carry it (BACKLOG #5875):
+    # - An ended `nosid` record is shared by whoever writes next, and no id tells them apart, so its
+    #   close is the boundary. The cost: a closer's own later nosid pass reads its claims as inherited.
+    # - An ended record with no start (an older writer drops the field) has only a close stamp, which
+    #   is not when the episode began, so the start is null and attribution says unknown.
+    # - An open record with no start still holds its first stamp in lifecycleAt.
+    $priorEnded = $lifecycle -in 'closed', 'handed'
+    $priorStart = Prior 'episodeStart' $null
+    $episodeStart = if ($priorEnded -and $sk.Key -eq 'nosid') { $lifecycleAt }
+                    elseif ($null -ne $priorStart) { $priorStart }
+                    elseif ($priorEnded) { $null }
+                    else { $lifecycleAt }
     if ($Close) {
         $lifecycle = if ($Handback) { 'handed' } else { 'closed' }
         $lifecycleAt = $now
@@ -1261,11 +1458,20 @@ try {
 
     # Resolved ONCE, before the record is built, so the record and the warning cannot disagree.
     # Whichever label this invocation is actually about: a declaration wins, a derived label fills a
-    # vacuum, and on a plain -Record pass there is no new label and the verdict is 'none'.
+    # vacuum, and on a plain -Record pass there is no new label, so the prior verdict is carried
+    # (BACKLOG #5876). `seat` itself is carried on that same condition, so the two stay paired.
+    #
+    # CARRIED, NOT RE-RESOLVED, because the resolver's objection would print on every hook pass. The
+    # cost: a carried verdict is the roster's answer WHEN THE LABEL WAS RESOLVED, and it goes stale
+    # if the roster changes afterwards, until a declaration next names a seat with -Seat.
     $labelUnderTest = if ($Declare -and $Seat) { $Seat }
                       elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
                       else { $null }
     $seatRoster = Resolve-SeatAgainstRoster -Label $labelUnderTest
+    if (-not $labelUnderTest) {
+        $seatRoster.Canonical = Prior 'seatCanonical' $seatRoster.Canonical
+        $seatRoster.Verdict = Prior 'seatRosterVerdict' $seatRoster.Verdict
+    }
 
     # Capped by the COLLAPSED length (BACKLOG #5764): the raw length overran a collapsed string.
     $collapsedNotes = if ($Notes) { $Notes -replace '\s+', ' ' } else { '' }
@@ -1282,6 +1488,7 @@ try {
         writes           = [int](Prior 'writes' 0) + 1
         lifecycle        = $lifecycle
         lifecycleAt      = $lifecycleAt
+        episodeStart     = $episodeStart
         boxKey           = $boxKey
         # The machine that wrote this record. Every liveness reader checks it before probing a path
         # on its own disk; see Test-CoordRecordIsHere and docs/COORD-SHARED-ROOT.md.
@@ -1297,18 +1504,16 @@ try {
         configRootLabel  = $cr.Label
         configRootSource = $cr.Source
         poolEpoch        = Get-PoolEpoch -SeatsDir $script:SeatsDir
-        # The roster's verdict on whatever label this invocation recorded. ADDITIVE: `seat` below
-        # still carries the verbatim label, because every existing reader keys on it.
+        # The roster's verdict on the label in `seat`, as of when that label was resolved. ADDITIVE:
+        # `seat` below still carries the verbatim label, because every existing reader keys on it.
         seatCanonical     = $seatRoster.Canonical
         seatRosterVerdict = $seatRoster.Verdict
         # A DERIVED label never overwrites a DECLARED one, and never claims to be one. The order
         # here is the whole rule: declared wins, derived fills only a vacuum, prior survives both.
-        seat             = if ($Declare -and $Seat) { $Seat }
-                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { $DerivedSeat }
-                           else { Prior 'seat' $null }
-        seatSource       = if ($Declare -and $Seat) { 'declared' }
-                           elseif ($Prompt -and $DerivedSeat -and -not (Prior 'seat' $null)) { 'derived:caller' }
-                           else { Prior 'seatSource' $null }
+        seat             = if ($labelUnderTest) { $labelUnderTest } else { Prior 'seat' $null }
+        seatSource       = if (-not $labelUnderTest) { Prior 'seatSource' $null }
+                           elseif ($Declare -and $Seat) { 'declared' }
+                           else { 'derived:caller' }
         # Only a declaration is dated as one. A derived seat leaves this null on purpose, so
         # "somebody said what this seat is for" stays answerable from the record alone.
         declaredAt       = if ($Declare -and $Seat) { $now } else { Prior 'declaredAt' $null }
@@ -1329,8 +1534,8 @@ try {
         dirty            = $g.dirty
         stashSha         = $g.stashSha
         stashCovers      = $g.stashCovers
-        claims           = @(Get-ClaimsFor -Dir (Join-Path $script:SharedRoot 'claims') -Wt $wt -EpisodeStart $lifecycleAt)
-        allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $lifecycleAt)
+        claims           = @(Get-ClaimsFor -Dir (Join-Path $script:SharedRoot 'claims') -Wt $wt -EpisodeStart $episodeStart)
+        allocations      = @(Get-AllocationsFor -Dir (Join-Path $script:SharedRoot 'alloc') -Wt $wt -EpisodeStart $episodeStart)
         handoff          = $handoffObj
         predecessor      = $pred
         notes            = if ($Declare -and $Notes) { $collapsedNotes } else { Prior 'notes' '' }
@@ -1370,8 +1575,9 @@ try {
     # gets a loud stderr notice below; leaving a marker the card hook will refuse would move that
     # failure to the next session start and make it quiet again.
     #
-    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*` with one negation, for
-    # `settings.json`. Verified with `git check-ignore -v`. Do not add a second negation.
+    # THE MARKER CANNOT RIDE INTO A COMMIT: `.gitignore` carries `/.claude/*`, and its negations
+    # re-include `settings.json` and `skills/e2e-smoke/SKILL.md` alone. Verified with
+    # `git check-ignore -v`. Do not add a negation that reaches the marker.
     if ($Declare -and $Seat -and $seatRoster.Canonical) {
         try {
             $markerPath = Join-Path $wt '.claude/seat.local.txt'
@@ -1420,8 +1626,9 @@ try {
 } catch {
     Write-WriterError -Stage 'main' -Message $_.Exception.Message
     Write-Error "seat.ps1: $($_.Exception.Message)" -EA Continue
-    # Rule 2 protects the HOOK paths. -ClearHandoff is a CLI act whose caller must hear a failure.
-    $exit = [int][bool]$ClearHandoff
+    # Rule 2 protects the HOOK paths, -Record and -Prompt. Every CLI verb is an act whose caller must
+    # hear a failure (BACKLOG #7593).
+    $exit = [int]($PSCmdlet.ParameterSetName -notin 'Record', 'Prompt')
 }
 
 exit $exit

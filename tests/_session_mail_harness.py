@@ -149,7 +149,7 @@ foreach ($s in $specs) {
             id         = if ($null -ne $s.jsonId) { [string]$s.jsonId } else { $stem }
             kind       = if ($s.kind) { [string]$s.kind } else { 'note' }
             createdUtc = $now.ToString('o')
-            expiresUtc = if ($s.expiresUtc) { [string]$s.expiresUtc } else { $now.AddMinutes(720).ToString('o') }
+            expiresUtc = if ($s.expiresUtc -is [datetime]) { $s.expiresUtc.ToString('o') } elseif ($s.expiresUtc) { [string]$s.expiresUtc } else { $now.AddMinutes(720).ToString('o') }
             from       = [ordered]@{
                 sessionId = '00000000-0000-0000-0000-000000000000'
                 cwd       = if ($null -ne $s.fromCwd) { [string]$s.fromCwd } else { 'D:\t\peer-wt' }
@@ -211,6 +211,22 @@ def seed(repo: Path, tmp_path: Path, specs: list[dict[str, Any]]) -> dict[str, A
     return dict(json.loads(proc.stdout))
 
 
+def assert_drain_stderr(
+    proc: subprocess.CompletedProcess[str], expected: str | None = None
+) -> None:
+    """Stderr is empty, or is exactly one line holding ``expected`` with nothing on stdout.
+
+    One line, so a PowerShell error printed beside the notice still fails. Empty stdout, because
+    stderr is only expected where stdout would re-wake a stopping session.
+    """
+    if expected is None:
+        assert not proc.stderr.strip(), f"drain wrote to stderr: {proc.stderr}"
+        return
+    lines = proc.stderr.strip().splitlines()
+    assert len(lines) == 1 and expected in lines[0], f"drain stderr: {proc.stderr!r}"
+    assert not proc.stdout.strip(), f"drain wrote to stdout beside its notice: {proc.stdout}"
+
+
 def run_drain(
     repo: Path,
     *,
@@ -218,8 +234,12 @@ def run_drain(
     session_id: str | None = SELF_ID,
     cwd: Path | None = None,
     script: Path = DRAIN,
+    expect_stderr: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
+
+    ``expect_stderr`` names the one line a test expects on stderr. Stderr stays asserted empty for
+    every call that does not name one, so allowing it for the OFF notice loosens nothing else.
 
     ``script`` defaults to the shipped drain and exists for PLANTED CONTROLS: an arm that asserts a
     guard protected a file has to also run a build with that guard removed, or it cannot tell a guard
@@ -253,7 +273,7 @@ def run_drain(
     # and a SessionStart hook that fails replaces the whole starting context; asserting it per-test
     # would leave every path nobody wrote a test for unchecked.
     assert proc.returncode == 0, f"{script.name} exited {proc.returncode}: {proc.stderr}"
-    assert not proc.stderr.strip(), f"{script.name} wrote to stderr: {proc.stderr}"
+    assert_drain_stderr(proc, expect_stderr)
     return proc
 
 

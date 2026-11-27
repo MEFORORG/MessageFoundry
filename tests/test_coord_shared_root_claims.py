@@ -414,7 +414,8 @@ def test_reconcile_never_releases_another_machines_claim(
 ) -> None:
     git(repo, "branch", "landed", "main")  # carries nothing main lacks: work that merged
     other = write_claim(shared / "claims", "k-other", tmp_path / "vanished-a", "landed", OTHER)
-    legacy = write_claim(shared / "claims", "k-legacy", tmp_path / "vanished-b", "landed", None)
+    # Inside the repository's own tree: a gone holder is judged only there (BACKLOG #7564).
+    legacy = write_claim(shared / "claims", "k-legacy", repo / "vanished-b", "landed", None)
 
     proc = run(repo, "claim-reconcile.ps1", "-Json", "-NoPullRequests", root=shared)
     assert proc.returncode == 0, proc.stderr

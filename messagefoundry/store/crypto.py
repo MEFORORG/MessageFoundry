@@ -103,6 +103,7 @@ this code can enforce. See the PR for the acceptance statement.
 from __future__ import annotations
 
 import base64
+import collections
 import contextlib
 import ctypes
 import hashlib
@@ -116,6 +117,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
 
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.redaction import json_loads_or_refusal
 
 #: An audit-chain MAC provider (ADR 0138 follow-up). Given the canonical row bytes it returns the row's
@@ -854,9 +856,11 @@ class AuditMacMalformedError(CipherError):
 
 class AuditKeyVersionRefusedError(CipherError):
     """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
-    read as a refusal of that version, while
-    Transit still answers under the latest. Transit's own refusal is one cause; the subclass
-    :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
+    read as a refusal of that version, while a probe under the latest version answers a
+    well-formed MAC naming another version (vault BACKLOG #6707 item 73). Transit's own refusal is
+    one cause; the subclass :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does
+    not read as one, and a 400 whose probe answers no well-formed MAC, so a handler of this class
+    cannot take a caught instance as proof that the probe answered one.
 
     The version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
@@ -879,20 +883,29 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     """A Transit check of a stored audit MAC at one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
     refusal, or whose reading raises one of
-    :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while the key still answers under the
-    latest (BACKLOG #6707).
+    :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while a probe under the latest
+    version answers a well-formed MAC naming another version (vault BACKLOG #6707). It also covers
+    a 400 hvac raises as ``InvalidRequest`` whose probe answers no well-formed MAC, whatever the
+    reply's wording (vault BACKLOG #6707 item 73): no evidence of a refused version, but a break
+    at the row with its alert. Its text does not name that cause; the cipher's warning does.
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
-    page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
-    handler of its parent handles it as it handles a refused version; the chain walk, for one,
-    reports a break at that row and goes on. Only the text differs. It names the version only,
+    page, and that cannot be told apart from a tamper behind it. So this is a subclass: a handler
+    of its parent that does not catch it apart handles it as a refused version, and the chain
+    walk, for one, reports a break at that row and goes on. At least
+    ``store.settle_transit_bound_attestation`` catches it apart and reports the MAC as not checked
+    (vault BACKLOG #6707 item 24). The error's text differs from the parent's. It names the version only,
     never the key or the reply, because the walk puts it in the tamper alert."""
 
     def __str__(self) -> str:
+        # "Not read as" holds also for a body too long to read and a read that faulted. It names
+        # at least the causes the reply leaves open, a refusal for another reason among them, so
+        # the alert reads as an unknown cause rather than an outage (vault BACKLOG #6707 items 11
+        # and 25).
         return (
             f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
-            "read as a version refusal, so the version could not be confirmed; the key may not "
-            "hold it, or its policy may retire it"
+            "read as a version refusal, so its cause is unknown: the key may not hold that "
+            "version, its policy may retire it, or the check was refused for another reason"
         )
 
 
@@ -1014,6 +1027,14 @@ class BatchCipher(Protocol):
     def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
 
 
+def cipher_blocks_on_io(cipher: object) -> bool:
+    """Whether ``cipher``'s calls wait on a network round trip (BACKLOG #3929).
+
+    A cipher says so with a ``blocks_on_io`` attribute, which :class:`TransitCipher` sets True. A
+    cipher without the attribute is read as False, so its calls stay on the caller's thread."""
+    return getattr(cipher, "blocks_on_io", False) is True
+
+
 def gave_no_verdict(error: CipherError) -> bool:
     """Whether a failed decrypt was the key service failing rather than the value (BACKLOG #6706).
 
@@ -1037,35 +1058,104 @@ def gave_no_verdict(error: CipherError) -> bool:
 
 
 #: The most exceptions :func:`detached` clears in one error's graph. Far past any real chain;
-#: reaching it is logged, never silent.
+#: reaching it is logged at WARNING, and a failure to log is reported on stderr where it can be.
 _DETACH_LIMIT = 10_000
 
 
 def detached(error: CipherError) -> CipherError:
     """``error``, with the traceback cleared on every exception reachable from it through
     ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
-    for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
-    through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
-    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops
-    and logs a WARNING."""
+    nearest first, for an error that is returned rather than raised (BACKLOG #6706). A
+    traceback's frames, through ``f_back``, reach the batch path's locals, which hold the other
+    values' plaintext; the errors' types, texts and links are kept. Cleared in place, so a caller
+    that keeps ``error`` itself keeps the cleared error.
+
+    Past :data:`_DETACH_LIMIT` exceptions it stops, cuts the graph there and then logs a
+    WARNING (vault BACKLOG #6706 item 1). A failure to log that raises an ``Exception`` is
+    reported on stderr, by its class where that can be read, and is not raised; nothing is
+    reported where the process has no writable stderr, and any other ``BaseException`` from the
+    log step is raised.
+    The cut: a visited error's link to an unvisited one is set to ``None``,
+    and an unvisited member of a visited group, which its group's tuple keeps, has its traceback
+    and its own links cleared, down through any group nested in it. The nearest links are visited
+    first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept. The cut is made
+    on the exceptions themselves, so another error sharing one of them sees it cut too."""
     seen: set[int] = set()
-    pending: list[BaseException] = [error]
+    visited: list[BaseException] = []
+    pending: collections.deque[BaseException] = collections.deque([error])
+    over_limit = False
     while pending:
-        link = pending.pop()
+        link = pending.popleft()
         if id(link) in seen:
             continue
         if len(seen) >= _DETACH_LIMIT:
-            _log.warning(
-                "an error's exception graph has more than %d links; the rest keep their tracebacks",
-                _DETACH_LIMIT,
-            )
+            over_limit = True
             break
         seen.add(id(link))
+        visited.append(link)
         link.__traceback__ = None
         pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
         if isinstance(link, BaseExceptionGroup):
             pending.extend(link.exceptions)
+    if over_limit:
+        # Drop this frame's hold on the unvisited exceptions, cut, and only then log: a failure
+        # to log cannot skip the cut, and this frame, which an error raised by the cut or the log
+        # step carries, holds none of the exceptions the cut unlinked. That error's traceback
+        # still carries its callers' frames. A cut that raises still logs the WARNING.
+        pending.clear()
+        del link
+        try:
+            _cut_unvisited(visited, seen)
+        finally:
+            _warn_detach_limit()
     return error
+
+
+def _warn_detach_limit() -> None:
+    """:func:`detached`'s WARNING. A failure to log that raises an ``Exception`` is reported on
+    stderr, by its class (``ascii``-escaped) where that can be read, and not raised; any other
+    ``BaseException`` is raised, and nothing is reported where there is no writable stderr."""
+    try:
+        _log.warning(
+            "an error's exception graph has more than %d links; the rest are cut off it, unless "
+            "the cut raises an error, which then propagates",
+            _DETACH_LIMIT,
+        )
+    except Exception as fault:  # noqa: BLE001 -- an Exception is reported below, not raised
+        text = "a detached-error WARNING could not be logged"
+        with contextlib.suppress(Exception):
+            text = f"{text} ({ascii(type(fault).__name__)})"
+        _last_resort(text)
+
+
+def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:
+    """For :func:`detached` past its limit: unlink every exception not in ``seen`` from the
+    ``visited`` ones. A group's members cannot be unlinked, so an unvisited member is cleared
+    instead and its own links cut, and a member that is a group has its members cleared alike.
+    Each member is cleared once, by id, so a member shared by several groups is descended into
+    once and a visited one is left as the first pass left it. Cutting a cause keeps the link's
+    ``__suppress_context__``, which setting ``__cause__`` also sets, so a kept context still
+    renders as it did. ``seen`` is extended with each cleared member."""
+    members: list[BaseException] = []
+    for link in visited:
+        if link.__cause__ is not None and id(link.__cause__) not in seen:
+            suppress = link.__suppress_context__
+            link.__cause__ = None
+            link.__suppress_context__ = suppress
+        if link.__context__ is not None and id(link.__context__) not in seen:
+            link.__context__ = None
+        if isinstance(link, BaseExceptionGroup):
+            members.extend(m for m in link.exceptions if id(m) not in seen)
+    while members:
+        member = members.pop()
+        if id(member) in seen:
+            continue
+        seen.add(id(member))
+        member.__traceback__ = None
+        member.__cause__ = None
+        member.__context__ = None
+        if isinstance(member, BaseExceptionGroup):
+            members.extend(member.exceptions)
 
 
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
@@ -1682,6 +1772,7 @@ class IdentityCipher:
     """No-op cipher: values are stored as-is (the default when no key is configured)."""
 
     encrypts = False
+    blocks_on_io = False
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         return plaintext  # identity: no encryption, so nothing to bind (aad ignored)
@@ -1734,6 +1825,8 @@ class AesGcmCipher(_UnmarkedPolicy):
     from when that writer emitted v2; since ADR 0196 it emits v4, sealed under the store data sub-key."""
 
     encrypts = True
+    #: In-process AES-GCM: no network call, so ``row_seal.cipher_call`` runs it inline (BACKLOG #3929).
+    blocks_on_io = False
 
     def __init__(
         self,

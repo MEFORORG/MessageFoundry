@@ -57,6 +57,7 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     ServiceStatusSettings,
     StoreSettings,
+    TlsSettings,
 )
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
@@ -163,6 +164,7 @@ _NON_BOOL_VALUES: dict[str, tuple[Any, ...]] = {
     "approvals": (ApprovalsSettings(),),
     "alerts_settings": (AlertsSettings(),),
     "service_settings": (ServiceStatusSettings(),),
+    "tls_settings": (TlsSettings(),),
     "ws_allowed_origins": (("https://console.example.test",),),
     "public_origin": ("https://console.example.test",),
     "oidc_authorization_endpoint": ("https://idp.example.test/authorize",),

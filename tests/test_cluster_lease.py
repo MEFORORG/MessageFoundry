@@ -1327,7 +1327,12 @@ class _FakeSqlLeaseStore:
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, object] | None:
         # The claim and the paused owner read (BACKLOG #5064); the clamp is not modelled here.
         return await self._fetchone(sql, params)
@@ -1348,10 +1353,16 @@ class _FakeSqlLeaseStore:
             in sql
         ), "the release must write the DB clock's now, never later (BACKLOG #1986)"
         _lease_key, owner = params
-        return self._db.release(owner)  # the store's _execute returns the driver's row count
+        # The count of rows the release matched, which the real store reads from OUTPUT (#6795).
+        return self._db.release(owner)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         return await self._execute(sql, params)  # the release; the clamp is not modelled here
 
@@ -1554,7 +1565,7 @@ async def test_sqlserver_the_retry_arms_a_fresh_pause_from_its_own_clock() -> No
 
 async def test_sqlserver_a_self_fenced_node_is_drained_and_says_so_truthfully() -> None:
     # The twin of the Postgres self-fence test: the same early return lived in the SQL Server release,
-    # and the release's row count now comes back through SqlServerStore._execute. CONTROL ARM,
+    # and the release's match count now comes back through SqlServerStore._execute_clamped. CONTROL ARM,
     # measured: against the unfixed coordinator this fails at the tuple shape, and with the
     # `_last_renew_ok` disjunct dropped it fails at `lease_released`.
     db = _FakeLeaseDB(_Clock(0.0))

@@ -1684,6 +1684,37 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     assert await cas("cas-nobody", None, source=SCOPE_SOURCE_MANUAL, expected_source=None) is False
 
 
+async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(store) -> None:
+    """BACKLOG #6887 on SQL Server: ``set_ad_channel_scope_if_unchanged`` writes only while the row
+    holds both the expected scope and source (``None`` matching NULL), marked ``ad``. Each refusal
+    is paired with the write that does go through."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    await store.create_user(
+        user_id="adcas",
+        username="adcas",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    cas = store.set_ad_channel_scope_if_unchanged
+    assert await cas("adcas", '["IB_A"]', expected_scope="[]", expected_source=None) is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source="ad") is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source=None) is True
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("adcas", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="ad") is False
+    assert (await store.get_user("adcas")).channel_scope == '["IB_A"]'
+    assert (
+        await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="manual") is True
+    )
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+    assert await cas("adcas-nobody", "[]", expected_scope=None, expected_source=None) is False
+
+
 async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(store) -> None:
     """The compare-and-set must match a scope longer than 4000 characters (BACKLOG #1927).
 
@@ -5705,6 +5736,13 @@ async def test_alert_generation_bounds_the_resolve_ss(store) -> None:
 
     await check_alert_generation_contract(store)
     await check_fenced_resolve_contract(store)
+
+
+async def test_suspended_until_after_reads_only_open_suspends_ss(store) -> None:
+    """Vault BACKLOG #3100 item 14: the suspend prime's filter, after ``TOP (?)``'s placeholder."""
+    from tests.test_alert_state import _assert_suspended_until_after_reads_only_open_suspends
+
+    await _assert_suspended_until_after_reads_only_open_suspends(store)
 
 
 async def test_alert_instance_lifecycle_ss(store) -> None:

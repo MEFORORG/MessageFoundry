@@ -422,7 +422,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "[pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved best-effort from the service "
         "settings (--service-config, else ./messagefoundry.toml if present); when no settings load "
         "it falls back to the setting's own default (ON) — matching the default engine, never a "
-        "silent OFF (#230).",
+        "silent OFF (#230), except under --env, where a settings load error stops the run. "
+        "A MEFOR_* variable that is a settings section's name alone can stop "
+        "the run instead; SectionNameEnvError in messagefoundry.config.settings says when.",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(
@@ -461,7 +463,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
         "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
-        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). A MEFOR_* "
+        "variable that is a settings section's name alone can fail the dryrun check instead; "
+        "SectionNameEnvError in messagefoundry.config.settings says when. "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
         "one in its own working directory; when they differ, each settings check's line names "
@@ -820,8 +824,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "admin-revoke-sessions",
         help="end the sessions it finds, of any account, from the host (the API is not needed)",
         description="End the sessions it finds, of any account, directly against the store, on "
-        "the same host gate as admin-unlock. docs/SECURITY.md, Limits of the session sweep, says "
-        "what it may miss. Audited. The engine may be running or stopped.",
+        "the same host gate as admin-unlock, and raise the global session epoch, which refuses "
+        "the sessions signed in before it unless someone with write access to the database "
+        "lowers or deletes its row. docs/SECURITY.md, Limits of the session sweep, says what "
+        "else it may miss. It writes an auth.session_revoked audit row after the revoke, and says "
+        "so when the store refuses that row or when the revoke's outcome is unknown. Run it with "
+        "the engine stopped, as ADR 0171 says for the commands on that gate.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",
@@ -1194,13 +1202,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "row, never a value. Exit 0 PASS, 1 FAIL (at least: a value that does not decrypt, a BLOB "
         "where the store writes text, a non-blank value with no at-rest marker on a surface the "
         "keyed store has sealed, or a walk stopped part way, by a VACUUM, a lock, a lost "
-        "connection, an unreadable row or the key service), 2 could not start, 3 NOT COVERED (a "
+        "connection, an unreadable row or the key service), 2 could not start, 3 NOT_COVERED (a "
         "PostgreSQL or SQL Server store whose catalog does not show this login a table or column "
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
         "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
-        "'vault_transit' values go to Transit in batches of up to BATCH_MAX_ITEMS "
-        "(store/crypto.py; BACKLOG #1719, #6706)",
+        "'vault_transit' values go to Transit in batches of up to 128 values and 524,288 "
+        "characters of them, and a value past that bound alone (BACKLOG #1719, #6706)",
     )
     cipher_audit.add_argument(
         "--service-config",
@@ -1222,7 +1230,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--chunk-rows",
         type=int,
         default=None,
-        help="rows read per statement, each its own short read transaction (default 500)",
+        help=(
+            "rows read per statement, each its own short read transaction (default 500); on a"
+            " server store the body cells and attachment chunks read at most 16 a statement"
+        ),
     )
     cipher_audit.add_argument(
         "--busy-timeout",
@@ -1255,8 +1266,19 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--to",
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
-        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "is unrecoverable, so a taken store name, or a taken SQLite -wal/-shm/-journal name beside it "
+        "(a file, a directory or a link, a dangling one included), is refused, and the store and "
+        "sidecar names are read again just before the write. Not caught, at least: a sidecar created "
+        "after that re-read. Nor, on Windows, a taken -wal, -shm or -journal name, or a "
+        "dangling link at the store name when the store is copied into place, on a share or drive "
+        "that neither read could reach: an unreachable share, which reads as free (at least WinError "
+        "53 and 67), or a drive letter that is gone (at least WinError 3). Nor, on Windows, "
+        "when the store is copied rather than hard-linked into place, a dangling link planted at the "
+        "store name after that re-read, which is followed. "
+        "Also refused: a name holding ':', and on Windows a "
+        "name ending in a dot or a space or otherwise opened as another path. To reuse a path, stop "
+        "the engine and move the old store aside with its -wal, -shm and -journal as one set. "
+        "Required, except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
         "whose bundle --config-to restores alone",
     )
     restore.add_argument(
@@ -3027,6 +3049,11 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
     return True
 
 
+#: The logging format of a ``[security]`` loosening line ``supervise`` and the remote-debugging
+#: refusal write, for a ``(name, text)`` entry (vault BACKLOG #3795 item 15).
+_SECURITY_LINE = "[security] %s: %s. See docs/SECURITY-LOOSENING.md."
+
+
 def _remote_debug_audit(
     settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
 ) -> str | None:
@@ -3065,9 +3092,7 @@ def _remote_debug_refused(
     # would not say that the engine's hook did not answer. The relaunch the refusal names turns
     # the interface off, and would leave what stopped the hook unreported.
     if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *unguarded)
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -3175,11 +3200,9 @@ def _audits_anchors_refused_before_the_lifespan(
 @_audits_anchors_refused_before_the_lifespan
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
-    # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
-    # this module's other imports and argument parsing; this one covers a caller that reached
-    # `_serve` some other way, and adds no second copy otherwise (`install_remote_debug_guard` says
-    # why). A no-op where the interpreter was started with remote debugging disabled, which is
-    # every engine shard under `supervise`.
+    # module-level call (vault BACKLOG #2742) has normally put the hook in place already;
+    # `install_remote_debug_guard` says what a later call does, and the module docstring of
+    # `messagefoundry.remotedebug` what start-up still runs before the hook.
     install_remote_debug_guard()
 
     import uvicorn
@@ -3383,10 +3406,16 @@ def _serve(args: argparse.Namespace) -> int:
     # keeps in a registry key any local user can read. Refused under EVERY enforcement setting
     # (owner rulings 2026-10-01 and 2026-11-14).
     # messagefoundry/serviceenv.py says what the reading covers.
-    from messagefoundry.serviceenv import service_env_posture, service_env_refusal
+    # At least two more cases. Where the engine read those lists, an engine secret other than a
+    # store key or a retired store key that is in this process's environment and not in them is
+    # refused under enforce only when the machine-wide environment's registry key sets it;
+    # otherwise it is named.
+    # Where the engine found its service but could not read the lists, a store key or another
+    # engine secret in this process's environment is refused under every enforcement setting.
+    from messagefoundry.serviceenv import service_env_posture, service_env_start_refusal
 
     service_env = service_env_posture()
-    service_env_refused = service_env_refusal(service_env)
+    service_env_refused = service_env_start_refusal(service_env, enforcing=enforcing)
     if service_env_refused is not None:
         print(f"error: refusing to start: {service_env_refused}.", file=sys.stderr)
         return 2
@@ -3645,8 +3674,8 @@ def _serve(args: argparse.Namespace) -> int:
     if (_breaker_note := settings.auth.breaker_budget_warning()) is not None:
         logging.getLogger("messagefoundry.config.settings").warning("%s", _breaker_note)
     # BACKLOG #1497 (Manager decision d20261030T213636115-0af931, "a warning, not a refusal"): on
-    # SQL Server a renew can land up to about twice the clamp after it is issued. Logged here for
-    # the same reason as the breaker note above.
+    # SQL Server the renew's COMMIT is outside the clamp, and under a 2 s clamp its statement can
+    # overrun it (BACKLOG #5064). Logged here for the same reason as the breaker note above.
     if (_renew_note := settings.sqlserver_renew_bound_warning()) is not None:
         logging.getLogger("messagefoundry.config.settings").warning("%s", _renew_note)
     # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
@@ -3743,6 +3772,9 @@ def _serve(args: argparse.Namespace) -> int:
         ai=settings.ai,
         store_privilege=None,
         audit_chain_unkeyed=None,
+        # Read again rather than reuse the gate's reading (vault BACKLOG #3795 item 15): the
+        # interface and hook halves cannot change in between, but the refused-script count is a
+        # snapshot, and this one counts any refusal since the gate.
         remote_debug=remote_debug_posture(),
         startup=startup,
         service_env=service_env,
@@ -5872,7 +5904,8 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
-    # Vault BACKLOG #2700: first, for the reason `_serve` gives. The supervisor holds the same
+    # Vault BACKLOG #2700: first, as in `_serve`. `install_remote_debug_guard` says what a call
+    # after the module-level one (vault BACKLOG #2742) does. The supervisor holds the same
     # environment its shards do, secrets included.
     install_remote_debug_guard()
 
@@ -5920,6 +5953,15 @@ def _supervise(args: argparse.Namespace) -> int:
     if args.db is not None:
         supervise_cli["store"] = {"path": args.db}
     if args.base_port is not None:
+        # The load would refuse it as [api].port (BACKLOG #5769), naming a key the operator did not
+        # write, so the flag is refused here under its own name.
+        if not 0 <= args.base_port <= 65535:
+            print(
+                f"error: --base-port {args.base_port} is not a port from 0 to 65535; refusing to "
+                "start the fleet.",
+                file=sys.stderr,
+            )
+            return 2
         supervise_cli["api"] = {"port": args.base_port}
     if args.env is not None:
         supervise_cli["ai"] = {"environment": args.env}
@@ -5941,18 +5983,11 @@ def _supervise(args: argparse.Namespace) -> int:
         # directory, so the supervisor still refuses several engine shards, as it would the value
         # written, and one engine shard's --db still names the root.
         db_base += "/."
-    # BACKLOG #5817: [api].port has no range check at load, and every engine shard's port counts
-    # up from it, so a value no socket takes is refused here, before the TLS renewal below writes
-    # anything. How many engine shards the graph has is known only once the supervisor loads it,
-    # so the range several of them need is checked there.
-    if not 0 <= settings.api.port <= 65535:
-        source = "--base-port" if args.base_port is not None else "[api].port"
-        print(
-            f"error: {source} {settings.api.port} is not a port from 0 to 65535; refusing to "
-            "start the fleet.",
-            file=sys.stderr,
-        )
-        return 2
+    # BACKLOG #5817: every engine shard's port counts up from [api].port (or --base-port, which
+    # reaches it through the load and is range-checked above under its own name). The load refuses
+    # a value outside 0 to 65535 (BACKLOG #5769), before the TLS renewal below writes anything. How
+    # many engine shards the graph has is known only once the supervisor loads it, so the range
+    # several of them need is checked there.
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
@@ -6021,15 +6056,11 @@ def _supervise(args: argparse.Namespace) -> int:
     remote_debug = remote_debug_loosening(remote_debug_reading)
     if remote_debug is not None:
         security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *remote_debug)
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *accepted
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *accepted)
     # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
     # `serve` makes next, at the same place among its gates. Without it here, a file another
     # account can write would refuse every engine shard, and the supervisor would only restart
@@ -6046,22 +6077,24 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     for startup_entry in startup_loosenings(startup):
         security_lines.append(startup_entry)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *startup_entry
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *startup_entry)
 
     # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
     # both, so every shard would refuse on what `serve` refuses there: an engine secret, or (vault
     # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
+    # Under enforce, also an engine secret other than a store key from outside its lists that the
+    # machine-wide environment's registry key sets; and, where the engine found its service but
+    # could not read its lists, a store key or another engine secret in this process's
+    # environment under every setting. Both as in `serve`.
     from messagefoundry.serviceenv import (
         service_env_loosenings,
         service_env_posture,
-        service_env_refusal,
+        service_env_start_refusal,
     )
 
     service_env = service_env_posture()
-    service_env_refused = service_env_refusal(service_env)
+    service_env_refused = service_env_start_refusal(service_env, enforcing=enforcing)
     if service_env_refused is not None:
         print(
             f"error: {service_env_refused}. Every engine shard would refuse to start; refusing to "
@@ -6071,9 +6104,7 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     for service_env_entry in service_env_loosenings(service_env):
         security_lines.append(service_env_entry)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *service_env_entry
-        )
+        logging.getLogger(__name__).warning(_SECURITY_LINE, *service_env_entry)
 
     # BACKLOG #2356: the two credential gates `serve` makes next, in its order. The
     # managed-identity gate, because the renewal below
@@ -6203,9 +6234,7 @@ def _supervise(args: argparse.Namespace) -> int:
             _write_start_audit([f"{fleet_audit} (Logged again for the off-box forwarder.)"])
         for security_line in security_lines:
             logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
+                f"{_SECURITY_LINE} (Logged again for the off-box forwarder.)", *security_line
             )
 
     try:
@@ -6328,6 +6357,7 @@ def _validate(args: argparse.Namespace) -> int:
 
 def _graph(args: argparse.Namespace) -> int:
     from messagefoundry.config.graph import build_wiring_graph
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
     # The missing-value-file refusal (exit 2) is the pre-check graph ran before --env read values:
@@ -6353,7 +6383,9 @@ def _graph(args: argparse.Namespace) -> int:
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
         reg = load_config(config_dir, allow_empty=True)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # ConfigDirMissing is a FileNotFoundError, not a WiringError: uncaught, a missing --config
+        # directory reached the last-resort CRITICAL floor instead of this envelope (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     # For the same reason an env() reference that does not resolve is reported beside the graph,
     # never instead of it. Keys only, never values.
@@ -6487,13 +6519,21 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
     top) and returns the loaded flag. When no settings load (no file, or one that won't
     parse/validate), fall back to the **Settings-model default (True)** — the posture of exactly the
     default, un-overridden engine — never a hardcoded ``False``, which would make the preview diverge
-    from the engine this command exists to mirror (ADR 0104 §8.1)."""
+    from the engine this command exists to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for the caller to
+    report rather than fall back on."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import PipelineSettings, load_settings
+    from messagefoundry.config.settings import (
+        PipelineSettings,
+        SectionNameEnvError,
+        load_settings,
+    )
 
     try:
         return load_settings(config_path=service_config).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        raise  # why: SectionNameEnvError's docstring
     except (FileNotFoundError, ValueError, ValidationError, OSError):
         return PipelineSettings().snapshot_on_send
 
@@ -6521,8 +6561,15 @@ def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
 
 
 def _dryrun(args: argparse.Namespace) -> int:
+    from messagefoundry.config.settings import SectionNameEnvError
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_messages,
+    )
     from messagefoundry.redaction import safe_error
 
     resolved = _resolve_offline_anchor(args, env_file_check=False)
@@ -6534,7 +6581,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return env_values
     try:
         reg = load_config(config_dir)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # As in _graph: a missing --config directory is not a WiringError (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     if env_values is not None and (problems := reg.env_resolution_problems(env_values)):
         # A preview in an environment the graph does not resolve in is refused. Keys only.
@@ -6550,7 +6598,22 @@ def _dryrun(args: argparse.Namespace) -> int:
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture, resolved from the service
     # settings serve would load, so a site's [pipeline] value reaches the preview; the library default,
     # True, is the PipelineSettings default and applies only where nothing is passed (BACKLOG #5794).
-    snapshot_on_send = _snapshot_on_send_setting(service_config)
+    try:
+        snapshot_on_send = _snapshot_on_send_setting(service_config)
+    except SectionNameEnvError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    # Built once for the run, as `check` builds it, so each file-backed reference set is read once
+    # rather than once per message (BACKLOG #6820). A loader fault the builder does not turn into a
+    # skipped set ends the run naming its type alone, since it now sits outside dry_run's own guard,
+    # which reported it as each message's ERROR.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the report
+        return _emit_error(
+            f"reference sets did not load for the preview ({type(exc).__name__})",
+            as_json=args.json,
+        )
 
     show_phi: bool = args.show_phi
     if not show_phi:
@@ -6574,6 +6637,7 @@ def _dryrun(args: argparse.Namespace) -> int:
                     inbound=args.inbound,
                     show_phi=show_phi,
                     snapshot_on_send=snapshot_on_send,
+                    reference_view=reference_view,
                 )
                 traced.append({"source": source, "path": path, **entry})
         except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
@@ -6584,7 +6648,13 @@ def _dryrun(args: argparse.Namespace) -> int:
     out: list[dict[str, Any]] = []
     try:
         for source, path, raw in messages:
-            result = dry_run(reg, raw, inbound=args.inbound, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=args.inbound,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             out.append(
                 {
                     "source": source,
@@ -7436,10 +7506,14 @@ def _resolve_expected_rows(args: argparse.Namespace) -> list[tuple[int, str]] | 
     """The ``(seq, row_hash)`` pairs for ``audit-verify``, or the exit code 2 if one is unusable
     (vault BACKLOG #2612). An empty list when neither flag was given.
 
-    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's rule for
-    which heads the store can emit. A refusal for a ``--expected-row`` value quotes it, since the
-    operator typed it; one for a file line names the line number and a reason that quotes nothing,
-    so a path typo'd onto another file does not put that file's content on the job's output.
+    Each pair is parsed by :func:`parse_audit_row_pair`, which shares the anchor parser's count
+    grammar and head rule: it refuses at least a malformed seq and a hex head that is not 64
+    characters, and passes a
+    ``vault:v`` head through unchecked, at the cost
+    :func:`~messagefoundry.store.store._audit_head_shape` states. A refusal for a ``--expected-row``
+    value quotes it, since the operator typed it; one for a file line names the line number and a
+    reason that quotes nothing, so a path typo'd onto another file does not put that file's content
+    on the job's output.
     """
     from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import (
@@ -7668,14 +7742,19 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             "written",
             as_json=args.json,
         )
-    # Could not start, exit 2 (ADR 0171 Amendment C): each is raised before anything is written.
+    # Could not start, exit 2 (ADR 0171 Amendment C): each is raised before this command's own
+    # write; at least a keyless-chain refusal follows a full open (BACKLOG #5067).
     # `_UnauditableWrite` is raised by the pre-check, which runs outside the write's catch below.
     could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
-        *_key_unresolved(),
+        # The OPEN only: a refused hop (#2532), a key, a short schema (#1720). A key that does not
+        # resolve arrives here as this class, never bare: _open_store_or_refuse converts it, and
+        # after the open every _key_unresolved() class is a RuntimeError or ValueError, which
+        # call_errors below takes as a refusal, exit 1. So the bare classes are not listed
+        # (BACKLOG #5633 item 11).
+        _StoreOpenRefused,
     )
     # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
     # raises when it cannot reach its database (vault BACKLOG #3054, item 10).
@@ -7693,8 +7772,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
-    # The name every refusal after the read uses: the stored username once the account is found,
-    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    # The stored username once the account is found, as the output and the audit row name it
+    # (BACKLOG #5633 item 7). The Forged arm below does not use it.
     named = [wanted]
 
     async def run() -> tuple[str, Any]:
@@ -7772,16 +7851,24 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
         _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.", as_json=args.json)
         return 2
-    except RowSealError:
-        # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
-        return _emit_error(
-            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
-        )
+    except RowSealError as exc:
+        # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
+        # before it may have (BACKLOG #5067).
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
+        # prints a value from the record that failed its seal (BACKLOG #5633 item 7;
+        # tests/test_cli.py pins the text, not the WARNING). Once the read found the account, an arm
+        # below that prints named[0] prints the username as get_user_by_username returned it, and
+        # that read verifies no seal. So on a refused unlock whose seal was not verified, at least
+        # on an Unverifiable answer or a Transit outage at the verify, the refusal text and the
+        # WARNING below print the stored username of an unverified record. An Unverifiable answer
+        # can come from a sound row or a planted seal; the engine denies it like a forged seal.
+        return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
-            _emit_error(
-                f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
-            )
+            # What the open may have changed before it, as for a keyless-chain refusal (#5067).
+            left = _opened_left_behind(extra, settings.store, keyed=_open_is_keyed(settings))
+            _emit_error(f"{_sentence(codec_safe_str(extra))} {left}.", as_json=args.json)
             return 2
         # #1670: a path that is not a database, or a server the driver could not reach. A refusal
         # class the engine defines, such as SchemaNotProvisionedError, is printed whole, so its
@@ -7796,9 +7883,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             text=_engine_refusal_text(extra) if whole else None,
         )
     if outcome in ("read-refused", "refused"):
-        # Logged, so the cause can be found: WARNING names the class only, since a driver's
-        # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
-        # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+        # Logged, so the cause can be found: WARNING names the error's class, never its message,
+        # since a driver's message can quote a stored value (ASVS 16.5.4); the traceback goes to
+        # DEBUG. It also names named[0], which can be an unverified record's stored username; the
+        # Forged arm's comment above says when. A busy store is not "could not start", so it keeps
+        # exit 1 (ADR 0171 Amendment C).
         log = logging.getLogger(__name__)
         log.warning(
             "admin-unlock: the store refused the %s for %r (%s)",
@@ -7809,8 +7898,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
     if outcome == "read-refused":
         return _emit_error(
-            f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
-            "nothing was written. Check the store key and the database, then re-run",
+            f"the store refused to read the account {wanted!r} ({type(extra).__name__}). "
+            # After a full open, which may have written (BACKLOG #5067).
+            f"{_opened_left_behind(extra, settings.store, keyed=_open_is_keyed(settings))}. "
+            "Check the store key and the database, then re-run",
             as_json=args.json,
         )
     # A Transit row seal is not a busy store, so neither gets the busy store's remedy (BACKLOG
@@ -8114,12 +8205,13 @@ def _show_on_terminal(text: str) -> None:
 def _show_during_enrolment(text: str, *, refusal: str) -> None:
     """Show the key, a prompt or a retry message on the console during enrolment, so an operator
     who redirected stderr still sees what the command is waiting for. Raises
-    :class:`_PasswordEntryRefused` with ``refusal`` and the cause when the console cannot be written;
-    enrolment is before any store write, so the refusal always says nothing was written."""
+    :class:`_PasswordEntryRefused` with ``refusal`` and the cause when the console cannot be written.
+    The refusal does not say what was written: the caller knows whether a store open came first
+    (BACKLOG #5067)."""
     try:
         _show_on_terminal(text)
     except OSError as exc:
-        raise _PasswordEntryRefused(f"{refusal} ({exc}); nothing was written") from exc
+        raise _PasswordEntryRefused(f"{refusal} ({exc})") from exc
 
 
 def _show_recovery_codes_once(
@@ -8206,7 +8298,7 @@ def _enrol_totp_at_terminal(
         code = sys.stdin.readline().strip()
         read_at = _time.time()
         if not code:
-            raise _PasswordEntryRefused("empty authenticator code; nothing was written")
+            raise _PasswordEntryRefused("empty authenticator code")
         if totp.verify_totp_step(enrolment, code, now=read_at, window=skew_steps) is not None:
             return enrolment, code, read_at
         if attempt < _PROVISION_TOTP_ATTEMPTS:  # never "try again" when no attempt is left
@@ -8214,7 +8306,7 @@ def _enrol_totp_at_terminal(
                 "That code did not match. Try the current one.\n", refusal=went_away
             )
     raise _PasswordEntryRefused(
-        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match; nothing was written. Check that the app "
+        f"{_PROVISION_TOTP_ATTEMPTS} codes did not match. Check that the app "
         "uses SHA-256 (add the account by its URI) and that the device's clock is right, then run "
         "the command again."
     )
@@ -8869,15 +8961,19 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     key_file = provider_key_file(settings.store)
     # Off Windows the file cannot be used at all: the key provider refuses it at store open and says
     # so, which is the fault the operator needs to hear about.
-    if key_file is None or not dpapi_available() or not Path(key_file).exists():
+    if key_file is None or not dpapi_available():
         return True
+    # absent_ok, not Path.exists(): a missing name is left to the key provider, but a link to a
+    # missing file, a share that cannot be reached and a file whose status cannot be read are
+    # judged, and refused (vault BACKLOG #5657).
     return _key_file_access_gate(
         key_file,
+        absent_ok=True,
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
             "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
-            "group may delete a file in, with no junction or link on its path that another account can change"
+            "group may delete a file in, with no junction or link on its path, or folder holding or above one, that an account the check does not trust can change (it trusts at least SYSTEM and Administrators, and the engine's own account unless it is Local service or Network service, or cannot be read)"
         ),
         enforcing=enforcing,
     )
@@ -8905,8 +9001,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
     import shlex
 
     remedy = (
-        "Where the refusal names who owns it, delete it and its certificate so the next start "
-        "mints a pair the engine owns: restricting it does not change its owner. Otherwise "
+        "Where the refusal names who owns the key itself, rather than the directory that "
+        "holds it, delete it and its certificate so the next start mints a pair the engine "
+        "owns: restricting it does not change its owner. Otherwise "
         "restrict it to the account the engine runs as, or delete it and its certificate so "
         "the next start mints a new pair. "
     )
@@ -8917,16 +9014,23 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
-            "Where it names a link on its path, keep the store where no link another account "
-            "can change is above it, since a new pair would be minted in the same place. "
+            "Where it names a link on its path, keep the store where no link above it, or folder "
+            "holding or above one, is owned by an account other than root or the engine's own "
+            "or may be written by a group or other without the sticky bit, since a new pair would be "
+            "minted in the same place. Where it names a mount type, a part of the key's path is on that "
+            "mount, and a new pair would be minted on it again: set [api].tls_cert_file and "
+            "[api].tls_key_file to a pair of your own on a local file system. "
         )
     else:
         remedy += (
             "Where the refusal names the directory that holds it, that is the store's directory: "
             "remove a broad group's right to delete files in it or change its access list, and "
-            "give it an owner that is not such a group. Where it names a folder on its path, keep "
-            "the store where no junction or link another account can change is above it. A new pair would be minted in the "
-            "same place again. "
+            "give it an owner that is not such a group. Where it names a folder, junction or link "
+            "on its path, keep "
+            "the store where no junction or link above it, or folder holding or above one, can be "
+            "changed by an account the check does not trust (it trusts at least SYSTEM and "
+            "Administrators, and the engine's own account unless it is Local service or Network "
+            "service, or cannot be read). A new pair would be minted in the same place again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "
@@ -9638,11 +9742,13 @@ class _ReopeningNoticeAudit:
 class _CountingNoticeAudit:
     """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
     notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
-    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records only a
-    send that raised, so a count above zero is one, whether or not the forwarded write then
-    succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
-    never left. A count of zero is not a delivery receipt: at least a drain ended by an interrupt
-    asks for no record."""
+    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records a send
+    that raised, and, when its close is cut, the send it cut or the notice it left queued (BACKLOG
+    #6832); at least an interrupt cuts this command's close, and it ends the run before the count
+    is read. So a count above zero says delivery is unconfirmed, whether or not the forwarded write
+    then succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
+    never left. A count of zero is not a delivery receipt: a send that returned says only that the
+    relay took the mail."""
 
     def __init__(self, inner: NoticeAuditSink) -> None:
         self._inner = inner
@@ -9947,15 +10053,21 @@ _PROVISION_AUTH_REFUSALS = {
 _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
-def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str | None:
+def _open_refusal_left_behind(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    opener: str = "the open",
+    after_an_earlier_open: bool = False,
+) -> str | None:
     """What a refused store open left behind, when that is more than "nothing was written"
     (BACKLOG #5067), or ``None`` when nothing was.
 
-    ``None`` for every refusal but the schema one below; the callers then say "nothing was
-    written", meaning no row. Not every other refusal comes before the database is touched: at
-    least a keyless-chain refusal on a server store comes after a full open, which under ``auto``
-    has run the same option switches and committed the schema, and this does not describe that.
-    A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
+    ``None`` for at least a key-resolution or hop refusal, and the caller decides: at least
+    ``provision-admin``'s arms and ``admin-unlock``'s account read, raised after their open
+    returned, then name what it may have changed (:func:`_opened_left_behind`, or over an existing
+    store :func:`_two_opens_left_behind`), and other callers
+    say "nothing was written", meaning no row. A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
     of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
     rolls its batch back and writes no schema marker. But on SQL Server under
     ``[store].schema_management = auto`` a writable open first switches the database's
@@ -9963,22 +10075,100 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     (``SqlServerStore._ensure_database_options``), outside that batch, and the refusal does not
     switch them back. So for that refusal it says the batch was rolled back and, there, that those
     options may already have changed: sentences, the last with no full stop, so a caller can end
-    it."""
+    it.
+
+    For a key, cipher or after-open refusal it names what the open may have changed, from the
+    refusal's class alone (:func:`_refused_open_keying`, :func:`_open_steps_left_behind`).
+
+    ``opener`` names the open the text describes, "the open" unless a caller ran more than one.
+    ``after_an_earlier_open`` says another open of this command returned before this one. Then
+    this open is not the command's only one, so the text says nothing of the command's own rows,
+    and this open found the one-time steps (the schema, the salt bind, the snapshot options, the
+    genesis record) already run, so the text names none of them for it.
+
+    Not every refusal it returns ``None`` for comes before the database is touched: at least a
+    store pin refusal under the host key provider can come after the schema step, and this does
+    not describe that."""
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     if not any(isinstance(e, ServerSchemaMismatchError) for e in (exc, exc.__cause__)):
-        return None
-    left = (
-        "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
-        "no row"
-    )
+        keying = _refused_open_keying(exc)
+        if keying is None:
+            return None
+        return _open_steps_left_behind(
+            store,
+            keyed=keying.keyed,
+            returned=keying.returned,
+            genesis=keying.genesis,
+            opener=opener,
+            after_an_earlier_open=after_an_earlier_open,
+        )
+    left = f"{_capitalized(opener)} rolled its schema batch back and wrote no schema marker"
+    if after_an_earlier_open:
+        return left
+    left += ", and this command wrote no row"
     if _open_switches_snapshot_options(store):
         left += (
-            ". Under [store].schema_management = auto the open may already have switched the "
+            f". Under [store].schema_management = auto {opener} may already have switched the "
             "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
             "that batch; the refusal does not switch them back"
         )
     return left
+
+
+class _RefusedOpenKeying(NamedTuple):
+    """What a refused open may have written, from the refusal's class (BACKLOG #5067): the
+    arguments :func:`_open_steps_left_behind` takes for it."""
+
+    keyed: bool
+    genesis: bool
+    returned: bool
+
+
+def _refused_open_keying(exc: BaseException) -> _RefusedOpenKeying | None:
+    """What an open refused with ``exc``, raised itself or as a cause, may have written, from the
+    class alone (BACKLOG #5067), or ``None`` where the class says nothing.
+
+    A key or cipher refusal (``StoreKeylessError``, ``CipherError``) can come before the open
+    reached its own writing steps, after them, or from a read after a full open; this does not
+    know which, so ``returned`` is false. A ``CipherError`` comes from a keyed open, which may
+    bind a salt and write an empty chain's genesis record; a ``StoreKeylessError`` from a keyless
+    one, which does neither.
+
+    Three refusals are raised only after a full open (:func:`_raised_after_a_full_open`), so
+    ``returned`` is true, and none names a salt record or a genesis record. A keyless-chain
+    refusal (``KeylessAuditChainRefused``) and a keyless open the settings refuse
+    (``_KeylessProvisionRefused``) follow a keyless open, which writes neither. The check that
+    this command's audit row would be refused (``_UnauditableWrite``) does not refuse a keyed
+    handle: one that does not hold the chain's current range key keys new audit rows under the
+    active key instead (``settle_audit_ranges`` in ``store/store.py``, which every backend's
+    chain load runs), so it follows a keyless open."""
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+
+    if _raised_after_a_full_open(exc):
+        return _RefusedOpenKeying(keyed=False, genesis=False, returned=True)
+    raised = (exc, exc.__cause__)
+    if any(isinstance(e, CipherError) for e in raised):
+        return _RefusedOpenKeying(keyed=True, genesis=True, returned=False)
+    if any(isinstance(e, StoreKeylessError) for e in raised):
+        return _RefusedOpenKeying(keyed=False, genesis=False, returned=False)
+    return None
+
+
+def _raised_after_a_full_open(exc: BaseException) -> bool:
+    """Whether ``exc``, raised itself or as a cause, is a refusal raised only after a full store
+    open (BACKLOG #5067): a keyless-chain refusal (``KeylessAuditChainRefused``), a keyless open
+    the settings refuse (``_KeylessProvisionRefused``), or the check that this command's audit
+    row could not be written (``_UnauditableWrite``)."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+
+    after = (KeylessAuditChainRefused, _KeylessProvisionRefused, _UnauditableWrite)
+    return any(isinstance(e, after) for e in (exc, exc.__cause__))
+
+
+def _capitalized(text: str) -> str:
+    """``text`` with its first character upper-cased, for a phrase that opens a sentence."""
+    return text[:1].upper() + text[1:]
 
 
 def _open_switches_snapshot_options(store: StoreSettings) -> bool:
@@ -9996,6 +10186,175 @@ def _open_runs_schema_ddl(store: StoreSettings) -> bool:
     from messagefoundry.config.settings import SchemaManagement
 
     return store.resolved_schema_management() is SchemaManagement.AUTO
+
+
+def _open_changes(store: StoreSettings, *, salt: bool, genesis: bool = False) -> str:
+    """What a writable open of ``store`` may change before a late refusal, as one phrase, or
+    ``""`` when it names nothing: the schema where the open runs DDL
+    (:func:`_open_runs_schema_ddl`), the store's salt record where ``salt`` says the cipher binds
+    one, on SQL Server the snapshot options (:func:`_open_switches_snapshot_options`), and the
+    audit chain's genesis record where ``genesis`` says a keyed open may write one. A caller says
+    "at least" before it: a step this omits may also write."""
+    changed = ["the store's salt record"] if salt else []
+    if _open_runs_schema_ddl(store):
+        changed.insert(0, "the schema, which the open creates or migrates")
+    if _open_switches_snapshot_options(store):
+        changed.append(
+            "the database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options, which "
+            "under [store].schema_management = auto the open switches on and does not switch back"
+        )
+    if genesis:
+        changed.append(
+            "the audit chain's genesis record, which a keyed open writes to an empty chain"
+        )
+    if len(changed) < 2:
+        return "".join(changed)
+    # Semicolons, since an item's own relative clause would swallow the next one after a comma.
+    return f"{'; '.join(changed[:-1])}; and {changed[-1]}"
+
+
+def _binds_salt(store: StoreSettings) -> bool:
+    """Whether a keyed writable open of ``store`` binds a salt: the ``aesgcm`` cipher with
+    ``aad_bind``, since the salt bind skips the ``vault_transit`` cipher and the v1 writer."""
+    return store.cipher_provider == "aesgcm" and store.aad_bind
+
+
+def _keyed_open_changes(store: StoreSettings, *, keyed: bool, genesis: bool | None = None) -> str:
+    """:func:`_open_changes` for an open keyed as ``keyed`` says: a keyed open may bind a salt
+    (:func:`_binds_salt`) and write an empty chain's genesis record, and a keyless one does
+    neither. ``genesis`` overrides the genesis half where the caller knows better."""
+    return _open_changes(
+        store,
+        salt=keyed and _binds_salt(store),
+        genesis=keyed if genesis is None else keyed and genesis,
+    )
+
+
+def _open_steps_left_behind(
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    returned: bool = False,
+    genesis: bool | None = None,
+    opener: str = "the open",
+    after_an_earlier_open: bool = False,
+) -> str:
+    """What a refusal left behind when it can follow the open's own writing steps (BACKLOG
+    #5067): sentences, the last with no full stop, as :func:`_open_refusal_left_behind` returns
+    them. Never "nothing was written", since an open ran. ``keyed`` is whether the open was
+    keyed, as far as the caller knows, and ``genesis`` as for :func:`_keyed_open_changes`. Where
+    :func:`_open_changes` names nothing, it says the open may have written all the same.
+    ``opener`` names the open, as for :func:`_open_refusal_left_behind`.
+
+    ``returned`` says the caller knows the open had returned before the refusal. Otherwise the
+    refusal may have come before the open reached its writing steps, at least from the cipher
+    build, which runs before the open connects, so the text names what it may have changed only
+    as a possibility and asserts no write.
+
+    ``after_an_earlier_open`` says another open of this command returned first, as for
+    :func:`_open_refusal_left_behind`: the caller has already said what that open may have
+    changed and that the change did not land, so this names none of the one-time steps
+    :func:`_open_changes` lists, and says only that ``opener`` may also have written."""
+    if after_an_earlier_open:
+        if returned:
+            return (
+                f"{_capitalized(opener)} may also have written to the database before this refusal"
+            )
+        return (
+            f"{_capitalized(opener)} may or may not have reached its own writing steps before "
+            "this refusal"
+        )
+    listed = _keyed_open_changes(store, keyed=keyed, genesis=genesis)
+    if not returned:
+        if not listed:
+            return (
+                f"The change this command makes did not land. {_capitalized(opener)} may or may "
+                "not have reached its own writing steps before this refusal, so the database may "
+                "or may not have changed"
+            )
+        return (
+            f"The change this command makes did not land. {_capitalized(opener)} may or may not "
+            "have reached its own writing steps before this refusal; if it did, it may have "
+            f"changed at least {listed}"
+        )
+    if not listed:
+        steps = "the open's own steps" if opener == "the open" else opener
+        return (
+            f"The change this command makes did not land, but {steps} may already have written "
+            "to the database before this refusal"
+        )
+    return (
+        f"The change this command makes did not land, but {opener} may already have changed the "
+        f"database before this refusal: at least {listed}"
+    )
+
+
+def _open_is_keyed(settings: ServiceSettings) -> bool:
+    """Whether a store open under ``settings`` is keyed, for what it may write
+    (:func:`_open_steps_left_behind`): a configured store key (:func:`_store_key_configured`), or
+    the ``vault_transit`` cipher, which keys the store in Vault with no local key (BACKLOG
+    #5067)."""
+    return _store_key_configured(settings) or settings.store.cipher_provider == "vault_transit"
+
+
+def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool) -> str:
+    """What a refusal raised after an open returned left behind (BACKLOG #5067): what
+    :func:`_open_refusal_left_behind` says for ``exc``, else :func:`_open_steps_left_behind`, so
+    it never says nothing was written. ``keyed`` is whether a store key is configured."""
+    return _open_refusal_left_behind(exc, store) or _open_steps_left_behind(
+        store, keyed=keyed, returned=True
+    )
+
+
+def _two_opens_left_behind(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    earlier_open: str,
+    this_open: str,
+    this_open_may_have_written: bool = False,
+    settings_keying_counts: bool = False,
+) -> str:
+    """What a refusal at, or after, a command's second store open left behind, once its first
+    open had returned (BACKLOG #5067, PR 3162 hold 3): sentences, the last with no full stop, as
+    :func:`_open_refusal_left_behind` returns them. ``earlier_open`` and ``this_open`` name the two
+    opens, as ``opener`` does there.
+
+    The earlier open's sentence takes keyedness and the genesis record from the refused class
+    where it says (:func:`_refused_open_keying`), since both opens ran under the same settings,
+    and from ``keyed`` otherwise, except under ``settings_keying_counts`` (below). That open ran the one-time steps, so they are named once, for
+    it, and ``this_open`` is described with none of them, and with no claim about this command's
+    rows. ``this_open_may_have_written`` says the caller knows ``this_open`` reached its own
+    writing steps before the refusal, whether or not it returned: then it may also have written,
+    whatever the class says. Otherwise a refusal whose class says nothing names the earlier open
+    alone: it may have come before ``this_open`` touched the database.
+
+    ``settings_keying_counts`` says each open resolves the key itself, so the two can differ: a
+    keyless refusal at ``this_open`` then does not show that the earlier open was keyless, and
+    keyed settings still describe it as a keyed open, which may bind a salt and write the genesis
+    record."""
+    keying = _refused_open_keying(exc)
+    if keying is None or (settings_keying_counts and keyed and not keying.keyed):
+        earlier_keyed, earlier_genesis = keyed, None
+    else:
+        earlier_keyed, earlier_genesis = keying.keyed, keying.genesis
+    left = _open_steps_left_behind(
+        store,
+        keyed=earlier_keyed,
+        genesis=earlier_genesis,
+        returned=True,
+        opener=earlier_open,
+    )
+    if this_open_may_have_written:
+        this_left: str | None = _open_steps_left_behind(
+            store, keyed=keyed, returned=True, opener=this_open, after_an_earlier_open=True
+        )
+    else:
+        this_left = _open_refusal_left_behind(
+            exc, store, opener=this_open, after_an_earlier_open=True
+        )
+    return left if this_left is None else f"{_sentence(left)} {this_left}"
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -10058,19 +10417,11 @@ def _invocation_bound_left_behind(store: StoreSettings) -> str:
     So the text says no account or audit row was written, and never that nothing was: the open's
     own steps may have written, and a minting ``provision-admin`` run wrote its key file before
     the open, which its caller names."""
-    changed = ["the store's salt record"]
-    if _open_runs_schema_ddl(store):
-        changed.insert(0, "the schema, which the open creates or migrates")
-    if _open_switches_snapshot_options(store):
-        changed.append(
-            "the database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options, which "
-            "under [store].schema_management = auto the open switches on and does not switch back"
-        )
-    listed = changed[0] if len(changed) == 1 else f"{', '.join(changed[:-1])} and {changed[-1]}"
+    listed = _open_changes(store, salt=_binds_salt(store))
     return (
         "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
         "account or audit row was written, but the steps the open runs before that read may "
-        f"already have changed the database: at least {listed}"
+        f"already have changed the database{f': at least {listed}' if listed else ''}"
     )
 
 
@@ -10085,41 +10436,133 @@ class _InvocationBoundOpenRefused(Exception):
 
 
 def _invocation_bound_refusal(
-    failure: Exception, store: StoreSettings, *, refusing: str = ""
+    failure: Exception, store: StoreSettings, *, refusing: str = "", left: str | None = None
 ) -> str:
     """The text for an open the invocation bound's pass failed (BACKLOG #5608): the store it names
     (:func:`_store_label`), the store's error as :func:`_transit_store_error_text` renders it, so
     a server's text, which can quote a stored value, shows as its class and SQLSTATE while an
     engine refusal keeps its remedy, then ``refusing``, then what the open left behind
-    (:func:`_invocation_bound_left_behind`), with no full stop."""
+    (:func:`_invocation_bound_left_behind`, or ``left`` where the caller gives it), with no full
+    stop."""
     # The class stands in for an engine refusal raised with no text, so the line names a cause.
     rendered = _sentence(_transit_store_error_text(failure) or type(failure).__name__)
     return (
         f"cannot open the store at {_store_label(store)}: {rendered} "
-        f"{refusing}{_invocation_bound_left_behind(store)}"
+        f"{refusing}{_invocation_bound_left_behind(store) if left is None else left}"
     )
 
 
 def _invocation_bound_provision_refusal(
-    failure: Exception, store: StoreSettings, *, kept: Path | None = None
+    failure: Exception,
+    store: StoreSettings,
+    *,
+    kept: Path | None = None,
+    after_the_pre_check: bool = False,
 ) -> str:
     """``provision-admin``'s :func:`_invocation_bound_refusal`. ``kept`` is the store key a failed
-    create kept, as for :func:`_provision_open_refusal`."""
-    text = _invocation_bound_refusal(failure, store, refusing="Refusing to provision. ")
+    create kept, as for :func:`_provision_open_refusal`. ``after_the_pre_check`` says the
+    pre-check's open over an existing store returned before the write's open failed the bound's
+    pass: that earlier open may have run the one-time steps, the genesis record included, so the
+    text names it (:func:`_two_opens_left_behind`) and claims no audit row for the command. Only a
+    keyed open reaches the bound's pass, so that earlier open is described as keyed, whatever the
+    settings say (follow-up from PR 3162's review)."""
+    left = None
+    if after_the_pre_check:
+        # The bound's pass runs late in the write's open, after steps that may write, so that open
+        # is described as one that may also have written, whatever the failure's class says.
+        both = _provision_two_opens(failure, store, keyed=True, this_open_may_have_written=True)
+        left = (
+            f"{_sentence(both)} The refusal came where the AES-GCM invocation bound reads the "
+            "key's persisted total"
+        )
+    text = _invocation_bound_refusal(failure, store, refusing="Refusing to provision. ", left=left)
     return text if kept is None else f"{text}. {_kept_key_sentence(kept)}"
 
 
+#: ``provision-admin``'s name for its pre-check's open, once the write's open came after it.
+_PRE_CHECK_OPEN = "this command's earlier open, which ran the pre-check before the prompts,"
+#: ``provision-admin``'s name for its write's open, once the pre-check's open came before it.
+_WRITE_OPEN = "the write's own open"
+
+
+def _provision_left_behind(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    opened: bool = False,
+    after_the_pre_check: bool = False,
+) -> str | None:
+    """What a ``provision-admin`` refusal at, or after, one of its store opens left behind
+    (BACKLOG #5067), or ``None`` where nothing was. ``opened`` says the open the refusal came at
+    had returned before ``exc``, so a refusal :func:`_open_refusal_left_behind` says nothing for
+    names what that open may have changed. ``keyed`` is :func:`_open_is_keyed` under the
+    settings.
+
+    ``after_the_pre_check`` says the refusal came at, or after, the write's open, once the
+    pre-check's open over an existing store had returned. The command then ran two opens, and the
+    text names each (:func:`_two_opens_left_behind`, follow-up from PR 3162's review). Each open
+    resolves the key itself, so keyed settings describe the pre-check's open as a keyed open even
+    after a keyless refusal at the write's."""
+    if opened:
+        return _provision_opened_left_behind(
+            exc, store, keyed=keyed, after_the_pre_check=after_the_pre_check
+        )
+    if after_the_pre_check:
+        return _provision_two_opens(exc, store, keyed=keyed)
+    return _open_refusal_left_behind(exc, store)
+
+
+def _provision_opened_left_behind(
+    exc: BaseException, store: StoreSettings, *, keyed: bool, after_the_pre_check: bool
+) -> str:
+    """:func:`_provision_left_behind` for a refusal raised once the open it came at had returned,
+    which never leaves nothing behind."""
+    if after_the_pre_check:
+        return _provision_two_opens(exc, store, keyed=keyed, this_open_may_have_written=True)
+    return _opened_left_behind(exc, store, keyed=keyed)
+
+
+def _provision_two_opens(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    this_open_may_have_written: bool = False,
+) -> str:
+    """:func:`_two_opens_left_behind` for ``provision-admin``'s two opens: the pre-check's, then
+    the write's, each resolving the key itself."""
+    return _two_opens_left_behind(
+        exc,
+        store,
+        keyed=keyed,
+        earlier_open=_PRE_CHECK_OPEN,
+        this_open=_WRITE_OPEN,
+        this_open_may_have_written=this_open_may_have_written,
+        settings_keying_counts=True,
+    )
+
+
 def _provision_open_refusal(
-    exc: BaseException, store: StoreSettings, *, kept: Path | None = None
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    kept: Path | None = None,
+    opened: bool = False,
+    after_the_pre_check: bool = False,
+    keyed: bool = True,
 ) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
-    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
+    behind (:func:`_provision_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
     every other command prints an open refusal: a key source's codec error quotes a byte of what
     it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
-    names it, and never says nothing was written (PR 2804 fourteenth hold)."""
+    names it, and never says nothing was written (PR 2804 fourteenth hold). ``opened``,
+    ``after_the_pre_check`` and ``keyed`` are as for :func:`_provision_left_behind`."""
     from messagefoundry.redaction import codec_safe_str
 
-    left = _open_refusal_left_behind(exc, store)
+    left = _provision_left_behind(
+        exc, store, keyed=keyed, opened=opened, after_the_pre_check=after_the_pre_check
+    )
     if kept is not None:
         held = _kept_key_sentence(kept)
         tail = (
@@ -10385,6 +10828,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # catch it to find a store error the invocation bound's pass re-raised (BACKLOG #5608).
     bound_open_errors = _invocation_bound_open_errors()
 
+    # Set once the pre-check's open has returned, so a refusal from the reads after it says what
+    # that open may have changed (BACKLOG #5067).
+    precheck_opened = False
+
+    def precheck_left() -> str:
+        """What a refusal before the write's open left behind (BACKLOG #5067): what the
+        pre-check's open may have changed, once it returned, or "Nothing was written" where the
+        store did not exist yet, since then the pre-check opened nothing."""
+        if not precheck_opened:
+            return "Nothing was written"
+        return _open_steps_left_behind(
+            settings.store, keyed=_open_is_keyed(settings), returned=True
+        )
+
     async def administrator_exists() -> tuple[bool, str | None]:
         """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
         # Opened WITHOUT create, so asking cannot make a SQLite store: an absent one holds no
@@ -10408,6 +10865,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # not start, as at the write's open below. Any other error propagates as before.
             _raise_if_bound_refused(exc, bound_open_errors)
             raise
+        nonlocal precheck_opened
+        precheck_opened = True
         store_slot.current = store
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
@@ -10581,13 +11040,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # On a server the probe refused only a store with a genesis record or with data.
                 held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
                 step = keep_the_key_step(
-                    settings.store, new_store=True, service_account=args.service_account
+                    settings.store,
+                    new_store=True,
+                    service_account=args.service_account,
+                    key_file_left=False,
                 )
                 raise HostCustodyRefused(
                     f"the store already {held}, and {missing}. A new key cannot open a store "
                     "another key made: run with the custody directory that holds the store's host "
-                    "blob, MEFOR_SECRETS_DIRECTORY set as the store's service has it, or unset for "
-                    "a SQLite store whose blob sits beside its file. If that blob is lost, the "
+                    "blob, MEFOR_CUSTODY_DIRECTORY and MEFOR_SECRETS_DIRECTORY set as the store's "
+                    "service has them, or both unset for a SQLite store whose blob sits beside "
+                    "its file. If that blob is lost, the "
                     f"store stays in place. {step}"
                 ) from missing
             absent, exists = True, None
@@ -10623,15 +11086,25 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # first fail at the write, after the prompt. Resolved now and discarded; the write
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
-            build_store_cipher(settings.store, posture=posture)
+            try:
+                build_store_cipher(settings.store, posture=posture)
+            except (StoreKeylessError, CipherError) as exc:
+                # This probe opens nothing, so nothing was written (BACKLOG #5067).
+                _emit_error(
+                    f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json
+                )
+                return 2
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
         # Either way the store could not be opened, so exit 2, as the keyless checks beside it
         # exit (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an owner
         # ruling).
-        # Through codec_safe_str, as every open refusal this command prints (#2532, #5067).
-        _emit_error(f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json)
+        # Through codec_safe_str, as every open refusal this command prints (#2532, #5067). One
+        # from the existing store's open, or a read after it, can follow the open's own writing
+        # steps, so the text names them (#5067).
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        _emit_error(f"{_sentence(codec_safe_str(exc))} {left}", as_json=args.json)
         return 2
     except _InvocationBoundOpenRefused as refused:
         # The pre-check's open failed at the invocation bound's strict pass (BACKLOG #5608),
@@ -10642,7 +11115,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
         return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
-        _emit_error(str(exc), as_json=args.json)
+        # It follows a full open, which may have changed the database (BACKLOG #5067).
+        chain_left = _opened_left_behind(exc, settings.store, keyed=False)
+        _emit_error(f"{exc} {chain_left}", as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # A store key that could not be resolved (the comment above `key_unresolved`). Or the
@@ -10653,7 +11128,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # and wrote no marker, and the text lists the differences and the remedy, then says what
         # the open may have changed before it (#5067). Exit 2: could not start, never the
         # dispatch floor's 1, this command's refusal.
-        _emit_error(_provision_open_refusal(exc, settings.store), as_json=args.json)
+        _emit_error(
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                opened=precheck_opened,
+                keyed=_open_is_keyed(settings),
+            ),
+            as_json=args.json,
+        )
         return 2
     except TrustAnchorError as exc:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
@@ -10662,7 +11145,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # command's refusal code. 2 stays "the store could not be opened".
         return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        if not precheck_opened:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # A read after the pre-check's open returned (BACKLOG #5067): no "cannot open", and no key
+        # was shown yet. Exit 2, as the open's own error exits. The class only: a driver's message
+        # can quote a stored value.
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        _emit_error(
+            f"the store failed after it opened ({type(exc).__name__}). Refusing to provision. "
+            f"{left}",
+            as_json=args.json,
+        )
+        return 2
     except FileExistsError as exc:
         # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
@@ -10709,8 +11203,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         actor = f"cli:{getpass.getuser()}"
     except OSError as exc:
         return _emit_error(
-            f"cannot name the OS user for the audit row ({exc}); refusing to provision, and "
-            "nothing was written",
+            f"cannot name the OS user for the audit row ({exc}); refusing to provision. "
+            f"{precheck_left()}",
             as_json=args.json,
         )
 
@@ -10732,13 +11226,30 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 username=username, skew_steps=settings.auth.totp_skew_steps
             )
         except _PasswordEntryRefused as exc:
-            return _emit_error(str(exc), as_json=args.json)
+            return _emit_error(f"{_sentence(exc)} {precheck_left()}", as_json=args.json)
 
-    # Set just before the service's write, which stores the seed (BACKLOG #5067).
+    # Set by the service right before its first account write, after its own reads, so a refusal
+    # from those reads is still one raised before any account write (BACKLOG #5067).
     write_started = False
+
+    def mark_write_started() -> None:
+        nonlocal write_started
+        write_started = True
+
     # Vault BACKLOG #3411: the minted blob, held in memory for the store's creation, and the file
     # it was written to, removed if the store cannot be created.
     minted: MintedCustody | None = None
+
+    def keep_the_entry() -> str:
+        """Once the write has started under a shown key, the advice to keep its entry until a
+        later run completes, with a leading space, or ``""`` (BACKLOG #5067 step 2)."""
+        if totp_secret is None:
+            return ""
+        return (
+            " If you added the entry this run showed to the authenticator app, keep it for now: "
+            "its seed may be stored. Once a later run of this command completes, delete it: that "
+            "run clears or replaces the seed."
+        )
 
     def after_the_key(refusal: str, before_write: str) -> str:
         """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
@@ -10748,15 +11259,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
         Before the write, ``before_write``, and under a shown key it then names the entry the
         operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a seed
         that was never stored; under ``--no-totp`` no key was shown. Once the write has started,
-        whatever class reached the arm, neither: the account and its seed may then be stored, so
-        it says so, as an integrity refusal does, and never to delete the entry, which would leave
-        the Administrator without its factor."""
+        whatever class reached the arm, the account and its seed may be stored, so it says so, as
+        an integrity refusal does. Under a shown key it then says to keep the entry until a later
+        run completes, never to delete it now, which could leave the Administrator without its
+        factor: a later run that completes clears or replaces the seed (BACKLOG #5067 step 2)."""
         if write_started:
-            return (
+            text = (
                 f"{_sentence(refusal)} The write had started, so the Administrator may be missing "
                 "or incomplete. Once the refusal is cleared, run the command again: it completes a "
                 "partly written account, or says why it cannot."
             )
+            return text + keep_the_entry()
         if totp_secret is None:
             return before_write
         return (
@@ -10769,11 +11282,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # A create batch that failed before its commit (PR 2804 hold 17): no write started, so its
     # error is never read as a refused write.
     batch_failed = False
+    # Set once the write's open has returned, so a refusal raised after it says what the open may
+    # have changed rather than that nothing was written (BACKLOG #5067).
+    store_opened = False
     # The takeover notice's audit sink, which counts what the notifier could not deliver (#5634).
     notice_audit: list[_CountingNoticeAudit] = []
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
-        nonlocal write_started, kept_key, batch_failed
+        nonlocal kept_key, batch_failed, store_opened
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         # Under the host key provider the store is created with the blob minted above, so its
         # genesis record carries that blob's store id (vault BACKLOG #3411).
@@ -10801,6 +11317,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             batch_failed = True
         if batch_failure is not None:
             raise batch_failure
+        store_opened = True
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -10837,7 +11354,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if security_notifier is not None:
                 security_notifier.start()
             try:
-                write_started = True
                 outcome = await service.provision_first_administrator(
                     username=args.username,
                     password=password,
@@ -10847,6 +11363,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     totp_secret=totp_secret,
                     totp_code=totp_code,
                     totp_code_read_at=totp_read_at,
+                    on_first_write=mark_write_started,
                 )
             finally:
                 if security_notifier is not None:
@@ -10862,22 +11379,49 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return (outcome, store.path)
         finally:
             store_slot.current = None
-            await store.close()
+            # A close that fails warns and never replaces the result: after a committed grant it
+            # would lose the recovery codes and the administrator_granted page (BACKLOG #5067).
+            await _close_store_quietly(store)
 
     def refused_write(exc: Exception) -> int:
         """An integrity refusal the service did not name (BACKLOG #2697). Exit 1, this command's
-        refusal. Any write can raise one, so the text does not say how far the run got.
+        refusal. Before the first account write landed it says no account was written;
+        after it, any write can have raised it, so the text does not say how far the run
+        got.
 
         Names the exception CLASS only, never its text. The driver's message carries the constraint,
-        the table and the duplicate key value, and ``safe_exc`` keeps all three: it redacts PHI
-        shapes, not schema names or a username. This arm sits ahead of the CLI floor, which never
-        formats the exception, so it must not print what that floor would not."""
+        the table and the duplicate key value. ``safe_exc`` withholds the message of a driver's own
+        error class, but it keeps all three, at least, where the error is raised as a builtin type
+        or wrapped in another library's class: it redacts PHI shapes, not schema names or a
+        username. This arm sits ahead of the CLI floor, which never
+        formats the exception, so it must not print what that floor would not.
+
+        Under a shown key it names the entry: keep it once the write has started, or, where the
+        refusal came before any account write (a refused first INSERT), delete it, since no seed
+        was stored (BACKLOG #5067)."""
+        if not write_started:
+            # Refused before the first account write landed, the INSERT itself included: no
+            # account row and no seed (BACKLOG #5067).
+            entry = (
+                ""
+                if totp_secret is None
+                else " If you added the entry this run showed to the authenticator app, delete "
+                "it: its seed was never stored."
+            )
+            return _emit_error(
+                f"the store refused a write before this command's first account write landed "
+                f"({type(exc).__name__}), so no account was written. Once no other provision-admin run is in progress, run "
+                "the command again. If it is refused the same way again, the store has a fault "
+                f"this command cannot repair.{entry}",
+                as_json=args.json,
+            )
         return _emit_error(
             f"the store refused one of this command's writes ({type(exc).__name__}), so the "
             "Administrator may be "
             "missing or incomplete. Once no other provision-admin run is in progress, run the "
             "command again: it completes a partly written account, or says why it cannot. If it "
-            "is refused the same way again, the store has a fault this command cannot repair",
+            "is refused the same way again, the store has a fault this command cannot repair."
+            + keep_the_entry(),
             as_json=args.json,
         )
 
@@ -10915,13 +11459,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # named as a literal: this text reaches stderr (keep_the_key_step says why).
         import os
 
-        from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
-
-        where = (
-            f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}"
-            if os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
-            else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
+        from messagefoundry.engine_secrets import (
+            CUSTODY_DIRECTORY_VARIABLE,
+            SECRETS_DIRECTORY_VARIABLE,
         )
+
+        if os.environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip():
+            where = f"MEFOR_CUSTODY_DIRECTORY set to {minted.path.parent}"
+        elif os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip():
+            where = (
+                f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}, with "
+                "MEFOR_CUSTODY_DIRECTORY unset"
+            )
+        else:
+            where = (
+                "MEFOR_CUSTODY_DIRECTORY and MEFOR_SECRETS_DIRECTORY unset, so that it looks "
+                "beside the SQLite store file"
+            )
         print(
             f"The store key was written to {minted.path}. The service looks for it in the custody "
             f"directory its own environment names; here that came from {where}. A service whose "
@@ -10959,17 +11513,37 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except FirstAdministratorGrantedSessionsLive as exc:
         # Vault BACKLOG #3023 residual (4): the role is granted, so it pages as any grant does,
         # then the command exits non-zero with the text naming the host command that ends the
-        # earlier holder's session.
-        page_granted(exc.username)
-        return _emit_error(str(exc), as_json=args.json, code="administrator_granted_sessions_live")
+        # earlier holder's session. Whether the page was delivered is reported as a granted run
+        # reports it: the JSON's administrator_granted_alerted, and the same line in text (vault
+        # BACKLOG #3023 items 11 and 30).
+        alerted = page_granted(exc.username)
+        if not args.json:
+            _safe_print(_administrator_granted_alert_line(alerted, exc.administrators_at_check))
+        return _emit_error(
+            str(exc),
+            as_json=args.json,
+            code="administrator_granted_sessions_live",
+            extra={"administrator_granted_alerted": alerted},
+        )
     except FirstAdministratorRefused as exc:
         # The service's own text says what to do with the entry it showed, where that is known: a
         # refusal can follow a grant that may have landed (#5067 leaves these as they are).
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
-        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
-        # Each is raised before the write, so the shown key's entry has no seed (#5067).
-        _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
+        # #1905, #1916: could not start -- exit 2 whichever of the three checks caught it: the
+        # two keyless ones, or the audit row's check. Each is raised before the write, so the
+        # shown key's entry has no seed (#5067). Each follows a full open, which may have changed
+        # the database, so the text says so (#5067). Each follows a keyless write open,
+        # `_UnauditableWrite` included (`_refused_open_keying`). Over an existing store the
+        # pre-check's open came first, and the text names both, the pre-check's open keyed as
+        # `keyed` says (#5067).
+        left = _provision_opened_left_behind(
+            exc,
+            settings.store,
+            keyed=_open_is_keyed(settings),
+            after_the_pre_check=precheck_opened,
+        )
+        _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {left}"), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
@@ -10977,7 +11551,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
         text = after_the_key(
-            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+            codec_safe_str(exc),
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                kept=kept_key,
+                opened=store_opened,
+                # The pre-check's open, over an existing store, came first (#5067).
+                after_the_pre_check=precheck_opened,
+                keyed=_open_is_keyed(settings),
+            ),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -10988,7 +11571,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
         if write_started:
             raise
         text = after_the_key(
-            codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+            codec_safe_str(exc),
+            _provision_open_refusal(
+                exc,
+                settings.store,
+                kept=kept_key,
+                opened=store_opened,
+                # The pre-check's open, over an existing store, came first (#5067).
+                after_the_pre_check=precheck_opened,
+                keyed=_open_is_keyed(settings),
+            ),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -11000,7 +11592,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
         failure = refused.failure
         text = after_the_key(
             _transit_store_error_text(failure),
-            _invocation_bound_provision_refusal(failure, settings.store, kept=kept_key),
+            _invocation_bound_provision_refusal(
+                failure,
+                settings.store,
+                kept=kept_key,
+                after_the_pre_check=precheck_opened,
+            ),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -11009,7 +11606,43 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # not a path that is not a database. A lost username race arrives as the refusal above.
         return refused_write(exc)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # Exit 2 either way, as before. The key was shown, so either way the text says what to do
+        # with its entry (BACKLOG #5067).
+        if not store_opened:
+            # The create open's own error, such as a --db in a directory this shell cannot write.
+            unopened = f"cannot open the store at {settings.store.path}: {_store_error_text(exc)}"
+            before_write = unopened
+            if precheck_opened:
+                # The pre-check's open, over an existing store, came first and may have written
+                # (follow-up from PR 3162's review).
+                # A create open can fail partway, after its schema step, so the write's own
+                # open is named as one that may or may not have reached its writing steps.
+                keyed = _open_is_keyed(settings)
+                earlier = _provision_two_opens(exc, settings.store, keyed=keyed)
+                this_open = _open_steps_left_behind(
+                    settings.store,
+                    keyed=keyed,
+                    opener=_WRITE_OPEN,
+                    after_an_earlier_open=True,
+                )
+                before_write = (
+                    f"{_sentence(unopened)} Refusing to provision. {_sentence(earlier)} {this_open}"
+                )
+            _emit_error(after_the_key(unopened, before_write), as_json=args.json)
+            return 2
+        # After the open returned, such as a lock during the writes: the store opened, so this is
+        # no "cannot open". The class only: a driver's message can quote a stored value.
+        refusal = f"the store failed after it opened ({type(exc).__name__})"
+        left = _provision_opened_left_behind(
+            exc,
+            settings.store,
+            keyed=_open_is_keyed(settings),
+            after_the_pre_check=precheck_opened,
+        )
+        _emit_error(
+            after_the_key(refusal, f"{refusal}. Refusing to provision. {left}"), as_json=args.json
+        )
+        return 2
     except Exception as exc:
         # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
         # MRO name as the service matches them; anything else propagates as it did before.
@@ -11028,7 +11661,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
     # unless a notice was dispatched. False is not a delivery receipt: it says only that the
-    # notifier recorded no undelivered notice, and at least a drain ended by an interrupt records none.
+    # notifier recorded no undelivered notice, and a send that returned says only the relay took it.
     holder_send_failed: bool | None = (
         bool(notice_audit) and notice_audit[0].undelivered > 0
         if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
@@ -11117,25 +11750,32 @@ def _provision_admin(args: argparse.Namespace) -> int:
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
     # Vault BACKLOG #3849 B5.
+    _safe_print(_administrator_granted_alert_line(alerted, outcome.administrators_at_check))
+    return 0
+
+
+def _administrator_granted_alert_line(alerted: bool, administrators: Sequence[str]) -> str:
+    """What ``provision-admin`` says about its ``administrator_granted`` page (vault BACKLOG #3849
+    B5), on a granted run and on one whose post-grant revoke was given up on (vault BACKLOG #3023
+    items 11 and 30): accepted, a WARNING naming the other enabled Administrators the run's check
+    found, or a plain note when there were none."""
     if alerted:
-        _safe_print(
+        return (
             "An [alerts] transport accepted the administrator_granted alert for this grant. A "
             "transport that failed shows as a WARNING above."
         )
-    elif outcome.administrators_at_check:
-        _safe_print(
+    if administrators:
+        return (
             "WARNING: no [alerts] transport confirmed delivery of the administrator_granted alert "
             "for this grant (none is configured, a rule routes it to none, or a WARNING or ERROR "
             "above says why), so it went to the log and nobody may have been paged. Tell the "
             "site's other Administrators yourself: "
-            + ", ".join(repr(name) for name in outcome.administrators_at_check)
+            + ", ".join(repr(name) for name in administrators)
         )
-    else:
-        _safe_print(
-            "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
-            "grant, so it went to the log."
-        )
-    return 0
+    return (
+        "No [alerts] transport confirmed delivery of the administrator_granted alert for this "
+        "grant, so it went to the log."
+    )
 
 
 def _admin_set_notify_email(args: argparse.Namespace) -> int:
@@ -11214,7 +11854,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     actor = f"cli:{getpass.getuser()}"
     # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
     # at least the store's own acquire timeout. The chain's in-memory key check (no key in this
-    # shell, or the current range's key not held) is asked before the append, so that refusal does
+    # shell over a keyed chain) is asked before the append, so that refusal does
     # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
     # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
     # RowSealError (BACKLOG #3510): the account's record fails its seal, so the write helper refused.
@@ -11227,6 +11867,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # Built here, off the event loop, as the set above is: the open's catch for a store error the
     # invocation bound's pass re-raised (BACKLOG #5608).
     bound_open_errors = _invocation_bound_open_errors()
+
+    # Set once the open below has returned, so a store error after it is no "cannot open" (#5067).
+    notify_opened = False
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -11247,17 +11890,21 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
             # open. So does a keyed open that meets a row it cannot read or that is not JSON once
-            # decrypted (BACKLOG #2308). Nothing has been read or written. Through
+            # decrypted (BACKLOG #2308). The command has read and written nothing, but the open's
+            # own steps may have, so the text names them (BACKLOG #5067). Through
             # `codec_safe_str`, as the sibling commands print it (BACKLOG #2532).
             from messagefoundry.redaction import codec_safe_str
 
-            return ("open-refused", wanted, codec_safe_str(exc))
+            left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+            return ("open-refused", wanted, f"{_sentence(codec_safe_str(exc))} {left}")
         except bound_open_errors as exc:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
             # arrived as the `CipherError` above: could not start, reported below. Any other
             # error propagates as before.
             _raise_if_bound_refused(exc, bound_open_errors)
             raise
+        nonlocal notify_opened
+        notify_opened = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -11276,8 +11923,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # PHI-free, and the address itself is left out, as `provision-admin` records only
             # whether one was set. The actor names the OS user, as `admin-unlock` does.
             detail = json.dumps({"username": user.username})
-            # The chain's key check, asked before the append: no key in this shell, or the current
-            # range's key not held. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
+            # The chain's key check, asked before the append: no key in this shell over a keyed
+            # chain. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
             # seat decision under owner delegation 2026-10-08, not an owner ruling).
             _refuse_an_unauditable_write(store)
             try:
@@ -11285,8 +11932,28 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             except store_errors as exc:
                 # Any other refusal of the append, such as a running engine holding the write lock
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
-                # keeps exit 1. Nothing has been written yet.
-                return ("audit-refused", user.username, str(exc))
+                # keeps exit 1. The command has written nothing yet, but the open may have, so the
+                # text names it (BACKLOG #5067).
+                # A refusal the engine wrote, such as an acquire timeout, prints whole, since its
+                # text names its fix. Any other error prints its class only: a driver's message can
+                # quote a stored value (ASVS 16.5.4; vault BACKLOG #5067 added item B). The WARNING
+                # names the class and the traceback goes to DEBUG, as admin-unlock logs a refusal.
+                log = logging.getLogger(__name__)
+                log.warning(
+                    "admin-set-notify-email: the store refused the audit row for %r (%s)",
+                    user.username,
+                    type(exc).__name__,
+                )
+                log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
+                left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+                # A blank engine refusal falls back to the class, so the text never ends empty.
+                whole = _engine_refusal_text(exc) if _is_engine_refusal(exc) else ""
+                refused = (
+                    f"the store refused the audit row: {whole}"
+                    if whole
+                    else f"the store refused the audit row ({type(exc).__name__})"
+                )
+                return ("audit-refused", user.username, f"{_sentence(refused)} {left}")
             try:
                 await store.set_user_notify_email(user.id, email=address)
             except BaseException as exc:
@@ -11308,7 +11975,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the result, as admin-unlock closes: after
+            # a commit it would read as a change that did not land (BACKLOG #5067).
+            await _close_store_quietly(store)
 
     try:
         outcome, username, extra = run_guarded(run())
@@ -11321,7 +11990,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _StoreOpenRefused,
         _UnauditableWrite,
     ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+        # A keyless-chain or audit refusal follows a full open, which may have written (#5067).
+        left = _open_refusal_left_behind(exc, settings.store)
+        _emit_error(str(exc) if left is None else f"{_sentence(exc)} {left}", as_json=args.json)
         return 2
     except _InvocationBoundOpenRefused as bound:
         # Could not start, exit 2, under the store's name, as a SQLite error from this open was
@@ -11330,14 +12001,22 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _emit_error(_invocation_bound_refusal(bound.failure, settings.store), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        if not notify_opened:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # A read after the open returned, such as a lock while the engine runs: no "cannot open",
+        # and the open may have written (BACKLOG #5067). Exit 2, as before. The class only.
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        _emit_error(
+            f"the store failed after it opened ({type(exc).__name__}). {left}", as_json=args.json
+        )
+        return 2
     if outcome == "open-refused":
         # The store could not be opened, so the command could not start: exit 2, the code ADR 0171
         # Amendment C gives "could not start" (BACKLOG #2124, a seat decision under owner
         # delegation 2026-10-08, not an owner ruling). A `CipherError` here is raised by the open,
         # before the command reads an account, so it is the same "could not start" as a
         # `StoreKeylessError`. Exit 1 stays a refusal about the account.
-        _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
+        _emit_error(extra, as_json=args.json)
         return 2
     if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
         refused = _seal_refusal(username, "address write")
@@ -11355,8 +12034,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. Nothing was written: the audit row goes first, and the store "
-        "refused it. If the engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, so the address is not set. If the "
+        "engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }
@@ -11485,7 +12164,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     posture = _command_hop_posture(settings)
     wanted = args.username.strip()
     # Could not start, so exit 2: as admin-unlock exits on the first four, and provision-admin on
-    # a store key that cannot be resolved (BACKLOG #2081). Each is raised before anything is written.
+    # a store key that cannot be resolved (BACKLOG #2081). Each is raised before this command's
+    # own write; at least a keyless-chain refusal follows a full open (BACKLOG #5067).
     could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -11508,28 +12188,52 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         *store_driver_errors(),
     )
 
-    def open_refused(exc: Exception, *, hint: str = "") -> int:
-        """The exit for a refusal raised while a store was opened or checked: nothing written.
+    # Set once check()'s open has returned, so open_refused can tell a refusal from a store
+    # that had opened, and may have written, at least once (BACKLOG #5067).
+    store_returned = False
+
+    def open_refused(exc: Exception, *, hint: str = "", after_check: bool = False) -> int:
+        """The exit for a refusal raised while a store was opened or checked, before this
+        command's own writes.
         ``hint`` follows the message once the key has been shown. The texts of the first two
         families are the engine's own and name settings, files, tables or key ids, never a value.
         Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
-        decoded (BACKLOG #2532). A short server schema says what the open may have changed before
-        it (BACKLOG #5067)."""
-        if isinstance(exc, could_not_start):
+        decoded (BACKLOG #2532). A short server schema, a key or cipher refusal and a keyless-chain
+        refusal say what the open may have changed before them (BACKLOG #5067). So does any refusal
+        raised once an open returned (``store_returned``), never "nothing was written".
+        ``after_check`` says the refusal came from the swap's open or a read after it, so check()'s
+        open had returned before it: the sentence that says what an open may have changed names
+        which open, the earlier one or the replacement's own, since "the open" would read as the
+        one just refused (:func:`_two_opens_left_behind`, PR 3162 hold 3). A refusal the class
+        says nothing about names the earlier open alone: it may have come before the
+        replacement's open touched the database."""
+        keyed = _open_is_keyed(settings)
+        if after_check:
+            left = _two_opens_left_behind(
+                exc,
+                settings.store,
+                keyed=keyed,
+                earlier_open=(
+                    "this command's earlier open, which checked the account before the key was "
+                    "shown,"
+                ),
+                this_open="the replacement's own open",
+            )
+        elif store_returned:
+            left = _opened_left_behind(exc, settings.store, keyed=keyed)
+        else:
             left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        if isinstance(exc, could_not_start):
             _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
-            return _emit_error(
-                f"{_sentence(codec_safe_str(exc))} Nothing was written.{hint}", as_json=args.json
-            )
-        if isinstance(exc, sqlite3.DatabaseError) and not hint:  # #1670: not a database
-            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-        # After the key was shown the store had already opened once, so this is no "cannot open".
-        # The class only: a driver's message can quote a stored value (ASVS 16.5.4).
+            return _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
+        if isinstance(exc, sqlite3.DatabaseError) and not hint and not store_returned:
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)  # #1670
+        # The store had already opened once, so this is no "cannot open". The class only: a
+        # driver's message can quote a stored value (ASVS 16.5.4).
         _emit_error(
-            f"the store failed before the replacement ({type(exc).__name__}); nothing was "
-            f"written.{hint}",
+            f"the store failed before the replacement ({type(exc).__name__}). {left}.{hint}",
             as_json=args.json,
         )
         return 2
@@ -11615,7 +12319,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def check() -> _ResetTarget | str:
         """The account to replace, pinned, or why not. Read before any key is shown."""
+        nonlocal store_returned
         store = await opened()
+        store_returned = True
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -11632,7 +12338,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
             return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin.digest)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the check's result (vault BACKLOG #5067
+            # added item C), as admin-unlock closes.
+            await _close_store_quietly(store)
 
     try:
         checked = run_guarded(check())
@@ -11642,13 +12350,19 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         return _emit_error(checked, as_json=args.json)
     target = checked
     username = target.username
+    # What check()'s open, which returned, may have changed, for a refusal before the swap's open
+    # (BACKLOG #5067).
+    after_check_open = _open_steps_left_behind(
+        settings.store, keyed=_open_is_keyed(settings), returned=True
+    )
     try:
         # Before the key is shown: a shell whose OS user cannot be named fails here, not after the
         # operator has enrolled a seed that would never be stored.
         actor = f"cli:{getpass.getuser()}"
     except OSError as exc:
+        # After check()'s open, which may have written (BACKLOG #5067).
         return _emit_error(
-            f"cannot name the OS user for the audit row ({exc}); nothing was written",
+            f"cannot name the OS user for the audit row ({exc}). {after_check_open}",
             as_json=args.json,
         )
 
@@ -11678,13 +12392,16 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         # The two refusals that fire before the key reaches the console get no hint: there is no
         # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
         before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
-        return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
+        return _emit_error(
+            f"{_sentence(exc)} {after_check_open}." + ("" if before_key else unused_entry),
+            as_json=args.json,
+        )
     # The prompt proved the code but returns no step (provision-admin hands the code to the service,
     # which derives the step the same way). The swap records this step, so the proving code is spent.
     step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)
     if step is None:  # reachable only through a stubbed prompt; refused rather than asserted
         return _emit_error(
-            "the authenticator code did not match; nothing was written." + unused_entry,
+            f"the authenticator code did not match. {after_check_open}." + unused_entry,
             as_json=args.json,
         )
     plain_codes = totp.generate_recovery_codes(settings.auth.mfa_recovery_code_count)
@@ -11707,6 +12424,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def run() -> str | None:
         """The swap, its session sweep and its audit row in one transaction, or why not."""
+        # check()'s open returned, and may have written, before this one (BACKLOG #5067), so a
+        # refusal from here is reported with after_check=True, which names both opens.
         store = await opened()
         try:
             user = await store.get_user_by_username(wanted)
@@ -11795,7 +12514,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             # Before the swap, but after the key was shown: nothing written, and the new entry
             # in the app has no seed behind it, so the hint goes with every store failure here.
             if isinstance(exc, Exception) and isinstance(exc, (*open_refusals, *store_errors)):
-                return open_refused(exc, hint=unused_entry)
+                return open_refused(exc, hint=unused_entry, after_check=True)
             raise  # nothing written; not a store failure, so the dispatch floor reports it
         # The swap committed, or may have, before this failure: Ctrl-C included, the codes must
         # still reach the operator and the report must say what happened.
@@ -12567,8 +13286,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "min_decryption_version above a version stops the values sealed under it from "
             "decrypting. Raising the audit key's min_decryption_version above a version breaks "
             "the audit chain at every row MACed under it; the audit key is the data key unless "
-            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
-            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY is set to the name of a different Transit key, and set "
+            "empty or to the data key's own name it is still the data key. Trimming a version off "
+            "either key does the same to what it sealed or MACed, and the engine cannot undo it; "
+            "a restore of a Vault snapshot taken before the trim may bring the version back, "
+            "and also returns everything else in Vault, every later key version included, to "
+            "that point. "
+            "docs/SECURITY.md, under "
             f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
             "does to the attestation. Nothing was changed.",
             file=sys.stderr,
@@ -13229,16 +13953,12 @@ def _cipher_audit(args: argparse.Namespace) -> int:
 
     A server store's schema is the build's, so every cell of the inventory asked for must be
     visible in its catalog read. One that is not, a table or a column, was not read, at least
-    because the login lacks a grant on it: that is NOT COVERED, never a PASS over the rest.
+    because the login lacks a grant on it: that is NOT_COVERED, never a PASS over the rest.
 
-    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT COVERED (a server store whose catalog hides an
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (a server store whose catalog hides an
     expected cell), 4 KEY_MISMATCH (a sealed value and no key resolved, the usual cause being a
     shell without the service's key). A FAIL or KEY_MISMATCH the visible cells earn leads 3."""
-    from messagefoundry.config.settings import (
-        StoreBackend,
-        hop_posture_from_ai,
-        keyless_opt_out_refusal,
-    )
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
@@ -13313,6 +14033,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             return 2
         cells = tuple(c for c in inventory if c.table in set(args.table))
     stopped: str | None = None
+    # A VACUUM or other schema change stopped the SQLite walk, so a rowid locator may have moved.
+    interrupted = False
     audit = CipherAudit()
     # A server store's cells, and its `keyed_surface`, that its catalog read did not show this login.
     hidden: list[str] = []
@@ -13328,6 +14050,26 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         # the error is raised for one value, and its text is not this command's to print.
         cause = exc.__cause__
         return type(exc).__name__ + (f" from {type(cause).__name__}" if cause else "")
+
+    def failing_value(found: CipherAudit) -> tuple[str, str] | None:
+        # The FAIL reason the values read earn and the first failing value's line: a value that
+        # did not open or a BLOB before an unmarked value the store refuses at read; None when
+        # every value read passes. The one ranking: the verdict below and a walk stopped part
+        # way both read it.
+        if found.failed or found.blob:
+            first = next(t.first_failure for t in found.tallies if t.first_failure)
+            return (
+                f"{found.failed} sealed value(s) did not open, and {found.blob} BLOB(s) sit where "
+                f"the store writes only text; the first: {first}"
+            ), first
+        if found.unmarked and not store.allow_unmarked_ciphertext:
+            first = next(t.first_unmarked for t in found.tallies if t.first_unmarked)
+            return (
+                f"{found.unmarked} non-blank value(s) on surfaces this keyed store has sealed "
+                "carry no at-rest marker, so the store refuses each at read: a damaged or "
+                f"stripped marker, or a planted row (BACKLOG #1169); the first: {first}"
+            ), first
+        return None
 
     if server:
         # A server store: opened read-only through `open_store`, which runs no DDL and none of the
@@ -13359,7 +14101,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # A keyless open of a keyed store refused by the open itself: the key, not the
                 # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
                 return False, CipherAudit(key_mismatch=safe_exc(exc)), None, []
-            except (RuntimeError, NotImplementedError, ValueError) as exc:
+            except (RuntimeError, ValueError) as exc:
                 # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
                 # least a missing driver extra, or an engine refusal of this open. Could not start.
                 if isinstance(
@@ -13384,22 +14126,32 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 ]
                 if "keyed_surface" not in columns:
                     hidden.append("keyed_surface")
+                # Filled in place, so a walk that raises part way keeps what it had tallied and a
+                # failure found before the stop is still reported (BACKLOG #1719 item 1).
+                found = CipherAudit()
                 try:
-                    found = await audit_server_cipher_cells(
-                        source, server_cipher, cells=cells, chunk_rows=chunk_rows, columns=columns
+                    await audit_server_cipher_cells(
+                        source,
+                        server_cipher,
+                        cells=cells,
+                        chunk_rows=chunk_rows,
+                        columns=columns,
+                        into=found,
                     )
                 except walk_errors as exc:
-                    if is_store_shape_error(exc):
-                        # A table, column or grant the read needs, as `audit-verify` splits it:
-                        # nothing about a row, so could not start rather than FAIL.
-                        raise _StoreUnreachable() from exc
-                    # Part way: a lost connection, a timeout, a value the driver cannot read. The
-                    # rendering is the error's class and SQLSTATE, never a row's content.
-                    return server_cipher.encrypts, CipherAudit(), _store_error_text(exc), hidden
+                    error: Exception = exc
                 except key_service_down as exc:
-                    stop = stopped_by_key_service(exc)
-                    return server_cipher.encrypts, CipherAudit(), stop, hidden
-                return server_cipher.encrypts, found, None, hidden
+                    return server_cipher.encrypts, found, stopped_by_key_service(exc), hidden
+                else:
+                    return server_cipher.encrypts, found, None, hidden
+                if is_store_shape_error(error) and failing_value(found) is None:
+                    # A table, column or grant the read needs, as `audit-verify` splits it:
+                    # nothing about a row, so could not start rather than FAIL.
+                    raise _StoreUnreachable() from error
+                # Part way: a lost connection, a timeout, a value the driver cannot read, or a
+                # grant the walk met after it had found a failing value. The rendering is the
+                # error's class and SQLSTATE, never a row's content.
+                return server_cipher.encrypts, found, _store_error_text(error), hidden
             finally:
                 await _close_store_quietly(handle)
 
@@ -13432,9 +14184,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             # too, and neither creates a file.
             _emit_error(f"no store at {path} (check --db / [store].path)", as_json=as_json)
             return 2
-        # The instance's own posture, derived as `serve` derives it, for the Vault hops the cipher
-        # build can dial (vault BACKLOG #2983).
-        posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+        # The posture the server branch opens on, for the Vault hops the cipher build can dial
+        # (vault BACKLOG #2983); `_command_hop_posture` says what it is (BACKLOG #1719 item 11).
+        posture = _command_hop_posture(settings)
         try:
             cipher = build_store_cipher(store, posture=posture)
         except _key_unresolved() as exc:
@@ -13460,18 +14212,21 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     as_json=as_json,
                 )
                 return 2
-            audit = audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows)
+            # Filled in place, so a stop part way keeps what was counted (BACKLOG #1719 item 1).
+            audit_cipher_cells(conn, cipher, cells=cells, chunk_rows=chunk_rows, into=audit)
         except sqlite3.Error as exc:
             # Part way: a lock held past --busy-timeout, a disk error, a value the driver cannot
             # read. The rendering quotes no row's content.
             stopped = _store_error_text(exc)
         except CipherWalkInterrupted as exc:
             stopped = str(exc)
+            interrupted = True
         except key_service_down as exc:
             stopped = stopped_by_key_service(exc)
         finally:
             conn.close()
 
+    failing = failing_value(audit)
     if audit.key_mismatch is not None:
         status, code = "KEY_MISMATCH", 4
         reason = (
@@ -13482,24 +14237,21 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         status, code = "FAIL", 1
         reason = (
             f"the audit stopped part way on an error ({stopped}). The values after it were not "
-            "read, and the counts are not reported: treat the store as unaudited until a run that "
+            "read, and no counts are reported: treat the store as unaudited until a run that "
             "finishes says otherwise"
         )
-    elif audit.failed or audit.blob:
+        if failing is not None:
+            # The first failing line only: a count over the values read before the stop would
+            # read as the store's.
+            reason += f". Before it stopped, a value it read already fails: {failing[1]}"
+            if interrupted:
+                reason += (
+                    ". The change that stopped the walk may have renumbered the rowid that line "
+                    "names"
+                )
+    elif failing is not None:
         status, code = "FAIL", 1
-        first = next(t.first_failure for t in audit.tallies if t.first_failure)
-        reason = (
-            f"{audit.failed} sealed value(s) did not open, and {audit.blob} BLOB(s) sit where the "
-            f"store writes only text; the first: {first}"
-        )
-    elif audit.unmarked and not store.allow_unmarked_ciphertext:
-        status, code = "FAIL", 1
-        first = next(t.first_unmarked for t in audit.tallies if t.first_unmarked)
-        reason = (
-            f"{audit.unmarked} non-blank value(s) on surfaces this keyed store has sealed carry no "
-            "at-rest marker, so the store refuses each at read: a damaged or stripped marker, or a "
-            f"planted row (BACKLOG #1169); the first: {first}"
-        )
+        reason = failing[0]
     elif hidden:
         # A server schema is the build's own, so an expected cell the catalog read did not show
         # was hidden from this login (at least a missing grant) rather than never created. Its
@@ -13543,8 +14295,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "on it, or let the service's open migrate the store, and run again"
         )
 
-    # A walk that stopped, on an error or on the key mismatch, has no counts worth printing: zeros
-    # would read as an empty store.
+    # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
+    # before the stop would read as the whole store's.
     counted = stopped is None and audit.key_mismatch is None
     cell_rows = audit.tallies if counted else []
     if as_json:
@@ -13600,29 +14352,58 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     It keeps no session: the shell that runs it holds none.
 
     The audit row is written after the revoke, and the audit append is checked for a refusal
-    before the revoke, so a refused row cannot follow a change that already landed.
+    before the revoke, so a key-check refusal of the row cannot follow a change that already
+    landed; a store that refuses the append itself still can, and the command then says so.
     ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
-    (BACKLOG #5633)."""
+    (BACKLOG #5633).
+
+    A revoke whose link to a server store failed may have committed, so it is reported as
+    unknown (BACKLOG #5093), and its own row records the attempt with ``"outcome": "unknown"`` and
+    no count, where the store accepts that row; :func:`_revoke_link_lost` says which failures
+    count. A failure of the report the store runs after the revoke committed is reported as a
+    revoke that landed, with ``"outcome": "committed"`` and no count, since the count is lost."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.alerts import LoggingAlertSink, authority_seal_page
-    from messagefoundry.redaction import safe_exc
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
+        audit_write_errors,
         open_store,
         store_call_errors,
+        store_connect_errors,
     )
+    from messagefoundry.store.store import REVOKE_COMMITTED_NOTE
 
     settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
     if isinstance(settings, int):
         return settings
     posture = _command_hop_posture(settings)
+    try:
+        # Before the store opens, as admin-unlock names it: a shell whose OS user cannot be named
+        # must not end the sessions and then fail to write the row that says who did.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({codec_safe_str(exc)}); nothing was "
+            "revoked",
+            as_json=args.json,
+        )
 
-    async def run() -> tuple[int | None, str | None]:
+    network = _store_on_network(settings)
+
+    async def run() -> tuple[
+        Literal["revoked", "committed", "refused", "unknown"], int | None, str | None, str | None
+    ]:
+        """``(outcome, count, problem, audit_problem)``. ``revoked`` carries the count;
+        ``committed`` the failure of the report after a revoke that landed, whose count is lost;
+        ``refused`` the store's refusal, which rolled the revoke back; ``unknown`` the link
+        failure, after which the revoke may have committed. ``audit_problem`` is the refusal of
+        this command's row, or ``None`` once it is written."""
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(
             open_store(
@@ -13631,61 +14412,151 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
-        # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through the
-        # store's own pager, on the logging sink, serve's fallback, since the CLI holds no notifier.
-        seal_pager = getattr(store, "seal_pager", None)
-        if callable(seal_pager):
-            seal_pager().arm(authority_seal_page(LoggingAlertSink()))
-        try:
-            _refuse_an_unauditable_write(store)
-            try:
-                revoked = (await store.revoke_all_sessions()).count
-            except AUDIT_WRITE_DEFECTS:
-                raise  # a bug, not a refused write
-            except store_call_errors() as exc:
-                # The store opened; the revoke itself was refused and rolled back. Not the open
-                # error the arm below words, which would read as a wrong --db path.
-                return None, f"nothing was revoked: {safe_exc(exc)}. Retry"
-            # The revoke has committed. A failed audit append (a running engine holding the
-            # write lock past the busy timeout, say) must not read as "nothing happened".
+
+        async def audit(detail: dict[str, object]) -> str | None:
+            """Append the row once the revoke has run. A refusal ``audit_write_errors()`` names,
+            a Transit MAC failure among them, is returned as text rather than raised, so it does
+            not replace what the command says about the revoke. The audit-write defects are
+            raised, as on main: a bug is not a refusal. The class goes to ERROR and the traceback
+            to DEBUG: a driver's message can quote a stored value."""
             try:
                 await store.record_audit(
-                    "auth.session_revoked",
-                    actor=f"cli:{getpass.getuser()}",
-                    detail=json.dumps({"scope": "all", "count": revoked}),
+                    "auth.session_revoked", actor=actor, detail=json.dumps(detail)
                 )
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
-            except store_call_errors() as exc:
-                return revoked, safe_exc(exc)
-            return revoked, None
+            except audit_write_errors() as exc:
+                log = logging.getLogger(__name__)
+                log.error(
+                    "admin-revoke-sessions: the auth.session_revoked row was refused (%s)",
+                    type(exc).__name__,
+                )
+                log.debug("admin-revoke-sessions: the refusal's traceback", exc_info=exc)
+                return _store_error_text(exc)
+            return None
+
+        try:
+            # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through
+            # the store's own pager, on the logging sink, serve's fallback, since the CLI holds no
+            # notifier. Inside the try, so a raise here still closes the store.
+            seal_pager = getattr(store, "seal_pager", None)
+            if callable(seal_pager):
+                seal_pager().arm(authority_seal_page(LoggingAlertSink()))
+            _refuse_an_unauditable_write(store)
+            try:
+                revoked = (await store.revoke_all_sessions()).count
+            except Exception as exc:
+                if REVOKE_COMMITTED_NOTE in getattr(exc, "__notes__", ()):
+                    # The revoke committed and the store's report after it failed, so the
+                    # sessions are ended and only the count is lost. The row records the act.
+                    committed: dict[str, object] = {
+                        "scope": "all",
+                        "count": None,
+                        "outcome": "committed",
+                    }
+                    return "committed", None, _store_error_text(exc), await audit(committed)
+                if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise  # a bug, not a refused write
+                if not isinstance(exc, (*store_call_errors(), *store_connect_errors())):
+                    raise
+                lost = _revoke_link_lost(exc, network=network)
+                # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
+                # bind-count mismatch, is a defect, as the transit-bound commands treat it, which
+                # the dispatch floor reports by class and SQLSTATE only. Unless a lost link sits
+                # in its implicit context: a rollback on a dead connection after a COMMIT whose
+                # link failed raises such a root, and the sessions may have ended, so the outcome
+                # is unknown and the row must record it (BACKLOG #5093).
+                defect = not isinstance(exc, store_call_errors()) and not (
+                    _is_transient_driver_error(exc)
+                )
+                if defect and not lost:
+                    raise _StoreDefect(_store_error_text(exc)) from exc
+                if lost:
+                    # The link failed, possibly after the server applied the COMMIT, so nothing
+                    # here can say whether the sessions ended. The row records the attempt.
+                    detail: dict[str, object] = {
+                        "scope": "all",
+                        "count": None,
+                        "outcome": "unknown",
+                    }
+                    return "unknown", None, _store_error_text(exc), await audit(detail)
+                # The store opened; the revoke itself was refused and rolled back. Not the open
+                # error the arm below words, which would read as a wrong --db path. Only a lock
+                # is fixed by stopping a SQLite engine, so only a lock gets that hint, as the
+                # transit-bound commands give it.
+                hint = (
+                    "; if the engine is running on this SQLite store, stop it and re-run"
+                    if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+                    else ""
+                )
+                return "refused", None, f"{_store_error_text(exc)}. Retry{hint}", None
+            # The revoke has committed. A failed audit append (a running engine holding the
+            # write lock past the busy timeout, say) must not read as "nothing happened".
+            return "revoked", revoked, None, await audit({"scope": "all", "count": revoked})
         finally:
-            await store.close()
+            # A close that fails after the commit must not report the revoke as refused.
+            await _close_store_quietly(store)
 
     try:
-        revoked, problem = run_guarded(run())
+        outcome, revoked, problem, audit_problem = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
         _StoreOpenRefused,
     ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+        # Through `codec_safe_str`: a key source's codec error quotes a byte of what it decoded.
+        _emit_error(codec_safe_str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-    if revoked is None:
-        return _emit_error(problem or "nothing was revoked", as_json=args.json)
-    if problem is not None:
+    if outcome == "refused":
+        return _emit_error(f"nothing was revoked: {problem}", as_json=args.json)
+    if outcome == "committed":
+        recorded = (
+            "An auth.session_revoked row with the outcome committed and no count records it"
+            if audit_problem is None
+            else f"The audit row could not be written either ({audit_problem}); record the act "
+            "by hand"
+        )
         return _emit_error(
-            f"revoked {revoked} session(s), but the audit row could not be written: {problem}. "
-            "The sessions are ended; record the act by hand",
+            "the revoke committed, so the sessions it found are ended, but the report the store "
+            f"runs after it failed ({problem}), so its count is not known. {recorded}",
+            as_json=args.json,
+        )
+    if outcome == "unknown":
+        recorded = (
+            "An auth.session_revoked row with the outcome unknown records the attempt"
+            if audit_problem is None
+            else "The audit row that would record the attempt could not be written either "
+            f"({audit_problem}); record the attempt by hand"
+        )
+        return _emit_error(
+            "the store connection failed or timed out during the revoke, so whether it took "
+            "effect is "
+            f"unknown ({problem}). {recorded}. Re-run the command: a second revoke ends what "
+            "this one would have, within the limits docs/SECURITY.md, Limits of the session "
+            "sweep, names, and also every session signed in since this attempt",
+            as_json=args.json,
+        )
+    if audit_problem is not None:
+        return _emit_error(
+            f"ended {revoked} unrevoked session row(s), but the audit row could not be written: "
+            f"{audit_problem}. The sessions are ended; record the act by hand",
             as_json=args.json,
         )
     if args.json:
         print(json.dumps({"ok": True, "revoked": revoked}))
     else:
-        print(f"OK: revoked {revoked} session(s); every signed-in user must sign in again")
+        # The count is the rows the sweep ended, expired ones never purged among them; the global
+        # session epoch the revoke raised is what ends the rest (BACKLOG #5091, #5095). The row is
+        # not sealed, so the claim is scoped to the documented limit rather than stated whole.
+        print(
+            f"OK: ended {revoked} unrevoked session row(s), expired ones included, and raised the "
+            "global session epoch, which refuses the sessions signed in before it unless someone "
+            "with write access to the database lowers or deletes its row; docs/SECURITY.md, "
+            "Limits of the session sweep, says what else it may miss"
+        )
     return 0
 
 
@@ -14352,7 +15223,7 @@ def _alert(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from messagefoundry.config import alerts_edit
-    from messagefoundry.config.settings import AlertRule, load_settings
+    from messagefoundry.config.settings import AlertRule, SectionNameEnvError, load_settings
     from messagefoundry.pipeline.alert_sinks import (
         check_rule_recipients,
         configured_alert_transport_names,
@@ -14395,6 +15266,8 @@ def _alert(args: argparse.Namespace) -> int:
                     configured = configured_alert_transport_names(
                         load_settings(config_path=path).alerts
                     )
+                except SectionNameEnvError:
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     configured = (
                         set()
@@ -14413,6 +15286,8 @@ def _alert(args: argparse.Namespace) -> int:
             if new_rule.recipients or any(step.recipients for step in new_rule.escalate):
                 try:
                     alerts = load_settings(config_path=path).alerts
+                except SectionNameEnvError:
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     alerts = None  # no settings yet, so no email transport sends the override
                 if (
@@ -14872,7 +15747,7 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
         context = _verifying_context(store)
     except (ValueError, OSError):
         return
-    _refuse_store_revocation(host=store.server or "", posture=posture, context=context)
+    _refuse_store_revocation(host=store.server, posture=posture, context=context)
 
 
 async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
@@ -14918,9 +15793,10 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
-    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
-    result. A close that fails prints a warning naming its
+    """Close ``store`` once a command has its result, at least ``audit-verify``,
+    ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
+    ``store withdraw-transit-bound``, ``provision-admin``, ``admin-set-notify-email`` and
+    ``admin-reset-totp``'s pre-write check. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
@@ -15054,6 +15930,46 @@ def _write_outcome_unknown(exc: BaseException) -> bool:
     return state is not None and (state.startswith("08") or state == "40003")
 
 
+def _store_on_network(settings: ServiceSettings) -> bool:
+    """Whether the store is a server database reached over a connection, not a SQLite file."""
+    from messagefoundry.config.settings import StoreBackend
+
+    return settings.store.backend != StoreBackend.SQLITE
+
+
+def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
+    """Whether ``admin-revoke-sessions``' failed revoke may have committed (BACKLOG #5093).
+
+    Never on SQLite: the file has no link to lose, and a revoke that raised there rolled back.
+    On a server store, an ``OSError`` raised by the revoke itself, a ``TimeoutError`` among them,
+    as :func:`_write_outcome_unknown` reads one for the transit-bound commands, or a SQLSTATE of
+    class 08, or 40003, "statement completion unknown", on the error or in its implicit
+    ``__context__`` chain. asyncpg's command timeout covers the COMMIT too, so its
+    ``TimeoutError`` can fire after the server committed. pyodbc's query timeout, SQLSTATE
+    ``HYT00``, is not a ``TimeoutError`` and reads as a refusal. The chain is read for a SQLSTATE only: a rollback on a dead
+    connection after a COMMIT whose link failed raises its own error with the lost link as its
+    context, while a refusal raised inside an ``except OSError`` block names no lost COMMIT. An
+    explicit cause or a suppressed context ends the chain: the raiser chose what it means. The
+    reading is an approximation from the outside; the store does not say whether its COMMIT was
+    sent."""
+    from messagefoundry.store.base import driver_sqlstate
+
+    if not network:
+        return False
+    if isinstance(exc, OSError):
+        return True
+    link: BaseException | None = exc
+    seen: set[int] = set()
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        state = driver_sqlstate(link)
+        if state is not None and (state.startswith("08") or state == "40003"):
+            return True
+        # Setting a cause, by `raise ... from` or by assignment, also suppresses the context.
+        link = None if link.__suppress_context__ else link.__context__
+    return False
+
+
 def _emit_store_open_error(
     exc: Exception, path: str, *, as_json: bool, text: str | None = None
 ) -> int:
@@ -15079,9 +15995,13 @@ def _emit_store_open_error(
     a job keeps in its log (vault BACKLOG #3054, item 10). The column name stays. A server driver's
     error that carries a SQLSTATE renders as its class, SQLSTATE and native error number, never its
     text: a server message can quote a stored value, such as SQL Server's "The duplicate key value
-    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). An
-    error with no SQLSTATE goes through ``safe_exc``: at least asyncpg's refused connection, an
-    OSError, and its client errors, whose text ``safe_exc`` redacts by pattern only.
+    is (...)", and ``safe_exc``'s pattern redaction keeps that (measured in BACKLOG #1661). A
+    SQLite error (a ``sqlite3.DatabaseError``) prints its own text, apart from that decode tail,
+    and never goes through ``safe_exc``, as before vault BACKLOG #8153. Any other error with no
+    SQLSTATE goes through ``safe_exc``: another driver's own error class, at least one of
+    asyncpg's client errors, renders as its class and a withheld message (vault BACKLOG #8153);
+    any other, at least asyncpg's refused connection and an OSError, keeps its text, redacted by
+    pattern only.
 
     ``text``, when given, replaces that rendering, for a caller that has already rendered the error
     its own way: the transit-bound commands print an engine refusal whole (BACKLOG #2337), and

@@ -52,7 +52,7 @@ def _through_the_chain(text: str) -> str:
     return record.getMessage()
 
 
-def _main_end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
+def _main_end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool = False) -> str:
     """The end-tag rest as main copied it, vendored: main appended ``text[tag.start():pos]``, which
     is the tag itself (still appended) followed by exactly this."""
     return text[start:stop]
@@ -70,7 +70,7 @@ def _main() -> Iterator[None]:
         yield
 
 
-def _never_masked_only(text: str, flat: str, *, widened: bool) -> bool:
+def _never_masked_only(text: str, flat: str, *, widened: bool, noted: bool = False) -> bool:
     """Main's round gate: no change is a mask alone, so only ``text == flat`` ends a round."""
     return False
 
@@ -114,7 +114,8 @@ def test_the_rest_is_masked_in_place(text: str, want: str) -> None:
     assert redact(text) == want
 
 
-#: Rests the XML pass keeps as main left them; :func:`redaction._end_tag_rest` lists the residual.
+#: Rests the XML pass keeps as main left them; :func:`redaction._end_tag_rest` names the residual,
+#: at least these shapes.
 _KEPT = {
     "comma": "<family>Smith</family Zq, Zqxdoe>",
     "credential-label": "<family>Smith</family password: Zqxdoe>",
@@ -200,13 +201,18 @@ def _clamped_at(shape: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "shape", ["a|b|</family zqxP", "a|b|</family Zqx 4455", "a|b|</family Kim"]
+    ("shape", "value"),
+    [("a|b|</family zqxP", "zqxP"), ("a|b|</family Zqx 4455", "4455"), ("a|b|</family Kim", "Kim")],
 )
-def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(shape: str) -> None:
+def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(
+    shape: str, value: str
+) -> None:
     """Code review round 3 (Manager repair): the bound note a clamp appends is stripped before the
-    XML pass reads the text, so the field-run arm judges the rest without it too. With the note left
-    on, a rest that ends the text read as followed by a line break and lost the end-of-text
-    refusals, so it was masked where main kept it. The answer is main's, with no new masking.
+    XML pass reads the text, so the field-run arm judges the rest without it too, and the two give
+    one answer. Both now know the note followed (BACKLOG #5925 root fix): no caller's text can be
+    glued to a rest the note follows, so the end-of-text refusals do not apply there and the rest is
+    masked. Before the root fix this test pinned main's answer, which printed these rests whole
+    behind the note; the answer is now main's with the rest masked, and the walk's.
 
     The clamp's name walk drops a trailing capitalized word such as ``Kim`` whole, so for that
     shape the clamped text is built from the note directly."""
@@ -214,10 +220,18 @@ def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(shape: str
         clamped = f"{shape}\n{redaction._clamp_marker(500)}"
     else:
         clamped = _clamped_at(shape)
-    assert redaction._TRAILING_NOTES.search(clamped) is not None  # the premise: the note is on
+    note = redaction._TRAILING_NOTES.search(clamped)
+    assert note is not None  # the premise: the note is on
     with _main():
         main = redact(clamped)
-    assert redact(clamped) == main
+    out = redact(clamped)
+    assert value in main  # the premise: main printed it
+    assert value not in out
+    assert _is_main_masked(out, main)
+    walked = redact(f"<family>Smith</family{clamped[len('a|b|</family') :]}")
+    prefix = "<family>[redacted]</family"
+    assert walked.startswith(prefix)
+    assert out == f"{redaction._REDACTED}{walked[len(prefix) :]}"
 
 
 @pytest.mark.parametrize("joiner", [" ", "\n"])
@@ -468,9 +482,7 @@ class _Tally:
                     self.gains += 1
 
 
-def _differential(
-    trials: int, seed: int, control: Callable[[str, int, int, bool], str]
-) -> tuple[_Tally, _Tally]:
+def _differential(trials: int, seed: int, control: Callable[..., str]) -> tuple[_Tally, _Tally]:
     """The shipped redactor's tally and ``control``'s, which replaces
     :func:`redaction._end_tag_rest`, over ``trials`` composed texts, each compared with main's
     answer for the same text, computed once."""
@@ -491,14 +503,15 @@ def _differential(
 
 def _is_main_masked(out: str, main: str) -> bool:
     """Whether ``out`` is ``main`` with some letters and digits masked to their class, and nothing
-    else changed: then no value main hid can print, by construction rather than by a value list."""
+    else changed: then no character main replaced is back in ``out``, checked without a value list.
+    A mask can still spell some other value, so this is not a proof that no value prints."""
     return len(out) == len(main) and all(
         a == b or (b.isascii() and b.isalnum() and a == b.translate(redaction._SHAPE))
         for a, b in zip(out, main, strict=True)
     )
 
 
-def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
+def _replace_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool = False) -> str:
     """The CONTROL: a rest REPLACED by the placeholder unless it holds only spaces and ``>``, the
     design the previous attempt took. It is not class-preserving, so the fuzz must find it leaking.
     It ignores ``mask``, so it also replaces walked rests in texts holding the backstop's opener,

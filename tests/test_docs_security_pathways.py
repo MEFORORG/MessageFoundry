@@ -128,6 +128,7 @@ _PARAGRAPH_TOKENS = (
 _REQUIRE_FACTORIES = frozenset(
     {
         "require",
+        "require_monitoring_read",
         "require_paced",
         "require_phi_read",
         "require_reauth_only",
@@ -1142,9 +1143,11 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
             f"the {label} MFA route's factor-state reads before verify_mfa are {pre_code}; the doc "
             "names only rotation_comes_first's must-change redirect."
         )
+    raw = _doc_text()
+    text = _flat(raw)
     assert (
         "before the code, through `rotation_comes_first`, whether a must-change session must "
-        "change its password first" in " ".join(_doc_text().split())
+        "change its password first" in text
     ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
@@ -1160,7 +1163,6 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         "POST /ui/reauth/webauthn",
     ], f"the console routes charging the per-actor ceremony budget changed: {ceremony}"
 
-    text = " ".join(_doc_text().split())
     for retired in (
         # Item 1 of the vault re-read: the console sign-in section named an AD form.
         "shows a sign-in form (Local / Active Directory)",
@@ -1193,7 +1195,6 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
             f"docs/SECURITY.md says {retired!r} again; the code contradicts it (BACKLOG #1133)."
         )
 
-    raw = _doc_text()
     oidc_row = next(
         line for line in raw.splitlines() if line.startswith("| `POST /ui/oidc/start`, `GET /ui")
     )
@@ -1264,6 +1265,136 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert "`verify_mfa` does ask" in text, (
         "the step-up paragraph must say verify_mfa refuses a satisfied oidc session's code."
     )
+
+
+_STEP_UP_HEADING = "### Step-up re-verification on sensitive operations (WP-L3-16, ASVS 7.5.3)"
+
+
+def test_the_mfa_gate_and_window_prose_points_at_one_statement() -> None:
+    """Vault BACKLOG #2964 items 19, 26 and 28: the MFA gate and the stamped-window prose.
+
+    Three cells (Table A's Authentication ambience row, the honest-limits bullet on the challenge
+    signals, and the Kerberos / SPNEGO strength row) each restated which proofs at the MFA gate
+    stamp a Kerberos session a window. Every rewording of that restatement introduced a new false
+    statement, so each cell now points at the Step-up re-verification paragraph instead, which
+    states the rule once, with the action-bound caveat under ``require_action_step_up``. These pin
+    the prose only. Some of the code facts behind them are pinned elsewhere: test_ui_mfa_gate.py's
+    test_a_satisfied_session_is_bounced_off_the_page (item 26), and test_webauthn.py's
+    test_a_factor_met_during_the_assertion_is_not_re_anchored (item 28).
+    """
+    raw = _doc_text()
+    text = _flat(raw)
+    for stated in (
+        "`POST /auth/mfa-verify` has no such must-change ask",
+        "unless, at least, the temporary credential has lapsed, which ends the session instead",
+        "submits a code to `verify_mfa`, through at least `POST /auth/mfa-verify` or `POST /ui/mfa`",
+        "an account holding a TOTP can do with effect only when, at least, the second-step lock is "
+        "not live",
+        "`GET /ui/mfa` renders its code form only to a session that owes a second factor it has "
+        "not met",
+        "That limits the page, not the code: `POST /ui/mfa` can still hand `verify_mfa` a code from "
+        "a session that has met its factor or owes none",
+        "or with a user-verified passkey that completes a pending factor, passes the window check",
+        "CORRECTED 2026-11-26 (vault BACKLOG #2964 (review of items 19, 26, 28)): this called it the "
+        "*second* such signal",
+    ):
+        assert stated in text, f"the doc no longer states: {stated}"
+
+    # The paragraph the pointers name must exist and must state the action-bound caveat, or the
+    # pointer promises a statement that is not there.
+    step_up = _flat(_heading_block(_STEP_UP_HEADING))
+    assert (
+        "An action-bound route still asks while `[auth].require_action_step_up` is on (the "
+        "default), because its single-use grant comes only from the step-up itself" in step_up
+    ), "the Step-up re-verification paragraph no longer states the action-bound caveat."
+
+    # Every cell below is whitespace-flattened once, so a line-wrapped phrase is still found.
+    pointer = (
+        f"[Step-up re-verification]({_github_anchor(_STEP_UP_HEADING)}) says what stamps a window, "
+        "and what an action-bound route still asks inside one"
+    )
+    lines = raw.splitlines()
+    ambience = _table_a_row("Authentication ambience")
+    kerberos_row = next(r for r in _primary_table()[1:] if r[0].startswith("**Kerberos / SPNEGO**"))
+    kerberos = _flat(" | ".join(kerberos_row))
+    start = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("- **") and "** contextual signals are a CHALLENGE" in line
+    )
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("- "))
+    bullet = _flat("\n".join(lines[start:end]))
+    for label, cell, forced in (
+        ("ambience row", ambience, "forces an explicit credential step-up"),
+        ("honest-limits bullet", bullet, "forces one"),
+        ("Kerberos row", kerberos, "forces a step-up"),
+    ):
+        assert f"a sensitive action {forced} while the session holds no live window" in cell, (
+            f"the {label} no longer says when a sensitive action forces a step-up."
+        )
+        assert pointer in cell, f"the {label} no longer points at the paragraph."
+        for restated in ("skips it when", "has already stamped", "which does too"):
+            assert restated not in cell, (
+                f"the {label} restates the stamped-window rule ({restated!r}) again; it points at "
+                "the Step-up re-verification paragraph instead (vault BACKLOG #2964 item 28)."
+            )
+    assert "An OIDC session's step-up is always the IdP leg (BACKLOG #2142" in ambience, (
+        "the ambience row no longer says an OIDC session's step-up is the IdP leg."
+    )
+    assert "The step-up is the **AD** row's directory re-bind" in kerberos, (
+        "the Kerberos row no longer names its step-up as the AD row's directory re-bind."
+    )
+    assert "the authentication ambience of an SSO/OIDC-minted session" in bullet, (
+        "the honest-limits bullet no longer names the SSO/OIDC-minted ambience signal."
+    )
+
+    # The first-seen-address row and defense-in-depth layer 5 point at the paragraph too, rather
+    # than restate which proofs stamp a window.
+    first_seen = _table_a_row(
+        "First-seen sign-in address — sign-in owes a second factor, or any directory sign-in"
+    )
+    assert f"born without step-up freshness anyway. {pointer}" in first_seen, (
+        "the first-seen sign-in address row no longer points at the paragraph."
+    )
+    assert f"The step-up gate refuses a session that has not. {pointer}" in text, (
+        "defense-in-depth layer 5 no longer points at the paragraph."
+    )
+
+    # The count of challenge signals the ambience row and the bullet give is read off Table A.
+    table = next(t for t in _tables(_heading_block(_H_TABLE_A)) if t[0][0] == "Attribute")
+    challenges = [r[0] for r in table[1:] if r[3].startswith("**CHALLENGE**")]
+    count = {2: "two", 3: "three", 4: "four", 5: "five"}[len(challenges)]
+    assert f"one of the {count} signals in this table whose action is a challenge" in ambience, (
+        f"the ambience row must count Table A's {count} CHALLENGE rows: {challenges}"
+    )
+    assert bullet.startswith(f"- **{count.capitalize()}** contextual signals are a CHALLENGE"), (
+        f"the honest-limits bullet must count Table A's {count} CHALLENGE rows: {challenges}"
+    )
+
+    for retired in (
+        # In forms longer than their CORRECTED quotes, so a CORRECTED note does not red here.
+        "until its holder submits a code to the MFA gate, which",
+        "outside that must-change case, an account holding a TOTP",
+        "a user-verified passkey, or a step-up",
+        "a user-verified passkey, which does too",
+        "with a code or a user-verified passkey passes the window check",
+        "or recovery code or a user-verified passkey proved at the MFA gate",
+        "or a user-verified passkey, proved at the MFA gate",
+        "the *second* signal in this table",
+        "A Kerberos session skips it when its holder",
+        "a user-verified passkey that completes the pending factor, or a step-up",
+        "also stamps the window on its own",
+        "code form for such a session",
+        "can do at any time the second-step lock",
+        "unless the temporary credential has lapsed",
+        "at first naming a user-verified passkey",
+        "always the IdP leg: a code meets its pending factor",
+        "That step-up is the **AD** row's",
+        "ambience of a browser SSO/OIDC-minted",
+    ):
+        assert retired not in text, (
+            f"docs/SECURITY.md says {retired!r} again; vault BACKLOG #2964 retired that wording."
+        )
 
 
 def _heading_block(heading: str) -> str:
@@ -2302,8 +2433,10 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     doubling = (
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
         "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
-        "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
-        "or whose value will not compute, still escalates. It does so too on a local account "
+        "the engine KNOWS this release refuses that enrolment (at least a marker it refuses, "
+        "BACKLOG #3422, a key under 160 bits, BACKLOG #5340, or no secret): a TOTP it cannot "
+        "judge, as [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068) says, still escalates. "
+        "It does so too on a local account "
         "holding a discoverable passkey under the configured relying party (BACKLOG #3937). "
         "Every other lock keeps "
         "`lockout_minutes`. A local account whose enrolment is known to be refused, and that holds "
@@ -2520,7 +2653,9 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             # Item 6: once TOTP is on, a covered account cannot remove it while no DISCOVERABLE
             # passkey remains; this one is not discoverable ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
-            staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+            staged_cell = await store.set_totp_secret(
+                identity.user_id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+            )
             assert await store.enable_totp(
                 identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
             )

@@ -21,8 +21,8 @@ HA (Workstream A2), a partitioned old leader **self-fences** before a standby ca
 store always gets the :class:`NullCoordinator`.
 
 **Steps 4 + 4b add leader election and leader-gated poll-source intake:** ``is_leader()`` reflects the
-held leadership lease, the engine gates its leader-only WRITE singletons (retention, the lease-reclaim
-sweep) on it, and the runner threads ``is_leader`` as a plain predicate into each source so only the
+held leadership lease, the engine gates its leader-only WRITE work (retention's shared-store phases,
+the lease-reclaim sweep) on it, and the runner threads ``is_leader`` as a plain predicate into each source so only the
 leader polls a **shared external resource** (a directory / DB table / remote dir) — listen sources
 (MLLP/TCP) ignore it and run on every node, but only the leader binds them (the graph runs on the
 leader only). Single-node operation stays byte-identical because :class:`NullCoordinator`'s
@@ -660,11 +660,13 @@ class StepdownOutcome(NamedTuple):
 
 def rows_affected(status: object) -> int:
     """The row count a release write reported, for BOTH coordinators: an ``int`` from
-    ``SqlServerStore._execute``, or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when there is none
-    to read, the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown count reads as
-    RELEASED: that keeps the stepdown's claim pause armed, which is the safe direction, at the cost of
-    a ``200`` that could over-report a drain. Both drivers report a count for a direct ``UPDATE``, so
-    this is a guard, not a path. Only a node that may own the row sends the write at all."""
+    ``SqlServerStore._execute_clamped``, which counts the release's ``OUTPUT`` rows rather than
+    ``cursor.rowcount`` (BACKLOG #6795), or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when
+    there is none to read, the DB-API spelling of "unknown". Neither store's release returns it
+    now, so it is a guard, not a path. Callers test ``!= 0``, so an unknown count would read as
+    RELEASED: that keeps the stepdown's claim pause armed, which is the safe direction, at the cost
+    of a ``200`` that could over-report a drain. Only a node that may own the row sends the write
+    at all."""
     if isinstance(status, int):
         return status
     if isinstance(status, str):
@@ -998,7 +1000,7 @@ class ClusterCoordinator(Protocol):
     async def stop(self) -> None: ...
 
     def is_leader(self) -> bool:
-        """Whether this node runs the leader-only singletons (the wired graph, retention, lease
+        """Whether this node runs the leader-only singletons (at least the wired graph and lease
         reclaim). Cheap/cached — never an ``await`` or a DB round-trip. Always ``True`` on
         :class:`NullCoordinator` (single-node)."""
         ...

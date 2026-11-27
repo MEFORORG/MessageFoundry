@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A credential the generic ODBC dialect sends WITHOUT braces is hidden whole on every log surface
-(BACKLOG #5030).
+"""Each word of a credential the generic ODBC dialect sends WITHOUT braces is masked character for
+character on the log surfaces below, except at least the words a later pass reads, which the
+comment on ``secretscrub._CONNECTION_STRING_MEMBER`` names (BACKLOG #5030).
 
 ``transports/database.py`` sends every ``odbc_params`` value plain, ``sslpassword`` among them. Such
-a value may hold a space, ",", "&" and, for a password, "=". The plain value class of the log
-scrubbers stopped at the first three, so an echoed connection string printed the tail of a plain
+a value may hold a space, "," and "&", and a plain password a log reaches by another route may
+also hold "=". The plain value class of the log scrubbers stopped at the first three, so an echoed connection string printed the tail of a plain
 password, and ``sslpassword`` printed whole, since "ssl" glued to "password" leaves no word boundary
 for the label.
 
@@ -248,10 +249,10 @@ _SHAPES_A_SECOND_PASS_PRINTED = (
 #: line break the control-character filter wrote as text; and the PHI pass's userinfo opener with a
 #: word glued on before it, which a review measured on six paths.
 _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
-    "connect failed;xpass=mfb64:v1:a1qkey= tail",
-    "connect failed;xpass=amfb64:v1:b2qkey= tail",
-    "%26;sslpassword=mfb64:v1:c3qkey=\t{password=ABC|",
-    ";xpass=mfb64:v1:x_mfb64:v1:d4qkey= tail",
+    "connect failed;xpass=mfb64:v1:a1qpwd= tail",
+    "connect failed;xpass=amfb64:v1:b2qpwd= tail",
+    "%26;sslpassword=mfb64:v1:c3qpwd=\t{password=ABC|",
+    ";xpass=mfb64:v1:x_mfb64:v1:d4qpwd= tail",
     ';xpass="family": \ne5q',
     "&<redacted>19800505;xpass=xnonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
 )
@@ -267,7 +268,7 @@ _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
 #: to a letter, which under a JSON ``name`` the PHI pass no longer read as an operator's value.
 _SHAPES_THE_WORD_MASK_PRINTED = (
     ";xpass=Patient%7CBearer #=\nc3qd4qBasic ",
-    "MRN: %26PID\x0ba1qkey=;KeyStorepwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
+    "MRN: %26PID\x0ba1qpwd=;KeyStorepwd={%41MSHstate=Jane Doemfb64:v1:mfb64:v1:ABC|Basic ",
     "Digest {~\x0cb2qe5q;xpass=%41%41MEFOR_X=[%5E05/05/1980/",
     "mfb64:v1:==mfb64:v1:;sslpassword=givenmfb64:v1:mfb64:v1:auth=;Accesstoken=-birthDate\x0c"
     "Zm9vYmFy+/Zm9vd4qstate=",
@@ -307,7 +308,7 @@ def _keep_without(*words: str) -> re.Pattern[str]:
 #: with the rule on is evidence. A rule is a pattern, or for the "#" fix and the mask itself a
 #: function, swapped for its earlier form.
 _RULE_CONTROLS = (
-    ("kept credential and query words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
+    ("kept credential and query-filter words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
     (
         "kept PHI words",
         "_MEMBER_KEEP",
@@ -446,7 +447,7 @@ _DIFFERENTIAL_PIECES = (
 _MEMBER_LED_KEYS = (";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=")
 _MEMBER_LED_OPENERS = ("", "", "", '"family": ')
 _MEMBER_LED_PIECES = (
-    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qkey=", "b2qtoken=", "c3q", "_", ".", "+", "/",
+    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qpwd=", "b2qtoken=", "c3q", "_", ".", "+", "/",
     "=", " ", "\n", '"family": ', "\x0c", "d4q",
 )  # fmt: skip
 
@@ -513,8 +514,10 @@ def _every_redaction_path(line: str) -> dict[str, str]:
 def _without_member_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """Take the member pass out of both surfaces, which is what ``origin/main`` runs: the pass is the
     only change these modules carry for BACKLOG #5030."""
-    monkeypatch.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", _NEVER)
-    monkeypatch.setattr(bundle_redact, "_CONNECTION_STRING_MEMBER", _NEVER)
+    for name in ("_CONNECTION_STRING_MEMBER", "_CONNECTION_STRING_FIRST_MEMBER"):
+        monkeypatch.setattr(secretscrub, name, _NEVER)
+        monkeypatch.setattr(bundle_redact, name, _NEVER)
+    monkeypatch.setattr(secretscrub, "_NARROW_MEMBER", _NEVER)
 
 
 def _printed_where_the_baseline_hid(
@@ -563,21 +566,21 @@ def test_a_bundle_marker_in_a_member_value_is_still_read_by_the_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The line a review found: the mask wrote ``mfb64:redacted:``, so a chain line the bundle read
-    back printed ``QUJDkey``, which ``origin/main`` hid there. On every path, the body prints only
+    back printed ``QUJDpwd``, which ``origin/main`` hid there. On every path, the body prints only
     where the baseline prints it too, and every path through the bundle hides it."""
-    line = "connect failed;xpass=mfb64:v1:QUJDkey= tail"
+    line = "connect failed;xpass=mfb64:v1:QUJDpwd= tail"
     paths = _every_redaction_path(line)
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
         baseline = _every_redaction_path(line)
     assert [
-        p for p, out in paths.items() if "QUJDkey" in out and "QUJDkey" not in baseline[p]
+        p for p, out in paths.items() if "QUJDpwd" in out and "QUJDpwd" not in baseline[p]
     ] == []
     through_the_bundle = [
         p for p in paths if "bundle" in p or p.startswith(("redact_log_line", "store path"))
     ]
     assert len(through_the_bundle) == 5
-    assert [p for p in through_the_bundle if "QUJDkey" in paths[p]] == [], paths
+    assert [p for p in through_the_bundle if "QUJDpwd" in paths[p]] == [], paths
 
 
 @pytest.mark.parametrize("line", _SHAPES_THE_WORD_MASK_PRINTED)
@@ -595,6 +598,31 @@ def test_a_shape_the_word_mask_printed_prints_nothing_the_baseline_hid_on_any_pa
         path: [f for f in _planted(line) if f in out and f not in baseline[path]]
         for path, out in paths.items()
     }
+    assert not {path: found for path, found in printed.items() if found}, paths
+
+
+#: Lines a review found printing a value ``origin/main`` hid on six later paths, once ``key`` and
+#: ``auth`` left the kept words and before the key-label words joined them (BACKLOG #5030 added item
+#: 1): the mask took a compound key label ``_KEY_MATERIAL`` reads, so a second redaction lost it.
+_SHAPES_A_KEY_LABEL_PRINTED = (
+    ";Accesstoken=,accessKey:Jane Doe\nb2qe5qMRNmasterKey=",
+    ';Accesstoken=accessKey:"\n\ne5qb2qsubscriptionKey=',
+)
+
+
+@pytest.mark.parametrize("line", _SHAPES_A_KEY_LABEL_PRINTED)
+def test_a_compound_key_label_in_a_value_prints_nothing_the_baseline_hid(
+    monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    paths = _every_redaction_path(line)
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = _every_redaction_path(line)
+    printed = {
+        path: [f for f in _planted(line) if f in out and f not in baseline[path]]
+        for path, out in paths.items()
+    }
+    assert _planted(line)
     assert not {path: found for path, found in printed.items() if found}, paths
 
 
@@ -643,13 +671,27 @@ def test_each_mask_rule_is_needed(
 def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None:
     """The pattern is a literal so the static regex scanner reads it; this holds the literal to its
     sources, and the bundle to the same function, so neither can drift."""
-    pattern = secretscrub._CONNECTION_STRING_MEMBER.pattern
-    words = re.findall(r"\(\?<=([a-z]+)\)", pattern)
-    assert sorted(words) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
-    # The braced body is kept to one line here; the label pattern's may cross one.
-    assert secretscrub._ODBC_BRACED.replace("[^}]", r"[^}\r\n]") in pattern
-    assert secretscrub._ODBC_BRACED_OVERRUN in pattern
-    assert vars(bundle_redact)["_CONNECTION_STRING_MEMBER"] is secretscrub._CONNECTION_STRING_MEMBER
+    words = sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
+    alternation = secretscrub._alternation
+    key_run = (
+        r"(?=[A-Za-z0-9_]*?(?:"
+        + alternation(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
+        + r")(?:_?(?:"
+        + alternation(secretscrub._MEMBER_QUALIFIERS)
+        + r"|[0-9]++))?=)[A-Za-z0-9_]++"
+    )
+    assert key_run == secretscrub._MEMBER_KEY_RUN
+    for name in ("_CONNECTION_STRING_MEMBER", "_CONNECTION_STRING_FIRST_MEMBER"):
+        pattern = getattr(secretscrub, name).pattern
+        # Each key test spells the words, then the optional qualifier.
+        alternations = re.findall(r"\(\?:((?:[a-z]+\|)+[a-z]+)\)\(\?:_\?", pattern)
+        assert alternations, name
+        assert all(sorted(found.split("|")) == words for found in alternations), name
+        assert secretscrub._MEMBER_KEY_RUN in pattern, name
+        # The braced body is kept to one line here; the label pattern's may cross one.
+        assert secretscrub._ODBC_BRACED.replace("[^}]", r"[^}\r\n]") in pattern
+        assert secretscrub._ODBC_BRACED_OVERRUN in pattern
+        assert vars(bundle_redact)[name] is getattr(secretscrub, name)
     assert vars(bundle_redact)["_mask_member"] is secretscrub._mask_member
 
 
@@ -664,7 +706,7 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         "secretscrub credential words": secretscrub._CREDENTIAL_WORDS,
         "secretscrub token words": secretscrub._TOKEN_WORDS,
         "secretscrub key-material words": secretscrub._KEY_MATERIAL_WORDS,
-        "secretscrub query-credential words": secretscrub._QUERY_CREDENTIAL_WORDS,
+        "secretscrub key-label words": secretscrub._KEY_LABEL_WORDS,
         "secretscrub query-credential compounds": secretscrub._QUERY_CREDENTIAL_COMPOUNDS,
         "secretscrub env prefix": (secretscrub._ENV_PREFIX,),
         "logging_setup query keys": logging_setup._CREDENTIAL_QUERY_KEYS,
@@ -851,7 +893,7 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     which the log chain's carriage pass still reads. A mask that took that ``v1`` printed the body
     on the chain where the baseline hid it; the fuzz differential found the line below. With the
     unit's alternative removed, it prints again."""
-    line = ';PWD="family": .=amfb64:v1:a1qkey=/"family": '
+    line = ';PWD="family": .=amfb64:v1:a1qpwd=/"family": '
     unit = secretscrub._MEMBER_VALUE_UNIT.pattern
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
@@ -861,3 +903,236 @@ def test_the_member_mask_keeps_a_replaced_marker_head(monkeypatch: pytest.Monkey
     assert stripped != unit
     monkeypatch.setattr(secretscrub, "_MEMBER_VALUE_UNIT", re.compile(stripped))
     assert _printed_where_the_baseline_hid([line], [_every_redaction_path(line)], baseline)
+
+
+#: A password word that holds a URL query-credential word (at least ``key``, ``sig``, ``auth`` and
+#: ``jwt``; ``secretscrub._QUERY_CREDENTIAL_WORDS`` holds them) before
+#: a ":" or "=". Those words were kept whole there, so the first word printed (BACKLOG #5030 added
+#: item 1). Each fragment is synthetic.
+_QUERY_WORD_PASSWORDS = (
+    ("Monkey", ";sslpassword=Monkey:Banana42;"),
+    ("Sigma7", ";sslpassword=Sigma7=Banana42;"),
+    ("Author", ";sslpassword=Author:Banana42;"),
+    ("Jwtz9", ";sslpassword=Jwtz9:Banana42;"),
+)
+
+
+@pytest.mark.parametrize(("fragment", "member"), _QUERY_WORD_PASSWORDS)
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_a_password_word_holding_a_query_credential_word_is_masked(
+    surface: str, apply: Callable[[str], str], fragment: str, member: str
+) -> None:
+    line = "DRIVER={Acme};SERVER=db1.example" + member
+    assert fragment in line
+    out = apply(line)
+    assert fragment not in out, f"{surface}: {fragment!r} printed -- {out!r}"
+    assert "Banana42" not in out, f"{surface}: the second word printed -- {out!r}"
+
+
+def test_the_query_credential_words_are_not_kept_words() -> None:
+    """No log pass reads them: ``credential_query_params`` reads them in a configured URL's parameter
+    names. A log pass reads ``key`` and ``auth`` only inside a longer label this list keeps, at
+    least ``_KEY_LABEL_WORDS`` (``accessKey``, ``AccountKey``, ``authKey``), checked here."""
+    for word in secretscrub._QUERY_CREDENTIAL_WORDS:
+        assert secretscrub._MEMBER_KEEP.search(word) is None, word
+        assert word.casefold() not in {w.casefold() for w in secretscrub._MEMBER_KEEP_WORDS}
+    for label in ("accessKey", "AccountKey", "authKey", "SharedAccessKey", "subscriptionKey"):
+        assert secretscrub._MEMBER_KEEP.search(label) is not None, label
+
+
+@pytest.mark.parametrize(
+    ("line", "masked"),
+    [
+        (";xpass=%3B.PID|x;", ";xpass=%0A.PID|x;"),
+        (";xpass=%3b-OBX|1;", ";xpass=%0A-OBX|0;"),
+        (";xpass=%7Z.PID|x;", ";xpass=%0x.PID|x;"),
+    ],
+)
+def test_a_hex_escape_before_a_segment_prefix_stays_a_hex_escape(line: str, masked: str) -> None:
+    """Right after a "%", the two characters of a hex escape stay hex in the segment-ID branch too,
+    as they do for any other word (BACKLOG #5030 added item 3): ``%3B.PID|`` was ``%0x.PID|``. A pair
+    that is not a hex escape (``7Z``) is masked like any other word. The bundle runs the same mask
+    after its PHI pass, which rewrites the text after the ``|``."""
+    assert scrub_credentials(line) == masked
+    assert masked.split("|")[0] + "|" in redact_log_line(line)
+
+
+#: The three shapes BACKLOG #5030 added item 4 names, each with a synthetic value holding a space
+#: and a ",": a first member with no ";" before it, a key that holds a credential word with a
+#: qualifier after it, and a member after "; ". Each value's tail after its space printed before.
+_ITEM_4_SHAPES = (
+    ("Password=Zq4f kW7m,Rt2v;Server=db1.example", ("Zq4f", "kW7m", "Rt2v")),
+    ("err: sslpassword=Zq4f kW7m,Rt2v; Server=db1.example", ("Zq4f", "kW7m", "Rt2v")),
+    ("DRIVER={X};ClientSecretValue=Zq4f kW7m,Rt2v;PORT=1", ("Zq4f", "kW7m", "Rt2v")),
+    ("DRIVER={X};PasswordOld=Zq4f kW7m,Rt2v;PORT=1", ("Zq4f", "kW7m", "Rt2v")),
+    ("DRIVER={X};Password_2=Zq4f kW7m,Rt2v;PORT=1", ("Zq4f", "kW7m", "Rt2v")),
+    ("DRIVER={X}; sslpassword=Zq4f kW7m,Rt2v;PORT=1", ("Zq4f", "kW7m", "Rt2v")),
+    ("DRIVER={X};\tPWD=Zq4f kW7m,Rt2v;PORT=1", ("Zq4f", "kW7m", "Rt2v")),
+)
+
+
+@pytest.mark.parametrize(("line", "fragments"), _ITEM_4_SHAPES)
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_each_item_4_shape_masks_its_whole_value(
+    surface: str, apply: Callable[[str], str], line: str, fragments: tuple[str, ...]
+) -> None:
+    """Each shape item 4 names (BACKLOG #5030) is masked to its ";" on every log surface, and the
+    member after it is kept."""
+    assert all(fragment in line for fragment in fragments)
+    out = apply(line)
+    assert not [f for f in fragments if f in out], f"{surface}: {out!r}"
+    assert ("Server=db1.example" in out) or ("PORT=1" in out), f"{surface}: {out!r}"
+
+
+@pytest.mark.parametrize(("line", "fragments"), _ITEM_4_SHAPES)
+def test_each_item_4_shape_printed_with_the_member_passes_off(
+    monkeypatch: pytest.MonkeyPatch, line: str, fragments: tuple[str, ...]
+) -> None:
+    """The control: with both member patterns off, which is what each shape met before this fix,
+    a fragment of each value prints, so the test above can fail."""
+    _without_member_pass(monkeypatch)
+    out = scrub_credentials(line)
+    assert [f for f in fragments if f in out], out
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # No member after the first value's ";", so it is no first member: prose stays readable.
+        "note: password=Zq4f kW7m; then the retry ran",
+        "accessToken=zq://ops:@Kv9;w@cache",
+        # A key holding a word, followed by something other than a qualifier.
+        "DRIVER={X};PasswordHint=street name;PORT=1",
+        "PasswordPolicy=strict;TokenEndpoint=https://idp.example/t",
+        # A word glued to a word character, "." or "-" before it is no first-member start.
+        "db.password=Zq4f kW7m;Server=h",
+    ],
+)
+def test_a_shape_item_4_does_not_name_is_left_to_the_other_passes(line: str) -> None:
+    """The first-member pattern needs a second ``<key>=`` after its ";", and a key may carry at most
+    one qualifier: each line here is no member to either pattern."""
+    for pattern in (
+        secretscrub._CONNECTION_STRING_MEMBER,
+        secretscrub._CONNECTION_STRING_FIRST_MEMBER,
+    ):
+        assert pattern.search(line) is None, (pattern.pattern[:40], line)
+
+
+@pytest.mark.parametrize(
+    ("line", "masked"),
+    [
+        # The kept words and shapes stay in a first member and after "; " as after ";".
+        ("sslpassword=a1q code=b2q;Server=h", "sslpassword=x0x code=x0x;Server=h"),
+        ("sslpassword=&state=b2q;Server=h", "sslpassword=&state=x0x;Server=h"),
+        ("sslpassword=x.PID|1;Server=h", "sslpassword=x.PID|0;Server=h"),
+        ("sslpassword=mfb64:v1:a1q b2q;Server=h", "sslpassword=mfb64:v1:x0x x0x;Server=h"),
+        ("x; sslpassword=(0010,1000)c3q;PORT=1", "x; sslpassword=(0010,1000)x0x;PORT=1"),
+        ("x; sslpassword=Bearer #x;PORT=1", "x; sslpassword=Bearer #x;PORT=1"),
+        ("x;ClientSecretValue=x_MRN#5;PORT=1", "x;ClientSecretValue=x_MRN#0;PORT=1"),
+    ],
+)
+def test_the_new_shapes_keep_what_a_later_pass_reads(line: str, masked: str) -> None:
+    """The mask in the new shapes keeps the words and shapes it keeps after a ";": the member mask
+    is the same function on the same value."""
+    assert scrub_credentials(line) == masked
+    assert scrub_credentials(masked) == masked
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "x pass=1 ",
+        " password=a b",
+        "; pwd=",
+        ";password" + "value" * 3,
+        " secretvalue",
+        "a" + "pass" * 4,
+        # A key glued after a non-ASCII letter: a first-member start, and so a stop too. When the
+        # stop read a Unicode class and the start an ASCII one, this was quadratic (code review).
+        "\u00e9pass=a ",
+        "\u0436pwd=1,",
+    ],
+)
+def test_the_new_shapes_scrub_in_linear_time(unit: str) -> None:
+    """About 400 KB of one unit, then a ";" and a second member, or a lone ";", so the member passes
+    run. The first-member walk stops at the next key a member could start at, so failed starts do
+    not re-read the line."""
+    for tail in (";", ";Server=h"):
+        line = unit * (400_000 // len(unit)) + tail
+        started = time.perf_counter()
+        scrub_credentials(line)
+        redact_log_line(line)
+        assert time.perf_counter() - started < 10.0, (unit, tail)
+
+
+#: Lines where a camelCase label's value holds an item 4 shape, each with what must not print.
+#: Read with the item 4 shapes, the union's member-key fallback or its shortcut probe returned the
+#: reading before whole, which reads no camelCase label, so each printed (found by code review).
+_CAMEL_LINES_ITEM_4_MUST_NOT_PRINT = (
+    ("cfg accessToken=Abc9,pwd=Zz7;Server=h", ("Abc9", "Zz7")),
+    ("cfg accessToken=Abc9,sslpassword=Zz7 Yy8;Server=h", ("Abc9", "Zz7", "Yy8")),
+    ("cfg accessToken=Abc9&sslpassword=Zz7;Server=h", ("Abc9", "Zz7")),
+    ("cfg apiToken=Abc9:pass=Zz7 Yy8;UID=u", ("Abc9", "Zz7", "Yy8")),
+    ("accessToken=Abc9;w=1,userPwd='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("x;PasswordOld=Abc9 x,clientSecret='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("sslpassword=Abc9;w=1,userPwd='Sec_77;PWD='", ("Abc9", "Sec_77")),
+    ("cfg userPwd='Abc9;PasswordOld=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg userPwd='Abc9; PWD=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg userPwd='Abc9;Password2=Zz7' rest", ("Abc9", "Zz7")),
+    ("cfg accessToken='Abc9;\tsslpassword=Zz7' rest", ("Abc9", "Zz7")),
+    ('cfg clientSecret="Abc9; Token=Zz7" rest', ("Abc9", "Zz7")),
+    # Lines only an item 4 shape changes take the union without its member-key fallback, so a
+    # member the shipped camelCase reading took with its key is still masked (code review round 2).
+    ("cfg userPwd='; sslpassword='Zq7 Kv9", ("Zq7", "Kv9")),
+    ("cfg userPwd=';PasswordOld='Zq7 Kv9", ("Zq7", "Kv9")),
+    ("apiToken=secret_new=@db'c3q;UID=,x", ("c3q",)),
+    ("connect redis://:Zq-Pw_1@h failed; userPwd='Kv9q;PWD='", ("Kv9q", "Zq-Pw_1")),
+    ("connect redis://h failed; userPwd='Kv9q;PWD='", ("Kv9q",)),
+)
+
+
+def _write_time_chain(line: str) -> str:
+    return logging_setup.scrub_log_text(line)
+
+
+@pytest.mark.parametrize(("line", "secrets"), _CAMEL_LINES_ITEM_4_MUST_NOT_PRINT)
+@pytest.mark.parametrize(
+    "apply",
+    [
+        scrub_credentials,
+        _write_time_chain,
+        redact_log_line,
+        lambda line: redact_log_line(_write_time_chain(line)),
+    ],
+    ids=["scrub_credentials", "write-time chain", "redact_log_line", "chain then bundle"],
+)
+def test_a_camelcase_value_holding_an_item_4_shape_prints_nothing(
+    apply: Callable[[str], str], line: str, secrets: tuple[str, ...]
+) -> None:
+    out = apply(line)
+    assert not [secret for secret in secrets if secret in out], out
+
+
+def test_the_union_reads_the_member_key_it_read_before_item_4() -> None:
+    """The fallback and the shortcut probe read :data:`secretscrub._NARROW_MEMBER`'s key, a ";"
+    then a key that ENDS in a word, and not the item 4 shapes, which the control shows they would
+    read if widened."""
+    for key in ("; PWD=", ";\tsslpassword=", ";PasswordOld=", ";Password2="):
+        assert secretscrub._MEMBER_KEY.match(key) is None, key
+        assert secretscrub._CONNECTION_STRING_MEMBER.match(key + "x") is not None, key
+    assert secretscrub._MEMBER_KEY.match(";sslpassword=") is not None
+    # The narrow head's words are the member words, as the wide key run's are.
+    narrow = re.findall(r"\(\?<=([a-z]+)\)", secretscrub._NARROW_KEY_HEAD)
+    assert sorted(narrow) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
+    assert secretscrub._NARROW_KEY_HEAD in secretscrub._NARROW_MEMBER.pattern
+    assert secretscrub._NARROW_KEY_HEAD in secretscrub._MEMBER_KEY.pattern
+
+
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_a_mefor_label_after_a_first_member_no_longer_prints(
+    surface: str, apply: Callable[[str], str]
+) -> None:
+    """The open cascade defect ``swallowed-mefor`` printed " pw-A2"; the first-member pass masks
+    it now, so it left that list, and this pins it hidden."""
+    out = apply("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'")
+    assert not [atom for atom in ("pw-A1", "pw-A2", "pw-B1") if atom in out], f"{surface}: {out!r}"

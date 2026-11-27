@@ -90,6 +90,14 @@ _BUILDERS = frozenset(
         # transports/
         "build_strict_opener",  # with no HTTPS handler, urllib supplies a verifying one
         "_no_redirect_opener",
+        # The shared-or-own choice over the two openers (BACKLOG #5527 item 10), so the hops that
+        # call it stay the sites, as for the IdP wrapper below.
+        "_verifying_opener",
+        # transports/ai_broker.py: the AI endpoint's shared-or-anchored choice (BACKLOG #5527 item
+        # 22), so each caller of it is a site, and a new caller fails the census until it is listed
+        # with its guard. Listed as the site itself, it was tied to one named caller's guard only.
+        # Named for its hop, since a builder name matches a def of that name in any module.
+        "_ai_endpoint_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
         "_client_ssl_context",
@@ -142,6 +150,8 @@ _GUARDS = _GUARD_ROOTS | frozenset(
         "_refuse_idp_revocation",
         "idp_revocation_guards",
         "_refuse_ad_revocation",  # auth/ldap.py, the LDAPS AD bind (BACKLOG #2193)
+        # auth/ldap.py, the guard's own call, which _refuse_ad_revocation makes (vault #8163 item 2)
+        "_enforce_ad_revocation_guard",
         # pipeline/alert_sinks.py, the [alerts] SMTP login and the webhook (BACKLOG #2193)
         "_refuse_alert_smtp_revocation",
         "_refuse_webhook_revocation",
@@ -237,11 +247,11 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         note="the SMART and OAuth2 token hops"
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
-    "messagefoundry/transports/ai_broker.py::_endpoint_opener": Guarded(
-        by="messagefoundry/transports/ai_broker.py::AiBroker.__init__",
-        note="the AI endpoint's opener, chosen under the [tls] policy since BACKLOG #5527; "
-        "AiBroker.__init__ hands it to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). Off "
-        "the box it crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
+    "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
+        note="the AI endpoint's opener, which _ai_endpoint_opener chooses under the [tls] policy since "
+        "BACKLOG #5527, handed to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). An "
+        "endpoint whose host does not read as loopback, in the reading that function states, "
+        "crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
         "(BACKLOG #5527) or on its [ai].endpoint_revocation_attested pair; an unknown posture "
         "counts as enforcing",
     ),
@@ -307,6 +317,10 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     "messagefoundry/auth/trust_anchors.py::anchor_cadata": Exempt(
         "loads a PEM into a scratch context to prove OpenSSL parses it; never handshakes"
     ),
+    "messagefoundry/auth/trust_anchors.py::_reads_to_the_end": Exempt(
+        "loads a PEM and a probe certificate into a scratch context to ask whether OpenSSL reads "
+        "to the end (BACKLOG #5229); never handshakes"
+    ),
     "messagefoundry/pki.py::_refuse_unless_openssl_loads": Exempt(
         "loads a client CA file into a scratch context to compare what OpenSSL took with the mTLS "
         "issuer index (BACKLOG #4948); never handshakes"
@@ -336,6 +350,7 @@ _EXEMPT_SITES = frozenset(
     {
         "messagefoundry/apiclient/client.py::_build_verify_context",
         "messagefoundry/auth/trust_anchors.py::anchor_cadata",
+        "messagefoundry/auth/trust_anchors.py::_reads_to_the_end",
         "messagefoundry/config/tls_policy.py::<module>",
         "messagefoundry/config/tls_policy.py::crl_scratch_context",
         "messagefoundry/config/tls_probe.py::_offer_context",
@@ -813,7 +828,8 @@ def _holds_when_relaxed(
     expr: ast.expr, fn: ast.AST, builders: frozenset[str], seen: frozenset[str] = frozenset()
 ) -> bool:
     """Whether ``expr``, read in ``fn``, is true on a relaxed hop, read off its shape. It is when it
-    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)``; asks
+    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)`` or
+    ``flag_from_settings(<x>, "tls_allow_expired")`` (vault BACKLOG #3234); asks
     ``skips_validity_period`` of the context a relaxing builder returned
     (:func:`_from_relaxing_builder`), never of some other context; is ``bool(...)`` of one of
     those; is an ``or`` with one of them as a part, or an ``and`` of them; or is a local name every
@@ -838,6 +854,9 @@ def _holds_when_relaxed(
             return _holds_when_relaxed(first, fn, builders, seen)
         if name == "skips_validity_period" and len(expr.args) == 1:
             return _from_relaxing_builder(first, fn, builders)
+        if name == "flag_from_settings" and len(expr.args) == 2:
+            key = expr.args[1]
+            return isinstance(key, ast.Constant) and key.value == "tls_allow_expired"
     if isinstance(expr, ast.Call) and callee_name(expr) == "get" and expr.args:
         first = expr.args[0]
         return isinstance(first, ast.Constant) and first.value == "tls_allow_expired"
@@ -1122,6 +1141,10 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("None if relaxed else self._other", "False", "pass", False),
         ("None if not relaxed else self._other", "False", "pass", True),
         ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
+        # The strict read of the setting holds; the same reader on another key does not (#3234).
+        ("self._other", 'flag_from_settings(config.settings, "tls_allow_expired")', "pass", False),
+        ("self._other", 'flag_from_settings(config.settings, "tls")', "pass", True),
+        ("self._other", "flag_from_settings(config.settings)", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
         pre, post = (extra[4:], "pass") if extra.startswith("PRE:") else ("pass", extra)

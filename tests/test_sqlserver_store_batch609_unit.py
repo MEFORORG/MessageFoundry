@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""SQL Server store fixes that need no live server: BACKLOG #5663, #5666, #5672, #5675, #5692.
+"""SQL Server store fixes that need no live server: BACKLOG #5663, #5666, #5667, #5672, #5675, #5692.
 
 * #5663: ``_SyncHandoffPool.acquire`` keeps its slot when the lazy reconnect of a placeholder
   raises, and discards a connection a BaseException left mid-transaction.
 * #5666: ``_ensure_database_options`` bounds its one-shot connections by
   ``[store].command_timeout`` and keeps raw driver text out of its errors and logs.
-* #5672, #5675, #5692: three writes read their match from ``OUTPUT`` rather than
+* #5667, #5672, #5675, #5692: four writes read their match from ``OUTPUT`` rather than
   ``cursor.rowcount``, which a session-wide ``SET NOCOUNT ON`` reports as ``-1``. The fake cursor
-  below always reports ``-1``, the NOCOUNT reading. The live counterparts are in
-  ``tests/test_sqlserver_store.py`` and run only on the gated SQL Server legs.
+  below always reports ``-1``, the NOCOUNT reading. The live counterparts of #5672, #5675 and #5692
+  are in ``tests/test_sqlserver_store.py`` and run only on the gated SQL Server legs. No live test
+  there runs the #5667 ingress incref under NOCOUNT.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import pytest
 
 import messagefoundry.store.sqlserver as sqlserver_module
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
+from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.sqlserver import SqlServerStore, _SyncHandoffPool
 
 # --- #5663: the sync handoff pool -------------------------------------------------------------
@@ -197,7 +199,8 @@ def _install(
     later_row: tuple[int, int] = (0, 0),
 ) -> dict[str, int]:
     """``alter_cursor_fails`` makes the first connection's second cursor open raise: the cursor
-    the ALTERs get. ``later_row`` is what every connection after the first reads."""
+    the RCSI ALTER gets, the first ALTER with a limit other than the state read's.
+    ``later_row`` is what every connection after the first reads."""
     timeouts: dict[str, int] = {}
     connects = 0
 
@@ -224,20 +227,56 @@ _STATE_READ = (
 _REREAD = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
 
 
-async def test_the_open_bounds_its_reads_and_not_its_alters(
+async def test_the_open_bounds_its_reads_and_the_snapshot_alter_not_the_rcsi_alter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Red before #5666: the open's state read and re-read probes kept pyodbc's default of no
-    statement limit. They now run under ``[store].command_timeout``. The ALTERs keep no limit: a
-    cancel landing after ROLLBACK IMMEDIATE rolled back the peers would leave RCSI off, and the
-    retry at every restart would roll them back again."""
+    statement limit. They now run under ``[store].command_timeout``, as the snapshot ALTER does
+    (the next test). The RCSI ALTER keeps no limit, for the reason the comment at the state read
+    in ``_ensure_database_options`` gives."""
     timeouts = _install(monkeypatch, alters_fail=False)
     await SqlServerStore._ensure_database_options(_settings())
-    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 0}, timeouts
+    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 17}, timeouts
     reread = _install(monkeypatch)  # the ALTER fails, so the re-read probes run
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
         await SqlServerStore._ensure_database_options(_settings())
     assert reread == {_STATE_READ: 17, _ALTER_RCSI: 0, _REREAD: 17}, reread
+
+
+async def test_the_open_bounds_the_snapshot_alter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red before #5666's snapshot limb: at an open the ALLOW_SNAPSHOT_ISOLATION ALTER ran with no
+    statement limit, so one waiting on a long transaction stalled the open with no end. It now
+    runs under ``[store].command_timeout``, whether or not the RCSI ALTER ran before it; a
+    timeout is only warned about, as any failure of that ALTER is."""
+    rcsi_on = _install(monkeypatch, alters_fail=False)
+
+    async def _connect(**kwargs: Any) -> _OptionsConn:
+        return _OptionsConn((1, 0), rcsi_on, False)  # RCSI already on, snapshot off
+
+    monkeypatch.setattr(sys.modules["aioodbc"], "connect", _connect)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert rcsi_on == {_STATE_READ: 17, _ALTER_SNAPSHOT: 17}, rcsi_on
+    both_off = _install(monkeypatch, alters_fail=False)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert both_off[_ALTER_RCSI] == 0  # the control: the RCSI ALTER still runs with none
+    assert both_off[_ALTER_SNAPSHOT] == 17, both_off
+
+
+async def test_a_failed_snapshot_alter_at_an_open_warns_and_the_open_goes_on(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bound's other half: a snapshot ALTER that fails, as one past its limit does, is a
+    warning, and the open does not fail on it."""
+    timeouts = _install(monkeypatch)  # every ALTER raises
+
+    async def _connect(**kwargs: Any) -> _OptionsConn:
+        return _OptionsConn((1, 0), timeouts, True)  # RCSI already on, snapshot off
+
+    monkeypatch.setattr(sys.modules["aioodbc"], "connect", _connect)
+    caplog.set_level(logging.WARNING, logger=sqlserver_module.log.name)
+    await SqlServerStore._ensure_database_options(_settings())
+    assert timeouts[_ALTER_SNAPSHOT] == 17
+    assert any("ALLOW_SNAPSHOT_ISOLATION" in r.getMessage() for r in caplog.records)
 
 
 async def test_provision_schema_options_alters_keep_no_limit(
@@ -445,3 +484,51 @@ async def test_a_failed_alter_cursor_open_reaches_the_alters_handler(
     # The control: a peer that turned RCSI on lets the open go on, as on main.
     _install(monkeypatch, alters_fail=False, alter_cursor_fails=True, later_row=(1, 1))
     await SqlServerStore._ensure_database_options(_settings())
+
+
+# --- #5667: the ingress incref reads OUTPUT -----------------------------------------------------
+
+
+class _IncrefCursor(_NocountCursor):
+    """Finds every attachment the incref names; every other statement has an empty rowset."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.params: list[Any] = []
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        await super().execute(sql, params)
+        self.params.append(params)
+        if sql == sqlserver_module._SQL_INCREF_ATTACHMENT:
+            self._current = [(params[1],)]
+
+
+def _ingress_store(cur: _NocountCursor) -> tuple[SqlServerStore, list[int]]:
+    store, commits = _store(cur)
+    store._cipher = make_cipher(None)
+    store._message_events = "all"
+    store.body_copies = 0
+    return store, commits
+
+
+async def test_ingress_of_a_missing_attachment_raises_under_nocount() -> None:
+    """Red before #5667: ``rowcount`` of -1 is truthy, so the link to a missing row committed."""
+    cur = _NocountCursor([])  # no rowset for any statement: the incref's OUTPUT is empty
+    store, commits = _ingress_store(cur)
+    with pytest.raises(KeyError):
+        await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=["f" * 64])
+    assert sqlserver_module._SQL_INCREF_ATTACHMENT in cur.executed
+    assert commits == [], "a message linked to a missing attachment must not commit"
+    assert not any("message_attachment" in sql for sql in cur.executed)
+
+
+async def test_ingress_increfs_inside_its_own_transaction() -> None:
+    """The incref runs on the ingress cursor, so one commit carries the row, incref and link."""
+    ref = "a" * 64
+    cur = _IncrefCursor()
+    store, commits = _ingress_store(cur)
+    await store.enqueue_ingress(channel_id="c", raw="MSH|", attachment_refs=[ref])
+    assert commits == [1]
+    at = cur.executed.index(sqlserver_module._SQL_INCREF_ATTACHMENT)
+    assert cur.params[at] == (1, ref)
+    assert "INSERT INTO message_attachment" in cur.executed[at + 1]

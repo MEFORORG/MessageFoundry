@@ -401,7 +401,9 @@ def test_a_wrong_code_at_the_terminal_writes_nothing_and_the_old_seed_still_work
     monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "nothing was written" in error
+    # After check()'s open, which may have written (BACKLOG #5067).
+    assert "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error
     # The real prompt names this command, not provision-admin, and labels the new entry apart from
     # the old one, which carries the bare username.
     shown = "".join(terminal.shown)
@@ -1055,7 +1057,8 @@ def test_a_seed_that_does_not_open_at_the_write_is_a_refusal_not_a_race(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
-    assert "Nothing was written" in error and "delete it" in error
+    # What the open may have changed before it (BACKLOG #5067), and no replacement.
+    assert "this command makes did not land" in error and "delete it" in error
     assert "enrolled again" not in error
     monkeypatch.setattr(MessageStore, "open_totp_secret", real_open)
     assert _state(db) == before
@@ -1107,3 +1110,251 @@ def test_a_hop_refusal_at_the_open_is_could_not_start(
     monkeypatch.setattr(store_base, "open_store", refused)
     assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
     assert "Nothing was written" in _error(capsys)
+
+
+def test_a_store_failure_after_the_write_open_says_what_the_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: a store failure after the write's open returned, before the swap, follows a
+    full open, which may have written, so it does not say nothing was written.
+
+    Mutation: print "nothing was written" again in ``open_refused``'s last branch."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "busy-after-open.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open = MessageStore.open_totp_secret
+    real_enrol = cli._enrol_totp_at_terminal
+
+    def open_or_fail(self: MessageStore, user_id: str, cell: str | None) -> str | None:
+        if prompted:
+            raise RuntimeError("synthetic busy store")
+        return real_open(self, user_id, cell)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(MessageStore, "open_totp_secret", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "this command makes did not land" in error and "delete it" in error, error
+    assert "nothing was written" not in error.lower(), error
+
+
+def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the first open returned, and may have written, before the second open
+    fails, so that failure does not say nothing was written.
+
+    Mutation: drop ``after_check=True`` from the swap's ``open_refused`` call."""
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "second-open-fails.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    from messagefoundry.store import base
+
+    prompted: list[bool] = []
+
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            raise RuntimeError("synthetic busy store at the second open")
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 2
+    error = _error(capsys)
+    assert "the store failed before the replacement (RuntimeError)" in error, error
+    assert "nothing was written" not in error.lower(), error
+
+
+_EARLIER_OPEN = "This command's earlier open, which checked the account before the key was shown,"
+
+
+@pytest.mark.parametrize(("refusal", "exit_code"), [("busy", 2), ("cipher", 1), ("unauditable", 2)])
+def test_a_refusal_at_the_second_open_names_the_earlier_open(
+    refusal: str,
+    exit_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PR 3162 hold finding 2 (BACKLOG #5067): a refusal at the swap's open said "the open may
+    already have changed the database", which reads as the open just refused. What may have
+    written is check()'s earlier open, which returned, so the text names that one, and names the
+    swap's own open as "the replacement's own open" wherever it describes it.
+
+    Mutation: drop ``after_check=True`` from the swap's ``open_refused`` call."""
+    from messagefoundry.__main__ import _UnauditableWrite
+    from messagefoundry.store import base
+    from messagefoundry.store.crypto import CipherError
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / f"second-open-{refusal}.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            if refusal == "cipher":
+                raise CipherError("synthetic cipher refusal at the second open")
+            if refusal == "unauditable":
+                raise _UnauditableWrite("synthetic unauditable write at the second open")
+            raise RuntimeError("synthetic busy store at the second open")
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    code = main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
+    error = _error(capsys)
+    assert code == exit_code, error
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    # Each sentence saying what an open may have changed names which open.
+    assert "the open may" not in error.lower() and "the open's" not in error.lower(), error
+    assert "this command makes did not land" in error and "delete it" in error, error
+    assert "nothing was written" not in error.lower(), error
+    # A busy store's class says nothing of the replacement's open, which may not have touched
+    # the database, so only the earlier open is named. Its text is printed as its class only;
+    # the other two print their own text and describe the replacement's own open.
+    named = refusal != "busy"
+    assert ("the replacement's own open may" in error.lower()) is named, error
+    assert ("at the second open" in error) is named, error
+
+
+def _refused_at_the_second_open(
+    exc: Exception,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> str:
+    """Run the command over a keyed-looking store whose swap open raises ``exc``; the error text."""
+    from messagefoundry.store import base
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "second-open.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    monkeypatch.setattr(cli, "_open_is_keyed", lambda _settings: True)
+    prompted: list[bool] = []
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            raise exc
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
+    return _error(capsys)
+
+
+_SALT = "the store's salt record"
+_GENESIS = "the audit chain's genesis record"
+_SCHEMA = "the schema, which the open creates or migrates"
+
+
+@pytest.mark.parametrize("refusal", ["keyless-chain", "keyless-key"])
+def test_a_keyless_refusal_at_the_second_open_names_no_keyed_step_for_the_earlier_open(
+    refusal: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PR 3162 hold 3 item 1 (BACKLOG #5067): after a keyless-class refusal at the swap's open,
+    the earlier-open sentence named the salt record and the genesis record from the settings'
+    keyedness. The refused class says the store opens keyless, so neither is named.
+
+    Mutation: build the earlier-open sentence from ``_open_is_keyed`` again."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    exc: Exception = (
+        KeylessAuditChainRefused("mefor", "[store].synthetic")
+        if refusal == "keyless-chain"
+        else StoreKeylessError("synthetic keyless store at the second open")
+    )
+    error = _refused_at_the_second_open(exc, tmp_path, monkeypatch, capsys)
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    assert _SALT not in error and _GENESIS not in error, error
+
+
+def test_a_cipher_refusal_at_the_second_open_names_each_one_time_step_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 2 (BACKLOG #5067): only one open can write the genesis record, to an
+    empty chain, and check()'s open had returned, so the swap's open finds the one-time steps
+    done. The text named the schema, the salt record and the genesis record for both opens.
+
+    Mutation: list the one-time steps in the replacement-open sentence again."""
+    error = _refused_at_the_second_open(
+        CipherError("synthetic cipher refusal at the second open"), tmp_path, monkeypatch, capsys
+    )
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    assert error.count(_GENESIS) == 1 and error.count(_SALT) == 1, error
+    assert error.count(_SCHEMA) == 1, error
+    assert "the replacement's own open may" in error.lower(), error
+
+
+def test_a_short_schema_at_the_second_open_claims_no_row_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 3 (BACKLOG #5067): "and this command wrote no row" described the
+    replacement's open as this command's only one. check()'s open ran first, so the text drops it.
+
+    Mutation: append "and this command wrote no row" whatever the opener."""
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    exc = ServerSchemaMismatchError("sqlserver", None, ["synthetic: table 'queue' is short"])
+    error = _refused_at_the_second_open(exc, tmp_path, monkeypatch, capsys)
+    assert "the replacement's own open rolled its schema batch back" in error.lower(), error
+    assert "wrote no row" not in error, error
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+
+
+def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the OS user is named after check()'s open, which may have written, so the
+    refusal does not say nothing was written.
+
+    Mutation: print "nothing was written" again in that refusal."""
+    import getpass
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "no-user.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+
+    def no_user() -> str:
+        raise OSError("no user name for this shell")
+
+    monkeypatch.setattr(getpass, "getuser", no_user)
+    assert main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "cannot name the OS user" in error and "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error

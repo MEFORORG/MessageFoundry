@@ -7,7 +7,9 @@
   200 against a 409 told it which names exist. It now gives the one
   refusal the per-name routes give (BACKLOG #2551, #2640) to every target outside the caller's scope.
 * ``GET /alerts/rules`` returned every rule's ``connection`` and ``control_target``. It now withholds
-  any rule that names a connection outside the caller's scope.
+  any rule that names a connection outside the caller's scope and, since BACKLOG #3378, any rule
+  naming a name not in the loaded config's inbound_names() or that the runner also knows as an
+  outbound, every ``restart_outbound`` rule, and every rule of an outbound-only event type.
 
 NOT-DEPLOYED beta: each gap was one a first deployment would have carried, not a live exposure.
 """
@@ -166,9 +168,11 @@ async def test_flag_with_no_graph_checks_the_scope_first(engine: Engine) -> None
         assert not [a for a in audit if a[0] == "auth.channel_denied"], audit
 
 
+#: The ``"*"`` rule is of an inbound-only type, so a scoped caller sees it; a ``"*"`` rule of a type
+#: an outbound can raise is withheld (BACKLOG #3378, #8390 item 14).
 _RULES = AlertsSettings(
     rules=[
-        AlertRule(id="all", connection="*"),
+        AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
         AlertRule(id="mine", connection="IB_A"),
         AlertRule(id="theirs", connection="IB_B"),
         AlertRule(id="glob", connection="IB_*"),
@@ -194,12 +198,36 @@ _RULES = AlertsSettings(
 #: What the caller scoped to ``IB_A`` reads of ``_RULES``: ``(id, connection, control_target)``.
 _SCOPED_SHOWN = [(None, "*", None), (None, "IB_A", None), (None, "IB_A", "IB_A")]
 
+#: The inbounds the stand-in graph below declares, for the tests built on ``_RULES``.
+_GRAPH = ("IB_A", "IB_B")
+
+
+def _attach_graph(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    inbounds: tuple[str, ...] = _GRAPH,
+    outbounds: tuple[str, ...] = (),
+) -> None:
+    """Give ``engine`` a stand-in runner whose graph declares ``inbounds`` and ``outbounds``, since
+    ``GET /alerts/rules`` shows a scoped caller only rules on in-scope names in ``inbound_names()``
+    that the runner does not also know as outbounds (BACKLOG #3378). Of the runner, that route
+    reads only ``registry.inbound_names()`` and ``knows_outbound``. ``monkeypatch`` restores the
+    engine's own (None) runner before the engine fixture stops it, as long as the test names
+    ``engine`` first."""
+    registry = SimpleNamespace(inbound_names=lambda: frozenset(inbounds))
+    stub = SimpleNamespace(registry=registry, knows_outbound=lambda name: name in outbounds)
+    monkeypatch.setattr(engine, "_registry_runner", stub)
+
 
 async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A scoped caller sees a rule only when its ``connection`` is ``*`` or a name in its scope and
-    its ``control_target`` is unset or in its scope. An all-channels caller sees every rule."""
+    its ``control_target`` is unset or in its scope; the graph declares ``IB_B`` too, so its rule
+    is withheld by the scope test, not the inbound one (BACKLOG #3378 adds that test and withholds
+    every ``restart_outbound`` rule). An all-channels caller sees every rule."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     await _user(service, "empty", Role.OPERATOR, [])
@@ -225,10 +253,12 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
 
 async def test_alert_rules_id_cannot_name_a_connection_outside_the_scope(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3378: a rule's id is free text, so an in-scope rule can carry an out-of-scope name
     in its label. A scoped caller reads the rule with a null id, and no byte of the answer holds
     that name. The control: an all-channels caller reads the id whole."""
+    _attach_graph(engine, monkeypatch)
     rules = AlertsSettings(rules=[AlertRule(id="page OB_SECRET on IB_A", connection="IB_A")])
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
@@ -245,12 +275,310 @@ async def test_alert_rules_id_cannot_name_a_connection_outside_the_scope(
     assert await engine.store.list_audit(action="alert_rules_withheld") == []
 
 
+async def test_alert_rules_withhold_an_outbound_the_scope_lists(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4, owner ruling 2026-11-04 ("part 4 stays strict"): a scope that lists an
+    outbound by name still sees no rule naming it, as ``connection`` or as ``control_target``, as
+    the flag route refuses that outbound. The control: the in-scope inbound's own rule shows, and an
+    all-channels caller reads every rule."""
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="in", connection="IB_TOML"),
+            AlertRule(id="out", connection="OB_TOML"),
+            AlertRule(
+                id="in-targets-out",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_outbound",
+                control_target="OB_TOML",
+            ),
+            # Withheld by the graph's sides alone: the action names the inbound side.
+            AlertRule(
+                id="in-inbound-action-targets-out",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_inbound",
+                control_target="OB_TOML",
+            ),
+        ]
+    )
+    service = await _service(toml_engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_TOML", "OB_TOML"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(toml_engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+
+        async def shown(username: str) -> list[tuple[str, str | None]]:
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            return [(rule["connection"], rule["control_target"]) for rule in r.json()["rules"]]
+
+        assert await shown("wide") == [
+            ("IB_TOML", None),
+            ("OB_TOML", None),
+            ("IB_TOML", "OB_TOML"),
+            ("IB_TOML", "OB_TOML"),
+        ]
+        assert await shown("scoped") == [("IB_TOML", None)]
+    # The withheld count covers these rules too, so the read that withheld three writes one row.
+    rows = await toml_engine.store.list_audit(action="alert_rules_withheld")
+    assert len(rows) == 1, rows
+    assert json.loads(str(rows[0]["detail"])) == {"shown": 1, "withheld": 3}
+
+
+async def test_alert_rules_withhold_a_name_on_both_sides(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378 item 4: a name the graph declares as both an inbound and an outbound is
+    withheld from a scope that lists it, as ``connection`` and as ``control_target``, since a rule
+    on it can match the outbound's events. A ``restart_outbound`` rule is withheld too, a ``"*"``
+    rule with no target included. The control: the same names on an inbound-only graph show, and
+    the in-scope inbound's own rule shows on both."""
+    _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"), outbounds=("SHARED",))
+    rules = AlertsSettings(
+        rules=[
+            # A type both sides raise, so only the name decides (an outbound-only type is
+            # withheld on its own; see the next tests).
+            AlertRule(id="buildup", event_type="queue_buildup", connection="SHARED"),
+            *(
+                AlertRule(
+                    id=f"in-{action}",
+                    event_type="connection_stopped",
+                    connection="IB_A",
+                    control_action=action,
+                    control_target="SHARED",
+                )
+                for action in ("restart_outbound", "restart_inbound")
+            ),
+            AlertRule(
+                id="any-outbound",
+                event_type="message_stall",
+                connection="*",
+                control_action="restart_outbound",
+            ),
+            AlertRule(id="mine", connection="IB_A"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A", "SHARED"])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "scoped")
+
+        async def shown() -> list[tuple[str, str | None]]:
+            r = await c.get("/alerts/rules", headers=h)
+            assert r.status_code == 200, r.text
+            return [(rule["connection"], rule["control_action"]) for rule in r.json()["rules"]]
+
+        assert await shown() == [("IB_A", None)]
+        _attach_graph(engine, monkeypatch, inbounds=("IB_A", "SHARED"))
+        assert await shown() == [
+            ("SHARED", None),
+            ("IB_A", "restart_inbound"),
+            ("IB_A", None),
+        ]
+
+
+def test_every_alert_event_type_and_control_action_has_a_side() -> None:
+    """BACKLOG #3378: ``GET /alerts/rules`` reads each rule's event type and action through these
+    maps, and withholds an unclassified one from a scoped caller. Pinning the key sets to the
+    settings' own sets makes a new type or action a red test here, not a silent withhold."""
+    from messagefoundry.config import settings
+
+    assert set(app_module._ALERT_EVENT_SIDE) == settings._ALERT_EVENT_TYPES
+    assert set(app_module._CONTROL_ACTION_SIDE) == settings._ALERT_CONTROL_ACTIONS
+    assert set(app_module._ALERT_EVENT_SIDE.values()) <= {"outbound", "inbound", "both", "none"}
+
+
+async def test_alert_rules_withhold_an_outbound_only_event_type(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378 item 4: a rule whose event type only an outbound raises is an outbound rule, so
+    a scoped caller does not see it, a ``"*"`` rule or one on its own inbound alike. The controls: a
+    ``"*"`` rule of an inbound-only type, and a rule of a type both sides raise on its own inbound,
+    show; an all-channels caller reads every rule."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stall", event_type="message_stall", connection="*"),
+            AlertRule(id="error", event_type="connection_error", connection="*"),
+            AlertRule(id="mine-stall", event_type="message_stall", connection="IB_A"),
+            AlertRule(id="sandbox", event_type="sandbox_worker_refused", connection="*"),
+            AlertRule(id="mine-buildup", event_type="queue_buildup", connection="IB_A"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (
+            ("scoped", [("sandbox_worker_refused", "*"), ("queue_buildup", "IB_A")]),
+            ("wide", [(r.event_type, r.connection) for r in rules.rules]),
+        ):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            got = [(x["event_type"], x["connection"]) for x in r.json()["rules"]]
+            assert got == expected, username
+
+
+async def test_alert_rules_withhold_a_star_rule_an_outbound_can_raise(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378 item 4, the ``"*"`` rule (#8390 item 14): a ``"*"`` rule fires for every
+    connection, outbounds included, so one of a type both sides raise, or of ``"any"``, matches
+    outbound events and is withheld from a scoped caller. The controls: a ``"*"`` rule of an
+    inbound-only type, or of a type keyed on no connection, shows, and so does a rule of a type
+    both sides raise, or ``"any"``, on the caller's own inbound; an all-channels caller reads every
+    rule."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stopped", event_type="connection_stopped", connection="*"),
+            AlertRule(id="cert", event_type="cert_expiry", connection="*"),
+            AlertRule(id="any", connection="*"),
+            AlertRule(
+                id="restart",
+                event_type="connection_stopped",
+                connection="*",
+                control_action="restart_inbound",
+            ),
+            AlertRule(id="sandbox", event_type="sandbox_worker_refused", connection="*"),
+            AlertRule(id="storage", event_type="storage_threshold", connection="*"),
+            AlertRule(id="mine-stopped", event_type="connection_stopped", connection="IB_A"),
+            AlertRule(id="mine-any", connection="IB_A"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (
+            (
+                "scoped",
+                [
+                    ("sandbox_worker_refused", "*"),
+                    ("storage_threshold", "*"),
+                    ("connection_stopped", "IB_A"),
+                    ("any", "IB_A"),
+                ],
+            ),
+            ("wide", [(r.event_type, r.connection) for r in rules.rules]),
+        ):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            got = [(x["event_type"], x["connection"]) for x in r.json()["rules"]]
+            assert got == expected, username
+
+
+async def test_alert_rules_withhold_an_unclassified_event_type_or_action(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3378: an event type or control action with no side recorded is withheld from a
+    scoped caller, so a new one fails closed until it is classified. The control: with both
+    classified, the same rules show."""
+    _attach_graph(engine, monkeypatch)
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="stopped", event_type="connection_stopped", connection="IB_A"),
+            AlertRule(
+                id="restart",
+                event_type="queue_buildup",
+                connection="IB_A",
+                control_action="restart_inbound",
+            ),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "scoped")
+
+        async def shown() -> list[str]:
+            r = await c.get("/alerts/rules", headers=h)
+            assert r.status_code == 200, r.text
+            return [x["event_type"] for x in r.json()["rules"]]
+
+        assert await shown() == ["connection_stopped", "queue_buildup"]
+        monkeypatch.setattr(app_module, "_ALERT_EVENT_SIDE", {}, raising=False)
+        monkeypatch.setattr(app_module, "_CONTROL_ACTION_SIDE", {}, raising=False)
+        assert await shown() == []
+
+
+async def test_alert_rules_with_no_graph_show_a_scoped_caller_no_named_rule(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4: with no graph loaded no name is known to be an inbound, so a scoped
+    caller sees no rule that names a connection, even one on a name its scope lists. A ``"*"`` rule
+    of an inbound-only type still shows, and a ``"*"`` rule of ``"any"`` does not (BACKLOG #8390
+    item 14). The control: an all-channels caller reads every rule."""
+    assert engine.registry_runner is None
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
+            AlertRule(id="mine", connection="IB_A"),
+            AlertRule(id="ob", connection="OB_X"),
+            # A "*" rule of "any" is withheld with no graph too (BACKLOG #8390 item 14).
+            AlertRule(id="any", connection="*"),
+        ]
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A", "OB_X"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        for username, expected in (("scoped", ["*"]), ("wide", ["*", "IB_A", "OB_X", "*"])):
+            r = await c.get("/alerts/rules", headers=await _login(c, username))
+            assert r.status_code == 200, r.text
+            assert [rule["connection"] for rule in r.json()["rules"]] == expected, username
+
+
+async def test_alert_rules_withhold_an_in_scope_name_the_graph_lacks(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378 item 4: a name the scope lists but the loaded graph does not declare, here one
+    that exists nowhere, is withheld as
+    ``connection`` and as ``control_target``, as the flag route refuses it. The control: the
+    in-scope inbound's own rule shows."""
+    rules = AlertsSettings(
+        rules=[
+            AlertRule(id="in", connection="IB_TOML"),
+            AlertRule(id="gone", connection="IB_GONE"),
+            AlertRule(
+                id="in-targets-gone",
+                event_type="connection_stopped",
+                connection="IB_TOML",
+                control_action="restart_inbound",
+                control_target="IB_GONE",
+            ),
+        ]
+    )
+    service = await _service(toml_engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_TOML", "IB_GONE"])
+    app = create_app(toml_engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
+        assert r.status_code == 200, r.text
+        assert [(x["connection"], x["control_target"]) for x in r.json()["rules"]] == [
+            ("IB_TOML", None)
+        ]
+
+
 async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
     engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3403: a read that withholds at least one rule writes ``alert_rules_withheld``, naming
     the counts shown and withheld and no rule's contents. A read that withholds nothing writes none,
     even a channel-scoped one. No read writes ``auth.channel_denied``."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     await _user(service, "empty", Role.OPERATOR, [])
@@ -261,7 +589,10 @@ async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
         engine,
         auth=service,
         alerts_settings=AlertsSettings(
-            rules=[AlertRule(id="all", connection="*"), AlertRule(id="mine", connection="IB_A")]
+            rules=[
+                AlertRule(id="all", event_type="sandbox_worker_refused", connection="*"),
+                AlertRule(id="mine", connection="IB_A"),
+            ]
         ),
     )
     async with (
@@ -299,6 +630,7 @@ async def _read_rules_while_the_row_raises(
 ) -> httpx.Response:
     """``GET /alerts/rules`` as a scoped caller, with the ``alert_rules_withheld`` write raising
     ``error`` and every other audit write landing."""
+    _attach_graph(engine, monkeypatch)
     service = await _service(engine)
     await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
     app = create_app(engine, auth=service, alerts_settings=_RULES)

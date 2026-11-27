@@ -254,7 +254,8 @@ class Control:
                   the export names none, which degrades to a TODO marker rather than a guess).
                   ``refusal`` is non-empty when the statement delivers a handle that is not provably
                   ``msg``; the render then raises at the send site instead of sending (BACKLOG #313).
-                  ``message`` is the local it delivers.
+                  ``message`` is the local a step 2 send delivers; ``""`` is a step 1 send, which
+                  renders ``msg.copy()`` (BACKLOG #5823).
     ``"clone"``   a whole-tree ``MsgTreeCopy`` that binds a handle to a local, and ``"create"`` a
                   ``MsgCreate`` that does: ``args`` is ``(local, expression)``. Only :class:`_Binder`
                   makes either, in a fully understood list (BACKLOG #313 step 2).
@@ -280,8 +281,9 @@ class Control:
     branches: tuple[Control, ...] = field(default_factory=tuple)
     # RAW text (escaped at the render site, like ``detail``). Only ``"send"`` sets it.
     refusal: str = ""
-    # The local a live ``"send"`` delivers: a name this module generated, never export text.
-    message: str = "msg"
+    # The local a live step 2 ``"send"`` delivers: a name this module generated, never export text.
+    # ``""`` is a step 1 send; the render says what it delivers.
+    message: str = ""
     # ``"call"`` on a ``"block"`` that would have been one, had its ``@Data`` not been a statement
     # off a ``<Line>`` (BACKLOG #2632). It renders and counts as the label it is. Only the test
     # that decides the shape of the tree reads it (:func:`_structural_kind`).
@@ -926,8 +928,9 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     deliver a handle *other* than their input than deliver the input itself, so "the input handle" is
     the wrong answer).
 
-    In a Handler, ``msg`` is the message that arrived **and** the message returned by ``Send`` — the
-    two are the same object. So the subject is the list's **input** handle, and only when that same
+    In a Handler, ``msg`` is the message that arrived **and** the message ``Send`` delivers. An
+    inline step 1 send delivers a copy of ``msg`` as it stood at the send (the render site in
+    :func:`_generate_construct` says which sends copy). Either way the subject is the list's **input** handle, and only when that same
     handle is what the list delivers. A list that builds a *separate* output tree and sends that has
     no equivalent at all: writing its fields onto ``msg`` would mutate the inbound message, which is
     not the message Corepoint was populating. (This is not hypothetical — more lists deliver a
@@ -3084,8 +3087,13 @@ def _generate_construct(ctrl: Control, indent: int, *, in_loop: bool) -> list[st
                 f"{pad}# TODO: Corepoint {ctrl.source_verb} — hand-finish: no destination named "
                 f"({label})"
             ]
+        # A Send holds its message object, and the step 1 path maps a write to msg that follows a
+        # send of it, so sending msg itself would let that write change the message already sent
+        # whenever [pipeline].snapshot_on_send is off or the handler is called directly (BACKLOG
+        # #5823). A step 2 local needs no copy: the binder declines a write to it after its send.
+        message = ctrl.message or "msg.copy()"
         return [
-            f"{pad}sends.append(Send({ctrl.args[0]}, {ctrl.message}))  # Corepoint {ctrl.source_verb}"
+            f"{pad}sends.append(Send({ctrl.args[0]}, {message}))  # Corepoint {ctrl.source_verb}"
         ]
     if ctrl.kind in ("clone", "create"):
         # Both halves are generated: the local is a name _Binder made from a handle the gate held to

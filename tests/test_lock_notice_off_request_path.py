@@ -837,8 +837,9 @@ async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
 
 
 async def test_a_closed_notifier_refuses_to_start_again() -> None:
-    """Vault BACKLOG #3120, review round two. A close can leave its stop sentinel on the queue, so a
-    drain loop started again could stop on it at once. ``start`` after ``aclose`` therefore raises,
+    """Vault BACKLOG #3120, review round two. A close could leave its stop sentinel on the queue,
+    until BACKLOG #6832 had a cut close empty it, and a drain loop started again could stop on it at
+    once. ``notify`` refuses every event once the close begins, so ``start`` after ``aclose`` raises,
     and the notifier goes on refusing events. The control is ``start`` on a notifier never closed,
     which raises nothing."""
     relay = _relay()
@@ -856,9 +857,10 @@ async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3120, review round two. The teardown bounds the notifier's close, and a close
-    cut while a send is under way leaves its stop sentinel on the queue. A drain loop started again
-    then read that sentinel and stopped, and ``notify`` answered ``True`` for an event nothing ever
-    sent. Whatever ``start`` does after a cut close, a notice reported queued must be sent.
+    cut while a send is under way left its stop sentinel on the queue, until BACKLOG #6832 had the
+    cut close empty it. A drain loop started again then read that sentinel and stopped, and
+    ``notify`` answered ``True`` for an event nothing ever sent. Whatever ``start`` does after a cut
+    close, a notice reported queued must be sent.
 
     The control is the event taken before the close: its send was under way when the close was
     cut, and once released it goes out and shows in ``sent``."""
@@ -882,7 +884,9 @@ async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
         assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the send never started"
         with pytest.raises(TimeoutError):  # the teardown's bound, cutting the close
             await asyncio.wait_for(relay.aclose(), 0.05)
-        assert relay._queue.qsize() == 1, "the cut close left no stop sentinel to test against"
+        # BACKLOG #6832: the cut close now empties the queue, its stop sentinel too, recording each
+        # notice it took. The property below still binds a start after it.
+        assert relay._queue.qsize() == 0, "the cut close left its sentinel or a notice queued"
         with suppress(RuntimeError):  # refusing is one way to keep the property below
             relay.start()
         late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
@@ -1148,7 +1152,9 @@ async def test_the_sign_in_lock_notice_reads_the_totp_verdict_its_escalation_use
 
     store, service, _notifier, row = await _harness(threshold=2)
     try:
-        cell = await store.set_totp_secret(row.id, secret="JBSWY3DPEHPK3PXP", now=1.0)
+        cell = await store.set_totp_secret(
+            row.id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0
+        )
         assert await store.enable_totp(
             row.id, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
         )

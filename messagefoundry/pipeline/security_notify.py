@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Final, Protocol
+import threading
+from collections.abc import Callable
+from typing import Any, Final, Protocol
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
@@ -74,7 +76,9 @@ log = logging.getLogger(__name__)
 #: states the row. Defined here, not in ``auth/notifications.py``, where every upper-case string is a
 #: notice kind.
 SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
-#: How many queue-full records may be in flight at once. Past it a drop goes unrecorded, so the
+#: How many records may be in flight at once when a queue-full drop starts one. Other records
+#: held in the same set take slots too, at least a failed send's and a cut close's. Past it a
+#: drop goes unrecorded, so the
 #: overload that filled the queue cannot also grow tasks and store writers without bound.
 _MAX_RECORDING: Final = 64
 
@@ -136,7 +140,7 @@ _DESCRIPTIONS = {
         "You gave another account a temporary password, and its holder has not replaced it yet."
     ),
     EMAIL_CHANGED: "Your account's email address was changed.",
-    ROLES_CHANGED: "Your account's roles were changed by an administrator.",
+    # ROLES_CHANGED and ACCOUNT_DISABLED are worded from their evidence (``_evidenced_description``).
     USERNAME_CHANGED: "Your account's username was changed.",
     FEDERATED_IDENTITY_BOUND: "An administrator linked an external identity provider sign-in to your account, and your sessions were ended. Windows single sign-on no longer signs you in. Sign in through that provider; if it is not offered, ask your administrator.",
     FEDERATED_IDENTITY_UNBOUND: "An administrator removed the external identity provider sign-in from your account, and your sessions were ended. That provider can no longer sign you in.",
@@ -147,13 +151,13 @@ _DESCRIPTIONS = {
         "a new password and gave the account the Administrator role, so the password it had before "
         "no longer works."
     ),
-    ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
-    # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
-    # ``detail["reason"]``. Which reasons those are is decided in
+    # vault BACKLOG #2140, #3171. One wording for every whole-account reason that sends this kind,
+    # with no branch on which one. Which reasons those are is decided in
     # ``AuthService._apply_reconcile_revocation``, and any reason added later falls here too; the
     # constant's comment in ``auth/notifications.py`` names at least the current ones. For at least
     # one of them no directory lookup ran, so neither this nor the subject may say one did, or that
-    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause.
+    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause. A role
+    # revocation that wrote no role has its own wording (``_ROLE_SESSIONS_ENDED``).
     DIRECTORY_SESSIONS_ENDED: (
         "MessageFoundry ended your sessions. It could not confirm from your organization's "
         "directory that your account may still sign in."
@@ -208,28 +212,102 @@ _DESCRIPTIONS = {
     ),
 }
 
-# Vault BACKLOG #3121. The reconciler's and the sign-in re-sync's role change and disable name no
-# administrator and close with "If you did not expect this change". Each carries its own source in
-# its words, so neither takes the generic directory line: a re-sync's roles come from the
-# directory's groups through the group-to-role map, which an administrator edits in the console,
-# so "not from the MessageFoundry console" would be false for it. The disable says what the
-# reconciler did, which is end the sessions; no MessageFoundry row was disabled. Both senders
-# of the role change end the sessions already open on the account first, the reconciler's pass
-# and the sign-in re-sync alike, so the role notice says so as the disable notice does.
-_DIRECTORY_DESCRIPTIONS = {
-    ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory, changed your "
-        "account's roles to match them, and ended any sessions already open on your account."
+# Vault BACKLOG #3121. A role change or disable the directory drove, from the session reconciler or
+# a directory sign-in's re-sync, names no administrator and carries its source in its own words,
+# so neither takes the generic directory line: a re-sync's roles come from the directory's groups
+# through the group-to-role map, which an administrator edits in the console, so "not from the
+# MessageFoundry console" would be false for it. The directory disable says what the directory
+# reported; no MessageFoundry row was disabled. Both kinds are worded from their evidence
+# (``_evidenced_description``), from an administrator or the directory alike.
+_EVIDENCED_KINDS = frozenset({ROLES_CHANGED, ACCOUNT_DISABLED})
+
+# BACKLOG #6034 (S08-57). What a role or disable notice says rests on the evidence its sender put on
+# the event, never on the order of the sender's calls, because the directory senders notify on
+# paths where the role write or the revoke raised, or its commit is unknown. At least: the
+# reconciler after a role write that raised past its retry or was retried at all, or a revoke that
+# raised, and the sign-in re-sync with an error held from either.
+# ``roles_written`` is True only once the sender knows the roles stand committed as it set out to
+# write them: the reconciler's own first write, or a sign-in re-sync whose sync held no error, which
+# includes roles another writer had already set, read back through the seal. ``sessions_revoked``
+# is the revoke's count, set only once the revoke returned. A count of 0 still proves no session was left open, so
+# "any sessions already open were ended" holds for it.
+_SESSIONS_ENDED = "Any sessions already open on your account were ended."
+_SESSIONS_UNCONFIRMED = (
+    "MessageFoundry could not confirm that the sessions already open on your account were ended."
+)
+_ROLES_WORDING = {
+    # (from the directory, the write confirmed)
+    (False, True): "Your account's roles were changed by an administrator.",
+    # No current administrator sender reaches this: ``set_roles`` notifies only after its write
+    # returned applied. It is the fail-closed wording for a sender that passes no evidence.
+    (False, False): (
+        "An administrator asked to change your account's roles. MessageFoundry could not confirm "
+        "that the change was saved."
     ),
-    ACCOUNT_DISABLED: (
-        "Your organization's directory reports your account as disabled, so MessageFoundry ended "
-        "your sessions."
+    (True, True): (
+        "MessageFoundry read your groups in your organization's directory and changed your "
+        "account's roles to match them."
+    ),
+    (True, False): (
+        "MessageFoundry read your groups in your organization's directory and tried to change your "
+        "account's roles to match them. It could not confirm that the change was saved."
     ),
 }
-# The administrator subject says the MessageFoundry account was disabled, which is false here.
-_DIRECTORY_SUBJECTS = {
-    ACCOUNT_DISABLED: "Your MessageFoundry sessions were ended: your directory account is disabled",
+# BACKLOG #6034. A reconciler role revocation that wrote no role only ended the sessions, so it
+# sends DIRECTORY_SESSIONS_ENDED. At least these reach it: the roles already stood at its target,
+# they moved after its read, or a group map did not verify, so no role was written from it (ADR
+# 0217 (b)). The pass did find the account in the directory, so the whole-account wording, "could
+# not confirm ... may still sign in", would mislead here; and the cause may be the engine's own map
+# read, so this names no group as the cause. ``_ROLE_REVOCATION`` is the reason
+# ``auth/reconcile.py`` gives a role revocation; it has no shared constant.
+_ROLE_REVOCATION = "roles_changed"
+_ROLE_SESSIONS_ENDED = (
+    "MessageFoundry ended your sessions while checking your account's roles against your "
+    "organization's directory."
+)
+# Each sender has confirmed the disable before it notifies: the administrator's write returned
+# applied, and the reconciler sends this only on a READ disabled bit (vault BACKLOG #2140).
+_DISABLE_WORDING = {
+    False: "Your account was disabled by an administrator.",
+    True: "Your organization's directory reports your account as disabled.",
 }
+
+
+def _roles_written(event: SecurityEvent) -> bool:
+    """Whether a ROLES_CHANGED sender confirmed its role write committed (BACKLOG #6034). Only the
+    literal ``True`` counts."""
+    return event.event_type == ROLES_CHANGED and event.detail.get("roles_written") is True
+
+
+def _roles_unconfirmed(event: SecurityEvent) -> bool:
+    """A ROLES_CHANGED whose write is not confirmed, which must claim no change (BACKLOG #6034)."""
+    return event.event_type == ROLES_CHANGED and not _roles_written(event)
+
+
+def _revoked_count(event: SecurityEvent) -> int | None:
+    """The ``sessions_revoked`` count, present only once the sender's revoke returned (BACKLOG
+    #6034, vault #2609). A bool or any other shape is no count, through :func:`_count`."""
+    return _count(event.detail.get("sessions_revoked"))
+
+
+def _sessions_ended_any(event: SecurityEvent) -> bool:
+    """Whether the sender's revoke returned having ended at least one session. A count of 0 backs
+    "any sessions already open were ended" but not a subject saying sessions were ended, and a
+    retried count can read low, so a 0 claims nothing there (BACKLOG #6034)."""
+    count = _revoked_count(event)
+    return count is not None and count > 0
+
+
+def _evidenced_description(event: SecurityEvent, *, from_directory: bool) -> str:
+    """The ROLES_CHANGED or ACCOUNT_DISABLED description: the change as far as ``roles_written``
+    confirms it, then the sessions sentence ``sessions_revoked`` backs, or the line saying that
+    could not be confirmed (BACKLOG #6034)."""
+    if event.event_type == ROLES_CHANGED:
+        what = _ROLES_WORDING[(from_directory, _roles_written(event))]
+    else:
+        what = _DISABLE_WORDING[from_directory]
+    ended = _revoked_count(event) is not None
+    return f"{what} {_SESSIONS_ENDED if ended else _SESSIONS_UNCONFIRMED}"
 
 
 def _from_directory(event: SecurityEvent) -> bool:
@@ -237,14 +315,20 @@ def _from_directory(event: SecurityEvent) -> bool:
     #2291, vault #3121). Gated on the kind as well as the tag: the reconciler tags every notice it
     sends, and its ``directory_sessions_ended`` must not claim the directory changed anything."""
     return (
-        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_DIRECTORY_DESCRIPTIONS)
+        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_EVIDENCED_KINDS)
         and event.detail.get("source") == "directory"
     )
 
 
 def _subject(event: SecurityEvent) -> str:
-    if _from_directory(event) and event.event_type in _DIRECTORY_SUBJECTS:
-        return _DIRECTORY_SUBJECTS[event.event_type]
+    # BACKLOG #6034: each subject claims no more than the body's evidence does.
+    if _roles_unconfirmed(event):
+        return "A change to your MessageFoundry account roles could not be confirmed"
+    if event.event_type == ACCOUNT_DISABLED and _from_directory(event):
+        # The administrator subject says the MessageFoundry account was disabled, false here.
+        if _sessions_ended_any(event):
+            return "Your MessageFoundry sessions were ended: your directory account is disabled"
+        return "Your directory account is reported as disabled"
     return _SUBJECTS.get(event.event_type, "MessageFoundry security alert")
 
 
@@ -286,6 +370,12 @@ _SECOND_STEP_FACTOR = {
 }
 
 
+def _count(value: object) -> int | None:
+    """``value`` when it is an ``int`` and not a ``bool``, else ``None``. ``bool`` subclasses
+    ``int``, so a bare ``isinstance`` check would print ``True`` as a count (BACKLOG #6034)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None]:
     """The ACCOUNT_LOCKED notice's own description, detail lines and closing (ADR 0197).
 
@@ -294,9 +384,9 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
     land on that counter too, and unconditional advice would tell an owner who mistyped their
     password to replace a working authenticator."""
     lock = event.detail.get("lock")
-    cycle = event.detail.get("cycle")
+    cycle = _count(event.detail.get("cycle"))
     lines: list[str] = []
-    if isinstance(cycle, int):
+    if cycle is not None:
         lines.append(f"Lock number: {cycle} since the last successful sign-in")
     if lock == "sign_in":
         description = "Your account's sign-in was locked after repeated failed sign-in attempts."
@@ -334,15 +424,29 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
     return None, [], None
 
 
-def _shown(text: str, what: str) -> str:
-    """``text`` when every character in it is printable, else a placeholder naming ``what``.
+def _shown(text: str, what: str, *, token: bool = False) -> str:
+    """``text`` when every character in it is printable, else a placeholder naming ``what``. With
+    ``token``, a space of any kind shows the placeholder too, for a value that never holds one, such
+    as a URL (BACKLOG #6034).
 
     A value carrying a line break could write its own lines into a notice, such as a false "If this
     was you" closing (BACKLOG #2291). A directory supplies the username and the email on a
     directory notice, so neither is shaped by this engine. An ASCII space is printable and passes:
     it cannot start a line, and a directory name may hold one. Other space characters, such as a
     no-break space, fail ``isprintable`` and show the placeholder, which is the safe side."""
-    return text if text.isprintable() else f"{what} that cannot be shown safely here"
+    if text.isprintable() and not (token and any(c.isspace() for c in text)):
+        return text
+    return f"{what} that cannot be shown safely here"
+
+
+def _roles_shown(roles: list[object]) -> str:
+    """The role ids, comma-separated, each through :func:`_shown` as one token (BACKLOG #6034): no
+    role id holds a space, so one that does cannot carry words into the list. An empty id is named
+    as one, so it cannot print as a stray comma or make a list read as no role at all."""
+    return ", ".join(
+        _shown(text, "a role", token=True) if (text := str(role)) else "a role with no id"
+        for role in roles
+    )
 
 
 def _holder_lines(event: SecurityEvent) -> list[str]:
@@ -371,6 +475,7 @@ def _build_body(event: SecurityEvent) -> str:
         event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
     )
     from_directory = _from_directory(event)
+    unconfirmed = _roles_unconfirmed(event)  # BACKLOG #6034
     if moved_by_admin:
         description = (
             "An administrator changed the address that receives security notices for your account."
@@ -379,8 +484,13 @@ def _build_body(event: SecurityEvent) -> str:
         description = (
             "An administrator set this address to receive security notices about your account."
         )
-    elif from_directory and event.event_type in _DIRECTORY_DESCRIPTIONS:
-        description = _DIRECTORY_DESCRIPTIONS[event.event_type]
+    elif event.event_type in _EVIDENCED_KINDS:
+        description = _evidenced_description(event, from_directory=from_directory)
+    elif (
+        event.event_type == DIRECTORY_SESSIONS_ENDED
+        and event.detail.get("reason") == _ROLE_REVOCATION
+    ):
+        description = _ROLE_SESSIONS_ENDED
     else:
         description = _DESCRIPTIONS.get(
             event.event_type, "A security event occurred on your account."
@@ -388,20 +498,24 @@ def _build_body(event: SecurityEvent) -> str:
     lock_description, lock_lines, lock_closing = (
         _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
     )
+    # Every opening prints the name through ``_shown``: a directory supplies it on a directory
+    # notice (BACKLOG #2291), and nothing here shapes it on any other.
+    account = _shown(event.username, "a username")
     if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
         # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
-        opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
+        opening = f"A reminder for you as a MessageFoundry administrator ({account})."
     elif event.event_type == ENROLMENT_CODE_SPENT:
         # ADR 0207 A5: also to the ISSUER, but about something that has happened, not a reminder.
-        opening = f"A notice for you as a MessageFoundry administrator ({event.username})."
+        opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
-        opening = f"A reminder about your MessageFoundry account ({event.username})."
+        opening = f"A reminder about your MessageFoundry account ({account})."
+    elif unconfirmed:
+        # BACKLOG #6034: no change is confirmed (see ``_evidenced_description``).
+        opening = f"A notice about your MessageFoundry account ({account})."
     else:
-        # Through ``_shown``: on a directory rename this is the directory's new name (BACKLOG #2291).
-        account = _shown(event.username, "a username")
         opening = f"A security-relevant change occurred on your MessageFoundry account ({account})."
     lines = [opening, "", lock_description or description]
-    failed = event.detail.get("failed_attempts")
+    failed = _count(event.detail.get("failed_attempts"))
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
@@ -417,7 +531,11 @@ def _build_body(event: SecurityEvent) -> str:
         # notice and the reminder (#2007) go to the holder; the issuer's reminder names the holder.
         # `expires_at` is the instant the login gate refuses on, read off the stored stamp.
         stamp = event.detail.get("expires_at")
-        expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
+        expires = (
+            deadline_utc(stamp)
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            else None
+        )
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
             lines += _holder_lines(event)
             if expires is not None:
@@ -486,12 +604,12 @@ def _build_body(event: SecurityEvent) -> str:
                     scrub_log_argument(event.username),
                     key,
                 )
-    if from_directory and event.event_type not in _DIRECTORY_DESCRIPTIONS:
+    if from_directory and event.event_type not in _EVIDENCED_KINDS:
         # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
         # about it: a directory-driven change is not editable in the console, so "contact your
         # administrator" is the only action, and an unexplained change the holder cannot find a
         # cause for reads as a compromise. The vault #3121 kinds name their source in their own
-        # description instead (see ``_DIRECTORY_DESCRIPTIONS``).
+        # description instead (see ``_EVIDENCED_KINDS``).
         lines.append(
             "This change came from your organization's directory, not from the MessageFoundry "
             "console."
@@ -511,11 +629,18 @@ def _build_body(event: SecurityEvent) -> str:
             else:
                 lines.append("The notification address for this account was changed.")
             lines.append("Notices about later changes go to the new address, not to this one.")
+    if event.event_type in (FEDERATED_IDENTITY_BOUND, FEDERATED_IDENTITY_UNBOUND):
+        # BACKLOG #6034 (S08-57): which provider was linked or removed. Both senders pass the
+        # issuer, never the subject (BACKLOG #1248). An issuer is a URL, so it prints only as one
+        # printable token, as the #2019 address does: a space could carry false words inline.
+        issuer = str(event.detail.get("issuer") or "")
+        if issuer:
+            lines.append(f"Identity provider: {_shown(issuer, 'an identity provider', token=True)}")
     if event.event_type == FEDERATED_IDENTITY_BOUND:
         # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
         # was signed in on several devices see that all of them went.
-        ended = event.detail.get("sessions_revoked")
-        if isinstance(ended, int) and not isinstance(ended, bool):
+        ended = _revoked_count(event)
+        if ended is not None:
             lines.append(f"Sessions ended: {ended}")
     if event.event_type == MFA_ENABLED and event.detail.get("issued_credential"):
         # ADR 0197 Amendment A: this account still held the password it was issued. An
@@ -525,10 +650,17 @@ def _build_body(event: SecurityEvent) -> str:
             "If you have not signed in to MessageFoundry yet, you did not do this. Contact your "
             "MessageFoundry administrator."
         )
-    if event.event_type == ACCOUNT_CREATED:
-        roles = event.detail.get("roles")
-        if isinstance(roles, list) and roles:
-            lines.append("Roles: " + ", ".join(str(r) for r in roles))
+    # BACKLOG #6034: each role id goes through ``_shown`` (S08-56), and a custom role prints by its
+    # id, as no display name travels with the event. An administrator's confirmed role change
+    # carries the whole set ``set_roles`` wrote (S08-57), so an empty one says the account was left
+    # with none; a creation with none prints nothing, as it did. Not an unconfirmed write, nor a
+    # directory role change: the sign-in re-sync passes the set it tried to write, so the line
+    # could name roles the account does not hold.
+    roles = event.detail.get("roles")
+    if _roles_written(event) and not from_directory and isinstance(roles, list):
+        lines.append(f"Roles now: {_roles_shown(roles) or 'none'}")
+    if event.event_type == ACCOUNT_CREATED and isinstance(roles, list) and roles:
+        lines.append(f"Roles: {_roles_shown(roles)}")
     if event.event_type == NEW_ADDRESS_REVERIFY and event.detail.get("cap_reached"):
         # vault BACKLOG #2159: past this notice the session reports no further new addresses until
         # it re-verifies, so silence after it must not read as "no more new locations".
@@ -538,33 +670,32 @@ def _build_body(event: SecurityEvent) -> str:
             "your MessageFoundry administrator."
         )
     if event.event_type == RECOVERY_CODE_USED:
-        remaining = event.detail.get("remaining")
-        if isinstance(remaining, int):
+        remaining = _count(event.detail.get("remaining"))
+        if remaining is not None:
             lines.append(f"Recovery codes remaining: {remaining}")
             if remaining == 0:
                 lines.append(
                     "That was your last recovery code. Enroll a new authenticator to generate more, "
                     "or you will need an administrator to reset your second factor."
                 )
-    if event.client_ip and from_directory:
+    # BACKLOG #6034: the address prints only as one printable token, as every other value does.
+    client_ip = _shown(event.client_ip, "an address", token=True) if event.client_ip else ""
+    if client_ip and from_directory:
         # BACKLOG #2291. The directory made this change, so the address is not where it was made,
-        # and a bare "Source IP" line would read as the address of whoever made it. Measured
-        # 2026-10-06, the directory notices that pass an address come from ``_upsert_ad_user``, on
-        # a directory sign-in to this account, which copies the change down BEFORE the sign-in is
-        # finished: a later step can still refuse it, or it can still owe a second factor. Since
-        # vault BACKLOG #3121 the role re-sync in ``_complete_ad_login`` is one more such sender,
-        # and it too runs inside a directory sign-in before the session is issued. So the
-        # line says a sign-in was under way, never that one succeeded. Nothing on the event says
-        # the address came from a sign-in, so a new sender passing another kind of address on a
-        # directory event would make this line false; such a sender must change it.
-        lines.append(
-            f"MessageFoundry picked up this change during a sign-in to your account from "
-            f"{event.client_ip}."
-        )
-    elif event.client_ip:
-        lines.append(f"Source IP: {event.client_ip}")
+        # and a bare "Source IP" line would read as the address of whoever made it. The directory
+        # notices that pass an address were measured on 2026-10-06 to come from a directory
+        # sign-in (``_upsert_ad_user``, and since vault BACKLOG #3121 the role re-sync in
+        # ``_complete_ad_login``), but nothing on the event says so, so the line names only the
+        # request (BACKLOG #6034). An unconfirmed role write claims no change.
+        what = "sent this notice" if unconfirmed else "picked up this change"
+        lines.append(f"MessageFoundry {what} while handling a request from {client_ip}.")
+    elif client_ip:
+        lines.append(f"Source IP: {client_ip}")
     if lock_closing is not None:
         closing = lock_closing
+    elif unconfirmed:
+        # BACKLOG #6034: "this change" would claim one (see ``_evidenced_description``).
+        closing = "If you did not expect this notice, contact your MessageFoundry administrator."
     elif event.event_type == PASSWORD_RESET:
         # An administrator did this, so "if this was you" cannot apply, and "no action is needed"
         # would contradict the deadline line above it (BACKLOG #1141).
@@ -601,9 +732,12 @@ def _build_body(event: SecurityEvent) -> str:
         moved_by_admin
         or set_by_admin
         or from_directory
+        or (event.event_type == MFA_DISABLED and event.detail.get("reset") is True)
         or event.event_type
         in (
             ACCOUNT_CREATED,
+            ROLES_CHANGED,
+            ACCOUNT_DISABLED,
             USERNAME_CHANGED,
             FEDERATED_IDENTITY_BOUND,
             FEDERATED_IDENTITY_UNBOUND,
@@ -615,12 +749,50 @@ def _build_body(event: SecurityEvent) -> str:
         # change or disable the directory drove (vault BACKLOG #3121). Nor to a federated link or
         # unlink:
         # both routes refuse an administrator changing their own account's binding. Nor to the
-        # engine ending sessions on a directory answer (vault BACKLOG #2140).
+        # engine ending sessions on a directory answer (vault BACKLOG #2140). Nor to an
+        # administrator's role change or disable, whose description says an administrator did it:
+        # ``PUT /users/{id}/roles`` and the disable in ``PATCH /users/{id}`` both refuse a
+        # self-target (BACKLOG #6034). Nor to an administrator's MFA reset, whose route refuses one
+        # too.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
     lines += ["", closing]
     return "\n".join(lines)
+
+
+def _consume_outcome(send: asyncio.Future[bool]) -> None:
+    """Read a send's outcome, so asyncio never reports it unread: after a cut close nobody else
+    reads it (BACKLOG #6832)."""
+    if not send.cancelled():
+        send.exception()
+
+
+class _SendGate:
+    """Whether a send's thread has begun, so a cut close can stop one still waiting for a worker
+    thread from mailing after the close (BACKLOG #6832). Thread-safe: the send's thread calls
+    :meth:`begin`, the loop calls :meth:`skip`, and exactly one of them wins."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = False
+        self._skipped = False
+
+    def begin(self) -> bool:
+        """In the send's thread: whether to send. False once :meth:`skip` won."""
+        with self._lock:
+            if self._skipped:
+                return False
+            self._started = True
+            return True
+
+    def skip(self) -> bool:
+        """On the loop: whether the send never began, and now never will."""
+        with self._lock:
+            if self._started:
+                return False
+            self._skipped = True
+            return True
 
 
 class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
@@ -683,9 +855,17 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         # lifespan passes the store. Of the offline commands, provision-admin passes its store and
         # admin-reset-totp a sink that reopens the store for the write (BACKLOG #5634).
         self._audit = audit
-        # The queue-full records still being written, held so the loop keeps them alive and so
-        # aclose() can wait for them.
-        self._recording: set[asyncio.Task[None]] = set()
+        # The records still being written, at least the queue-full ones and a failed send's, held so
+        # the loop keeps them alive and so aclose() can wait for them.
+        self._recording: set[asyncio.Future[Any]] = set()
+        # The send the drain is waiting on, with what it needs to record or count it, so a cut
+        # close can record it (BACKLOG #6832). None between sends.
+        self._sending: (
+            tuple[SecurityEvent, asyncio.Future[bool], _SendGate, Callable[[], None]] | None
+        ) = None
+        # Set when the first aclose() has finished or been cut, so a second one waits for it rather
+        # than racing it (BACKLOG #6832).
+        self._closed = asyncio.Event()
         # Set when aclose() begins, and never cleared: start() refuses (vault BACKLOG #3120). An event
         # queued after that sits behind the stop sentinel, or on a queue nothing reads, and is never
         # sent, so notify() refuses it; the contract on ``SecurityNotifier`` says why.
@@ -778,43 +958,178 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short can leave its
-        # stop sentinel on the queue, so a drain loop started again would read it and stop, and
-        # notify() would answer True for events nothing sends. The engine builds a new notifier for
-        # each lifespan rather than restart one.
+        # Never again once closed (vault BACKLOG #3120). From the moment aclose() begins, notify()
+        # refuses every event, so a drain started again would serve a queue nothing fills while the
+        # notices it was meant to send were already recorded or sent. The engine builds a new
+        # notifier for each lifespan rather than restart one.
         if self._closing:
             raise RuntimeError(f"{type(self).__name__} has been closed and cannot be started again")
         super().start()
 
     async def aclose(self) -> None:
+        """Drain the queue and stop. The close sets no bound of its own: the shutdown's step bound
+        cuts it, so every notice the drain mails inside that bound goes out. A close cut short
+        cancels the drain and starts recording, with a sink, the send it cut and each notice still
+        queued (BACKLOG #6832). It waits for those writes unless it is cancelled again, which stops
+        only the wait. The writes are not bounded: past the step's cut grace the shutdown stops
+        waiting for them, and they go on, beside engine.stop(), until the store closes, which fails
+        the rest. The count of queued notices is logged before any of them is written. A second
+        call waits until the first ends, and closes nothing itself: once its record writes end,
+        or sooner if a second cancel stops its wait."""
+        if self._closing:
+            await self._closed.wait()
+            return
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         try:
-            await super().aclose()
+            await self._close()
         finally:
-            # Each one swallows its own failure, so this only waits.
-            await asyncio.gather(*self._recording, return_exceptions=True)
+            self._closed.set()
 
-    async def _handle(self, event: SecurityEvent) -> None:
+    async def _close(self) -> None:
+        drain = self._task
+        cut = False
         try:
-            await asyncio.to_thread(self._send, event)
-        except Exception:
-            # Best-effort: a failed send must never propagate. The event is usually also in the audit
-            # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
-            # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
-            # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
-            # still shows, on every other kind of notice.
-            if event.event_type not in LOG_SILENT_EVENT_TYPES:
-                log.warning(
-                    "security-event email failed for %s (%s)",
-                    event.username,
-                    event.event_type,
-                    exc_info=True,
+            await super().aclose()
+        except asyncio.CancelledError:
+            cut = True
+            raise
+        finally:
+            # Taken and logged before any await, so a second cancel cannot leave them untold.
+            left = self._take_queued()
+            # Skipped here too, before any await, so a send still waiting for a worker thread cannot
+            # begin once the close is cut, even while the drain unwinds.
+            pending, self._sending = self._sending, None
+            skipped = pending is not None and pending[2].skip()
+            try:
+                if drain is not None:
+                    # Cut while the sentinel waited on a full queue, the drain still runs; cut while
+                    # the close waited on the drain, it is already cancelled.
+                    drain.cancel()
+                    self._task = None
+                    await asyncio.gather(drain, return_exceptions=True)
+                    # Uncut, the base close has already raised the drain's failure to the caller.
+                    if cut and not drain.cancelled() and (error := drain.exception()) is not None:
+                        log.error("%s drain loop failed", type(self).__name__, exc_info=error)
+            finally:
+                # Held and shielded like a failed send's record, so a cut of this close stops only
+                # its wait: the writes go on until the store closes.
+                records = asyncio.ensure_future(self._record_cut(left, pending, skipped))
+                self._recording.add(records)
+                records.add_done_callback(self._recording.discard)
+                # Each one swallows its own failure, so this only waits.
+                await asyncio.shield(asyncio.gather(*self._recording, return_exceptions=True))
+
+    def _take_queued(self) -> list[SecurityEvent]:
+        """Empty the queue, stop sentinel included, and log how many notices it held. At least a
+        cut close, and the close of a notifier never started, leave some."""
+        left: list[SecurityEvent] = []
+        while not self._queue.empty():
+            if (event := self._queue.get_nowait()) is not None:
+                left.append(event)
+        # A count, never one that includes a lock notice (BACKLOG #1131).
+        shown = sum(event.event_type not in LOG_SILENT_EVENT_TYPES for event in left)
+        if shown:
+            log.warning(
+                "%s closed with %d security notice(s) still queued, never sent",
+                type(self).__name__,
+                shown,
+            )
+        return left
+
+    async def _record_cut(
+        self,
+        left: list[SecurityEvent],
+        pending: tuple[SecurityEvent, asyncio.Future[bool], _SendGate, Callable[[], None]] | None,
+        skipped: bool,
+    ) -> None:
+        """Record the send a cut close stopped waiting for, and each notice it left queued.
+        ``skipped`` says the close stopped that send before its thread began."""
+        records: list[tuple[SecurityEvent, str]] = []
+        if pending is not None:
+            event, send, _gate, delivered = pending
+            if skipped:
+                # Read first: a skipped send whose thread then ran returns False, and would
+                # otherwise read as a send that ended with nothing to record.
+                records.append((event, "abandoned"))
+            elif not send.done() or send.cancelled():
+                # A send still waiting for a worker thread was skipped above, so it never mails
+                # after the close: "abandoned", like a queued one. One whose thread began runs on
+                # to its own timeout, so the notice may still go out: "interrupted" says its
+                # delivery is unknown. No line for it: a cut that leaves notices queued nearly
+                # always has a send in flight, so a line skipped for a lock notice would say a lock
+                # landed (BACKLOG #1131).
+                records.append((event, "interrupted"))
+            elif (exc := send.exception()) is not None:
+                # It ended before the cut reached the drain, so its outcome is known.
+                self._log_send_failed(event, exc)
+                records.append((event, "send_failed"))
+            elif send.result():
+                delivered()
+        # "abandoned", apart from "closing": a lock notice refused at notify() reads mailed: false
+        # on its auth.lock_notice row, while one queued before the close reads mailed: true.
+        records += [(event, "abandoned") for event in left]
+        if self._audit is None:
+            return  # nowhere to record them; the counts are already in the log
+        failed = 0
+        try:
+            for event, reason in records:
+                recorded = await self._record_undelivered(
+                    event, {"reason": reason}, log_failure=False
                 )
+                failed += not recorded and event.event_type not in LOG_SILENT_EVENT_TYPES
+        finally:
+            if failed:
+                # One line, not one per row: a store closing under a full queue refuses them all.
+                log.warning(
+                    "%d undelivered security notice(s) could not be recorded in the audit log at "
+                    "close",
+                    failed,
+                )
+
+    async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
+        # Shielded, so a cut close can read how the send ended (BACKLOG #6832). Its outcome is
+        # consumed here, since a cut leaves nobody else to read it.
+        gate = _SendGate()
+        send = asyncio.ensure_future(asyncio.to_thread(self._send_gated, event, gate))
+        send.add_done_callback(_consume_outcome)
+        self._sending = (event, send, gate, delivered)
+        try:
+            sent = await asyncio.shield(send)
+        except Exception as exc:
+            self._sending = None
+            # Best-effort: a failed send must never propagate.
+            self._log_send_failed(event, exc)
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
-            await self._record_undelivered(event, {"reason": "send_failed"})
+            # Shielded and held, so a cut close waits for this write rather than cancelling it.
+            record = asyncio.ensure_future(
+                self._record_undelivered(event, {"reason": "send_failed"})
+            )
+            self._recording.add(record)
+            record.add_done_callback(self._recording.discard)
+            await asyncio.shield(record)
+            return
+        # A cancel leaves self._sending set, for the cut close to record.
+        self._sending = None
+        if sent:
+            delivered()
 
-    async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
+    def _log_send_failed(self, event: SecurityEvent, exc: BaseException) -> None:
+        # The event is usually also in the audit log; a refused directory-reconciler audit write
+        # leaves no row (BACKLOG #3018). A lock notice fails silently here (BACKLOG #1131,
+        # LOG_SILENT_EVENT_TYPES): a line per failed lock mail would show a logs:view reader when a
+        # lock landed. A relay that is down still shows, on every other kind of notice.
+        if event.event_type not in LOG_SILENT_EVENT_TYPES:
+            log.warning(
+                "security-event email failed for %s (%s)",
+                scrub_log_argument(event.username),
+                notice_kind_log_label(event.event_type),
+                exc_info=exc,
+            )
+
+    async def _record_undelivered(
+        self, event: SecurityEvent, why: dict[str, str], *, log_failure: bool = True
+    ) -> bool:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
 
         Before this, a full queue or a failed send left only a WARNING line, so the trail could not
@@ -823,11 +1138,11 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
         was. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
         in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
-        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
-        not at all for a lock notice: that kind writes no other line, so a lone line would say a
-        lock landed."""
+        #1131). A failed write is swallowed, like the send it reports on. It is logged by class,
+        unless ``log_failure`` is False, and never for a lock notice: that kind writes no other
+        line, so a lone line would say a lock landed. Returns whether the row was written."""
         if self._audit is None:
-            return
+            return False
         silent = event.event_type in LOG_SILENT_EVENT_TYPES
         action = LOCK_NOTICE_UNDELIVERED_ACTION if silent else SECURITY_NOTICE_UNDELIVERED_ACTION
         detail = {"notice": notice_kind_log_label(event.event_type), **why}
@@ -839,15 +1154,24 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)
             )
         except Exception as exc:  # noqa: BLE001 - best-effort, like the notice itself
-            if not silent:
+            if log_failure and not silent:
                 log.warning(
                     "an undelivered security notice could not be recorded in the audit log (%s)",
                     type(exc).__name__,
                 )
+            return False
+        return True
 
-    def _send(self, event: SecurityEvent) -> None:
+    def _send_gated(self, event: SecurityEvent, gate: _SendGate) -> bool:
+        """Mail the notice unless a cut close skipped it before its thread began."""
+        if not gate.begin():
+            return False
+        return self._send(event)
+
+    def _send(self, event: SecurityEvent) -> bool:
+        """Mail the notice, returning whether it was sent."""
         if not event.email:  # narrowed for mypy; notify() already filtered these out
-            return
+            return False
         send_plain_email(
             host=self._host,
             port=self._port,
@@ -864,6 +1188,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             tls_ca_file=self._tls_ca_file,
             trust_anchor_policy=self._trust_anchor_policy,
         )
+        return True
 
 
 def security_notifier_from_settings(

@@ -810,11 +810,12 @@ def sessions_page(sessions: Sequence[Mapping[str, object]], *, notice: str | Non
     expires_at / client / current) — this module never touches the store.
 
     **Revoking one's OWN sessions is step-up gated** (ASVS 7.5.2, BACKLOG #1149): both terminate
-    POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so the cookie
+    POSTs take ``require_ui_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)``, so, except
+    under ``[auth].require_action_step_up = false`` (docs/CONFIGURATION.md, that row), the cookie
     alone does not carry them — ``/ui/reauth`` mints a single-use grant bound to that action and each
-    terminate consumes one. It is the password-only family on purpose: the full step-up would
-    deadlock an MFA-required-but-unenrolled operator out of revoking their own sessions. An operator
-    who HAS a factor proves it first (BACKLOG #1951).
+    terminate consumes one. It is the password-only family, but no pending session passes it: an
+    operator who HAS a factor proves it first (BACKLOG #1951), and one with no factor under
+    ``require_mfa`` is sent to enrol first (BACKLOG #1149).
 
     *This docstring previously said "no step-up", which stopped being true when that gate landed.
     A stale absence claim beside a control is worse than silence: it reads as a licence to remove

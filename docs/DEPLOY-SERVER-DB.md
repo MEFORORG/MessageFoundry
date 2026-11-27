@@ -178,11 +178,16 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`,
   and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
   `VIEW DEFINITION` reaching its default schema or `dbo` by any route, at least a grant on the
-  schema, the database or the server, schema ownership, or a role or group membership. Remove it
-  and run the check again.
-- It **exits 4** when the probe could not read the login at all, for example on a failed connection
-  or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
-  result.
+  schema, the database or the server, schema ownership, or a role or group membership. A named
+  role or `CONTROL` grant hides the lines for rights it carries, which the gMSA must never hold
+  either: at least `db_owner`, `sysadmin`, database `CONTROL` or `CONTROL SERVER` hides the
+  schema-DDL, `audit_log` and `VIEW DEFINITION` lines, `db_securityadmin` the `VIEW DEFINITION`
+  line, and `db_ddladmin` the schema-DDL lines and `ALTER` on `audit_log`. The output can also
+  list grants it could not read. Remove each grant it names and run the check again; once nothing
+  over-granted is left, a grant it still could not read makes it exit 4.
+- It **exits 4** when the probe could not read the login, for example on a failed connection, or
+  when a permission read came back NULL, or as a value that is not 0 or 1, and nothing it did read
+  is over-granted. That is not a clean result. A read over-grant beside such a read exits 3.
 - It exits 1 when the service settings do not load.
 
 It also probes each Vault token the engine uses and the AD bind account, when they are
@@ -554,40 +559,35 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 
 This script needs PowerShell 7.1 or later (pwsh); it refuses to run under Windows PowerShell 5.1.
 
-The helper shows every certificate in the file, and refuses the whole file in at least these cases:
-any one is not a CA or carries a private key, any one does not chain to a self-signed root in the
-same file, a root in it is outside its validity period, or a DER value in it does not end where its
-bytes end. The helper's own help lists the rest.
+The helper shows every certificate in the file, and refuses the whole file, importing nothing,
+unless every certificate in it passes its checks. What it checks, what it refuses and what it only
+warns of are stated once, in the DESCRIPTION of the help block at the top of the script; read it
+in the file.
 
-**Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
-documents point here. A self-signed root, whose signature verifies under its own key, goes into
-`LocalMachine\Root`; the helper asks .NET's chain engine (`X509Chain`) whether that signature
-verifies. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
-self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
-The Windows chain engine needs an authority key identifier to link a self-issued certificate to its
-signer; without one it reads the certificate as self-signed with a signature that fails, so the
-file is refused. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18 chain
-building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
-engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
-system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
-partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. So the helper refuses a file unless the chain engine, given every
-certificate in the file, builds a chain from each one to a self-signed root in the same file with
-every signature verifying and no fault reported but an untrusted root or a time status, and every
-self-signed root in it is within its validity period. Only the file's own roots anchor that chain,
-and the helper turns off fetching a missing issuer from a URL a certificate names. It warns of,
-but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
-you may still decline the root and accept another CA, so give it the root of the CA you mean to
-trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+**Where each CA goes.** This paragraph is the statement of it; other documents point here. A
+self-signed root goes into `LocalMachine\Root`. Any other CA in the file, such as an issuing CA in
+a `.p7b` chain, or a self-issued certificate another key signed, goes into the intermediate store
+`LocalMachine\CA`. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18
+chain building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a
+trust anchor by the engine's Python TLS on Windows: CPython's `ssl.create_default_context()`,
+which the PostgreSQL system-trust path calls, loads the `CA` and `ROOT` system stores, and Python
+3.13 and later set partial-chain verification, so a chain that reaches a certificate in
+`LocalMachine\CA` validates there without its root, which is why the helper checks each CA's
+chain (its help says how). With `-Confirm` you may still
+decline the root and accept another CA, so give it the root of the CA you mean to trust, alone or
+in that CA's own `.p7b` chain, and accept every certificate it offers.
 
-The built-ins below check none of that, so use them only for a file holding one self-signed root
-CA you have checked yourself:
+The built-ins below do not run the helper's CA, chain and validity checks, and they put what they
+are given into the store you name, so use them only for a file holding one self-signed root CA
+you have checked yourself. Each line adds a trusted root to the machine store, so it refuses to
+run on any host but the one you mean: put that host's name, as `[Environment]::MachineName`
+prints it, in place of `<HOST>`. Run one of the two.
 
 ```powershell
 # PowerShell:
-Import-Certificate -FilePath C:\certs\internal-root-ca.crt -CertStoreLocation Cert:\LocalMachine\Root
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { Import-Certificate -FilePath C:\certs\internal-root-ca.crt -CertStoreLocation Cert:\LocalMachine\Root }
 # certutil equivalent:
-certutil -addstore -f Root C:\certs\internal-root-ca.crt
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else { certutil -addstore -f Root C:\certs\internal-root-ca.crt }
 ```
 
 Both write `LocalMachine\Root` and are idempotent (keyed on thumbprint). After import, the DB server
@@ -611,10 +611,37 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete the old CA from whichever machine store holds it, `LocalMachine\Root` for
-     a root or `LocalMachine\CA` for an issuing CA (e.g.
-     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq <old> | Remove-Item`).
-   - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
+   - **SQL Server:** delete **every** certificate the old CA's file put in the machine stores that
+     the new CA's file does not also hold: its root from `LocalMachine\Root` and each of its
+     issuing CAs from `LocalMachine\CA`. Removing the root alone is not enough. An old issuing CA
+     left in `LocalMachine\CA` stays a trust anchor for the engine's Python TLS (§5.2, "Where each
+     CA goes"), so a server certificate it issued would still validate there. **Keep** any
+     certificate the new file also holds, such as the shared root when only the issuing CA
+     rotated: removing it breaks the new chain, which is the outage this order exists to avoid.
+     Keep too any certificate something else on the host still relies on, such as a root another
+     DB's CA file shares or one a Group Policy deploys: the helper does not record what it added,
+     so an old file's root may have been in the store before it.
+     The helper prints each certificate's thumbprint; run it with `-WhatIf` on the old file and on
+     the new one, and take the old file's thumbprints that the new file's listing does not show.
+     For a file the helper reads, it prints the list before it refuses the file for a CA, chain or
+     validity check, so it lists them even once the old root has expired; a file it cannot read
+     at all lists nothing, so find its certificates by Subject in
+     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA` instead.
+     Then remove them all at once. Removing a CA a host still relies on breaks that host's
+     connections, so the command refuses to run on any host but the one you checked: put that
+     host's name, as `[Environment]::MachineName`
+     prints it, in place of `<HOST>`.
+
+     ```powershell
+     if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+         $old = @('<old thumbprint>', '<old thumbprint>')  # every old one the new file does not hold
+         Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
+             Where-Object Thumbprint -in $old | Remove-Item
+     }
+     ```
+   - **PostgreSQL:** drop the old CA from the PEM bundle and reload. Where the PostgreSQL hop uses
+     the machine stores instead of a file pin, remove the old CA from them as the SQL Server step
+     above says.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still
 chains to the already-trusted CA. Just roll it before expiry. **Caveat — leaf pinning:** if you pinned
@@ -704,13 +731,17 @@ If Group Policy already sets **SSL Cipher Suite Order** on the host, change that
 **2. Turn TLS 1.0 and 1.1 off for the client role (vendor-documented).** Microsoft's
 [TLS registry settings](https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings)
 page gives the key: a DWORD named `Enabled` with value `0` under the version's `Client` subkey. These
-hops are TLS clients, so `Client` is the subkey that matters here. From an elevated PowerShell:
+hops are TLS clients, so `Client` is the subkey that matters here. The command changes the whole
+host's TLS clients, so it refuses to run on any host but the one you mean; put that host's name,
+as `[Environment]::MachineName` prints it, in place of `<HOST>`. From an elevated PowerShell:
 
 ```powershell
-foreach ($v in 'TLS 1.0', 'TLS 1.1') {
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
-    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-    New-ItemProperty -Path $key -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
+if ([Environment]::MachineName -ne '<HOST>') { Write-Host "STOP     this must run on <HOST>, but this is $([Environment]::MachineName); nothing ran" } else {
+    foreach ($v in 'TLS 1.0', 'TLS 1.1') {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$v\Client"
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        New-ItemProperty -Path $key -Name Enabled -Value 0 -PropertyType DWord -Force | Out-Null
+    }
 }
 ```
 

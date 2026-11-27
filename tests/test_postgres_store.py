@@ -302,6 +302,49 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
         assert RawMessage(raw, "hl7v2").raw_bytes == body  # exact bytes recoverable
 
 
+#: Every C0 control but NUL, DEL and every C1 control: control characters ``LoginRequest`` passes
+#: to the service in a sign-in name, which the service then looks up (vault BACKLOG #5342). The
+#: model passes a NUL too; ``AuthService.login`` refuses that one before the lookup. The model
+#: refuses a lone surrogate
+#: (tests/test_api_auth.py::test_login_refuses_a_lone_surrogate_before_the_service).
+_SIGN_IN_CONTROLS = [chr(c) for c in (*range(0x01, 0x20), 0x7F, *range(0x80, 0xA0))]
+
+
+async def test_a_control_character_sign_in_name_reaches_no_store_error(store) -> None:
+    """Vault BACKLOG #5342, the control-characters limb. An unknown sign-in name reaches the store
+    twice: ``AuthService.login`` looks it up by name, then writes it as the ``auth.login_failed``
+    actor. A name with no NUL is written as typed (``_storable_actor`` escapes its control
+    characters only when it holds a NUL, and the login refuses a NUL name before the lookup). So
+    each of these controls must be a miss and a written, read-back actor, with no error to escape
+    the sign-in's failure pad. The NUL lookup is the positive control: it shows the instrument sees
+    the refusal it is looking for."""
+    import asyncpg  # extra-gated; imported inside the (skip-guarded) test, never at module import
+
+    with pytest.raises(asyncpg.exceptions.DataError) as probe:
+        await store.get_user_by_username("s\x00up")
+    assert getattr(probe.value, "sqlstate", None) == "22021"
+
+    # A stored account the control spellings are built around, so a backend that dropped or
+    # ignored a control character in the match would find it.
+    head, tail = "pg", uuid4().hex[:8]
+    await store.create_user(
+        user_id=f"u-{tail}",
+        username=head + tail,
+        auth_provider="local",
+        password_generated=False,
+        now=1.0,
+        audits=(),
+    )
+    assert await store.get_user_by_username(head + tail) is not None  # the lookup can find it
+
+    spellings = [head + ch + tail for ch in _SIGN_IN_CONTROLS]
+    for name in spellings:
+        assert await store.get_user_by_username(name) is None, repr(name)
+        await store.record_audit("auth.login_failed", actor=name, detail="{}")
+    rows = await store.list_audit(action="auth.login_failed", limit=len(spellings) + 1)
+    assert sorted(r["actor"] for r in rows) == sorted(spellings)
+
+
 async def test_record_received_filtered_and_error(store) -> None:
     f = await store.record_received(channel_id="IB", raw=RAW, status=MessageStatus.FILTERED)
     e = await store.record_received(
@@ -1206,10 +1249,39 @@ async def test_webauthn_store_contract(store) -> None:
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
-    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    """BACKLOG #2733 on Postgres: ``create_session``'s own missing-account refusal, as on SQLite and
+    SQL Server. It answers before the INSERT, so this does not reach the session's user foreign key
+    (vault BACKLOG #2733 item 10)."""
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def test_the_sessions_user_key_refuses_an_orphan(store) -> None:
+    """Vault BACKLOG #2733 item 6: the test above no longer reaches the ``sessions.user_id``
+    foreign key, so this reaches it directly. A session row moved onto an account that does not
+    exist is refused."""
+    import asyncpg
+
+    user_id = f"fk-{uuid4().hex}"
+    token_hash = uuid4().hex * 2
+    await store.create_user(
+        user_id=user_id,
+        username=f"fk-{uuid4().hex}",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    assert await store.create_session(token_hash=token_hash, user_id=user_id, expires_at=9e9)
+    async with store._pool.acquire() as conn:
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "UPDATE sessions SET user_id=$1 WHERE token_hash=$2",
+                f"no-such-{uuid4().hex}",
+                token_hash,
+            )
 
 
 async def test_webauthn_conditional_bind_contract(store) -> None:
@@ -1634,6 +1706,37 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     got = await store.get_user("cas-src")
     assert (got.channel_scope, got.channel_scope_source) == ('["IB_C"]', SCOPE_SOURCE_MANUAL)
     assert await cas("cas-nobody", None, source=SCOPE_SOURCE_MANUAL, expected_source=None) is False
+
+
+async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(store) -> None:
+    """BACKLOG #6887 on Postgres: ``set_ad_channel_scope_if_unchanged`` writes only while the row
+    holds both the expected scope and source (``None`` matching NULL), marked ``ad``. Each refusal
+    is paired with the write that does go through."""
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    await store.create_user(
+        user_id="adcas",
+        username="adcas",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    cas = store.set_ad_channel_scope_if_unchanged
+    assert await cas("adcas", '["IB_A"]', expected_scope="[]", expected_source=None) is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source="ad") is False
+    assert await cas("adcas", '["IB_A"]', expected_scope=None, expected_source=None) is True
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
+    await store.set_user_channel_scope("adcas", '["IB_A"]', source=SCOPE_SOURCE_MANUAL)
+    assert await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="ad") is False
+    assert (await store.get_user("adcas")).channel_scope == '["IB_A"]'
+    assert (
+        await cas("adcas", '["IB_B"]', expected_scope='["IB_A"]', expected_source="manual") is True
+    )
+    got = await store.get_user("adcas")
+    assert (got.channel_scope, got.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_AD)
+    assert await cas("adcas-nobody", "[]", expected_scope=None, expected_source=None) is False
 
 
 async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
@@ -4915,6 +5018,13 @@ async def test_alert_generation_bounds_the_resolve_pg(store) -> None:
 
     await check_alert_generation_contract(store)
     await check_fenced_resolve_contract(store)
+
+
+async def test_suspended_until_after_reads_only_open_suspends_pg(store) -> None:
+    """Vault BACKLOG #3100 item 14: the suspend prime's filter, its ``$n`` numbering included."""
+    from tests.test_alert_state import _assert_suspended_until_after_reads_only_open_suspends
+
+    await _assert_suspended_until_after_reads_only_open_suspends(store)
 
 
 async def test_alert_instance_lifecycle_pg(store) -> None:

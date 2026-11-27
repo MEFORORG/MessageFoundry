@@ -9,8 +9,10 @@ Only a read that returns exactly ``off`` is OFF. The tests drive the real script
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -119,9 +121,9 @@ def _mark(root: Path, seat: str) -> None:
     marker.write_text(seat, encoding="utf-8")
 
 
-def _linked_worktree(sb: Sandbox, name: str = "wt") -> Path:
-    """A linked worktree of the sandbox repository, as git lays one out: _hookinput.ps1 reads it."""
-    gitdir = sb.repo / ".git" / "worktrees" / name
+def _linked_worktree(sb: Sandbox, name: str = "wt", repo: Path | None = None) -> Path:
+    """A linked worktree of ``repo`` (the sandbox's by default), as git lays one out."""
+    gitdir = (repo or sb.repo) / ".git" / "worktrees" / name
     gitdir.mkdir(parents=True)
     (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
@@ -302,6 +304,245 @@ def test_a_cwd_inside_no_checkout_gives_no_instruction_and_says_so(sb: Sandbox) 
     outside.mkdir()
     proc = _seat_run(sb, "off", "builder", cwd=outside)
     assert proc.stdout == "" and "inside no checkout" in proc.stderr, proc.stderr
+
+
+def _foreign_repo(sb: Sandbox, seat: str) -> Path:
+    """A checkout of another repository, with a roster that maps no alias to Special."""
+    foreign = sb.repo.parent / "foreign"
+    foreign.mkdir()
+    subprocess.run(["git", "init", "-q", str(foreign)], check=True, capture_output=True, timeout=60)
+    roles = foreign / "docs" / "roles"
+    roles.mkdir(parents=True)
+    (roles / "seats.json").write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _mark(foreign, seat)
+    (foreign / "src").mkdir()
+    return foreign
+
+
+NOT_OURS = "not shown to be a checkout of this repository"
+
+
+def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
+    """The instruction, its Special-skips sentence and the not-ours note were printed.
+
+    Every instruction carries that sentence, so this alone does not prove the seat was undeclared.
+    Where a caller sets this repository's own marker to Special and the cwd is elsewhere, reading
+    that marker instead would print nothing. A non-Special cwd marker, read as the seat, would print
+    the same instruction, so only the not-ours note shows that it did not name the seat.
+    """
+    text = _instruction(proc.stdout)
+    assert "A Special seat skips this" in text, (proc.stdout, proc.stderr)
+    assert NOT_OURS in proc.stderr, proc.stderr
+
+
+def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox) -> None:
+    # BACKLOG #7559. A cwd in another repository's checkout must not let that checkout's marker, or
+    # its roster missing the Special alias, name the seat: a non-Special one reads as undeclared.
+    foreign = _foreign_repo(sb, "builder")
+    _undeclared(_seat_run(sb, "off", "special", cwd=foreign / "src"))
+
+
+@pytest.mark.parametrize("marker", ["", "\ufeff", "  \n"])
+def test_a_blank_foreign_marker_falls_through_to_korus_seat_not_to_a_fault(
+    sb: Sandbox, marker: str
+) -> None:
+    # KORUS_SEAT is Special, so only a fall-through to it prints nothing; returning undeclared on
+    # the blank marker would print the instruction, and a fault would say so on stderr.
+    foreign = _foreign_repo(sb, "builder")
+    _mark(foreign, marker)
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special")
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert VETO not in proc.stderr and "no skill instruction" not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("seat", ["special", "adhoc"])
+def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: str) -> None:
+    # The foreign roster maps no alias, so only this script's roster can make 'adhoc' Special.
+    foreign = _foreign_repo(sb, "builder")
+    proc = _seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT=seat)
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+    assert VETO not in proc.stderr, proc.stderr  # KORUS_SEAT silenced it, not the marker
+
+
+def test_a_foreign_cwd_with_a_non_special_korus_seat_gets_the_instruction(sb: Sandbox) -> None:
+    # The negative control for the test above.
+    foreign = _foreign_repo(sb, "builder")
+    _undeclared(_seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT="builder"))
+
+
+def test_a_linked_worktree_of_another_repository_reads_as_undeclared(sb: Sandbox) -> None:
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "special"))
+    _mark(wt, "builder")
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+VETO = "its seat marker names a Special seat, so no instruction"
+
+
+def _veto(proc: subprocess.CompletedProcess[str]) -> None:
+    """No instruction, no fault, and the not-ours branch's veto is what silenced it."""
+    assert proc.stdout == "", (proc.stdout, proc.stderr)
+    assert VETO in proc.stderr and "no skill instruction" not in proc.stderr, proc.stderr
+
+
+def _orphan_worktree(sb: Sandbox) -> Path:
+    """A worktree whose git dir is gone, so its common dir cannot be read."""
+    wt = sb.repo.parent / "orphan"
+    wt.mkdir()
+    (wt / ".git").write_text(
+        f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
+    )
+    return wt
+
+
+# A marker outside this repository cannot NAME the seat, but one naming Special, or an alias of it
+# in this script's roster, still VETOES the instruction, as it did before the repository check.
+# Each case leaves this repository's own marker on a non-Special seat, so only the cwd's marker
+# can silence the hook; the foreign roster maps no alias, so only ours can make 'adhoc' Special.
+@pytest.mark.parametrize("marker", ["special", " Special\n", "adhoc", "special-1", "specials"])
+def test_a_foreign_special_marker_vetoes_the_instruction(sb: Sandbox, marker: str) -> None:
+    foreign = _foreign_repo(sb, marker)
+    _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
+def test_an_alias_only_the_foreign_roster_maps_still_vetoes(sb: Sandbox) -> None:
+    # This script's roster does not know 'special9', so only the cwd's roster can make it Special.
+    foreign = _foreign_repo(sb, "special9")
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text(json.dumps({"aliases": {"special9": "special"}}), encoding="utf-8")
+    _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
+def test_a_foreign_cwd_reads_korus_seat_against_the_cwd_roster_too(sb: Sandbox) -> None:
+    # With no marker, KORUS_SEAT is the label read. This script's roster does not know 'special9',
+    # so only the cwd's roster can make it Special, as it does for the marker above.
+    foreign = _foreign_repo(sb, "builder")
+    (foreign / ".claude" / "seat.local.txt").unlink()
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text(json.dumps({"aliases": {"special9": "special"}}), encoding="utf-8")
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special9")
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+    assert VETO not in proc.stderr, proc.stderr  # KORUS_SEAT silenced it, not the marker
+    # The controls: the same setup with a non-Special KORUS_SEAT prints the instruction, and so
+    # does 'special9' once the cwd's roster stops mapping it, so that roster is what silenced it.
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="builder"))
+    roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special9"))
+
+
+@pytest.mark.parametrize("label", ["marker", "korus_seat"])
+def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox, label: str) -> None:
+    # A Special alias only that roster maps would be lost if the fault were skipped, so it throws
+    # and prints no instruction, as a fault reading this script's roster or the marker does. The
+    # label it would be read for is the cwd's marker or, with no marker, KORUS_SEAT. Every label
+    # here is non-Special, so only the fault can silence the hook.
+    foreign = _foreign_repo(sb, "builder")
+    env = {}
+    if label == "korus_seat":
+        (foreign / ".claude" / "seat.local.txt").unlink()
+        env["KORUS_SEAT"] = "builder"
+    roster = foreign / "docs" / "roles" / "seats.json"
+    roster.write_text("not json", encoding="utf-8")
+    proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", **env)
+    assert proc.stdout == "", (proc.stdout, proc.stderr)
+    assert VETO not in proc.stderr, proc.stderr
+    # The fault names the roster it could not read, the cwd's and not this script's: the JSON error
+    # alone names no file, and the sandbox's own roster path holds 'foreign' through tmp_path.
+    fault = [line for line in proc.stderr.splitlines() if "no skill instruction" in line]
+    assert len(fault) == 1, proc.stderr
+    assert re.search(r"[\\/]foreign[\\/]docs[\\/]roles[\\/]seats\.json", fault[0]), fault[0]
+    # The control: the same setup with a readable roster prints the instruction, so the roster's
+    # content is what silenced it above.
+    roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", **env))
+
+
+def test_a_foreign_special_marker_outranks_korus_seat(sb: Sandbox) -> None:
+    # As the cwd's marker outranks KORUS_SEAT within this repository.
+    foreign = _foreign_repo(sb, "special")
+    _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="builder"))
+
+
+def test_a_foreign_linked_worktree_special_marker_vetoes_the_instruction(sb: Sandbox) -> None:
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "builder"))
+    _mark(wt, "special")
+    _veto(_seat_run(sb, "off", "builder", cwd=wt))
+
+
+def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> None:
+    # Its common dir cannot be read, so it cannot be shown to be this repository's.
+    wt = _orphan_worktree(sb)
+    _mark(wt, "builder")
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+@pytest.mark.parametrize("marker", ["special", "adhoc"])
+def test_a_special_marker_where_the_git_dir_is_gone_vetoes_the_instruction(
+    sb: Sandbox, marker: str
+) -> None:
+    # Its common dir cannot be read, so the marker cannot name the seat, but it can still veto.
+    wt = _orphan_worktree(sb)
+    _mark(wt, marker)
+    _veto(_seat_run(sb, "off", "builder", cwd=wt))
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    if sys.platform == "win32":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_worktree_of_this_repository_spelled_through_a_link_names_its_seat(
+    sb: Sandbox,
+) -> None:
+    # The positive control for the repository check: the script runs through a link to the repo,
+    # while the worktree's gitdir line names the real path, as git writes it. Its Special marker
+    # holds only if the worktree is recognised as ours; read as undeclared it would print.
+    wt = _linked_worktree(sb)
+    _mark(wt, "special")
+    link = sb.repo.parent / "linked-repo"
+    _dir_link(link, sb.repo)
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    roles = sb.repo / "docs" / "roles"
+    roles.mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "docs" / "roles" / "seats.json", roles / "seats.json")
+    payload = {"hook_event_name": "SessionStart", "source": "compact", "cwd": str(wt)}
+    argv = sb.argv(KILL, "-Banner")
+    argv[argv.index("-File") + 1] = str(link / KILL.relative_to(ROOT))
+    proc = subprocess.run(
+        argv,
+        cwd=str(link),
+        env=sb.env(KORUS_SEAT="", KORUS_AGENT=""),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (proc.stdout, proc.stderr) == ("", "")
+
+
+def test_an_unreadable_own_checkout_reads_as_undeclared(sb: Sandbox) -> None:
+    # The script's own common dir cannot be read, so no cwd can be shown to be this repository's.
+    (sb.repo / ".git" / "HEAD").unlink()
+    _undeclared(_seat_run(sb, "off", "builder"))
+
+
+def test_a_special_marker_in_an_unreadable_own_checkout_vetoes_the_instruction(
+    sb: Sandbox,
+) -> None:
+    (sb.repo / ".git" / "HEAD").unlink()
+    _veto(_seat_run(sb, "off", "special"))
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])

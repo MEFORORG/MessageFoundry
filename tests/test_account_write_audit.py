@@ -225,7 +225,7 @@ async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write
     # The account's first sign-in wrote its first roles, with their row.
     assert await _details(store, "auth.ad_roles_resynced") == [{"from": [], "to": ["operator"]}]
     # Refused in the role write's transaction only: the row is then written on its own.
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    await _move_map(service, store, first, "viewer")
     refused = _refuse(monkeypatch, store, "auth.ad_roles_resynced")
     second = (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
     assert second is not None
@@ -240,7 +240,7 @@ async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write
     monkeypatch.undo()
 
     # Refused on its own too: the roles and the revoke still land, and the sign-in fails.
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
+    await _move_map(service, store, second, "operator")
     real = store._append_audit_row
 
     async def refusing(name: str, **kwargs: Any) -> Any:
@@ -302,6 +302,14 @@ async def _signed_in(
     return service, first, grants, audit_pages
 
 
+async def _move_map(service: Any, store: MessageStore, token: str, role: str) -> None:
+    """Move jdoe's group to ``role`` through the store, not the service, whose map edit would end
+    ``token`` itself and leave a stale-session assertion true whatever the sign-in then did (vault
+    BACKLOG #3085 item 19). The session is checked live first."""
+    await store.set_ad_group_role_map([("cn=mf-ops,dc=x", role)])
+    assert await service.identity_for_token(token) is not None
+
+
 def _append_fails(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore, *errors: Exception
 ) -> list[str]:
@@ -328,7 +336,7 @@ async def test_a_defect_in_the_sign_in_role_row_still_lands_the_roles_and_ends_t
     authoritative, so the roles still land, the row is written on its own, and the stale sessions
     end and the user is told before the defect is raised, as the reconciler's role write does."""
     service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    await _move_map(service, store, first, "viewer")
     service._security_notifier.sent.clear()
     raised = _append_fails(monkeypatch, store, NotImplementedError("synthetic defect"))
     with pytest.raises(NotImplementedError):
@@ -362,7 +370,7 @@ async def test_a_sign_in_role_sync_that_raises_still_pages_its_administrator_gra
     raises, after the revoke and the user's notice. A row lost twice also pages
     ``audit_write_failed``, as the reconciler's does."""
     service, first, grants, audit_pages = await _signed_in(store, "viewer")
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
+    await _move_map(service, store, first, ADMIN)
     service._security_notifier.sent.clear()
     _append_fails(monkeypatch, store, *errors)
     with pytest.raises(type(errors[0])):
@@ -485,7 +493,7 @@ async def test_an_unclassified_error_in_the_sign_in_role_row_still_ends_the_sess
     row: the write may have committed, so the roles are written again without it, the stale
     sessions end and the user is told, and only then does the sign-in fail with the error."""
     service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    await _move_map(service, store, first, "viewer")
     service._security_notifier.sent.clear()
     raised = _append_fails(monkeypatch, store, error)
     with pytest.raises(type(error)):
@@ -514,7 +522,7 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
     committed, so the account's other sessions still end and the user is still told before the
     sign-in fails with the retry's error."""
     service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    await _move_map(service, store, first, "viewer")
     service._security_notifier.sent.clear()
     calls: list[int] = []
 
@@ -587,8 +595,7 @@ async def test_a_sign_in_demotion_whose_role_write_raises_before_it_writes_ends_
     directory removed, so they end before the error is raised. The notice still goes although no
     role changed: the engine errs loud, never open."""
     service, first, grants, _audit_pages = await _signed_in(store, ADMIN)
-    # Through the store, not the service, whose map edit would end ``first`` itself.
-    await store.set_ad_group_role_map([("cn=mf-ops,dc=x", VIEWER)])
+    await _move_map(service, store, first, VIEWER)
     service._security_notifier.sent.clear()
 
     async def refused(*_args: object, **_kwargs: object) -> None:

@@ -375,8 +375,8 @@ def test_the_merge_group_arm_emits_a_usable_tooling_matrix(workdir: Path, tmp_pa
         "the merge_group arm exits without writing tooling_matrix. fromJSON on an unset output FAILS "
         "the job -- it does not fall back to a full matrix"
     )
-    assert json.loads(outputs["tooling_matrix"])["os"], (
-        "the merge_group arm emitted an empty os list"
+    assert json.loads(outputs["tooling_matrix"])["include"], (
+        "the merge_group arm emitted an empty leg list"
     )
 
 

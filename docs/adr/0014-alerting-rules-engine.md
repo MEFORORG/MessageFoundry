@@ -230,16 +230,27 @@ install. All three shipped defaults are unchanged and byte-identical.
   repository. PHI-view exclusion is unchanged.
 - **16.4.2 — tamper-evident audit chain.** Two levers, both instructed (§"Tamper-evident audit chain"):
   (A) `[integrity].audit_verify_on_start = true` re-walks the chain at startup — **alert-only, never
-  crashes** (a broken chain WARNs + fires `integrity_drift`); (B) keying the chain against forgery
+  crashes** (a broken chain WARNs + fires `integrity_drift`), though the `audit_anchor_file` read it
+  arms can fail startup (`docs/CONFIGURATION.md`, `[integrity]`); (B) keying the chain against forgery
   **cannot be a config flip** — its HMAC key is HKDF-derived from the store DEK, so the runbook instructs
   `[ai].data_class = "phi"` + a store key + the one-time `messagefoundry rekey_audit_chain` migration,
   after which keying is automatic. **Residual (accepted):** lever (B) depends on store encryption being
   on (off by default), so 16.4.2 is **Partial** until the WP #243 needle-mover turns encryption on —
   tamper-evident today, forgery-evident once keyed. **A second residual on lever (A), added 2026-08-04
-  ([BACKLOG #328](../BACKLOG.md)):** it is a *bare* walk — it passes no anchor — so it cannot see a
-  truncated tail (the surviving prefix still chains cleanly), whatever the keying state. The operator
-  lever for that is `messagefoundry audit-verify --expected-anchor`, run against a quiesced chain; there
-  is no startup setting that consumes an anchor. Do not read (A) as covering deletion of the newest rows.
+  ([BACKLOG #328](../BACKLOG.md)):** it is a *bare* walk unless `[integrity].audit_anchor_file` supplies an
+  anchor it can use (`docs/CONFIGURATION.md`, `[integrity]`), and a bare walk cannot see a truncated
+  tail (the surviving prefix still chains cleanly), whatever the keying state. With an anchor, the
+  startup walk compares it as a prefix: the row count, and the head at the anchor's row position
+  against the recorded one. That catches a cut that leaves fewer rows than the anchor's count. Do not
+  read (A) as covering deletion of the newest rows past the anchor's count: rows appended after the
+  anchor can be deleted unseen, and that is how a running engine's newest rows would be hidden. Nor
+  does it cover, at least, a re-chained rewrite after the anchor on a keyless chain, or an anchor
+  file that whoever can write `audit_log` can also rewrite. A truncation alarm from the anchored walk
+  is not proof of tampering either: an anchor head the chain does not hold at that row raises it on
+  an intact chain, at least a mistyped head, another store's anchor, and a malformed `vault:v` head,
+  which the parser passes through unchecked (the `_audit_head_shape` docstring in `store/store.py`
+  states that cost). The operator lever for an exact seal is `messagefoundry audit-verify
+  --expected-anchor`, run against a quiesced chain.
 
 Each control is **A → Partial (accepted) / B → Pass** — none reaches an unconditional loopback
 (Posture-A) Pass; the exposed-deployment Pass is the instructed configuration above. This ADR does not

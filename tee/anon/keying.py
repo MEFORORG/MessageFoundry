@@ -31,57 +31,73 @@ from collections import Counter
 #: 128-bit seed — ample entropy to index any surrogate pool without collisions you'd notice.
 _DIGEST_SIZE = 16
 
-#: A salt shorter than this is almost certainly a placeholder/typo, not a real secret. The CLI
-#: boundaries source it from the environment and should pass a high-entropy value; we refuse an
-#: obviously-weak salt rather than emit guessable surrogates (fail closed, ADR 0030 §4).
-MIN_SALT_LEN = 16
+#: The salt's length floor, in characters: the floor BACKLOG #4652 builds toward the 128 bits ADR
+#: 0030 section 4 asks of the salt at generation. 32 is the length of ``secrets.token_hex(16)``, 128
+#: bits in hex, and of ``secrets.token_urlsafe(24)``, 192 bits; both pass. ``secrets.token_hex(8)``,
+#: 16 characters and 64 bits, is refused. It is a LENGTH floor, not an entropy measurement, and it
+#: does not track 128 bits exactly: ``secrets.token_urlsafe(16)`` is 22 characters carrying 128
+#: bits and is refused, while 32 random decimal digits carry about 106 bits and can pass, as can a
+#: guessable 32-character string the entropy screen below does not catch. The low-entropy check is
+#: that screen, and nothing here measures the 128 bits.
+MIN_SALT_LEN = 32
 
-#: Floor on the salt's ESTIMATED entropy, in bits. Length alone is not strength: sixteen copies of
-#: the letter "a" clears ``MIN_SALT_LEN`` and is guessable on the first try, so the length floor
-#: could be passed by a salt with no secrecy at all.
+#: Floor on the salt's ESTIMATED entropy, in bits. Length alone is not strength: one letter repeated
+#: ``MIN_SALT_LEN`` times clears the length floor and is guessable on the first try, so the length
+#: floor could be passed by a salt with no secrecy at all. Since ``MIN_SALT_LEN`` became 32, the
+#: per-character floor below refuses every salt this one does (2.0 bits x 32 characters is 64), so
+#: this total decides only which refusal message a salt gets, not whether it is refused. Both
+#: messages state the per-character floor, because that is the one that binds.
 MIN_SALT_ENTROPY_BITS = 32.0
 
 #: Floor on the salt's estimated entropy PER CHARACTER, in bits. The total-bits floor above is
-#: length-scaled, so **length alone would rescue a degenerate pattern**: ``"ab"`` repeated eight
-#: times scores 16.00 bits and is refused, while the SAME two-symbol pattern repeated sixteen times
-#: scores 32.00 and would pass. That is not a blind spot the estimator's docstring can wave at -- it
-#: is the length floor defeating the entropy floor -- so the rate is checked separately from the
-#: total and a string has to clear BOTH.
+#: length-scaled, so **length alone would rescue a degenerate pattern** from it: ``"ab"``
+#: repeated sixteen times is 32 characters, scores 32.00 bits and clears the total, on 1.00 bits per
+#: character. That is not a blind spot the estimator's docstring can wave at -- it is length
+#: defeating the entropy total -- so the rate is checked separately from the total, a string has to
+#: clear BOTH, and this rate floor is the one that refuses that pattern.
 #:
 #: 2.0 bits per character means an effective alphabet of four symbols. Measured against the shapes
 #: that matter: ``"ab"`` repeated scores 1.00 and is refused at any length; ``"abc"`` repeated scores
 #: about 1.58 and is refused; a random DECIMAL salt -- the narrowest alphabet a real generator would
 #: produce -- scores about 3.32 on average, and random hex about 3.9. A single repeated character
-#: scores 0.00 and was already refused by the total. ON AVERAGE is the qualifier: at 16 characters
-#: this floor is the same inequality as the total (2.0 x 16 = 32), and from 17 it is the BINDING
-#: floor for an unlucky random decimal draw, though the total, checked first, still raises for some.
-#: The rates are in ``_estimated_entropy_bits``.
+#: scores 0.00 and was already refused by the total. ON AVERAGE is the qualifier: an unlucky random
+#: decimal draw can score under 2.0. At the 32-character length floor this is the binding floor,
+#: though the total, checked first, still raises for some. The rates are in
+#: ``_estimated_entropy_bits``.
 MIN_SALT_ENTROPY_BITS_PER_CHAR = 2.0
 
 #: **WHY 32 BITS AND NOT THE 128 THE ADR NAMES.** ADR 0030 section 4 requires ``dataset_key`` to be
 #: DRAWN from ``secrets.token_bytes``/``os.urandom`` with at least 128 bits of entropy. That is a
 #: requirement on GENERATION and it is not the same measurement as this one. These floors grade a
 #: string the engine did not generate, using a distribution estimate that is a LOWER BOUND and a
-#: loose one: a genuine 128-bit secret rendered as sixteen decimal digits estimates about 40 bits
-#: here, and rendered as base62 about 95 -- neither reaches 128, because the estimator cannot see
-#: the entropy of the generator, only of the characters in front of it.
+#: loose one. A genuine 128-bit secret estimates, on average over 20,000 draws measured
+#: 2026-11-23, about 123 bits rendered as 39 decimal digits, 116 as 32 hex characters and 91 as 22
+#: base62 characters -- none reaches 128 on average, because the estimator cannot see the entropy of
+#: the generator, only of the characters in front of it.
 #:
 #: So a floor set at the ADR's 128 would refuse real, conformant secrets, which is why it is not set
 #: there. **The consequence must be read honestly: clearing these floors does NOT establish that a
 #: salt meets ADR 0030, and no check on a supplied string could.** This is a screen against a
 #: visibly degenerate salt, sitting underneath the ADR requirement rather than implementing it. The
 #: control that actually delivers 128 bits is generating the salt with the tool the error message
-#: names, and that stays where the ADR puts it.
+#: names, and that stays where the ADR puts it. The 32-character length floor on ``MIN_SALT_LEN``
+#: refuses ``secrets.token_hex(8)`` and anything else under 32 characters; it does not measure
+#: entropy either.
 
 #: The advice both entropy refusals carry, held once so the two cannot drift apart. It names the
 #: generator and nothing else on purpose: a salt drawn at random from a narrow alphabet, such as
 #: decimal digits, can be refused, and the remedy is ``secrets.token_urlsafe(24)``, not another draw
-#: from the same alphabet. Sixteen random digits carry about 53 bits, under ADR 0030's 128.
+#: from the same alphabet. Thirty-two random digits carry about 106 bits, under ADR 0030's 128.
+#: ``_GENERATE`` and ``_WITHHELD`` are its two ends, which the too-short and encoding refusals carry
+#: too, without the narrow-alphabet sentence that does not follow from their causes. The too-long
+#: refusal carries neither and states the salt's encoded length.
+_GENERATE = "Generate one with secrets.token_urlsafe(24) and supply it from the environment."
+_WITHHELD = "The salt itself is withheld from this message on purpose."
 _GENERATE_ADVICE = (
-    "Generate one with secrets.token_urlsafe(24) and supply it from the environment. A random salt "
+    f"{_GENERATE} A random salt "
     "from a narrow alphabet, such as decimal digits, can be refused; replace it with one from "
-    "secrets.token_urlsafe(24), not another draw from the same alphabet. The salt itself is "
-    "withheld from this message on purpose."
+    "secrets.token_urlsafe(24), not another draw from the same alphabet. "
+    f"{_WITHHELD}"
 )
 
 #: Ceiling on the salt's UTF-8 length in BYTES, set by BLAKE2b's keyed mode
@@ -100,49 +116,61 @@ def _estimated_entropy_bits(salt: str) -> float:
     generate: count the symbols, take ``-sum(p * log2(p))`` for the per-character entropy, and
     multiply by the length for a total in bits. It needs no dictionary, no alphabet table and no
     network, it grades continuously rather than by category, and -- unlike a bare count of distinct
-    characters -- it sees SKEW. A salt of sixteen "a" characters plus seven distinct others has
-    eight distinct characters and would clear a distinct-character floor of eight, while this
-    estimator scores it at about 40 bits for twenty-three characters and grades it near the floor,
-    which is the honest reading of a string that is five-sixths one symbol.
+    characters -- it sees SKEW. A salt of twenty-four "a" characters plus eight distinct others has
+    nine distinct characters and would clear a distinct-character floor of eight, while this
+    estimator scores it at about 50 bits for thirty-two characters, about 1.56 per character, and
+    the per-character floor refuses it, which is the honest reading of a string that is
+    three-quarters one symbol.
 
     WHAT IT CANNOT SEE, stated plainly because every distribution-based estimator shares the blind
     spot: it is ORDER-BLIND and DICTIONARY-BLIND. It scores every permutation of a string
-    identically, so "abcdefghijklmnop" measures a full 64.00 bits at the length floor -- the
-    arithmetic maximum for sixteen characters -- and passes, despite being one of the first strings
-    any attacker would try. A repeated cycle such as "abcdabcdabcdabcd" measures exactly 32.00 bits
-    and also passes. This check therefore catches a salt that is visibly DEGENERATE; it cannot
-    certify that a salt is unpredictable, and nothing short of generating the salt ourselves could.
+    identically, so ``string.ascii_letters[:32]`` measures a full 160.00 bits at the 32-character
+    length floor -- the arithmetic maximum for 32 characters -- and passes, despite being one of
+    the first strings any attacker would try. A repeated cycle such as "abcd" eight times measures
+    exactly 64.00 bits and also passes. This check therefore catches a salt that is visibly
+    DEGENERATE; it cannot certify that a salt is unpredictable, and nothing short of generating
+    the salt ourselves could.
     The real defence stays where ADR 0030 section 4 puts it: an env-supplied secret from a random
     generator. This is the floor under that, not a substitute for it.
 
-    Where the floor came from. Measured 2026-08-22 by sampling 200,000 random 16-character salts
-    per alphabet and counting how many this estimator scores below 32 bits: base62 0, lowercase 0,
-    lowercase hex 1, and decimal digits 57 -- the tightest realistic case, and a 16-digit salt
-    carries only about 53 bits of real entropy to begin with. The zeros are trustworthy because the
-    same run returned NON-ZERO at higher floors (at 40 bits the same four alphabets rejected 0, 2,
-    306 and 11,066 of 200,000), so the instrument can fire. A 40-bit floor would refuse better than
-    5 percent of genuinely random 16-digit salts, which is refusing real secrets.
+    Where the 32-bit total came from, under the former 16-character length floor. Measured
+    2026-08-22 by sampling 200,000 random 16-character salts per alphabet and counting how many this
+    estimator scores below 32 bits: base62 0, lowercase 0, lowercase hex 1, and decimal digits 57 --
+    the tightest realistic case, and a 16-digit salt carries only about 53 bits of real entropy to
+    begin with. The zeros are trustworthy because the same run returned NON-ZERO at higher floors
+    (at 40 bits the same four alphabets rejected 0, 2, 306 and 11,066 of 200,000), so the instrument
+    can fire. A 40-bit floor would refuse better than 5 percent of genuinely random 16-digit salts,
+    which is refusing real secrets.
 
-    32 BITS STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
-    source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359
-    took the accepted path rather than lowering the floor, which would weaken the screen. Whether a
+    At the 32-character length floor the per-character floor decides every entropy refusal: it
+    refuses a salt whose estimated total is under 2 bits times its length, which is 64 bits at
+    exactly 32 characters and more for a longer salt. The 32-bit total refuses no salt of 32
+    characters or more on its own and only picks the message (see MIN_SALT_ENTROPY_BITS).
+
+    THE SCREEN STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
+    source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359,
+    under the former 16-character length floor, accepted that rate rather than lower the 32-bit
+    total. At 32 characters the rates below are set by the per-character floor. Whether a
     different estimator could refuse fewer random salts without passing more degenerate ones is a
     separate question nobody has measured. A draw that happens to repeat characters scores low.
     Computed EXACTLY, by enumerating every multiset of character counts against both floors, a
-    uniform random salt is refused with probability:
+    uniform random salt that clears the 32-character length floor is refused by this screen with
+    probability:
 
-    * 16 decimal digits: 2.76e-4, about 1 in 3,600. 17 digits: 1.50e-4. 20 digits: 1.38e-5.
-      From 17 digits the per-character floor is the binding one, though the total, checked
-      first, still raises for about a fifth of the 17-digit refusals.
-    * 16 lowercase hex characters (``secrets.token_hex(8)``): 2.51e-6, about 1 in 400,000. The
-      sampled count of 1 above was too few to give the rate.
+    * 32 decimal digits: 6.87e-10. 33 digits: 3.30e-10. 40 digits: 8.09e-13.
+    * 32 lowercase hex characters (``secrets.token_hex(16)``): 7.13e-15.
     * 32 URL-safe characters, the shape ``secrets.token_urlsafe(24)`` emits: 3.96e-29.
 
-    The stated bound is UNDER 1 IN 1,000 for random decimal salts of 16 characters or more, since
-    the rate only falls with length. ``tests/test_anon_core.py`` pins the decimal and hex rates
-    above by the same enumeration, run through ``Keyer`` itself, and holds the bound and the
-    32-character URL-safe shape with seeded sweeps. An operator refused with a real random salt
-    replaces it with one from ``secrets.token_urlsafe(24)``.
+    Under the 16-character length floor this screen ran with until BACKLOG #4652, the rates were far
+    higher: 2.76e-4 for 16 decimal digits and 2.51e-6 for ``secrets.token_hex(8)``. The length floor
+    now refuses those shapes before this screen reads them. The stated bound is UNDER 1 IN 1,000
+    for random decimal salts that clear the length floor, since the rate only falls with length.
+    ``tests/test_anon_core.py`` pins the 32-, 33- and 40-digit decimal rates and the 32-character
+    hex rate above by the same enumeration, run through ``Keyer`` itself; it does not pin the
+    16-character rates. It holds the 32-character URL-safe shape with a seeded sweep; no
+    test pins the URL-safe rate itself.
+    An operator refused with a real random salt replaces it with one from
+    ``secrets.token_urlsafe(24)``.
     """
     if not salt:
         return 0.0
@@ -165,9 +193,27 @@ class Keyer:
         if len(salt) < MIN_SALT_LEN:
             raise ValueError(
                 f"anonymizer salt must be a secret of at least {MIN_SALT_LEN} characters "
-                "(ADR 0030 §4: pinned-per-dataset secret, env-supplied, never committed)"
+                "(ADR 0030 §4: pinned-per-dataset secret, env-supplied, never committed). "
+                f"{_GENERATE} {_WITHHELD}"
             )
-        encoded = salt.encode("utf-8")
+        # The codec's own error keeps the WHOLE salt on its ``.object`` and quotes the character it
+        # could not encode in its message. That character is part of the salt: os.environ maps an
+        # undecodable byte to a lone surrogate on POSIX, and Windows can hold an unpaired one. So
+        # the refusal is raised OUTSIDE the handler: raised inside it, even ``from None`` would keep
+        # the codec error, and the salt with it, as ``__context__`` (BACKLOG #4652;
+        # tests/test_from_none_is_not_redaction.py). This clears the message and the exception
+        # chain only: the frames the traceback carries, this one and its callers', can still hold
+        # the salt as a local.
+        encoded: bytes | None
+        try:
+            encoded = salt.encode("utf-8")
+        except UnicodeEncodeError:
+            encoded = None
+        if encoded is None:
+            raise ValueError(
+                "anonymizer salt holds a character UTF-8 cannot encode, such as an undecodable "
+                f"byte or an unpaired surrogate in the environment. {_GENERATE} {_WITHHELD}"
+            )
         if len(encoded) > MAX_SALT_BYTES:
             raise ValueError(
                 f"anonymizer salt must be at most {MAX_SALT_BYTES} bytes when UTF-8 encoded "
@@ -180,17 +226,19 @@ class Keyer:
         # it appears in the message: it is a re-identification key, so an exception that quotes it
         # would leak it into a traceback, a log or a CI transcript.
         entropy = _estimated_entropy_bits(salt)
+        per_char = entropy / len(salt)
         if entropy < MIN_SALT_ENTROPY_BITS:
             raise ValueError(
-                f"anonymizer salt is too predictable: about {entropy:.1f} bits of estimated "
-                f"entropy against a floor of {MIN_SALT_ENTROPY_BITS:.0f}. {_GENERATE_ADVICE} "
+                f"anonymizer salt is too predictable: about {per_char:.2f} bits of estimated "
+                f"entropy per character, against a floor of {MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f} "
+                f"per character. {_GENERATE_ADVICE} "
                 "Note this floor is a SCREEN, not the ADR 0030 section 4 requirement: that one is "
                 "128 bits at generation, which no check on a supplied string can confirm."
             )
         # Checked SEPARATELY from the total, because the total is length-scaled and length would
         # otherwise rescue a degenerate pattern -- "ab" repeated sixteen times reaches the 32-bit
-        # total on 1.00 bits per character. Both floors bind; neither substitutes for the other.
-        per_char = entropy / len(salt)
+        # total on 1.00 bits per character. At the 32-character length floor this check refuses
+        # every salt the total refuses too, so the total only decides which message is raised.
         if per_char < MIN_SALT_ENTROPY_BITS_PER_CHAR:
             raise ValueError(
                 f"anonymizer salt repeats too few distinct characters: about {per_char:.2f} bits "

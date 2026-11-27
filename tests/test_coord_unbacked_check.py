@@ -179,6 +179,45 @@ def test_a_detached_worktree_head_is_counted(repo: Path, tmp_path: Path) -> None
     assert "worktree checkouts" in res.stdout
 
 
+def test_a_repository_s_Commits_includes_its_detached_head_commits(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #6489 item 1. The per-repository figure summed branch findings only, so a repository whose
+    only unbacked work sat on a detached HEAD reported Commits 0 while CommitsUnbacked said 1 -- and
+    the NO-REMOTE and UNVERIFIABLE lines print that per-repository figure."""
+    git(repo, "checkout", "-q", "--detach")
+    _commit(repo, "d.txt", "detached work", "detached only")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", "main")
+    git(repo, "worktree", "add", "--detach", str(tmp_path / "detached-wt"), sha)
+
+    r = check(repo, extra=["-Json"])
+    assert r.returncode == 1, r.stdout + r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["DetachedWorktreesUnbacked"] == 1
+    assert doc["CommitsUnbacked"] == 1
+    assert doc["Repositories"][0]["Commits"] == 1
+
+
+def test_a_HEAD_detached_on_a_branch_s_history_is_not_counted_twice(tmp_path: Path) -> None:
+    """BACKLOG #6489 item 1, its overlap case. A no-remote repository holds 3 commits on ``main``
+    and its primary checkout is detached at main: 3 distinct commits, not 6."""
+    r = tmp_path / "lonely"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
+    git(r, "config", "user.email", "t@example.invalid")
+    git(r, "config", "user.name", "t")
+    for i in range(3):
+        _commit(r, "f.txt", str(i), f"c{i}")
+    git(r, "checkout", "-q", "--detach")
+
+    res = check(r)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert (
+        "3 commits across 1 refs and 1 detached checkout(s) exist on this disk only" in res.stdout
+    )
+
+
 def test_a_repo_with_no_remote_at_all_is_reported_not_skipped(tmp_path: Path) -> None:
     r = tmp_path / "lonely"
     r.mkdir()

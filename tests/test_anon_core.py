@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import math
 import random
+import re
 import secrets
 import string
 from collections.abc import Callable, Iterator
@@ -36,6 +37,7 @@ from messagefoundry_toolkit.anon import rules as rules_module
 from messagefoundry_toolkit.anon.keying import (
     MAX_SALT_BYTES,
     MIN_SALT_ENTROPY_BITS,
+    MIN_SALT_ENTROPY_BITS_PER_CHAR,
     MIN_SALT_LEN,
     _estimated_entropy_bits,
 )
@@ -61,7 +63,7 @@ _NO_SCANNER = pytest.mark.skipif(
     reason="leak-check needs scripts/security/scan_forbidden.py (absent on an installed wheel)",
 )
 
-_SALT = "unit-salt-0123456789abcdef"
+_SALT = "unit-salt-0123456789abcdef-0123456789"
 _SEPS = Seps()
 
 
@@ -105,11 +107,12 @@ _SAMPLE = _msg(
 
 
 def test_keyer_deterministic_and_salt_sensitive() -> None:
-    a, b = Keyer("salt-7Kq2mVz9pLx4Rw"), Keyer("salt-7Kq2mVz9pLx4Rw")
+    a, b = Keyer("salt-7Kq2mVz9pLx4Rw-3hTd8sN6yQe1Gb"), Keyer("salt-7Kq2mVz9pLx4Rw-3hTd8sN6yQe1Gb")
     assert a.seed("mrn", "12345") == b.seed("mrn", "12345")
     assert a.seed("mrn", "12345") != a.seed("mrn", "54321")
     assert a.seed("mrn", "12345") != a.seed("name", "12345")  # kind is part of the key
-    assert Keyer("other-saltttttttttt").seed("mrn", "12345") != a.seed("mrn", "12345")
+    other = Keyer("other-saltttttttttt-0123456789abcdef")
+    assert other.seed("mrn", "12345") != a.seed("mrn", "12345")
 
 
 def test_keyer_rejects_weak_salt() -> None:
@@ -119,11 +122,11 @@ def test_keyer_rejects_weak_salt() -> None:
         Keyer("")
 
 
-# A salt that is genuinely random yet REPEATS characters -- generated with secrets.token_hex(8),
-# nine distinct characters over sixteen, one of them appearing five times. It is the POSITIVE
-# CONTROL for the entropy gate: without it, a check that refused every salt would still satisfy the
-# rejection tests below, and the gate would be indistinguishable from a permanent outage.
-_REAL_RANDOM_SALT_WITH_REPEATS = "0222439f2bb823dd"
+# A salt that is genuinely random yet REPEATS characters -- generated with secrets.token_hex(16),
+# 32 characters, one of them appearing five times. It is the POSITIVE CONTROL for the entropy gate:
+# without it, a check that refused every salt would still satisfy the rejection tests below, and the
+# gate would be indistinguishable from a permanent outage.
+_REAL_RANDOM_SALT_WITH_REPEATS = "ef6f531ffd00386abf0c40dd459c5793"
 
 
 def test_keyer_accepts_real_high_entropy_salts_including_one_with_repeats() -> None:
@@ -134,9 +137,9 @@ def test_keyer_accepts_real_high_entropy_salts_including_one_with_repeats() -> N
     for salt in (
         _REAL_RANDOM_SALT_WITH_REPEATS,
         # FIXED draws, not fresh ones: a control that can fail at random is not a control, and a
-        # fresh 16-character hex draw is refused now and then (BACKLOG #3359; the rate is in the
-        # estimator's docstring).
-        "f93e8522e800a6f1",  # secrets.token_hex(8): 16 characters, exactly at MIN_SALT_LEN
+        # fresh draw is refused now and then (BACKLOG #3359; the rate is in the estimator's
+        # docstring).
+        "c07bf6d17f3e6e9bfb2843efe7c52028",  # secrets.token_hex(16): 32 characters, at MIN_SALT_LEN
         "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24)
         "c75ea23aa891e361a23926b2bbdcd10c76cad07eb0f7a0de1d934b8ba51936e4",  # secrets.token_hex(32)
     ):
@@ -149,12 +152,18 @@ def test_keyer_rejects_a_long_salt_with_too_little_entropy() -> None:
         "a" * MIN_SALT_LEN,  # the exact case the length-only gate accepted
         "a" * 64,  # length does not rescue a one-symbol salt
         "0" * 32,
-        "abababababababab",  # two symbols
-        "xxxxxxxxxxxxxxxy",  # skewed: diverse by distinct count, one symbol in practice
-        "salt-aaaaaaaaaaaaaaaa",  # a plausible-looking placeholder
+        "ab" * 16,  # two symbols: 32.00 bits in total, so the per-character floor refuses it
+        "x" * 31 + "y",  # skewed: one symbol in practice
+        "salt-" + "a" * 27,  # a plausible-looking placeholder
     ):
         assert len(salt) >= MIN_SALT_LEN, "the length gate must not be what fires here"
-        with pytest.raises(ValueError, match="too predictable"):
+        # Whichever message fires, it names the per-character floor, the one that binds.
+        with pytest.raises(
+            ValueError,
+            match=r"(too predictable|too few distinct characters)[\s\S]*against a floor of "
+            + re.escape(f"{MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f}")
+            + r"\b",
+        ):
             Keyer(salt)
 
 
@@ -189,15 +198,14 @@ def test_keyer_weak_salt_error_never_quotes_the_salt() -> None:
 def test_entropy_estimate_is_order_blind_which_is_the_declared_blind_spot() -> None:
     """Pin the limitation the estimator's docstring admits, so nobody later overstates the gate.
 
-    Sixteen distinct characters in alphabetical order score the arithmetic maximum for that length
-    and are ACCEPTED, even though the string is trivially guessable. A distribution-based estimator
-    cannot see order; claiming otherwise would be the dishonest reading of this check.
+    Thirty-two distinct characters in alphabetical order score the arithmetic maximum for that
+    length and are ACCEPTED, even though the string is trivially guessable. A distribution-based
+    estimator cannot see order; claiming otherwise would be the dishonest reading of this check.
     """
-    assert _estimated_entropy_bits("abcdefghijklmnop") == _estimated_entropy_bits(
-        "pnmlkjihgfedcba" + "o"
-    )
-    assert _estimated_entropy_bits("abcdefghijklmnop") >= MIN_SALT_ENTROPY_BITS
-    Keyer("abcdefghijklmnop")  # accepted -- documented blind spot, not an oversight
+    ordered = string.ascii_letters[:32]
+    assert _estimated_entropy_bits(ordered) == _estimated_entropy_bits(ordered[::-1])
+    assert _estimated_entropy_bits(ordered) >= MIN_SALT_ENTROPY_BITS
+    Keyer(ordered)  # accepted -- documented blind spot, not an oversight
 
 
 def test_entropy_estimate_grades_the_measured_cases() -> None:
@@ -205,7 +213,9 @@ def test_entropy_estimate_grades_the_measured_cases() -> None:
     assert _estimated_entropy_bits("a" * MIN_SALT_LEN) == 0.0
     assert _estimated_entropy_bits("") == 0.0  # helper is safe on empty; the length gate owns it
     assert _estimated_entropy_bits("abababababababab") == pytest.approx(16.0)
-    assert _estimated_entropy_bits(_REAL_RANDOM_SALT_WITH_REPEATS) == pytest.approx(46.39, abs=0.01)
+    assert _estimated_entropy_bits(_REAL_RANDOM_SALT_WITH_REPEATS) == pytest.approx(
+        118.13, abs=0.01
+    )
 
 
 # --- rule model -----------------------------------------------------------------------------------
@@ -399,7 +409,9 @@ def test_obx5_allowlist_is_separator_aware(adapter: Callable[..., str]) -> None:
 
 def test_anonymize_is_deterministic_and_salt_sensitive() -> None:
     assert anonymize(_SAMPLE, salt=_SALT) == anonymize(_SAMPLE, salt=_SALT)
-    assert anonymize(_SAMPLE, salt=_SALT) != anonymize(_SAMPLE, salt="different-saltttttttt")
+    assert anonymize(_SAMPLE, salt=_SALT) != anonymize(
+        _SAMPLE, salt="different-saltttttttt-0123456789"
+    )
 
 
 def test_a40_merge_keeps_pid3_mrg1_linkage() -> None:
@@ -826,17 +838,20 @@ def test_real_generated_salts_are_still_accepted() -> None:
 
     Each salt is a FIXED draw from the generator its comment names, not a fresh one. This test drew
     fresh salts until BACKLOG #3359, and failed a required CI leg whenever a 16-digit draw landed in
-    the share the screen refuses. The rate itself is pinned by the seeded sweep below."""
+    the share the screen refuses. The exact enumeration below pins the refusal rates for 32-, 33-
+    and 40-digit decimal salts and 32-character hex salts."""
     for salt in (
         "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24), the recommended generator
-        "006392195aac21a4",  # secrets.token_hex(8)
+        # secrets.token_hex(8) is refused by the 32-character length floor (BACKLOG #4652).
         "b3601e0acceec7205183707ba608c1ed",  # secrets.token_hex(16)
-        "9800610913639340",  # 16 x secrets.choice(string.digits)
+        "14805239215301635997999364603876",  # 32 x secrets.choice(string.digits)
     ):
         Keyer(salt)  # must not raise
 
 
-#: Draws per alphabet in the seeded sweep: enough to see the decimal refusals, under a second to run.
+#: Draws per alphabet in each seeded sweep. At the 32-character length floor the exact decimal
+#: refusal rate is under 1e-9, so a decimal sweep this size is expected to see none; the sweep
+#: test asserts only the bound below, and the exact enumeration below pins the decimal rate.
 _SWEEP_DRAWS = 20_000
 
 #: The stated bound on refusing a genuinely random decimal salt, under 1 in 1,000. The source of
@@ -866,12 +881,15 @@ def _refusals(salts: list[str]) -> int:
 
 
 def test_seeded_sweep_holds_the_refusal_bound_for_random_decimal_salts() -> None:
-    """The screen refuses a small share of genuinely random 16-digit salts, BY DESIGN (BACKLOG
+    """The screen refuses a small share of genuinely random decimal salts, BY DESIGN (BACKLOG
     #3359): the estimator reads the characters a draw happens to repeat, not the generator. This
-    sweep holds that cost under the stated bound. It must also see at least one refusal: a sweep
-    that never fires would pass just as well against an estimator that could not refuse anything."""
+    sweep holds that cost under the stated bound. At the 32-character length floor (BACKLOG #4652)
+    the exact rate is under 1e-9, so a sweep this size sees none; the positive control is the same
+    sweep over a two-symbol alphabet, which the per-character floor refuses every time, so a sweep
+    that could not fire would fail there."""
     refused = _refusals(_seeded_salts(string.digits, MIN_SALT_LEN, seed=3359))
-    assert 0 < refused < _MAX_DECIMAL_REFUSALS, refused
+    assert refused < _MAX_DECIMAL_REFUSALS, refused
+    assert _refusals(_seeded_salts("ab", MIN_SALT_LEN, seed=3359)) == _SWEEP_DRAWS
 
 
 def _partitions(n: int, parts: int, largest: int) -> Iterator[tuple[int, ...]]:
@@ -913,18 +931,17 @@ def _exact_refusal_rate(alphabet: str, length: int) -> float:
 @pytest.mark.parametrize(
     "alphabet,length,rate",
     [
-        (string.digits, MIN_SALT_LEN, 2.76e-4),  # the two floors are the same inequality here
-        (string.digits, MIN_SALT_LEN + 1, 1.50e-4),  # the per-character floor binds from here up
-        (string.digits, 20, 1.38e-5),
-        ("0123456789abcdef", MIN_SALT_LEN, 2.51e-6),  # secrets.token_hex(8)
+        (string.digits, MIN_SALT_LEN, 6.87e-10),  # the per-character floor binds at this length
+        (string.digits, MIN_SALT_LEN + 1, 3.30e-10),
+        (string.digits, 40, 8.09e-13),
+        ("0123456789abcdef", MIN_SALT_LEN, 7.13e-15),  # secrets.token_hex(16)
     ],
 )
 def test_exact_refusal_rates_match_the_estimator_docstring(
     alphabet: str, length: int, rate: float
 ) -> None:
     """PIN the rates the docstring of ``_estimated_entropy_bits`` states, so a change to either
-    floor or to the estimator has to face them. The 17-digit case also fails if the per-character
-    floor is removed: the total floor alone refuses about a fifth as many."""
+    floor or to the estimator has to face them."""
     assert _exact_refusal_rate(alphabet, length) == pytest.approx(rate, rel=0.01)
 
 
@@ -943,9 +960,10 @@ def test_seeded_sweep_never_refuses_the_recommended_generator() -> None:
 
 
 def test_the_two_floors_are_independent() -> None:
-    """Neither floor substitutes for the other, so both must be able to fire alone. A single
-    repeated character fails the TOTAL (0 bits); a two-symbol pattern long enough to clear the
-    total fails the RATE. If one message could serve both, one floor would be redundant. Each
+    """Each floor's message must be reachable. A single repeated character fails the TOTAL
+    (0 bits); a two-symbol pattern long enough to clear the total fails the RATE. At the
+    32-character length floor the rate floor refuses everything the total does, so the total
+    decides only which message is raised (BACKLOG #4652), and this pins the two messages. Each
     message must also name the generator the sweep above holds at zero refusals, and send a
     refused random salt to it rather than to another draw from the same alphabet."""
     generator = r"[\s\S]*secrets\.token_urlsafe\(24\)[\s\S]*not another draw from the same alphabet"
@@ -953,6 +971,55 @@ def test_the_two_floors_are_independent() -> None:
         Keyer("a" * MIN_SALT_LEN)
     with pytest.raises(ValueError, match="too few distinct characters" + generator):
         Keyer("ab" * MIN_SALT_LEN)
+
+
+_BINDING_FLOOR_TEXT = "per character, against a floor of 2.0 per character."
+
+
+@pytest.mark.parametrize(
+    ("salt", "expected"),
+    [
+        (
+            "a" * MIN_SALT_LEN,
+            "anonymizer salt is too predictable: about 0.00 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
+        ),
+        (
+            "x" * 31 + "y",  # non-zero, so a value in the wrong slot would show
+            "anonymizer salt is too predictable: about 0.20 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
+        ),
+        (
+            "x" * 39 + "y",  # longer than the minimum, so the rate's denominator shows
+            "anonymizer salt is too predictable: about 0.17 bits of estimated entropy "
+            + _BINDING_FLOOR_TEXT,
+        ),
+    ],
+    ids=["at-the-length-floor", "skewed-non-zero", "skewed-forty-characters"],
+)
+def test_too_predictable_names_the_floor_that_binds(salt: str, expected: str) -> None:
+    """The too-predictable refusal names the PER-CHARACTER floor, because that is the floor that
+    binds: every salt that reaches the total check is at least MIN_SALT_LEN characters, so the
+    per-character floor refuses it too (BACKLOG #4652 item 3). The literal pins the wording; the
+    last assertion checks the 32-bit total is not cited in the shapes its regex names."""
+    with pytest.raises(ValueError) as excinfo:
+        Keyer(salt)
+    message = str(excinfo.value)
+    assert message.startswith(expected)
+    assert (
+        re.search(
+            rf"\b{MIN_SALT_ENTROPY_BITS:.0f}[- ]bit|floor of {MIN_SALT_ENTROPY_BITS:.0f}\b", message
+        )
+        is None
+    )
+
+
+def test_the_per_character_floor_subsumes_the_total_at_the_length_floor() -> None:
+    """The too-predictable message names the per-character floor, which is true only while that
+    floor refuses every salt the total does at MIN_SALT_LEN. Moving any of the three constants
+    past this point, at least by raising the total or lowering either floor, would make the
+    message name a floor the salt clears."""
+    assert MIN_SALT_ENTROPY_BITS <= MIN_SALT_LEN * MIN_SALT_ENTROPY_BITS_PER_CHAR
 
 
 # --- a segment id is untrusted text too (BACKLOG #1710 repair) --------------------------------------

@@ -224,6 +224,23 @@ def test_a_named_run_as_may_not_own_the_directory(
     assert _grants(_installer_dir_for(_TI, owner=_TI)) == (_SY, _BA, _TI)
 
 
+@pytest.mark.parametrize("run_as", [_LOCAL_USER, _GMSA], ids=["a local user", "a gMSA"])
+def test_a_virtual_account_owner_is_refused_beside_a_named_run_as(
+    monkeypatch: pytest.MonkeyPatch, run_as: str
+) -> None:
+    # BACKLOG #3760 added item 9: a virtual account may own its directory only as the run-as the
+    # directory grants. Here the directory grants a named user and is owned by a virtual account it
+    # does not grant, so the owner keeps WRITE_DAC over a store it cannot open: refused, before any
+    # lookup.
+    lookup = _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    dacl = store_mod._parse_sddl_dacl(_installer_dir_for(run_as, owner=_TI))
+    assert dacl is not None
+    assert store_mod._hardening_refusal(dacl) == (
+        f"it is owned by {_TI}, which keeps WRITE_DAC over it"
+    )
+    assert lookup.asked == []
+
+
 @pytest.mark.parametrize(
     ("label", "kind"),
     [
@@ -763,9 +780,8 @@ def test_a_store_directory_reached_through_a_junction_is_not_hardened(tmp_path: 
 def test_a_store_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -> None:
     # A developer checkout or a temp directory: the half of ADR 0163's property the fix keeps. The
     # directory is BUILT broad (the user plus BUILTIN\Users), not inherited from the runner's temp,
-    # and the file is reset to inherit it, so it starts with no explicit entry of any kind: the old
-    # owner-only rewrite leaves other principals' explicit entries in place (measured), which is a
-    # separate, pre-existing gap and not what this test is about.
+    # and the file is reset to inherit it, so it starts with no explicit entry of any kind: which
+    # explicit entries the owner-only rewrite keeps is tested in tests/test_store.py.
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()

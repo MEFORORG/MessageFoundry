@@ -58,9 +58,9 @@ from messagefoundry.controlchars import (
     strip_control_chars,
 )
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
+from messagefoundry.parsing.sniff import _looks_like_hl7, _sniff_head, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.path_reach import is_absent, is_unreachable
+from messagefoundry.path_reach import is_absent, is_name_absent, is_unreachable
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
@@ -101,10 +101,12 @@ _ORPHAN_TMP_RE = re.compile(
     rf"\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\.tmp\Z"
 )
 
-# How stale a leftover must look before the orphan sweep will remove it. This is a floor for a
-# leftover from a process that DIED mid-write, NOT the mechanism that protects a live write — that is
-# ``_inflight_names``, which is an exact identity test. An hour matches the default prune cadence and
-# sits far outside any single write, which is bounded by ``max_bytes``.
+# How stale a leftover must look before the orphan sweep will remove it. A write in THIS process is
+# protected by ``_inflight_names``, an exact identity test, and not by this floor. For a write in
+# another process, at least a sibling engine shard's, this age test is the main protection this
+# pass has, and ``max_bytes`` bounds that write's size, not how long it can stall:
+# :meth:`UploadStore._sweep_orphans_sync` states what that leaves open. An hour matches the default
+# prune cadence and sits far outside a healthy write.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
 
 # How long a cancelled save waits for each engine-shard ledger call, the reserve and the release, to
@@ -253,6 +255,9 @@ _REPORT_INTERVAL_S = 3600.0
 _REPORTED_MAX = 4096
 #: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
 _TAG_REF_LEN = 12
+#: How much of a stored value the tag-failure checks read: more than any marker this build writes
+#: (version, algorithm, key id and v4 salt), so a multi-MiB body is not copied to read its key id.
+_TAG_MARKER_HEAD_CHARS = 256
 
 
 class _OncePerInterval:
@@ -285,9 +290,13 @@ class _OncePerInterval:
         return True
 
 
-#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). One memo for the process,
-#: whichever cipher instance reported.
+#: The ``"<part> <upload id>"`` keys of the sidecar and body tag failures reported (BACKLOG #5553,
+#: #5552 item 6 (a)), so one upload can hold two entries. One memo for the process, whichever
+#: cipher instance reported.
 _tag_reported = _OncePerInterval()
+
+#: The parts of an upload whose tag failure is reported, as the alert names them.
+_TaggedPart = Literal["sidecar", "body"]
 
 
 def _not_a_plain_file(path: Path) -> str | None:
@@ -299,10 +308,43 @@ def _not_a_plain_file(path: Path) -> str | None:
         info = path.lstat()
     except OSError:
         return None
+    return _plain_refusal(info)
+
+
+def _plain_refusal(info: os.stat_result) -> str | None:
+    """Why the file an ``lstat`` result describes must not be read, as :func:`_not_a_plain_file`
+    words it, or ``None`` when it is a regular file."""
     if _names_a_link(info):
         return "it is a link and was not followed"
     if not _is_regular(info):
         return "it is not a regular file"
+    return None
+
+
+def _sidecar_is_absent(sidecar: Path) -> bool:
+    """Whether an ``lstat`` reports ``sidecar`` as not there, by
+    :func:`~messagefoundry.path_reach.is_name_absent`, whose limits apply to a ``True``. ``False``
+    when the ``lstat`` succeeds, in any form of file, since it follows no link. Any other failure
+    raises ``OSError`` (BACKLOG #6575)."""
+    try:
+        os.lstat(sidecar)
+    except FileNotFoundError as exc:
+        if is_name_absent(exc):
+            return True
+        raise
+    return False
+
+
+def _root_fault(root: Path) -> str | None:
+    """The reason the uploads root's own ``stat`` failed, or ``None`` when it answers. A failure
+    is read as the root being lost, which an entry's own error cannot show: a dangling link can
+    raise the codes a lost share does. An answer proves nothing about the entries under it: a POSIX
+    mount that dropped leaves a mount point that still answers. Text and not the exception, whose
+    traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+    try:
+        root.stat()
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
     return None
 
 
@@ -354,6 +396,17 @@ class _NotPlainError(OSError):
     ``OSError``, so each reader treats it as it treats a file it could not read."""
 
 
+class _RefusedBeforeOpen(_NotPlainError):
+    """A :class:`_NotPlainError` raised by :func:`_open_plain`'s own ``lstat``, before any open:
+    ``reason`` is :func:`_plain_refusal`'s. The listing scan reads it rather than making that
+    ``lstat`` itself (BACKLOG #5552 item 8). ``reason`` defaults, and lives in the instance dict,
+    so a copy or unpickle, which calls the class with ``args`` alone, rebuilds it."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     """The regular file ``path`` open for reading, without following a link, and its ``fstat``
     (BACKLOG #5387 added item 1). The caller closes it.
@@ -390,8 +443,9 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         unreached = codec_safe_str(exc)
     if unreached is not None:
         raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
-    if _names_a_link(before) or not _is_regular(before):
-        raise _NotPlainError(f"{path.name} is not a plain file")
+    refused = _plain_refusal(before)
+    if refused is not None:
+        raise _RefusedBeforeOpen(f"{path.name} is not a plain file", refused)
     met: tuple[_Recheck, str] | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
@@ -923,7 +977,7 @@ def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
 
 def _refuse_unplain(file_id: str, part: str, path: Path) -> None:
     """Raise the damaged refusal when ``path`` is not a plain file (:func:`_not_a_plain_file`),
-    the check the listing scan makes (BACKLOG #5552), so a by-id read does not open a directory,
+    the test the listing scan meets through :func:`_open_plain`'s own ``lstat`` (BACKLOG #5552), so a by-id read does not open a directory,
     which answered a server error, or a FIFO, which blocked a worker thread for good, that is in
     place when it looks. It guards against what is on disk then, not against a writer racing it.
     The reads that follow open through :func:`_open_plain`, which refuses a file swapped in after
@@ -1334,7 +1388,7 @@ def validate_upload_content(display: str, data: bytes) -> None:
         raise UploadContentError(
             display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
         )
-    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
+    if ctype == "xml" and not _sniff_head(data).startswith(b"<"):
         raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 
@@ -1520,10 +1574,11 @@ class PruneResult:
     """What one :meth:`UploadStore.prune_expired` pass did.
 
     ``pruned`` is the aged (blob, meta) pairs it deleted, carried whole because the caller writes one
-    ``upload.prune`` audit row per file from that metadata. ``orphans_removed`` counts the write
-    leftovers the same pass swept (BACKLOG #1678); those have no metadata by definition — a leftover
-    is precisely a file whose sidecar never landed — so they are a count here and a WARNING in the
-    log, not audit rows."""
+    ``upload.prune`` audit row per file from that metadata. ``orphans_removed`` counts what the same
+    pass swept as write leftovers (BACKLOG #1678). The sweep reads no metadata for one, so it is a
+    count here and a WARNING in the log, not an audit row. A body goes on the file system's report
+    that it has no sidecar, which does not prove that none landed
+    (:meth:`UploadStore._sweep_orphans_sync`)."""
 
     pruned: list[UploadedFileMeta] = field(default_factory=list)
     orphans_removed: int = 0
@@ -1628,8 +1683,11 @@ class UploadStore:
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
         # The running UploadRetentionRunner's wake, or None (BACKLOG #3184). See wake_retention.
         self._retention_wake: Callable[[], bool] | None = None
-        # The scan's and the prune's lines for a pair left for an operator, keyed by upload id and
-        # reason, so each is not logged on every pass (BACKLOG #5552).
+        # The scan's, the prune's and the orphan sweep's lines for what they left for an operator,
+        # keyed by what each line is about, so a listing or a save does not repeat one inside
+        # _REPORT_INTERVAL_S (BACKLOG #5552). The default retention pass is as far apart as that
+        # interval, so a lasting fault can log on every scheduled pass, and a key pushed out past
+        # _REPORTED_MAX logs again sooner.
         self._link_logged = _OncePerInterval()
 
     def wake_retention(self) -> bool:
@@ -1768,9 +1826,10 @@ class UploadStore:
 
     def _iter_sidecars(self) -> Iterator[tuple[str, Path]]:
         """Every ``(file_id, sidecar path)`` pair in the uploads root, as :meth:`_walk_sidecars`
-        yields them, which holds the ONE definition of "a file of ours". The listing scan consumes
-        this, and the re-seal pass consumes :meth:`_walk_sidecars` itself, so the id shape and the
-        sidecar suffix cannot drift apart between them. Anything else in the directory (an
+        yields them, which holds the definition of "a file of ours" for those two. The listing scan
+        consumes this, and the re-seal pass consumes :meth:`_walk_sidecars` itself, so the id shape
+        and the sidecar suffix cannot drift apart between them. The orphan sweep derives a sidecar
+        name from a body name itself, from the same ``_FILE_ID_RE`` and ``_META_SUFFIX``. Anything else in the directory (an
         operator's stray file, a temp file, an id that fails the strict 32-hex shape) is not ours
         and is skipped without being opened. A root that is not a directory yields nothing here,
         since the first save creates it."""
@@ -1862,8 +1921,9 @@ class UploadStore:
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
         skipped, and its log line is rate-limited per upload: a followed link read a file outside
         the root, or another upload's sidecar, and a FIFO would block the scan, and the
-        ``_quota_lock`` a save holds over it, for good. One swapped in between that check and the
-        open is refused at the open (:func:`_read_plain_text`), and no read takes more than
+        ``_quota_lock`` a save holds over it, for good. The check is the open's own ``lstat``
+        (:class:`_RefusedBeforeOpen`); one swapped in between it and the open is refused at the
+        open (:func:`_read_plain_text`) and logged as unreadable, and no read takes more than
         :data:`_SIDECAR_LIMIT` bytes, so a planted oversized sidecar cannot exhaust memory under
         that lock either; it is refused as malformed (BACKLOG #5387 added item 1)."""
         out: list[UploadedFileMeta] = []
@@ -1872,17 +1932,20 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
-            refused = _not_a_plain_file(entry)
-            if refused is not None:
-                if self._link_logged.first(f"scan {fid} {refused}"):
-                    _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
-                continue
             classify = False
             broken = False
             stored = ""
             try:
                 stored = _read_sidecar(entry)
                 out.append(self._decrypt_meta(stored, fid))
+            except _RefusedBeforeOpen as exc:
+                # The open's own lstat refused it, so the scan makes none of its own under
+                # _quota_lock (BACKLOG #5552 item 8).
+                if self._link_logged.first(f"scan {fid} {exc.reason}"):
+                    _log.warning(
+                        "uploaded-file sidecar %s: %s, so it was not read", fid, exc.reason
+                    )
+                continue
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
                     # Its own line, so an outage never reads as the refusal logged below. Logged
@@ -1941,15 +2004,18 @@ class UploadStore:
                 self._body_checks.pop(name, None)
         return out
 
-    def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
-        """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
-        failing under a key the cipher holds, once per upload per :data:`_REPORT_INTERVAL_S`
-        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s
+    def _report_tag_failure(
+        self, fid: str, stored: str, exc: CipherError, part: _TaggedPart = "sidecar"
+    ) -> None:
+        """Raise the cipher's tag-failure alert for upload ``fid``'s ``part``, its sidecar or its
+        body, when ``exc`` is that part's AEAD tag failing under a key the cipher holds, once per
+        part per upload per :data:`_REPORT_INTERVAL_S` and only while its hook is armed (BACKLOG
+        #5553; the body by :meth:`read_bytes`, BACKLOG #5552 item 6 (a)). The tests are ``store/cell_tag.py``'s
         ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
-        ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
-        beside it names the whole id."""
+        ``cell_tag`` names a row: the id is random and carries no PHI. The WARNING the scan, or
+        :meth:`read_bytes` for a body, logs beside it names the whole id."""
         cipher = self._cipher
         report = getattr(cipher, "report_tag_failure", None)
         # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
@@ -1960,15 +2026,18 @@ class UploadStore:
             return
         if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
             return
-        if not cipher.is_encrypted(stored):
+        head = stored[:_TAG_MARKER_HEAD_CHARS]
+        if not cipher.is_encrypted(head):
             return
         holds = getattr(cipher, "holds_key_for", None)
-        held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
-        if not (held and _tag_reported.first(fid)):
+        held = holds(head) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
+        if not (held and _tag_reported.first(f"{part} {fid}")):
             return
+        # The body under its own table name, so its alert has its own notifier subject and a
+        # sidecar page inside the cooldown cannot hold it back (BACKLOG #5552 item 6 (a)).
         report(
-            "uploaded_file",
-            f"an uploaded-file sidecar failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
+            "uploaded_file" if part == "sidecar" else "uploaded_file_body",
+            f"an uploaded-file {part} failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
         )
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
@@ -3085,17 +3154,28 @@ class UploadStore:
             _refuse_unplain(file_id, "body", blob_path)
             kind: _ReadRefusal = "damaged"
             unreached: str | None = None
+            stored = ""
             try:
                 # No size cap: a sound body stored under a larger max_upload_bytes is still
                 # served, as the reseal pass keeps it too.
-                return self._decrypt_blob(_read_plain_text(blob_path), file_id)
+                stored = _read_plain_text(blob_path)
+                return self._decrypt_blob(stored, file_id)
             except _UnreachableError as exc:
                 unreached = codec_safe_str(exc)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherUnavailableError as exc:
+                stored = ""
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
+                # Logged with the whole id, as the scan logs a sidecar's, and a body under a held
+                # key whose tag fails is reported as a sidecar is (BACKLOG #5552 item 6 (a)). The
+                # cipher's message carries no decrypted value.
+                _log.warning("uploaded-file body %s: cipher declined it: %s", file_id, exc)
+                self._report_tag_failure(file_id, stored, exc, part="body")
+                # This frame's copy is let go; _decrypt_blob's frame on the cause's traceback
+                # still holds the stored text, as it did before this report.
+                stored = ""
                 raise UploadUnreadableError(str(exc)) from exc
             except OSError as exc:
                 # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error
@@ -3108,6 +3188,9 @@ class UploadStore:
             except (UnicodeError, binascii.Error) as exc:
                 # Not UTF-8, not ASCII, or not the strict base64 the body is stored as.
                 defect = codec_safe_str(exc)
+            # The refusal raised below holds this frame on its traceback, so the stored body is
+            # let go first.
+            stored = ""
             if unreached is not None:
                 raise _unreachable(file_id, unreached)
             raise _refusal(file_id, "body", defect, kind)
@@ -4200,59 +4283,102 @@ class UploadStore:
     def _sweep_orphans_sync(self, *, now: float, abort: threading.Event | None = None) -> int:
         """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
 
-        Two shapes, both meaning a write that started and never landed: a ``.<id>.<suffix>.<tag>.tmp``
-        whose ``os.replace`` never ran, and an ``<id>.blob`` whose sidecar was never written. Neither is
-        reachable through :meth:`_walk_sidecars`, which yields ``.meta`` names only, so
-        :meth:`list_files`, :meth:`prune_expired` and :meth:`reseal_to_active` all walk straight
-        past them: a partial body would otherwise sit in the uploads root for the life of the
-        directory, outside the retention window this module promises, and (under a configured key)
-        as ciphertext ``rotate-key`` would never re-seal.
+        Two shapes, which this pass reads as a write that started and never landed: a
+        ``.<id>.<suffix>.<tag>.tmp`` whose ``os.replace`` never ran, and an ``<id>.blob`` whose
+        sidecar was never written. Neither is reachable through :meth:`_walk_sidecars`, which
+        yields ``.meta`` names only, so :meth:`list_files`, :meth:`prune_expired` and
+        :meth:`reseal_to_active` all walk straight past them: a partial body would otherwise sit in
+        the uploads root for the life of the directory, outside the retention window this module
+        promises, and (under a configured key) as ciphertext ``rotate-key`` would never re-seal.
 
-        **This pass UNLINKS, so it refuses anything it cannot positively identify as ours.** A name
-        matching neither exact shape is an operator's own file and is never touched, the same way
+        **This pass UNLINKS, so it refuses any name that does not match one of its two shapes.** A
+        name matching neither is treated as an operator's own file and is never touched, the same way
         :meth:`_iter_sidecars` skips it. A ``.blob`` whose sidecar exists but cannot be DECRYPTED is
-        kept, because :meth:`_iter_sidecars` yields that sidecar without opening it — a rotated-away key
-        can no more destroy data here than it can in the age pass.
+        kept, because this pass checks that the sidecar's name exists without opening it — a
+        rotated-away key can no more destroy data here than it can in the age pass.
 
-        **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
-        in this process currently holds, and a held name is skipped outright, so the threshold never
-        adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is the floor for everything
-        else — a leftover the registry cannot see comes from a process that DIED mid-write (every
-        in-process failure, cancellation included, now cleans up after itself), or from a sibling engine
-        shard sharing this ``uploads_dir``.
+        **A fault whose code does not mean a missing name keeps the body (BACKLOG #6575).** The root
+        is listed once, whole, before anything is removed. A listing error
+        :func:`~messagefoundry.path_reach.is_absent` reads as no root is an empty pass, and any
+        other raises with nothing removed. A body the listing shows with no sidecar goes only once
+        it is past the floor and :func:`_sidecar_is_absent`, asked right before the unlink, reports
+        the sidecar not there.
 
-        **That second case is the residual, stated precisely.** A sibling shard whose single write — one
-        write, bounded by ``max_bytes`` — has been stalled for longer than the floor could have its temp
-        removed underneath it. Its ``os.replace`` then raises and its ``save`` fails cleanly: nothing is
-        published half-written, nothing is left behind, and the operator retries. An hour against a
-        25 MiB default bound is far outside that window.
+        **That report is the file system's answer, not proof that no sidecar exists.**
+        :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
+        missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. Any
+        of them can send a body whose sidecar still exists to the unlink. The check narrows the
+        race with a sidecar landing after the listing and does not close it: one can land between
+        that check and the unlink. Neither that check nor the unlink holds :func:`_pair_lock`.
 
-        ``abort`` is :meth:`prune_expired`'s, checked before each entry, so a slow sweep over a large
-        dir does not hold a stop past its bound (BACKLOG #2264). The pass's audit rows are already
-        written when this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the
-        next one resumes."""
+        **The floor reads an mtime, which proves less than "abandoned".** ``stat`` follows a link,
+        so a new link to an old file is past the floor the moment it appears, as is a body restored
+        with its mtime preserved. With no sidecar reported, that name is unlinked. The mtime is
+        the stamp the file system recorded, and it is compared with this host's clock. Which clock
+        stamped it can differ by file system and is not asserted here.
+
+        A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
+        too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
+        :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
+        interval is as long, so a lasting fault can log on every scheduled pass.
+
+        **A live write in THIS process is safe by IDENTITY, not by age.** ``_inflight_names`` holds
+        every name a write in this process currently holds, and a held name is skipped outright, so
+        the threshold never adjudicates a race this process can see. ``_ORPHAN_MIN_AGE_SECONDS`` is
+        the floor for everything else. A file the registry cannot see can come from at least a
+        process that DIED mid-write (an in-process failure, cancellation included, removes its own
+        temp, though that unlink suppresses ``OSError`` and can leave one behind), a sibling engine shard sharing this ``uploads_dir``, or a restore.
+
+        **A sibling shard's stalled write is a residual, in at least two forms.**
+        ``_inflight_names`` does not reach another process, so the floor, and for a body the sidecar
+        re-check, are what stand between this pass and a write stalled past it. On Windows an open
+        handle can also block the unlink. The first form covers a ``save``'s temp and a stalled
+        ``rotate-key`` re-seal's temp, which share the temp shape. Stalled before a temp's ``os.replace``, it can have that temp removed underneath
+        it: the ``os.replace`` then raises. A ``save`` fails and the operator retries; a re-seal is not a
+        save, it fails in ``_replace_if_unchanged`` and is handled as a skipped half. Nothing is
+        published half-written either way. Stalled after its body landed and before its
+        sidecar did, it can LOSE THE BODY: this pass sees a body past the floor with no sidecar and
+        unlinks it, with no audit row, and the ``save`` then publishes the sidecar and reports
+        success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
+        and not how long it can stall, so an hour is a margin against this and not a bar to it.
+
+        ``abort`` is :meth:`prune_expired`'s. It is checked before the listing and before each entry
+        once the listing has been read, so a slow sweep over a large dir does not hold a stop past
+        its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
+        ``Path.iterdir`` reads the whole directory before it returns on this Python, so a stop set
+        meanwhile takes effect when that read ends. The pass's audit rows are already written when
+        this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the next one
+        resumes."""
         stop = abort if abort is not None else threading.Event()
         root = self._root
-        if stop.is_set() or not root.is_dir():
+        if stop.is_set():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
+        # The one listing, read whole before anything goes, so a failure at any point removes
+        # nothing. An error is_absent reads as no root ends the pass at 0, and any other raises;
+        # prune_expired logs that and keeps its result (BACKLOG #6575).
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            if is_absent(exc):
+                return 0  # read as no root yet, as a lost drive or parent also is
+            raise
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
-        reachable: set[str] = set()
-        for fid, _ in self._iter_sidecars():
-            if stop.is_set():
-                return 0  # nothing removed yet; the listing alone can be long on a large dir
-            reachable.add(fid)
+        names = {entry.name for entry in entries}
         removed = 0
-        for entry in root.iterdir():
+        for entry in entries:
             if stop.is_set():
                 break
             name = entry.name
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
+            sidecar: Path | None = None
             if _ORPHAN_TMP_RE.match(name):
                 kind = "temp file"
             elif _FILE_ID_RE.match(stem):
-                if stem in reachable:
+                sidecar_name = f"{stem}{_META_SUFFIX}"
+                if sidecar_name in names:
                     continue
+                sidecar = root / sidecar_name
                 kind = "body with no sidecar"
             else:
                 continue  # not one of ours — never touched
@@ -4260,21 +4386,48 @@ class UploadStore:
                 continue  # a write in this process is holding it right now
             try:
                 if entry.stat().st_mtime > cutoff:
-                    continue  # too young to be certain it is abandoned
+                    continue  # inside the floor; being past it does not prove it abandoned
+                # The listing is a snapshot and a share can return a short one with no error, so
+                # ask again, last, before the unlink.
+                if sidecar is not None and not _sidecar_is_absent(sidecar):
+                    continue
                 entry.unlink()
             except OSError as exc:
+                if (root_fault := _root_fault(root)) is not None:
+                    _log.log(
+                        logging.ERROR
+                        if self._link_logged.first("orphan sweep stopped")
+                        else logging.DEBUG,
+                        "uploaded-logs orphan sweep stopped at %s: the uploads root stopped "
+                        "answering (%s); no further file was removed and the next pass retries",
+                        name,
+                        root_fault,
+                    )
+                    break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
-                # a random tag, never a body.
-                _log.debug("uploaded-logs orphan sweep left %s alone: %s", name, exc)
+                # a random tag, never a body. What is_name_absent does not read as gone is logged,
+                # since a body whose sidecar cannot be checked is left for a later pass, which unlinks it
+                # if the fault has cleared and the sidecar still reads as absent. A dangling
+                # link can read as gone too, since the stat follows it: on POSIX with any part of
+                # its target missing, and on Windows with only the target's last part missing.
+                quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
+                _log.log(
+                    logging.DEBUG if quiet else logging.WARNING,
+                    "uploaded-logs orphan sweep left %s alone: %s",
+                    name,
+                    exc.strerror or type(exc).__name__,
+                )
                 continue
             removed += 1
             # ASCII only in the message itself: a stock Windows cp1252 console raises
             # UnicodeEncodeError on the em dashes this module's prose uses freely.
+            # A temp is removed with no sidecar check, so only a body's text says one read as absent.
             _log.warning(
-                "uploaded-logs: removed an abandoned %s (%s): a write started and never landed",
+                "uploaded-logs orphan sweep removed %s %s: past the age floor%s",
                 kind,
                 name,
+                "" if sidecar is None else ", and its sidecar read as absent",
             )
         return removed
 
@@ -4867,7 +5020,11 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     the re-seal's check and rename unguarded: a file system that cannot lock, where both sides go on
     unlocked with a WARNING (:func:`~messagefoundry.config.atomic_edit.edit_lock`), and an engine
     removal that could not take the lock, below. The orphan sweep and a save's own cleanup do not
-    take it; neither removes a pair the re-seal walks.
+    take it. Both aim at files the re-seal does not walk, a temp or a body with no sidecar, but the
+    sweep's sidecar check and unlink run outside this lock, so it orders neither against a re-seal.
+    A sidecar that check misses (:meth:`UploadStore._sweep_orphans_sync`) would have the sweep
+    remove the body of a pair the re-seal walks, and a re-seal past its own check could then put
+    that body back.
 
     **A lock the engine cannot take does not stop it removing uploads.** Retention and delete must
     not depend on a file anyone who can write the uploads directory can plant, so the removal goes

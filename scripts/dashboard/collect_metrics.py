@@ -7,10 +7,12 @@ WHAT IT READS, at least: the private vault at its ``origin/main`` (never its wor
 may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
 JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance, in
 the git checkout ``--engine-repo`` names (default: the checkout this script sits in); and, from the
-tree THIS script sits in, ``scripts/asvs/scorecard.py`` and ``scripts/ci/check_stalled_prs.py``,
-which it runs and imports. That tree need not be a git checkout: the scheduled refresh runs a
-``git archive`` copy, and passes ``--archive-ref`` with the commit it archived, because the
-scorecard tool then stamps ``engine=NO-GIT``.
+tree THIS script sits in, ``scripts/asvs/scorecard.py``, which it runs. That tree need not be a
+git checkout: the scheduled refresh runs a ``git archive`` copy, and passes ``--archive-ref`` with
+the commit it archived, because the scorecard tool then stamps ``engine=NO-GIT``. It also reads
+the ``Batch queue`` tab of the ``/batch`` runbook workbook (``--runbook``, else
+``MEFOR_RUNBOOK``, else ``%USERPROFILE%/OneDrive/Desktop/MEFOR/MEFOR-backlog-runbook.xlsx``),
+parsed with the engine's vendored defusedxml loaded by path.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
 repository, where a ``git add .`` would publish it. ``--out``'s directory, and the work directory the
@@ -28,8 +30,8 @@ environment: only the variables whose names match ``_CHILD_ENV_KEEP`` case-insen
 recorded. That is NO SANDBOX, and the environment scrub does not limit what that code can do: the
 child runs with the full power of the user who runs this script. It can run ``gh`` or ``git`` with
 the user's stored credentials (keyring, ``hosts.yml``), read and write any file that user can, and
-so alter the engine files this process runs after it, such as ``scripts/ci/check_stalled_prs.py``,
-``scripts/asvs/scorecard.py``, ``render_html.py`` and this script. Running this script therefore
+so alter the engine files this process runs after it, such as ``scripts/asvs/scorecard.py``,
+``render_html.py`` and this script. Running this script therefore
 trusts vault ``origin/main`` as fully as the engine code itself. Pinning the vault code to a
 reviewed commit would narrow that trust; it is not done here.
 
@@ -45,14 +47,14 @@ WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
 ``git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main``, one in the vault and one
 in the engine checkout. Each moves only ``refs/remotes/origin/main``, and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
-is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
-write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to a fresh
-``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
-exit; a removal that fails is an error, and such directories older than two hours are swept at the
-start of the next run, since a run killed by a time limit skips its cleanup.
+is created; the release tag is resolved with ``git ls-remote``. Loading the vendored defusedxml
+by path can write ``__pycache__`` in the tree this script sits in. Vault files and downloads go to
+a fresh ``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory),
+removed at exit; a removal that fails is an error, and such directories older than two hours are
+swept at the start of the next run, since a run killed by a time limit skips its cleanup.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
-(open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
+(open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
 run time whatever ``--through`` says, and each says so in its detail. The open ``ci-red`` PR count
 is the exception: for a past ``--through`` it is not read at all, so it cannot pass for history.
 The final window week ends at ``--through``, for the ledger counts as for the GitHub ones.
@@ -89,7 +91,8 @@ import tarfile
 import tempfile
 import time
 import urllib.request
-from collections.abc import Callable, Sequence
+import zipfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -164,8 +167,6 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     # last full week's merges against the mean of the window's full weeks: warn below half of it,
     # bad at zero merges.
     "prs_merged": {"warn_fraction_of_mean": 0.5},
-    # oldest open PR age in days; any green-but-stalled PR is at least warn.
-    "flow_health": {"good_oldest_days": 7, "warn_oldest_days": 14},
     # main CI pass percent for the last full week; any open ci-red PR is at least warn.
     "ci_main": {"good_pct": 90, "warn_pct": 75},
     # ASVS pass cells over applicable (non-na) cells.
@@ -176,7 +177,33 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "owner_waiting": {"warn_max": 5},
     # engine commits on origin/main since the latest PyPI release.
     "release_distance": {"good_max": 50, "warn_max": 200},
+    # weeks until the open ledger reaches zero at the recent net closing pace; no positive pace
+    # (filing keeps up with closing) is bad.
+    "backlog_forecast": {"good_weeks": 13, "warn_weeks": 52},
 }
+
+#: The most weeks of ledger history kept: a mistyped year on one ledger date must not stretch the
+#: history, and the page's charts, across decades.
+HISTORY_MAX_WEEKS = 104
+
+#: The full weeks the backlog forecast averages over, and a shorter, more recent read beside it.
+FORECAST_WEEKS = 4
+FORECAST_SHORT_WEEKS = 2
+
+#: The priority table's statuses that are open rows; the rest are closed kinds.
+OPEN_STATUSES = ("open", "partial", "in progress")
+
+#: The census activity columns that take a row off the open ledger.
+CLOSED_COLUMNS = ("closed", "declined", "superseded")
+
+_ISO_WEEK = re.compile(r"(\d{4})-W(\d{2})")
+
+#: The /batch runbook workbook: ``MEFOR_RUNBOOK``, else this name under OneDrive/Desktop/MEFOR.
+ENV_RUNBOOK = "MEFOR_RUNBOOK"
+RUNBOOK_NAME = "MEFOR-backlog-runbook.xlsx"
+RUNBOOK_SHEET = "Batch queue"
+#: A retired batch number holding no row; it is no batch to report.
+RUNBOOK_EMPTY = "EMPTY"
 
 
 class CollectError(Exception):
@@ -253,6 +280,96 @@ def series_value(series: Sequence[dict[str, Any]], week: str) -> Any:
     return next((p["value"] for p in series if p["week"] == week), None)
 
 
+def week_after(label: str) -> str:
+    """``2026-W52`` -> ``2026-W53`` or ``2027-W01``, whichever the ISO calendar holds."""
+    m = _ISO_WEEK.fullmatch(label)
+    if m is None:
+        raise CollectError(f"{label!r} is not an ISO week label")
+    monday = dt.date.fromisocalendar(int(m[1]), int(m[2]), 1)
+    return iso_week(monday + dt.timedelta(weeks=1))
+
+
+def burn_history(weeks: Mapping[str, Mapping[str, int]], last: str) -> list[dict[str, Any]]:
+    """Filed and closed rows for every ISO week from the census's first dated week through
+    ``last``, oldest first, a week with no activity zero-filled, and at most
+    :data:`HISTORY_MAX_WEEKS` weeks. A key that is no week label (the after-through bucket) is left
+    out."""
+    m = _ISO_WEEK.fullmatch(last)
+    if m is None:
+        raise CollectError(f"{last!r} is not an ISO week label")
+    floor = iso_week(
+        dt.date.fromisocalendar(int(m[1]), int(m[2]), 1) - dt.timedelta(weeks=HISTORY_MAX_WEEKS - 1)
+    )
+    dated = sorted(w for w in weeks if _ISO_WEEK.fullmatch(w) and floor <= w <= last)
+    out: list[dict[str, Any]] = []
+    week = dated[0] if dated else last
+    while week <= last:
+        got = weeks.get(week, {})
+        out.append(
+            {
+                "week": week,
+                "filed": int(got.get("filed", 0)),
+                "closed": sum(int(got.get(k, 0)) for k in CLOSED_COLUMNS),
+            }
+        )
+        week = week_after(week)
+    return out
+
+
+def open_history(
+    history: Sequence[Mapping[str, Any]], open_now: int, after: Mapping[str, int]
+) -> list[dict[str, Any]]:
+    """Open rows at the end of each history week, worked BACK from the open count at run time:
+    each week's filed rows are taken off and its closed rows put back, starting with the activity
+    dated after the window. A reconstruction, so a reopened row, or one whose filing or closing
+    carries no date, is not seen."""
+    level = open_now - int(after.get("filed", 0))
+    level += sum(int(after.get(k, 0)) for k in CLOSED_COLUMNS)
+    out: list[dict[str, Any]] = []
+    for point in reversed(history):
+        out.append({"week": point["week"], "value": level})
+        level = level - int(point["filed"]) + int(point["closed"])
+    out.reverse()
+    return out
+
+
+def pace(history: Sequence[Mapping[str, Any]], full: str, n: int) -> dict[str, Any] | None:
+    """Mean filed and closed rows per week over the ``n`` full weeks ending ``full``; ``None``
+    when the history holds fewer."""
+    weeks = [p for p in history if p["week"] <= full][-n:]
+    if len(weeks) < n:
+        return None
+    filed = statistics.fmean(int(p["filed"]) for p in weeks)
+    closed = statistics.fmean(int(p["closed"]) for p in weeks)
+    # Two places: a mean over n whole weeks is exact there while n divides 100 (a test pins the
+    # forecast windows to that), so weeks_to_zero dates the finish from the figure the page prints.
+    return {
+        "weeks": [p["week"] for p in weeks],
+        "filed_per_week": round(filed, 2),
+        "closed_per_week": round(closed, 2),
+        "net_closed_per_week": round(closed - filed, 2),
+    }
+
+
+def weeks_to_zero(open_rows: int, per_week: float) -> float | None:
+    """Weeks until ``open_rows`` reach zero at ``per_week`` fewer each week; ``None`` when the
+    count does not fall."""
+    if open_rows <= 0:
+        return 0.0
+    return open_rows / per_week if per_week > 0 else None
+
+
+def finish_day(today: dt.date, weeks: float | None) -> str | None:
+    return None if weeks is None else (today + dt.timedelta(days=math.ceil(weeks * 7))).isoformat()
+
+
+def status_forecast(weeks: float | None) -> str:
+    t = THRESHOLDS["backlog_forecast"]
+    if weeks is None:
+        return "bad"
+    return "good" if weeks <= t["good_weeks"] else "warn" if weeks <= t["warn_weeks"] else "bad"
+
+
 def status_burn(filed: int, closed: int) -> str:
     t = THRESHOLDS["backlog_burn"]
     if filed == 0 or closed >= filed * t["good_ratio"]:
@@ -265,18 +382,6 @@ def status_merged(last: int, full_week_values: Sequence[int]) -> str:
         return "bad"
     mean = statistics.fmean(full_week_values) if full_week_values else 0.0
     return "warn" if last < mean * THRESHOLDS["prs_merged"]["warn_fraction_of_mean"] else "good"
-
-
-def status_flow(oldest_days: float | None, stalled: int | None) -> str:
-    t = THRESHOLDS["flow_health"]
-    if oldest_days is None or oldest_days <= t["good_oldest_days"]:
-        base = "good"
-    elif oldest_days <= t["warn_oldest_days"]:
-        base = "warn"
-    else:
-        base = "bad"
-    # An unread stall count (None) is not zero stalls: it caps the status at warn, like a stall.
-    return "warn" if base == "good" and (stalled is None or stalled) else base
 
 
 def status_ci(pass_pct: float | None, ci_red: int | None) -> str:
@@ -552,6 +657,8 @@ class Census:
     active_verdicts: list[str]
     deferred_verdict: str
     activity: list[str]
+    #: Rows per priority per status (``_vault_census.priority_census``).
+    by_priority: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def open_rows(self) -> int:
@@ -590,17 +697,16 @@ class Context:
     fetch: Fetcher = fetch_url
     #: False when the caller already fetched both repositories' main this run.
     git_fetch: bool = True
-    #: The tree the engine scripts are run and imported from.
+    #: The tree the engine scorecard tool is run from.
     engine_root: Path = ENGINE_ROOT
     #: The engine git checkout for the release distance.
     engine_repo: Path = ENGINE_ROOT
     #: The commit ``engine_root`` was ``git archive``d from, when it is no git checkout.
     archive_ref: str | None = None
-    #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
-    stall_runner: Callable[[list[str], float], str] | None = None
+    #: The /batch runbook workbook; None when no path was resolved.
+    runbook: Path | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
     gh_backoff: float = GH_BACKOFF_SECONDS
-    merged_cache: dict[str, list[dict[str, Any]] | CollectError] = field(default_factory=dict)
     _vault: VaultRead | CollectError | None = None
 
     @property
@@ -627,16 +733,6 @@ class Context:
         if isinstance(self._vault, CollectError):
             raise self._vault
         return self._vault
-
-
-def _load_module(name: str, path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise CollectError(f"cannot load {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root: Path) -> None:
@@ -695,6 +791,11 @@ def _read_vault(ctx: Context) -> VaultRead:
         active_verdicts=[str(v) for v in got["active_verdicts"]],
         deferred_verdict=str(got["deferred_verdict"]),
         activity=[str(c) for c in got["activity"]],
+        # Absent, the table is empty and c_backlog_burn's open-row check marks it partial.
+        by_priority={
+            str(p): {str(k): int(v) for k, v in c.items()}
+            for p, c in got.get("by_priority", {}).items()
+        },
     )
     # The checker's anti-narrowing floors, reused: a dropped, emptied or unscanned ledger file, then
     # the row-count floor. The archive is no git top level, so the checker globs it from disk.
@@ -759,6 +860,63 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
         "undated": dict(c.undated),
         "series_is": "closed minus filed, per week",
         "after_through": dict(c.weeks.get(AFTER_THROUGH, {})),
+        "by_priority": {p: dict(counts) for p, counts in c.by_priority.items()},
+    }
+    # The priority table's open buckets must hold every open row the census counted: a parser
+    # change on either side would otherwise make the table quietly disagree with the tile.
+    table_open = sum(
+        n for counts in c.by_priority.values() for k, n in counts.items() if k in OPEN_STATUSES
+    )
+    if table_open != c.open_rows:
+        add_partial(
+            m.detail,
+            f"the priority table counts {table_open} open rows, the census {c.open_rows}",
+        )
+    history = burn_history(c.weeks, labels[-1])
+    m.detail["history"] = history
+    m.detail["open_series"] = open_history(history, c.open_rows, c.weeks.get(AFTER_THROUGH, {}))
+    m.detail["open_series_is"] = (
+        "open rows at the end of each week, worked back from the open count at run time through "
+        "each week's filed and closed rows"
+    )
+
+
+def c_backlog_forecast(ctx: Context, m: Metric) -> None:
+    v = ctx.vault_read()
+    c = v.census
+    c.require(columns=("filed", *CLOSED_COLUMNS))
+    labels = ctx.labels
+    full = last_full_week(ctx.through, labels, ctx.today)
+    history = burn_history(c.weeks, labels[-1])
+    open_now = c.open_rows
+    recent = pace(history, full, FORECAST_WEEKS)
+    if recent is None:
+        raise CollectError(f"the ledger history holds fewer than {FORECAST_WEEKS} full weeks")
+    short = pace(history, full, FORECAST_SHORT_WEEKS)
+    weeks = weeks_to_zero(open_now, recent["net_closed_per_week"])
+    no_filing = weeks_to_zero(open_now, recent["closed_per_week"])
+    short_weeks = None if short is None else weeks_to_zero(open_now, short["net_closed_per_week"])
+
+    def rounded(n: float | None) -> float | None:
+        return None if n is None else round(n, 1)
+
+    m.value = finish_day(ctx.today, weeks) or "never at this pace"
+    m.status = status_forecast(weeks)
+    m.detail = {
+        "vault_origin_main": v.sha,
+        "open_total": open_now,
+        "last_full_week": full,
+        "pace": recent,
+        "weeks_to_zero": rounded(weeks),
+        "finish": finish_day(ctx.today, weeks),
+        "short_pace": short,
+        "short_weeks_to_zero": rounded(short_weeks),
+        "short_finish": finish_day(ctx.today, short_weeks),
+        "no_filing_weeks_to_zero": rounded(no_filing),
+        "no_filing_finish": finish_day(ctx.today, no_filing),
+        "method": f"open rows at run time over the mean net rows closed per week (closed minus "
+        f"filed) across the last {FORECAST_WEEKS} full weeks; no positive net pace has no date",
+        "state_as_of": "vault origin/main at run time",
     }
 
 
@@ -790,24 +948,12 @@ def list_per_week(
 
 
 def merged_prs(ctx: Context, repo: str) -> list[dict[str, Any]]:
-    """Every PR merged in the window, cached per repo so two metrics share one read.
-
-    A failure is cached too, like the vault read: a second metric would only repeat it, slower.
-    """
-    if repo not in ctx.merged_cache:
-        try:
-            ctx.merged_cache[repo] = list_per_week(
-                ctx,
-                ["pr", "list", "-R", repo, "--state", "merged"]
-                + ["--json", "number,createdAt,mergedAt"],
-                lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
-            )
-        except CollectError as exc:
-            ctx.merged_cache[repo] = exc
-    cached = ctx.merged_cache[repo]
-    if isinstance(cached, CollectError):
-        raise cached
-    return cached
+    """Every PR merged in the window in ``repo``."""
+    return list_per_week(
+        ctx,
+        ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,mergedAt"],
+        lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
+    )
 
 
 def c_prs_merged(ctx: Context, m: Metric) -> None:
@@ -825,72 +971,6 @@ def c_prs_merged(ctx: Context, m: Metric) -> None:
     m.status = status_merged(m.value, full_values)
     m.series = total
     m.detail = {"value_week": week, "per_repo": per_repo}
-
-
-def c_flow_health(ctx: Context, m: Metric) -> None:
-    rows = gh_list(
-        ctx, ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--json", "number,createdAt"]
-    )
-    # Open PRs are today's set, so their ages are measured from now, never from --through: a past
-    # --through would give a PR opened after it a negative age.
-    now = dt.datetime.now(dt.UTC)
-    ages = [(now - parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
-    oldest_raw = max(ages) if ages else None
-    oldest = None if oldest_raw is None else round(oldest_raw, 1)
-    detail: dict[str, Any] = {
-        "open_prs": len(rows),
-        "oldest_open_days": oldest,
-        "median_open_to_merge_hours": None,
-        "merged_prs_measured": None,
-    }
-
-    # The merged-PR read feeds only the time-to-merge fields, so its failure nulls those alone.
-    try:
-        hours = [
-            (parse_stamp(r["mergedAt"]) - parse_stamp(r["createdAt"])).total_seconds() / 3600
-            for r in merged_prs(ctx, ENGINE_REPO)
-            if r.get("mergedAt") and r.get("createdAt")
-        ]
-        detail["median_open_to_merge_hours"] = round(statistics.median(hours), 1) if hours else None
-        detail["merged_prs_measured"] = len(hours)
-    except (CollectError, ValueError, TypeError, KeyError, AttributeError) as exc:
-        add_partial(detail, f"merged PRs: {type(exc).__name__}: {exc}")
-
-    stalled: int | None = None
-    try:
-        checker = _load_module(
-            "dashboard_check_stalled_prs",
-            ctx.engine_root / "scripts" / "ci" / "check_stalled_prs.py",
-        )
-        # The checker's own `_fetch` (private, but the one definition of the split query and its
-        # fail-closed guards). Its retrying runner is used unless a test injects one.
-        prs = checker._fetch(ENGINE_REPO, None, ctx.stall_runner)
-        stalled = len(checker.scan(prs))
-        detail["green_but_unmergeable"] = stalled
-        detail["green_but_unmergeable_rule"] = (
-            "scripts/ci/check_stalled_prs.py signature: OPEN, BEHIND, no failing or pending check"
-        )
-    except (
-        CollectError,
-        RuntimeError,
-        OSError,
-        ValueError,
-        KeyError,
-        AttributeError,
-        TypeError,
-        ImportError,
-        # The checker's own runner calls subprocess.run with a timeout, so a hung `gh` surfaces
-        # as TimeoutExpired, which is none of the above.
-        subprocess.SubprocessError,
-    ) as exc:
-        # An optional part: the status is capped at warn and the run exits 3, never a quiet null.
-        detail["green_but_unmergeable"] = None
-        add_partial(detail, f"stall count: {type(exc).__name__}: {exc}")
-    detail["state_as_of"] = "run time; --through does not apply to open PRs"
-    m.value = len(rows)
-    # Banded on the raw age, so 7.04 days never rounds into the 7-day band.
-    m.status = status_flow(oldest_raw, stalled)
-    m.detail = detail
 
 
 def c_ci_main(ctx: Context, m: Metric) -> None:
@@ -1031,13 +1111,16 @@ def c_asvs(ctx: Context, m: Metric) -> None:
 _ENGINE_REF = re.compile(r"\bengine=(\S+)")
 
 
+def asvs_header_line(provenance: Sequence[str]) -> str | None:
+    """The scorecard tool's provenance header: the first line naming ``engine=``, or ``None``."""
+    return next((line for line in provenance if _ENGINE_REF.search(line)), None)
+
+
 def asvs_engine_ref(provenance: Sequence[str]) -> str | None:
     """The ``engine=<ref>`` the scorecard tool's provenance header names, or ``None``."""
-    for line in provenance:
-        found = _ENGINE_REF.search(line)
-        if found:
-            return found.group(1)
-    return None
+    header = asvs_header_line(provenance)
+    found = _ENGINE_REF.search(header) if header else None
+    return found.group(1) if found else None
 
 
 def asvs_ref_pair(detail: dict[str, Any]) -> str:
@@ -1211,6 +1294,201 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
         add_partial(m.detail, uploaded_error)
 
 
+_XLSX_NS = {
+    "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+_CELL_REF = re.compile(r"([A-Z]+)\d+")
+_CLOSED_OF = re.compile(r"\s*(\d+)\s*/\s*(\d+)\s*")
+
+
+def default_runbook(env: Mapping[str, str]) -> Path | None:
+    """The runbook workbook: ``MEFOR_RUNBOOK``, else OneDrive/Desktop/MEFOR under the profile."""
+    if env.get(ENV_RUNBOOK):
+        return Path(env[ENV_RUNBOOK])
+    profile = env.get("USERPROFILE") or env.get("HOME")
+    return Path(profile) / "OneDrive" / "Desktop" / "MEFOR" / RUNBOOK_NAME if profile else None
+
+
+def _col_index(ref: str) -> int:
+    m = _CELL_REF.fullmatch(ref)
+    if m is None:
+        raise CollectError(f"unreadable cell reference {ref!r}")
+    n = 0
+    for ch in m[1]:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+#: The engine's vendored defusedxml. The scheduled refresh runs a ``git archive`` of ``scripts/``
+#: and this directory with no engine package installed, so it is loaded by path, as a package of
+#: its own, rather than imported through ``messagefoundry``.
+DEFUSEDXML_DIR = ENGINE_ROOT / "messagefoundry" / "_vendor" / "defusedxml"
+_DEFUSED = "_mf_dashboard_defusedxml"
+
+
+def safe_xml() -> ModuleType:
+    """defusedxml's ElementTree: stdlib ElementTree refuses no DTD or entity declaration, and the
+    workbook is a file anyone with the user's rights can replace."""
+    module = sys.modules.get(f"{_DEFUSED}.ElementTree")
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(
+        _DEFUSED, DEFUSEDXML_DIR / "__init__.py", submodule_search_locations=[str(DEFUSEDXML_DIR)]
+    )
+    if spec is None or spec.loader is None:
+        raise CollectError(f"cannot load the vendored defusedxml from {DEFUSEDXML_DIR}")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[_DEFUSED] = package
+    try:
+        spec.loader.exec_module(package)
+        return importlib.import_module(f"{_DEFUSED}.ElementTree")
+    except (ImportError, OSError) as exc:
+        sys.modules.pop(_DEFUSED, None)
+        raise CollectError(f"cannot load the vendored defusedxml: {exc}") from None
+
+
+def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
+    """Every row of ``sheet`` in an .xlsx file, as text, read with the standard library and the
+    vendored defusedxml. A formula cell reads as the value Excel last cached for it."""
+    ET = safe_xml()  # noqa: N806 - the module's conventional name
+
+    def parse(xml: bytes) -> Any:
+        # Every part this function reads today goes through here; a new part must too, since
+        # nothing else refuses a DTD and the test lists only these four parts.
+        return ET.fromstring(xml, forbid_dtd=True)
+
+    ns = _XLSX_NS
+    text_tag = f"{{{ns['m']}}}t"
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            book = parse(z.read("xl/workbook.xml"))
+            rels = parse(z.read("xl/_rels/workbook.xml.rels"))
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                for si in parse(z.read("xl/sharedStrings.xml")).findall("m:si", ns):
+                    shared.append("".join(t.text or "" for t in si.iter(text_tag)))
+            rid = next(
+                (
+                    s.get(f"{{{ns['r']}}}id")
+                    for s in book.iterfind("m:sheets/m:sheet", ns)
+                    if s.get("name") == sheet
+                ),
+                None,
+            )
+            if rid is None:
+                raise CollectError(f"the workbook has no {sheet!r} tab")
+            target = next(
+                (
+                    r.get("Target")
+                    for r in rels.iterfind("pr:Relationship", ns)
+                    if r.get("Id") == rid
+                ),
+                None,
+            )
+            if not target:
+                raise CollectError(f"the workbook names no part for the {sheet!r} tab")
+            part = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+            root = parse(z.read(part))
+    except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError) as exc:
+        raise CollectError(f"unreadable workbook: {type(exc).__name__}: {exc}") from None
+    rows: list[list[str]] = []
+    for row in root.iterfind("m:sheetData/m:row", ns):
+        cells: dict[int, str] = {}
+        col = -1
+        for c in row.iterfind("m:c", ns):
+            # OOXML makes a cell's reference optional; one without it follows the previous cell.
+            ref = c.get("r")
+            col = _col_index(ref) if ref else col + 1
+            kind = c.get("t")
+            if kind == "inlineStr":
+                text = "".join(t.text or "" for t in c.iter(text_tag))
+            else:
+                v = c.find("m:v", ns)
+                text = "" if v is None or v.text is None else v.text
+                if kind == "s" and text:
+                    try:
+                        text = shared[int(text)]
+                    except (ValueError, IndexError):
+                        where = ref or f"in column {col + 1} of its row"
+                        raise CollectError(f"cell {where} names no shared string") from None
+            cells[col] = text
+        rows.append([cells.get(i, "") for i in range(max(cells, default=-1) + 1)])
+    return rows
+
+
+def batch_census(rows: Sequence[Sequence[str]]) -> dict[str, Any]:
+    """Batches and their ledger rows by state, from the queue tab's rows, header first. A
+    retired EMPTY number is left out."""
+    if not rows:
+        raise CollectError(f"the {RUNBOOK_SHEET!r} tab is empty")
+    header = [h.strip() for h in rows[0]]
+    need = ("Batch", "State", "Ledger closed / rows")
+    missing = [h for h in need if h not in header]
+    if missing:
+        raise CollectError(f"the {RUNBOOK_SHEET!r} tab no longer has the columns {missing}")
+    at = {h: header.index(h) for h in need}
+
+    def get(row: Sequence[str], name: str) -> str:
+        i = at[name]
+        return row[i].strip() if i < len(row) else ""
+
+    batches: dict[str, int] = {}
+    closed: dict[str, int] = {}
+    total: dict[str, int] = {}
+    unread: list[str] = []
+    for row in rows[1:]:
+        if not get(row, "Batch"):
+            continue
+        state = get(row, "State").upper() or "(blank)"
+        if state == RUNBOOK_EMPTY:
+            continue
+        batches[state] = batches.get(state, 0) + 1
+        m = _CLOSED_OF.fullmatch(get(row, "Ledger closed / rows"))
+        if m is None:
+            unread.append(get(row, "Batch"))
+            continue
+        closed[state] = closed.get(state, 0) + int(m[1])
+        total[state] = total.get(state, 0) + int(m[2])
+    return {"batches": batches, "rows_closed": closed, "rows": total, "unread": unread}
+
+
+def c_batch_progress(ctx: Context, m: Metric) -> None:
+    path = ctx.runbook
+    if path is None:
+        raise CollectError(f"no runbook path: set {ENV_RUNBOOK} or USERPROFILE")
+    try:
+        data = path.read_bytes()
+        saved = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.UTC)
+    except OSError as exc:
+        raise CollectError(f"cannot read the runbook {path}: {type(exc).__name__}") from None
+    got = batch_census(xlsx_sheet_rows(data, RUNBOOK_SHEET))
+    closed = sum(got["rows_closed"].values())
+    total = sum(got["rows"].values())
+    if not total:
+        raise CollectError("the runbook's batches hold no ledger rows")
+    m.value = floor_pct(closed, total)
+    # Progress, not a health bar: no threshold says what share of the runbook should be closed.
+    m.status = "info"
+    m.detail = {
+        "batches_by_state": got["batches"],
+        "batches_total": sum(got["batches"].values()),
+        "rows_closed_by_state": got["rows_closed"],
+        "rows_by_state": got["rows"],
+        "rows_closed": closed,
+        "rows_total": total,
+        "runbook_saved": saved.isoformat(timespec="seconds"),
+        "state_as_of": "the runbook as last saved; its row counts are its own last ledger sync",
+    }
+    if got["unread"]:
+        add_partial(
+            m.detail,
+            f"{len(got['unread'])} batches carry no 'closed / rows' count: "
+            + ", ".join(got["unread"][:10]),
+        )
+
+
 @dataclass(frozen=True)
 class Spec:
     id: str
@@ -1232,22 +1510,30 @@ SPECS: tuple[Spec, ...] = (
         c_backlog_burn,
     ),
     Spec(
+        "backlog_forecast",
+        "Backlog finish",
+        "At the recent pace, when does the open ledger reach zero?",
+        "",
+        "vault origin/main: the backlog_burn census, its weekly filed and closed rows over the "
+        f"last {FORECAST_WEEKS} full weeks",
+        c_backlog_forecast,
+    ),
+    Spec(
+        "batch_progress",
+        "Batch progress",
+        "How much of the /batch runbook's work is closed?",
+        "percent",
+        f"{RUNBOOK_NAME}, tab {RUNBOOK_SHEET!r}: State and 'Ledger closed / rows' per batch",
+        c_batch_progress,
+    ),
+    Spec(
         "prs_merged",
         "PRs merged",
         "How many pull requests merged per week across engine, vault and korus?",
         "PRs per week",
-        "gh pr list -R <repo> --state merged --search merged:<week> --json number,createdAt,mergedAt, "
+        "gh pr list -R <repo> --state merged --search merged:<week> --json number,mergedAt, "
         f"for {', '.join(MERGED_REPOS)}",
         c_prs_merged,
-    ),
-    Spec(
-        "flow_health",
-        "Engine PR flow",
-        "Are engine pull requests flowing: open count, oldest age, time to merge?",
-        "open PRs",
-        f"gh pr list -R {ENGINE_REPO} --state open|merged --json createdAt,mergedAt; "
-        "scripts/ci/check_stalled_prs.py scan()",
-        c_flow_health,
     ),
     Spec(
         "ci_main",
@@ -1492,6 +1778,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="YYYY-MM-DD",
         help="last day of the window (default: today, UTC)",
     )
+    ap.add_argument(
+        "--runbook",
+        type=Path,
+        default=None,
+        help=f"the /batch runbook workbook (default: {ENV_RUNBOOK}, else "
+        f"%%USERPROFILE%%/OneDrive/Desktop/MEFOR/{RUNBOOK_NAME})",
+    )
     args = ap.parse_args(argv)
     # Error text can quote a ledger line or a git message; a cp1252 console must not raise on it.
     for stream in (sys.stdout, sys.stderr):
@@ -1532,6 +1825,7 @@ def main(argv: list[str] | None = None) -> int:
             engine_repo=args.engine_repo.resolve(),
             archive_ref=args.archive_ref,
             git_fetch=not args.no_fetch,
+            runbook=args.runbook or default_runbook(os.environ),
         )
         metrics = collect(ctx)
         write_json_atomic(out, snapshot(ctx, metrics))

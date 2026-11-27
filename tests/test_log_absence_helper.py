@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from tests._log_absence import assert_capture_sees
+from tests._log_absence import assert_capture_sees, assert_capture_sees_tree, assert_no_records
 
 _NAME = "messagefoundry.tests.log_absence_probe"
 
@@ -41,6 +41,42 @@ def test_a_visible_logger_passes_and_the_probe_is_taken_out(
         assert not [r for r in caplog.records if r.name == _NAME and "probe" in r.getMessage()]
 
 
+def test_the_probe_leaves_no_text_and_reaches_no_other_handler(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 35: the probe line stayed in ``caplog.text`` and reached every
+    other handler on its way up. The code's own record, on both sides of it, is the control."""
+
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            # Only this logger's records: the root spy also sees every other logger's, and a stray
+            # line from one of them must not fail the comparison below.
+            if record.name == _NAME:
+                self.messages.append(record.getMessage())
+
+    other, above = _Keep(), _Keep()
+    probe_logger.addHandler(other)
+    logging.getLogger().addHandler(above)  # a handler up the chain, as pytest's own are
+    try:
+        with caplog.at_level(logging.WARNING, logger=_NAME):
+            probe_logger.warning("before the probe")
+            assert_capture_sees(caplog, _NAME)
+            logging.getLogger(f"{_NAME}_other").warning("a stray line from another logger")
+            probe_logger.warning("after the probe")
+    finally:
+        probe_logger.removeHandler(other)
+        logging.getLogger().removeHandler(above)
+    assert other.messages == ["before the probe", "after the probe"]
+    assert above.messages == other.messages
+    assert "capture probe" not in caplog.text
+    assert "before the probe" in caplog.text and "after the probe" in caplog.text
+    assert not other.filters  # the drop filter is taken off again
+
+
 def _propagate_off(log: logging.Logger) -> None:
     log.propagate = False
 
@@ -68,3 +104,34 @@ def test_a_capture_that_cannot_see_the_logger_fails(
         assert not [r for r in caplog.records if r.name == _NAME]
         with pytest.raises(AssertionError, match="would pass on nothing"):
             assert_capture_sees(caplog, _NAME)
+
+
+def test_a_tree_probe_fails_where_a_child_hides_what_a_root_probe_misses(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 29: probing the root alone passes while a child with
+    ``propagate=False`` keeps its records from the capture. The tree probe names that child."""
+    root = _NAME.rsplit(".", 1)[0]
+    with caplog.at_level(logging.WARNING):
+        probe_logger.propagate = False
+        assert_capture_sees(caplog, root)  # the root still reaches the capture
+        with pytest.raises(AssertionError, match=_NAME):
+            assert_capture_sees_tree(caplog, root)
+        probe_logger.propagate = True
+        assert_capture_sees_tree(caplog, root)
+
+
+def test_no_records_probes_the_logger_it_checks(
+    caplog: pytest.LogCaptureFixture, probe_logger: logging.Logger
+) -> None:
+    """Vault BACKLOG #3766 item 36: the absence check and its probe name one logger, so a blind
+    capture fails the check rather than passing it, and a matching record fails it too."""
+    with caplog.at_level(logging.WARNING, logger=_NAME):
+        probe_logger.warning("unrelated")
+        assert_no_records(caplog, _NAME, lambda r: "secret" in r.getMessage())
+        probe_logger.warning("a secret line")
+        with pytest.raises(AssertionError, match="matched"):
+            assert_no_records(caplog, _NAME, lambda r: "secret" in r.getMessage())
+        probe_logger.propagate = False
+        with pytest.raises(AssertionError, match="would pass on nothing"):
+            assert_no_records(caplog, _NAME, lambda r: False)

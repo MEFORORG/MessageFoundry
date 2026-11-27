@@ -33,6 +33,7 @@ through the real routes as the built-in Auditor.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import json
@@ -54,8 +55,9 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.audit_visibility import (
     DIRECTORY_LOGIN_LOCKED_ACTION,
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
+    LOCAL_MINT_CONTENDED_DETAILS,
 )
-from messagefoundry.auth.identity import Identity
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService, _opened_totp_state
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -316,6 +318,9 @@ async def _add_reader(service: AuthService, username: str, role: Role) -> None:
     )
     # A wired notifier makes the API refuse an account with no notification address.
     await service.store.set_user_notify_email(user_id, email=f"{username}@example.test")
+    # A channel-scoped caller is refused the audit trail and the log tail (BACKLOG #4346),
+    # so a reader of either is given the all-channels grant.
+    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
 
 
 @dataclass
@@ -668,9 +673,150 @@ async def test_the_hidden_refusal_details_match_what_the_writers_store(
         rows = await world.engine.store.list_audit(actor="probe-directory")
         assert [r["action"] for r in rows] == [DIRECTORY_LOGIN_LOCKED_ACTION]
         assert set(_HIDDEN_LOCK_ACTIONS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions
-        assert set(_HIDDEN_LOCKED_REFUSALS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        assert (
+            set(_HIDDEN_LOCKED_REFUSALS) | set(_HIDDEN_MINT_CONTENDED)
+            == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        )
     finally:
         await world.engine.stop()
+
+
+#: The local password leg's contended-insert rows (BACKLOG #5653), which only a right password
+#: reaches, so they are hidden like the lock rows.
+_HIDDEN_MINT_CONTENDED = tuple(
+    ("auth.login_failed", detail) for detail in sorted(LOCAL_MINT_CONTENDED_DETAILS)
+)
+
+
+def test_the_hidden_mint_contended_details_are_what_the_local_writer_stores() -> None:
+    """The exclusion matches EXACT detail text, so each one must be the string the local writer
+    stores for that cause, plain and combined, for every cause the store can raise."""
+    from messagefoundry.auth.service import SESSION_MINT_CONTENDED, _local_refusal_detail
+    from messagefoundry.store.store import SESSION_MINT_CAUSES
+
+    written = {
+        _local_refusal_detail(SESSION_MINT_CONTENDED, combined=combined, extra={"contention": c})
+        for c in SESSION_MINT_CAUSES
+        for combined in (False, True)
+    }
+    assert written == LOCAL_MINT_CONTENDED_DETAILS
+    assert len(written) == 2 * len(SESSION_MINT_CAUSES)
+
+
+async def test_a_local_mint_contended_row_is_hidden_from_a_reader_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5653, Manager decision: a local sign-in's ``session_mint_contended`` row says the
+    password was right, so the Auditor reads none of them and an Administrator reads them all. An
+    existing hidden refusal stays hidden, and the controls -- a wrong password and a directory
+    contended row, which share the action -- stay visible. RED on the head that hid no such row."""
+    world = await _open_world(tmp_path, monkeypatch)
+    store = world.engine.store
+    existing_hidden = ("auth.login_failed", '{"provider": "ad", "reason": "locked"}')
+    visible = (
+        ("auth.login_failed", '{"provider": "local", "reason": "bad_credentials"}'),
+        (
+            "auth.login_failed",
+            '{"contention": "busy", "provider": "ad", "reason": "session_mint_contended"}',
+        ),
+    )
+    try:
+        for action, detail in (*_HIDDEN_MINT_CONTENDED, existing_hidden, *visible):
+            await store.record_audit(action, actor="probe-target", detail=detail)
+        everything = {*_HIDDEN_MINT_CONTENDED, existing_hidden, *visible}
+        for read in (_read_trail, _read_export):
+            auditor = {(r[1], r[3]) for r in await read(world, _AUDITOR) if r[0] == "probe-target"}
+            admin = {
+                (r[1], r[3]) for r in await read(world, _SECOND_ADMIN) if r[0] == "probe-target"
+            }
+            assert auditor == set(visible), (read.__name__, auditor)
+            assert admin == everything, (read.__name__, admin)
+    finally:
+        await world.engine.stop()
+
+
+_CONTENDED_TARGET = "probe-contended"
+_CONTENDED_PASSWORD = "the-contended-target-passphrase"
+
+
+async def _contended_or_wrong_sign_in(
+    world: _World, monkeypatch: pytest.MonkeyPatch, *, contended: bool
+) -> None:
+    """One local password sign-in on a fresh password-only account. ``contended`` sends the right
+    password into an insert that meets contention; otherwise a wrong password is sent."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_BUSY
+
+    user_id = await create_local_user_chosen(
+        world.service,
+        username=_CONTENDED_TARGET,
+        password=_CONTENDED_PASSWORD,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await world.engine.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await world.engine.store.set_password(
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
+    )
+    world.since = time.time()
+    if contended:
+
+        async def contended_insert(*_a: Any, **_k: Any) -> bool:
+            raise SessionMintContended(SESSION_MINT_BUSY, 3)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(world.engine.store, "create_session", contended_insert)
+            out = await world.service.login(_CONTENDED_TARGET, _CONTENDED_PASSWORD)
+        assert out.reason == "session_mint_contended", out
+    else:
+        out = await world.service.login(_CONTENDED_TARGET, "not-the-passphrase")
+        assert out.error == "invalid credentials", out
+    assert not out.ok
+
+
+def _target_rows(rows: list[_Row]) -> list[_Row]:
+    return [r for r in rows if r[0] == _CONTENDED_TARGET]
+
+
+async def test_a_contended_local_sign_in_reads_as_a_wrong_password_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5653, the #1131 pattern: only a right password reaches the session insert, so its
+    ``session_mint_contended`` row is hidden, and the writer first stores the row a wrong password
+    stores. Through ``GET /audit`` and the CSV export the Auditor's view of a contended sign-in
+    equals their view of a wrong password; an Administrator reads the stand-in and the true row,
+    as with a refusal by a lock. RED on the head that wrote only the hidden row."""
+    right = await _open_world(tmp_path / "right", monkeypatch)
+    wrong = await _open_world(tmp_path / "wrong", monkeypatch)
+    try:
+        await _contended_or_wrong_sign_in(right, monkeypatch, contended=True)
+        await _contended_or_wrong_sign_in(wrong, monkeypatch, contended=False)
+        stand_in = json.dumps({"provider": "local", "reason": "bad_credentials"}, sort_keys=True)
+        true_row = json.dumps(
+            {"contention": "busy", "provider": "local", "reason": "session_mint_contended"},
+            sort_keys=True,
+        )
+        for read in (_read_trail, _read_export):
+            seen_right = _target_rows(await read(right, _AUDITOR))
+            seen_wrong = _target_rows(await read(wrong, _AUDITOR))
+            assert seen_right == seen_wrong, (read.__name__, seen_right, seen_wrong)
+            assert [(r[1], r[3]) for r in seen_right] == [("auth.login_failed", stand_in)], (
+                read.__name__,
+                seen_right,
+            )
+            admin = sorted((r[1], r[3]) for r in _target_rows(await read(right, _SECOND_ADMIN)))
+            assert admin == sorted(
+                [("auth.login_failed", stand_in), ("auth.login_failed", true_row)]
+            ), (read.__name__, admin)
+    finally:
+        await right.engine.stop()
+        await wrong.engine.stop()
 
 
 async def test_a_marked_directory_lock_refusal_is_hidden_whole_on_every_read_path(
@@ -1214,3 +1360,81 @@ async def test_a_cancel_as_the_writes_finish_is_not_swallowed() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert written == ["row"], "the write was abandoned"
+
+
+class _WriteFailed(Exception):
+    """The synthetic failure of a deferred audit write."""
+
+
+async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6884. RED when: ``_write_through_cancellation`` lets a write's error escape after
+    an earlier cancel. The cancel lands while the write waits; the write then fails on the loop's
+    next wait. The caller must end in ``CancelledError``, with the write's error logged,
+    and not leave with the write's error and its cancel unconsumed. The test above covers a cancel
+    in the turn the write finishes; this one parts the two by a whole wait."""
+    from messagefoundry.auth.service import _write_through_cancellation
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def write() -> None:
+        started.set()
+        await release.wait()
+        raise _WriteFailed("synthetic write failure")
+
+    task = asyncio.ensure_future(_write_through_cancellation([write], what="the test's write"))
+    try:
+        await started.wait()
+        task.cancel()
+        for _ in range(3):  # let the cancel land on the caller's wait before the write fails
+            await asyncio.sleep(0)
+        assert not task.done(), "the caller left before its write finished"
+        # The failure is logged once, by the service, and asyncio adds no second record of THIS
+        # write's error (a cancelled shield used to add "exception in shielded future"). Only those
+        # are counted, so an unrelated ERROR from elsewhere in the run cannot fail the test.
+        with caplog.at_level(logging.ERROR):
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        # A failed assertion above must not leave the write pending past the test.
+        release.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, _WriteFailed):
+                await task
+    assert task.cancelled()
+    errors = [
+        r
+        for r in caplog.records
+        if r.name == "messagefoundry.auth.service" and r.levelno >= logging.ERROR
+    ]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    # The walk below reads the same capture that just held the service's record, so it saw records.
+    assert len(caplog.records) >= 1
+    echoed = [
+        r
+        for r in caplog.records
+        if r.name == "asyncio"
+        and r.exc_info is not None
+        and isinstance(r.exc_info[1], _WriteFailed)
+    ]
+    assert echoed == [], [r.getMessage() for r in echoed]
+    assert "the test's write failed while the request was cancelled" in errors[0].getMessage()
+    assert errors[0].exc_info is not None and isinstance(errors[0].exc_info[1], _WriteFailed)
+
+
+async def test_an_uncancelled_caller_still_gets_the_write_error() -> None:
+    """BACKLOG #6884, the control. RED when: the fix swallows a write's error for a caller nobody
+    cancelled. With no cancel, a failed write raises to the caller as it did when the rows were
+    written inline."""
+    from messagefoundry.auth.service import _write_through_cancellation
+
+    async def write() -> None:
+        await asyncio.sleep(0)
+        raise _WriteFailed("synthetic write failure")
+
+    with pytest.raises(_WriteFailed):
+        await _write_through_cancellation([write])

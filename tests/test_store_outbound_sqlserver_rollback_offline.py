@@ -72,6 +72,9 @@ def _store(events: list[str], cur: _Cursor) -> SqlServerStore:
     store.fenced_writes = 0
     store._leader_epoch = None
     store._lease_key = None
+    # complete_with_response builds its delivered event before the finalize applock, through
+    # _prepare_event rather than the stubbed _event, so the verbosity gate reads this (BACKLOG #3929).
+    store._message_events = "all"
     conn = _Conn(events)
 
     @asynccontextmanager

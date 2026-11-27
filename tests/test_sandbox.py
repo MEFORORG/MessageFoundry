@@ -8,7 +8,9 @@ a runaway is capped without wedging intake, a sandboxed ``db_lookup``/``fhir_loo
 the marshalled :class:`RunContext` reaches the worker, a ``__reduce__`` gadget returned by a Handler
 never executes in the engine parent, a desynchronized/forged/pre-staged response frame can never
 answer a later dispatch, and the engine's code-set tables — not the child's own re-read of
-``codesets/`` — are what a sandboxed Handler resolves against. Synthetic HL7 only."""
+``codesets/`` — are what a sandboxed Handler resolves against. It also pins one known limitation,
+not a guarantee: a Handler calling XML signature ``verify()`` in a worker fails closed with
+``SandboxError`` until vault BACKLOG #6812 is fixed. Synthetic HL7 only."""
 
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import logging
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -337,6 +340,98 @@ def test_forbidden_import_is_denied_and_worker_survives(graph: tuple[Registry, s
         ) == _deliveries(registry, "h_ok")
     finally:
         session.close()
+
+
+_VERIFY_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+from messagefoundry.parsing.xml import verify
+
+inbound("IB_V", MLLP(port=19317), router="r_v")
+outbound("OB_V", MLLP(host="127.0.0.1", port=19318))
+
+_DOC = __DOC__
+_CERT = __CERT__
+
+
+@router("r_v")
+def r_v(msg):
+    return "h_verify"
+
+
+@handler("h_verify")
+def h_verify(msg):
+    return Send("OB_V", f"verified={verify(_DOC, x509_cert=_CERT).verified}")
+
+
+@handler("h_verify_catch")
+def h_verify_catch(msg):
+    try:
+        result = verify(_DOC, x509_cert=_CERT)
+    except RuntimeError as exc:
+        return Send("OB_V", f"caught {type(exc).__name__}: {exc}")
+    return Send("OB_V", f"verified={result.verified}")
+"""
+
+
+@pytest.mark.parametrize("mode", [SandboxMode.SUBPROCESS, SandboxMode.ISOLATED])
+def test_a_handler_calling_xml_signature_verify_fails_closed_in_a_worker(
+    tmp_path: Path, mode: SandboxMode
+) -> None:
+    """Pins the documented #6812 limitation for a Handler: ``verify()`` raises ``SandboxError``.
+
+    ``docs/CONFIGURATION.md`` ``[sandbox]`` and the ``verify()`` docstring say that, under the default
+    forbidden-import set and ``mode`` ``subprocess`` or ``isolated``, ``verify()`` fails closed with
+    ``SandboxError`` once it reaches the ``cryptography`` import the guard blocks: left uncaught it
+    fails the call as an isolation denial, and a Handler catching ``RuntimeError`` catches it. Today
+    that import is signxml's own, reached through ``load_signxml()``, so the pin also rests on signxml
+    importing ``cryptography`` eagerly. The document is a valid signature over a synthetic body, and
+    a ``mode=off`` session is the positive control: it verifies, so the worker's failure is the guard
+    and not the payload. Both calls share one worker, as an inbound's calls do, and the first denial
+    must neither kill it nor change the second. Only the transform phase is pinned here, not a Router,
+    an ``accepts=`` predicate or the runner's disposition. This test is inverted when the fix in vault
+    BACKLOG #6812 lets ``verify()`` run in a worker."""
+    pytest.importorskip(
+        "signxml", reason="the [xml] extra (signxml + cryptography) is not installed"
+    )
+    from tests.test_xml_signature_coverage import _BODY, _cert_pem, _sign
+
+    # Exactly the top-level package: a denial of only a late submodule would mean ``cryptography``
+    # itself was already loaded past the guard.
+    denied = r"import of 'cryptography' is forbidden inside the sandbox"
+
+    source = _VERIFY_GRAPH.replace("__DOC__", repr(_sign(_BODY))).replace(
+        "__CERT__", repr(_cert_pem())
+    )
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    registry = load_config(tmp_path)
+
+    # Positive control: under mode=off, both Handlers verify the same document.
+    off = _session(str(tmp_path), inbound="IB_V", policy=SandboxPolicy(mode=SandboxMode.OFF))
+    try:
+        for hname in ("h_verify_catch", "h_verify"):
+            assert _deliveries(registry, hname, sandbox=off, run_context=RunContext()) == [
+                ("OB_V", "verified=True")
+            ]
+    finally:
+        off.close()
+
+    session = _session(
+        str(tmp_path), inbound="IB_V", policy=SandboxPolicy(mode=mode, wall_seconds=15.0)
+    )
+    try:
+        # SandboxError is a RuntimeError, so a Handler catching RuntimeError sees it as one.
+        caught = _deliveries(registry, "h_verify_catch", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        pid = session._proc.pid
+        # Left uncaught, on the same worker, the guard's error fails the call as an isolation denial.
+        with pytest.raises(SandboxError, match=rf"^sandbox denied transform 'h_verify': {denied}"):
+            _deliveries(registry, "h_verify", sandbox=session, run_context=RunContext())
+        assert session._proc is not None and session._proc.pid == pid
+        assert not session.kill_counts, session.kill_counts
+    finally:
+        session.close()
+    assert len(caught) == 1 and caught[0][0] == "OB_V", caught
+    assert re.match(rf"caught SandboxError: {denied}", caught[0][1]), caught
 
 
 # --- (c) resource cap: a runaway is capped, intake is not wedged --------------
@@ -671,9 +766,30 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("6.8.0-1017-azure", True),
         ("5.15.0-91-generic", True),
         ("4.7.0", True),
+        ("4.7", True),
+        ("4.7-rc1", True),
+        # Numeric, not lexical: "10" and "14" sort below "4" and "7" as strings.
+        ("4.10", True),
+        ("4.14.0-1-generic", True),
+        ("10.0", True),
+        # Positive control for the off-Linux test below: its release passes here.
+        ("14.0-RELEASE", True),
+        ("6.1.0-13-amd64", True),
+        # A two-component release whose minor carries a suffix (BACKLOG #6811).
+        ("6.12-rc4", True),
+        ("5.15-aws", True),
+        ("5.15+", True),
+        ("4.6", False),
+        ("4.6-rc1", False),
         ("4.4.0-210-generic", False),
         ("3.10.0-1160.el7.x86_64", False),
         ("unparseable", False),
+        ("garbage", False),
+        ("6", False),
+        ("6-rc1", False),
+        ("4." + "9" * 5000, False),
+        ("\uff14.\uff17", False),  # fullwidth digits: a kernel release is ASCII
+        ("", False),
     ],
 )
 def test_rlimit_data_is_trusted_only_from_linux_4_7(
@@ -686,8 +802,36 @@ def test_rlimit_data_is_trusted_only_from_linux_4_7(
     from messagefoundry.pipeline import _sandbox_worker
 
     # The worker's own `os` is this module; raising=False because Windows has no os.uname.
-    monkeypatch.setattr(os, "uname", lambda: SimpleNamespace(release=release), raising=False)
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname="Linux", release=release), raising=False
+    )
     assert _sandbox_worker._rlimit_data_counts_mmap() is counts
+
+
+@pytest.mark.parametrize("sysname", ["FreeBSD", "Darwin"])
+def test_rlimit_data_is_not_trusted_off_linux(
+    sysname: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    # "14.0-RELEASE" would pass the Linux 4.7 threshold, but another kernel's RLIMIT_DATA need not
+    # count mmap, so the worker keeps the absolute RLIMIT_AS cap there (BACKLOG #6811).
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(sysname=sysname, release="14.0-RELEASE"), raising=False
+    )
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
+
+
+def test_rlimit_data_is_not_trusted_without_uname(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    from messagefoundry.pipeline import _sandbox_worker
+
+    monkeypatch.delattr(os, "uname", raising=False)
+    assert _sandbox_worker._rlimit_data_counts_mmap() is False
 
 
 def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
@@ -1110,6 +1254,382 @@ def test_request_ids_are_unpredictable_and_never_reused(
     assert len({rid[:8] for rid in seen}) == 3
 
 
+def _stray_during_encode(
+    monkeypatch: pytest.MonkeyPatch, session: SandboxSession, times: int = 1
+) -> list[str]:
+    """Patch ``encode_request`` to queue a stray frame on ``session`` after the call's first check
+    and before its request is written, ``times`` times. Returns the request ids encoded."""
+    real_encode = codec.encode_request
+    ids: list[str] = []
+
+    def _encode(*, request_id: str, **kw: Any) -> bytes:
+        ids.append(request_id)
+        out = real_encode(request_id=request_id, **kw)
+        if len(ids) <= times:
+            session._responses.put(b"\x00\x00\x00\x02{}")
+        return out
+
+    monkeypatch.setattr(codec, "encode_request", _encode)
+    return ids
+
+
+def test_a_stray_frame_queued_after_the_check_is_found_before_the_request_is_written(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 steps 7 and 13: the AC-10 window is narrowed by a second check.
+
+    A frame queued after :meth:`SandboxSession._live_worker`'s check and before the request is
+    written used to be read in that call's answer slot, which killed the worker as an invalid frame
+    and failed a message that never reached it. The check now runs again once the request is
+    encoded, right before the write, so that frame is found there: the worker is killed as
+    unsolicited and the message is retried once on a fresh worker, as for a frame found at the
+    first check."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        first = session._proc
+        generation = session._generation
+        ids = _stray_during_encode(monkeypatch, session)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert len(ids) == 1  # encoded once: the retry writes the same request to the new worker
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 1
+        assert KillCause.INVALID_FRAME not in session.kill_counts
+        assert first is not None and first.poll() is not None
+        assert session._generation == generation + 1
+    finally:
+        session.close()
+
+
+def test_the_second_check_shares_the_one_retry_a_dispatch_gets(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stray frame at the first check uses the dispatch's one retry, so a second one found by the
+    check before the write fails the call rather than retry again (vault BACKLOG #3135 step 7)."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"\x00\x00\x00\x02{}")
+        _stray_during_encode(monkeypatch, session)
+        with pytest.raises(SandboxError, match="unsolicited"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 2
+    finally:
+        session.close()
+
+
+# A Handler that spawns a grandchild the ordinary way, inheriting its standard streams, and reports
+# whether the grandchild's fd 0 is a pipe. Before vault BACKLOG #3135 step 8 fd 0 was the worker's
+# request pipe, through which the grandchild could read a later request's id and forge its answer.
+_FD0_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_F", MLLP(port=19353), router="r")
+outbound("OB_F", MLLP(host="127.0.0.1", port=19354))
+
+
+@router("r")
+def r(msg):
+    return "h_fd0"
+
+
+@handler("h_fd0")
+def h_fd0(msg):
+    import subprocess
+    import sys
+
+    probe = (
+        "import os, stat, sys\\n"
+        "mode = os.fstat(0).st_mode\\n"
+        "sys.exit(3 if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) else 0)\\n"
+    )
+    argv = [sys.executable, "-c", probe]
+    inherited = subprocess.run(argv, timeout=30).returncode
+    every_fd = subprocess.run(argv, timeout=30, close_fds=False).returncode
+    # The negative control: the probe must see a pipe it is handed.
+    piped = subprocess.run(argv, timeout=30, stdin=subprocess.PIPE).returncode
+    return Send("OB_F", f"{inherited},{every_fd},{piped}")
+"""
+
+
+# A sandbox worker boot plus six interpreter starts, each a fresh process: unloaded this took
+# about 14 s on Windows (2026-11-24), and under a loaded runner it has reached the 60 s per-test cap
+# the Ubuntu leg passes with --timeout, which this marker overrides. Each probe keeps its own 30 s
+# subprocess timeout, so 240 s still bounds a hang. Starting with -I -S measured no faster.
+@pytest.mark.timeout(240)
+def test_a_process_a_handler_spawns_does_not_get_the_request_pipe_on_fd_0(tmp_path: Path) -> None:
+    """Vault BACKLOG #3135 steps 8 and 13: a process a Handler spawns finds no pipe on its fd 0.
+
+    The worker moves the pipe to a private, non-inheritable descriptor before it reads the boot
+    frame, and points fd 0 at the null device, so a process a Handler spawns, with its descriptors
+    inherited or not, finds no pipe on fd 0. Exit status 3 means the grandchild's fd 0 was a pipe;
+    the third probe is handed one, to show the probe can see it.
+
+    This proves only what fd 0 is, not that the grandchild cannot reach the request pipe another
+    way. On Windows, a worker started through a virtual environment's ``python.exe`` launcher
+    holds a second inheritable handle to the pipe, which the ``close_fds=False`` probe inherits
+    while its fd 0 is not the pipe (ADR 0087, the step 8 notes)."""
+    (tmp_path / "graph.py").write_text(_FD0_GRAPH, encoding="utf-8")
+    registry = load_config(tmp_path)
+    # Each dispatch starts three interpreters, so the default 15 s wall cap would fail it on the
+    # loaded runner the marker above is for.
+    session = _session(
+        str(tmp_path),
+        inbound="IB_F",
+        policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=120.0),
+    )
+    try:
+        assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
+            ("OB_F", "0,0,3")
+        ]
+        # The worker still reads its requests: a second message is answered by the same worker.
+        proc = session._proc
+        assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
+            ("OB_F", "0,0,3")
+        ]
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs() -> None:
+    """Vault BACKLOG #3135 step 8: the detach must come before the boot frame is read, since the
+    boot frame's reply path runs ``load_snapshot()``, the earliest admin code, which can start a
+    process of its own. The Handler-time test above cannot see a detach moved below that point, so
+    this reads the order of the calls in ``main`` from its syntax tree, never from its text."""
+    import ast
+    import inspect
+    import textwrap
+
+    from messagefoundry.pipeline import _sandbox_worker
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_sandbox_worker.main)))
+    first: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called is not None:
+                first[called] = min(first.get(called, node.lineno), node.lineno)
+    assert first["_detach_request_pipe"] < first["_read_frame_bytes"]
+    assert first["_detach_request_pipe"] < first["load_snapshot"]
+
+
+_DETACH_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline._sandbox_worker import _detach_request_pipe
+
+reader = _detach_request_pipe()
+fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+sys.stderr.write(
+    f"{os.get_inheritable(reader.fileno())},{fd0_is_pipe},{reader.readline().decode().strip()}"
+)
+"""
+
+
+def test_the_private_request_pipe_is_not_inheritable() -> None:
+    """Vault BACKLOG #3135 step 8: the private copy of the request pipe is non-inheritable, fd 0 is
+    no longer a pipe, and the copy still reads what the parent writes. A grandchild that keeps
+    every inheritable descriptor (``close_fds=False``) therefore does not get the copy either."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "False,False,hello"
+
+
+# The detach failing after its os.dup: the null device cannot be opened. The refusal must carry a
+# reader on the private copy, so the caller can drain the boot frame and close it, and fd 0 must
+# still be the pipe, since nothing was moved.
+_DETACH_FAIL_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline import _sandbox_worker
+
+def _no_devnull(*a, **k):
+    raise OSError("no null device")
+
+os.open = _no_devnull
+try:
+    _sandbox_worker._detach_request_pipe()
+except _sandbox_worker._RequestPipeRefused as exc:
+    with exc.reader as reader:
+        line = reader.readline().decode().strip()
+    fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+    sys.stderr.write(f"{line},{fd0_is_pipe},{reader.closed}")
+"""
+
+
+def test_a_detach_that_fails_after_its_dup_hands_back_the_private_copy() -> None:
+    """Vault BACKLOG #3135 step 8: a detach that fails once the pipe is duplicated does not leak
+    the copy. The refusal hands it back as a reader, which the caller drains and closes."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_FAIL_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "hello,True,True"
+
+
+def test_a_detach_refusal_drains_the_boot_frame_and_reports_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    """Vault BACKLOG #3135 step 8: a worker that refuses to detach its request pipe reads the boot
+    frame before it replies, so the parent's boot write completes and the parent reads the
+    refusal's reason as a failed boot, rather than recording a failed boot write."""
+    from messagefoundry.config.snapshot import ConfigSnapshot
+    from messagefoundry.pipeline import _sandbox_worker
+
+    class _Tracked(io.BytesIO):
+        # Where the reader stood when it was closed: a drain reads to the end of the boot frame.
+        closed_at = -1
+
+        def close(self) -> None:
+            if not self.closed:
+                self.closed_at = self.tell()
+            super().close()
+
+    stdin, stdout = _Tracked(), io.BytesIO()
+    boot = codec.encode_boot(
+        snapshot=ConfigSnapshot(directory=Path("."), files={}),
+        forbidden=(),
+        mem_mb=None,
+        code_sets=None,
+    )
+    sandbox_mod._write_frame(stdin, boot)
+    size = stdin.tell()
+    stdin.seek(0)
+
+    def _refuse() -> io.BufferedReader:
+        raise _sandbox_worker._RequestPipeRefused("the request pipe stays", reader=stdin)
+
+    monkeypatch.setattr(_sandbox_worker, "_detach_request_pipe", _refuse)
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=stdout))
+    assert _sandbox_worker.main() == 1
+    assert stdin.closed
+    assert stdin.closed_at == size > 0  # read to the end of the boot frame before it was closed
+    stdout.seek(0)
+    reply = sandbox_mod._read_frame_bytes(stdout)
+    assert reply is not None
+    worker_graph, why = codec.decode_boot_reply(reply)
+    assert worker_graph is None
+    assert "the request pipe stays" in why
+
+
+def test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: a worker spawned by a dispatch's first check and dead by its
+    second is recorded as ``EXITED_AFTER_BOOT``, not reaped silently by the respawn."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed = session._proc
+            assert doomed is not None
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session.kill_counts[KillCause.EXITED_AFTER_BOOT] == 1
+        assert session._generation == 2
+    finally:
+        session.close()
+
+
+def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: the second check also finds a worker that exited while the
+    request was encoded, and the request goes to a fresh worker rather than a dead pipe."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert KillCause.REQUEST_WRITE not in session.kill_counts
+        # It died during this dispatch, so the death is recorded, as a write to it would have been.
+        assert session.kill_counts[KillCause.CRASH] == 1
+    finally:
+        session.close()
+
+
+def test_a_kept_worker_already_dying_at_the_first_check_is_not_recorded_as_a_crash(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3135 step 7: a kept worker that died between dispatches, and was still in its
+    exit tail at the dispatch's first check (not yet a zombie, its EOF not yet queued), is found
+    dead by the second check. Its response pipe closed before the first check ended, so it did not
+    die during this dispatch: it is replaced as the first check replaces such a worker, with no
+    kill recorded and no WARNING, not as a ``CRASH``. The test above is the control: a worker that
+    dies while the request is encoded is still recorded."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        doomed.kill()
+        _wait_exited(doomed)
+        # Hold the EOF the reader queued, and hide the exit from the first check, so the first
+        # check meets the exit tail: a running process with nothing queued.
+        eof = session._responses.get(timeout=10.0)
+        assert eof is sandbox_mod._EOF
+        real_exited = sandbox_mod._has_exited
+        monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            # The tail ends while the request is encoded: the exit and the EOF become visible.
+            monkeypatch.setattr(sandbox_mod, "_has_exited", real_exited)
+            session._responses.put(eof)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        with caplog.at_level(logging.WARNING, logger=sandbox_mod.log.name):
+            assert (
+                _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+            )
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert not session.kill_counts, session.kill_counts
+        assert session.last_kill_cause is None
+        assert not [r for r in caplog.records if "cause=" in r.getMessage()]
+    finally:
+        session.close()
+
+
 def test_response_view_reaches_a_sandboxed_handler(graph: tuple[Registry, str]) -> None:
     """New capability, not a regression guard: ``response_view`` carries ``CapturedResponse`` objects,
     which used to live in ``messagefoundry.store`` — a FORBIDDEN import inside the child, raised from
@@ -1183,14 +1703,24 @@ def test_code_sets_reach_the_child_without_travelling_per_dispatch() -> None:
 
 def _codeset_graph(tmp_path: Path, mapped: str) -> Registry:
     (tmp_path / "codesets").mkdir(exist_ok=True)
-    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\n", encoding="utf-8")
+    (tmp_path / "codesets" / "cs.csv").write_text(f"key,value\nA,{mapped}\nR,h\n", encoding="utf-8")
     (tmp_path / "graph.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, MLLP, Send, code_set\n"
         'inbound("IB_C", MLLP(port=19331), router="r")\n'
+        'inbound("IB_C_GEN", MLLP(port=19333), router="r_gen_cs")\n'
+        'inbound("IB_C_MISS", MLLP(port=19334), router="r_gen_missing")\n'
         'outbound("OB_C", MLLP(host="127.0.0.1", port=19332))\n'
         '@router("r")\n'
         "def r(msg):\n"
         '    return "h"\n'
+        '@router("r_gen_cs")\n'
+        "def r_gen_cs(msg):\n"
+        "    # A GENERATOR Router whose body reads a run-scoped provider (BACKLOG #5780).\n"
+        '    yield code_set("cs")["R"]\n'
+        '@router("r_gen_missing")\n'
+        "def r_gen_missing(msg):\n"
+        "    # A GENERATOR Router whose body raises a code_set error (BACKLOG #5780).\n"
+        '    yield code_set("no_such_set")["R"]\n'
         '@handler("h")\n'
         "def h(msg):\n"
         '    return Send("OB_C", code_set("cs")["A"])\n'
@@ -1243,6 +1773,44 @@ def test_a_generator_handlers_body_runs_inside_the_childs_run_context(tmp_path: 
     with run_contexts(rc, phase="transform"):
         off, _, _, _ = transform_one(registry, "h_gen_cs", RAW, run_context=rc)
     assert [(d.to, d.payload) for d in ds] == [(d.to, d.payload) for d in off]
+
+
+def test_a_generator_routers_body_runs_inside_the_childs_run_context(tmp_path: Path) -> None:
+    """BACKLOG #5780: a generator Router's body runs when something iterates it. The child must do
+    that inside ``with run_contexts(...)`` and inside its exception arms, as ``mode=off`` does.
+
+    Iterated anywhere else, a ``code_set(...)`` read in the body raises "called with no active code
+    sets" under ``mode=subprocess`` while it resolves under ``mode=off``, and a body error comes back
+    as an "unmarshallable result" instead of the Router's own error. So each half compares with
+    ``mode=off`` exactly. The worker survives either way, because ``_respond`` has caught every raise
+    since BACKLOG #5890; survival is checked here, but it is not what pins this fix."""
+    registry = _codeset_graph(tmp_path, "MAPPED")
+    gen_ic = registry.inbound["IB_C_GEN"]
+    miss_ic = registry.inbound["IB_C_MISS"]
+    rc = RunContext(code_sets=registry.code_sets)
+    with run_contexts(rc, phase="router"):
+        off = route_only(registry, gen_ic, RAW, run_context=rc)
+        with pytest.raises(Exception, match="no such code set 'no_such_set'") as off_err:
+            route_only(registry, miss_ic, RAW, run_context=rc)
+    assert off == ["h"]
+    off_text = f"{type(off_err.value).__name__}: {off_err.value}"
+
+    # One session per inbound, as production runs them.
+    gen_session = _session(str(tmp_path), inbound="IB_C_GEN", code_sets=registry.code_sets)
+    try:
+        assert route_only(registry, gen_ic, RAW, sandbox=gen_session, run_context=rc) == off
+    finally:
+        gen_session.close()
+    miss_session = _session(str(tmp_path), inbound="IB_C_MISS", code_sets=registry.code_sets)
+    try:
+        for _ in range(2):
+            with pytest.raises(SandboxError) as sub_err:
+                route_only(registry, miss_ic, RAW, sandbox=miss_session, run_context=rc)
+            assert str(sub_err.value) == f"sandbox failed router 'r_gen_missing': {off_text}"
+            proc = miss_session._proc
+            assert proc is not None and proc.poll() is None
+    finally:
+        miss_session.close()
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:
@@ -1918,6 +2486,10 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
 
     class _Exploding:
         def read(self, _n: int) -> bytes:
+            raise OSError("pipe died with the worker")
+
+        def close(self) -> None:
+            # The relay closes the stream it drained (BACKLOG #6831); this one fails that too.
             raise OSError("pipe died with the worker")
 
     _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]

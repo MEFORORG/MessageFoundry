@@ -11,6 +11,7 @@ next to it that passes.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,9 +24,10 @@ from starlette.requests import Request
 
 from messagefoundry.api import create_app
 from messagefoundry.api.auth_models import UserCreateRequest
+from messagefoundry.api.security import DIRECTORY_GRANTED_BY
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import InvalidUsername
-from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.auth.usernames import RESERVED_ACTOR_FORMS, username_refusal
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from tests.test_api_auth import _add, _auth, _login, _reauth, _service
@@ -78,6 +80,28 @@ REFUSED = [
     "\u2800bob",
     "\U0001d159",
     "bob\U00016fe4",
+    # BACKLOG #5520 item 37: the directory sign-in's synthetic granted_by marker,
+    # api.security.DIRECTORY_GRANTED_BY, which the "<...>" form refuses.
+    "<directory>",
+]
+
+#: BACKLOG #5520 items 3, 14 and 35: reserved forms spelled with a lookalike of their colon or
+#: angle brackets that NFKC leaves as it is. Each renders as a reserved form, so each is refused.
+LOOKALIKE_DELIMITERS = [
+    "cli\u2236root",  # RATIO
+    "cli\ua789root",  # MODIFIER LETTER COLON
+    "system\u02f8rotate-key",  # MODIFIER LETTER RAISED COLON
+    "SYSTEM\u2236x",
+    "\u2039oidc\u203a",  # SINGLE LEFT/RIGHT-POINTING ANGLE QUOTATION MARK
+    "\u3008kerberos\u3009",  # LEFT/RIGHT ANGLE BRACKET (CJK)
+    "\u2329reconciler\u232a",  # LEFT/RIGHT-POINTING ANGLE BRACKET, which NFKC takes to U+3008/9
+    "\u02c2directory\u02c3",  # MODIFIER LETTER LEFT/RIGHT ARROWHEAD
+    "\u27e8oidc\u27e9",  # MATHEMATICAL LEFT/RIGHT ANGLE BRACKET
+    "\u2039oidc>",
+    "cli" + chr(0x0903) + "root",  # DEVANAGARI SIGN VISARGA
+    "cli" + chr(0x0A83) + "root",  # GUJARATI SIGN VISARGA
+    "cli" + chr(0x17D6) + "root",  # KHMER SIGN CAMNUC PII KUUH
+    chr(0x1D236) + "oidc" + chr(0x1D237),  # GREEK INSTRUMENTAL NOTATION SYMBOL-40 and SYMBOL-42
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
@@ -96,8 +120,23 @@ ACCEPTED = [
     "cli",
     "client",
     "sysadmin",
-    # What the module docstring says the rule admits: a space separator inside the name.
+    # What the module docstring says the rule admits: a space separator inside the name, and
+    # same-script lookalikes, a dotless i and the modifier low arrowheads.
     "a\u3000b",
+    "cl" + chr(0x0131) + ":root",
+    chr(0x02F1) + "oidc" + chr(0x02F2),
+    # Letters the module docstring says the reserved-form key does not fold: a t with stroke and a
+    # y with hook, which NFKD does not split into a base and a mark, and a Cyrillic small u.
+    "sys" + chr(0x0167) + "em",
+    "s" + chr(0x01B4) + "stem",
+    "s" + chr(0x0443) + "stem",
+    # Controls for LOOKALIKE_DELIMITERS: a lookalike delimiter outside a reserved form.
+    "sys\u2236tem",
+    "\u2039bob",
+    "bob\u203a",
+    # Letters the confusables data lists for "<" and ">", left out of the table: a Canadian
+    # syllabics name that starts with PA and ends with PO is not a "<...>" form.
+    chr(0x1438) + chr(0x140A) + chr(0x1433),
 ]
 
 
@@ -109,6 +148,126 @@ def test_the_rule_refuses(name: str) -> None:
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_the_rule_accepts(name: str) -> None:
     assert username_refusal(name) is None
+
+
+@pytest.mark.parametrize("name", LOOKALIKE_DELIMITERS)
+def test_the_rule_refuses_a_reserved_form_with_a_lookalike_delimiter(name: str) -> None:
+    """BACKLOG #5520 items 3, 14 and 35. The controls are ACCEPTED's lookalikes outside a form."""
+    assert username_refusal(name) is not None
+    with pytest.raises(ValidationError):
+        UserCreateRequest(username=name, email="x@example.test", roles=[])
+
+
+#: BACKLOG #5519: reserved forms spelled with accented letters. A store or audit column that
+#: compares accent-insensitively finds each as the reserved form, so each is refused. Precomposed
+#: and combining spellings both, a dotted capital I, a mark case folding turns into a letter
+#: (U+0345), spacing and enclosing marks, a spacing accent NFKC turns into a space and a mark
+#: (U+00A8), and the NOT LESS-THAN and NOT GREATER-THAN signs NFD splits into a bracket and a mark.
+ACCENTED_RESERVED = [
+    "system" + chr(0x0345),  # COMBINING GREEK YPOGEGRAMMENI, which casefold takes to an iota
+    "syste" + chr(0x0345) + "m:x",
+    "system" + chr(0x1715),  # TAGALOG SIGN PAMUDPOD, a spacing mark (Mc)
+    "system" + chr(0x20DD),  # COMBINING ENCLOSING CIRCLE (Me)
+    "<oidc>" + chr(0x20E3),  # COMBINING ENCLOSING KEYCAP (Me)
+    "system" + chr(0x00A8),  # DIAERESIS
+    chr(0x226E) + "oidc" + chr(0x226F),
+    "s\xfdst\xe9m",  # precomposed y with acute, e with acute
+    "sy\u0301stem",  # y + COMBINING ACUTE ACCENT
+    "syst\xe8m:rotate-key",
+    "cl\xed:root",
+    "CL\u0130:root",  # LATIN CAPITAL LETTER I WITH DOT ABOVE
+    "<oidc>\u0332",  # trailing COMBINING LOW LINE
+    "s\xffstem",  # precomposed y with diaeresis
+    "syst\xebm",  # precomposed e with diaeresis
+]
+
+#: What username_refusal answers for a reserved form, and for nothing else.
+_RESERVED_REFUSAL = username_refusal("system")
+
+#: Controls for ACCENTED_RESERVED: accented names that are not a reserved form once unaccented.
+ACCENTED_ACCEPTED = ["Jos\xe9", "s\xfdstems", "cl\xedent", "Ren\xe9e"]
+
+
+@pytest.mark.parametrize("name", ACCENTED_RESERVED)
+def test_the_rule_refuses_a_reserved_form_spelled_with_accents(name: str) -> None:
+    """BACKLOG #5519: the accent-insensitive collation case of the reserved-name check. The refusal
+    must be the reserved-form one, so a name refused for another reason cannot pass this."""
+    assert username_refusal(name) == _RESERVED_REFUSAL
+    with pytest.raises(ValidationError, match="reserved for the audit trail"):
+        UserCreateRequest(username=name, email="x@example.test", roles=[])
+
+
+@pytest.mark.parametrize("name", ACCENTED_ACCEPTED)
+def test_the_rule_accepts_an_accented_name_outside_a_reserved_form(name: str) -> None:
+    """The controls, through the model with the same arguments the refusals use."""
+    assert username_refusal(name) is None
+    assert UserCreateRequest(username=name, email="x@example.test", roles=[]).username == name
+
+
+def test_the_directory_marker_is_a_reserved_form() -> None:
+    """BACKLOG #5520 item 37: the comment on DIRECTORY_GRANTED_BY says the rule refuses it."""
+    assert DIRECTORY_GRANTED_BY in REFUSED
+    assert username_refusal(DIRECTORY_GRANTED_BY) is not None
+    # Control: the bare word is not reserved, as the module docstring says.
+    assert username_refusal("directory") is None
+
+
+def _literal_actors() -> list[tuple[str, str]]:
+    """Every synthetic audit actor the engine package spells as a literal: a constant, or the
+    constant head of an f-string, passed as an ``actor=`` keyword or as an ``actor`` parameter's
+    default, and the module constants named ``*_ACTOR`` or ``*_GRANTED_BY``."""
+    root = Path(__file__).resolve().parents[1] / "messagefoundry"
+    found: list[tuple[str, str]] = []
+
+    def text(node: ast.expr | None) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr) and node.values:
+            return text(node.values[0])
+        return None
+
+    for path in sorted(root.rglob("*.py")):
+        where = path.relative_to(root.parent).as_posix()
+        for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+            values: list[ast.expr | None] = []
+            if isinstance(node, ast.Call):
+                values += [kw.value for kw in node.keywords if kw.arg == "actor"]
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                positional = node.args.posonlyargs + node.args.args
+                with_default = positional[len(positional) - len(node.args.defaults) :]
+                pairs: list[tuple[ast.arg, ast.expr | None]] = list(
+                    zip(with_default, node.args.defaults, strict=True)
+                )
+                pairs += zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
+                values += [default for arg, default in pairs if arg.arg == "actor"]
+            elif isinstance(node, ast.Assign | ast.AnnAssign):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(
+                    isinstance(t, ast.Name) and t.id.endswith(("_ACTOR", "_GRANTED_BY"))
+                    for t in targets
+                ):
+                    values.append(node.value)
+            for value in values:
+                literal = text(value)
+                if literal is not None:
+                    found.append((where, literal))
+    return found
+
+
+def test_every_literal_audit_actor_is_a_reserved_form() -> None:
+    """BACKLOG #5520 item 3: a census for RESERVED_ACTOR_FORMS. Each synthetic actor the engine
+    package spells as a literal where ``_literal_actors`` looks must be a form the rule refuses, so
+    a new literal actor form there fails here until it is added to the rule. An actor built at run
+    time, or passed under another name, is not seen. The positive control: the census finds the
+    forms the rule's comment names."""
+    actors = _literal_actors()
+    literals = {literal for _, literal in actors}
+    for expected in ("system", "system:rotate-key", "<oidc>", "<kerberos>", "<reconciler>", "cli:"):
+        assert expected in literals, (expected, sorted(literals))
+    assert DIRECTORY_GRANTED_BY in literals
+    assert actors
+    unreserved = [(where, lit) for where, lit in actors if not RESERVED_ACTOR_FORMS.fullmatch(lit)]
+    assert not unreserved, unreserved
 
 
 @pytest.mark.parametrize("name", REFUSED)

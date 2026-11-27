@@ -150,6 +150,9 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Send -To all -Body "rebasing main 
 # every box in the repo, and this worktree's own box
 pwsh -NoProfile -File scripts\coord\mail.ps1 -List
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
+
+# your own sent mail still in an inbox (not consumed), expiring within 24 hours
+pwsh -NoProfile -File scripts\coord\mail.ps1 -Expiring -WithinHours 24
 ```
 
 - `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
@@ -161,8 +164,21 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
   target is keyed for this PC.
 - `-ToSessionId <id>` -- optional filter. The message is delivered only if the reading session has that
   id. Use it when the note would be misleading to whoever occupies that worktree next.
-- `-TtlMinutes <n>` -- default 720. Past the TTL the message is swept to `expired/` rather than shown,
-  so a session starting next week is not told to act on something from last Tuesday.
+- `-TtlMinutes <n>` -- default 4320 (72 hours). Past the TTL the message is swept to `expired/` rather
+  than shown, so a session starting next week is not told to act on something from last Tuesday.
+  **CORRECTED (BACKLOG #1386):** this said the default was 720; `mail.ps1` raised it to 4320 on
+  2026-08-11, and its parameter comment says why.
+- `-Expiring [-WithinHours <n>]` -- the warning **before** a TTL fires (BACKLOG #1386). It lists the
+  mail this worktree sent, on this PC, that is still in a recipient's inbox, so not consumed, and whose
+  TTL falls within the window, default 24 hours. Mail a session was shown but has not consumed is
+  listed too, flagged HELD: the drain still sweeps it at its TTL, and its receipt then reads
+  `expired-unshown`. Mail past its TTL is listed until a drain of that box sweeps it, and a box no
+  session reads is never swept. The view is sender-side on purpose. The case that loses mail is an
+  idle recipient, and an idle seat runs no drain. After the loss, the recipient is told the swept id
+  only if the sweeping drain emits output, as at least a drain that shows mail or one at SessionStart
+  does. The sender learns from the `expired-unshown` receipt, when that write succeeds. Before the loss there are at least two signals: this view, and the drain
+  footer's inbox depth and oldest age, which reach only a recipient that runs a drain. A `from` field
+  is whatever the writer chose, so a row is a claim, not provenance.
 - `-Kind note|handoff|alert|broadcast` -- a label for the reader, nothing more.
 - `-MailRoot <path>` -- point the queue at a fixture. Tests use it; nothing else should.
 
@@ -176,8 +192,14 @@ already-shown counts separately.
 reached or a receipt that aged out. Read a receipt inside the window or not at all.
 
 **The OFF switch.** Creating the file `mefor-coord/mail/OFF` suppresses delivery repo-wide. Mail keeps
-being queued and is not lost; it is not shown. It reaches **already-running** sessions, which an
-environment variable cannot, and that is the point of it being a file. Delete it to resume.
+being queued; it is not shown or consumed. A message whose expiry passes meanwhile moves to `expired/`
+at the first drain of its box after the switch is removed. Its receipt then reads `expired-unshown` with an empty
+`observedUtc`, **even if a session was shown that message before OFF went up**, so that receipt does
+not prove the message was never seen. The drain says OFF is up as context at
+SessionStart. At Stop it says so on stderr, because output there would re-wake the session, and the
+model does not receive stderr from a hook that exits 0. The switch takes effect in **already-running**
+sessions, which an environment variable cannot, and that is the point of it being a file. Delete it
+to resume.
 
 ---
 
@@ -207,6 +229,18 @@ some producers are git and some are Windows.
 checkout's path. A prefix match therefore resolves *any* peer to some arbitrary worktree -- most likely
 the primary one -- and does so silently, because a wrong-but-existing box looks exactly like a right
 one from both ends.
+
+**A folder inside a worktree addresses that worktree's box (BACKLOG #7581).** The sender, the drain,
+the watcher and `seat.ps1` each pass a path through `Resolve-BoxPath` in `mail-key.ps1` before keying
+it. A folder inside a live worktree is raised to the nearest root above it, so a session started in a
+subdirectory reads the box its seat record publishes. This is not a prefix match: the walk stops at the
+first `.git`. A path that is not raised keeps the key it had before; at least a path in no checkout, a
+path under a `.git` that names no git directory, a folder git ignores, and a path git fails to answer
+for are not raised. A removed worktree's leftover directory under the primary's `.claude/worktrees/`
+is ignored, so mail sent to that PATH does not reach the primary's box. Its session's seat record is a
+separate matter: `seat.ps1` keys on git's toplevel, which for that directory is the primary. Mail
+queued under a subdirectory's old key is moved into the root's box when a session whose cwd is that
+subdirectory drains or watches, as the legacy key's mail is.
 
 **Injectivity comes from the hash, not the slug.** The key is `<readable-slug>-<hash>`. Two different
 worktree paths can sanitise to the same slug, and the failure mode of a slug-only key is one worktree

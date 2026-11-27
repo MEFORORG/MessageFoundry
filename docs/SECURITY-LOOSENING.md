@@ -226,26 +226,28 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[auth].admin_new_ip_step_up` | `true` |
 | | `[auth].require_action_step_up` | `true` (`false` lets the action-bound step-up routes accept the session-wide step-up window) |
 | | `[auth].password_check_breached`, `password_check_context`, `password_check_username` | `true` (each `false` turns off one screen of a local password) |
-| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` turns a limit off; a negative count or window is refused at load) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
+| | `[auth].monitoring_read_rate_limit_enabled`, `monitoring_read_rate_limit_per_actor`, `monitoring_read_rate_limit_window_seconds` | `true` / `600` / `60` s (`false`, a count of `0` or above `600`, or a window below `60` s) |
 | | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
 | | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
 | | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
-| | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
-| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[auth].max_sessions_per_user` | `5` (`0` means unlimited, and so is named, as is any cap above `5`; a negative cap is refused at load) |
+| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. The load refuses a cap below `1`, which would refuse every flow) |
 | | `[auth].step_up_max_age_seconds` | `300` s (a window above `300` s is named. `0` or less is stricter: it passes no session, except briefly after the system clock steps back) |
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[auth].mfa_recovery_code_count` | `10` (more codes is named. `0` mints none, which is stricter. The load refuses a value outside `0` to `50`) |
-| | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` or less sets none) |
+| | `[auth].password_min_length` | `15` (a shorter floor is named, and `0` sets none; a negative floor is refused at load) |
 | | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` | `60` s / `3600` s / `300` s / `43200` s (*conditional* — a loosening only while OIDC is on; a value above its default is named) |
-| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` or less removes the bound) |
+| | `[auth].oidc_jwks_min_refetch_seconds` | `300` s (*conditional* — a loosening only while OIDC is on; a value below `300` s, or above the default JWKS lifetime of `3600` s, is named, and `0` removes the bound; what the load refuses is in [SECURITY.md](SECURITY.md#the-documented-protection-set-asvs-611), control 9) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
 | | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
+| | `[cert_monitor].check_interval_seconds`, `[secret_rotation].check_interval_seconds` | `43200` / `86400` s (a longer interval makes that credential reminder later, and is named while the reminder is on, as `cert_monitor.check_interval_seconds` and `secret_rotation.check_interval_seconds`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
@@ -271,7 +273,8 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
 `[auth].ad_group_search_deadline`, `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
-keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
+keys, the three named `[auth].phi_read_rate_limit_*` keys, the three named
+`[auth].monitoring_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
@@ -280,7 +283,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
+`[cert_monitor].warn_days`, both `check_interval_seconds`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
 `security_window_seconds`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
@@ -852,11 +855,36 @@ than theirs: a reminder one day ahead leaves no time to renew.
   listed in `enforce_secret_expiry_classes` does the same. On a keyless or `vault_transit` store
   these checks find nothing, so with `warn_days = 0` no `secret_rotation` alert of any kind fires
   there. The `[alerts]` recipient gate counts each reminder separately, so turning one off does not
-  hide the others. A longer `check_interval_seconds` also delays a reminder, and it is not named.
+  hide the others.
 - **When acceptable:** an instance where something outside the engine tracks the same certificates or
   secrets and reminds a person in time.
 - **Compensating controls:** that outside tracker, and a calendar entry per credential.
 - **Reversible:** yes. Set the default or more, or delete the line, and restart.
+
+### `[cert_monitor].check_interval_seconds` or `[secret_rotation].check_interval_seconds` above its default — a credential reminder is later
+Named as `cert_monitor.check_interval_seconds` and `secret_rotation.check_interval_seconds` (ASVS
+6.4.5, BACKLOG #2008). Each runner scans once at start, then once per interval, so a longer interval
+than the shipped default (`43200` and `86400` seconds) is named while that reminder is on. Using the
+default as the bound is a judgment, not a measured threshold, made as the sign-in limits are read
+against theirs. With `warn_days = 0` the reminder is already named as off, so its interval is not
+named as well. A value that is not a finite number above `0` is refused at load.
+- **What you lose:** time. A certificate, CRL file or secret that enters its warn window after start
+  waits up to one interval plus up to two scans' duration for its first reminder, which spends part
+  of the lead `warn_days` gives.
+  The lead counts whole days, so the window opens `warn_days + 1` days before a certificate or CRL
+  expires or a secret's due day ends, and an interval of at least that can put the first reminder
+  after that point,
+  and at an interval of a year nothing is reminded until the next restart. `[cert_monitor]`'s
+  interval also throttles the handshake alert for a service caller's expiring client certificate,
+  so that alert repeats no more often than once per interval.
+- **What you keep:** the scan at each start, and the first handshake alert for each expiring client
+  certificate, which fires immediately whatever the interval. For `[secret_rotation]`, also the start-time expiry
+  checks the entry above describes; `[cert_monitor]` has no start-time check beyond its first scan.
+- **When acceptable:** an instance that restarts more often than the interval, or where something
+  outside the engine tracks the same credentials.
+- **Compensating controls:** a scheduled restart, that outside tracker, or a calendar entry per
+  credential.
+- **Reversible:** yes. Set the default or less, or delete the line, and restart.
 
 ### `[[alerts.rules]]` that send a credential reminder to no transport — the reminder is recorded but nobody is told
 Named as `alerts.rules`, with each rule's position, its `id`, and the reminder events it can match
@@ -1012,12 +1040,21 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
   With the switch off, those routes accept the session-wide step-up window instead. At least a
-  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  local sign-in that owes no further factor, unless the first-seen address check withholds the
+  window, a combined sign-in (a passkey one included) from any address, a TOTP
+  or recovery code on any session but an `oidc` one, and a passkey assertion that
   completes a pending factor with the user-verification flag, on any session but an `oidc` one,
   can open that window; that flag is
   the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
-  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
-  or export bodies in bulk with no fresh proof.
+  2026-11-14 amendment). The `step_up_max_age_seconds` row of [CONFIGURATION.md](CONFIGURATION.md)
+  says when that check withholds the window, and that it fails open, so the window opens, when the
+  sign-in carries no client address or the known-address record cannot be read. So a session taken over inside it can, with no fresh proof, at
+  least bind an authenticator, disable MFA where `[security].require_mfa` does not refuse the
+  disable, end the account's other sessions, reset another
+  account's password or factor, inject a message, export bodies in bulk, purge a queue or reload
+  config. CORRECTED 2026-11-26 (vault BACKLOG #8391): this read "At least a sign-in" and gave the
+  three consequences "bind an authenticator, inject a message or export bodies in bulk" as the
+  whole list.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short, keep
@@ -1074,7 +1111,7 @@ count is above `0` (vault BACKLOG #2613).
 > | Value | What loosens |
 > |---|---|
 > | `login_rate_limit_enabled = false` | Both sign-in limits, per address and across all clients, and the per-user limit on credential ceremonies. None is built. |
-> | `login_rate_limit_window_seconds` of `0` or less | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
+> | `login_rate_limit_window_seconds` of `0` | The same three are off. The limiter ages every attempt out before it counts it, while the enable switch still reads as on. |
 > | `login_rate_limit_window_seconds` below `60` | The same three admit their counts once per that window instead of once per minute. A tiny window, such as `1e-6`, admits nearly every attempt. |
 > | `login_rate_limit_per_ip = 0`, or above `10` | The per-address sign-in limit, and the per-user ceremony limit, which reads the same number. `0` turns both off. |
 > | `login_rate_limit_global = 0`, or above `60` | The all-clients sign-in limit. `0` turns it off. |
@@ -1082,18 +1119,20 @@ count is above `0` (vault BACKLOG #2613).
 > Each value above also loosens, the same way, the two audit-row budgets built on these keys:
 > the repeated-credential budget and the IdP step-up return's (controls 10 and 11 of the
 > [6.1.1 protection set](SECURITY.md#the-documented-protection-set-asvs-611), BACKLOG #2454,
-> #3965). On the step-up return's budget, `login_rate_limit_global = 0` also removes the page its
-> backstop raises when it stops a row. The report names only the limits in the table.
+> #3965). Control 11's row states what each value does to the step-up return's budget, its
+> backstop and page included. The report names only the limits in the table.
 >
 > The **credential ceremonies** are re-auth, password change, MFA enrolment, and the console's
 > second-factor step at sign-in (`POST /ui/mfa`); [SECURITY.md](SECURITY.md) lists the routes. With the
 > limiter off, a count or window changes nothing, so only `login_rate_limit_enabled` is named, and a
-> window of `0` or less likewise stands in for its counts. A short window is not named when every count
+> window of `0` likewise stands in for its counts. A short window is not named when every count
 > it paces is `0`, since it then paces nothing; each zeroed count is named instead. **The cutoff is the shipped default, not a
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
-> value at or stricter than the default is not reported. That includes a **negative** count, which
-> refuses *more* attempts, not fewer. A window that is not a number, or is infinite, does not load
+> value at or stricter than the default is not reported. A **negative** count or window does not load
+> (BACKLOG #5318): a negative per-address count refused every attempt after an address's first in a
+> window, a negative all-clients count refused every attempt, the first included, and a negative window aged
+> every attempt out, as `0` does. A window that is not a number, or is infinite, does not load
 > (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
 > the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
 > not load either, since a huge finite one does the same in practice. Both rules hold for
@@ -1152,9 +1191,9 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
 > No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
-> = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
+> = false`; a `phi_read_rate_limit_window_seconds` of `0` (off) or below `60` s (looser); a
 > `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
-> sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
+> sign-in: with the limiter off, or its window at `0`, its count is not named again.
 > `phi_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the default and it is
 > never named.
 - **What you lose:** the per-account pace on the PHI-read routes and console views
@@ -1164,6 +1203,27 @@ count is above `0` (vault BACKLOG #2613).
   client can reach. Prefer a modest raise to turning it off, and put it back afterwards.
 - **Compensating controls:** keep sessions short, restrict the operator surface with
   `[security].allowed_client_networks`, and review the PHI-access audit rows.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[auth].monitoring_read_rate_limit_*` looser than its default — monitoring reads go less paced
+> No sign-in condition applies (vault BACKLOG #1191, ASVS 15.2.2). Named:
+> `monitoring_read_rate_limit_enabled = false`; a `monitoring_read_rate_limit_window_seconds` below
+> `60` s; a `monitoring_read_rate_limit_per_actor` of `0` (off) or above `600`. The window cannot be
+> `0` or less (the load refuses it). With the limiter off, its parts are not named again.
+> `monitoring_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the
+> default and it is never named.
+- **What you lose:** the per-account pace on six `monitoring:read` GETs of the JSON API
+  ([SECURITY.md](SECURITY.md), *Monitoring-read pacing*, names them). One signed-in account can make
+  the engine rebuild the wiring graph and scan the store through those routes faster, up to as fast
+  as it answers. With the pace on, some of that work stays reachable unpaced: the `/ws/stats`
+  socket runs the outbox counts on every frame, and where the web console is served
+  (`[security].serve_web_console` on) that socket also runs the `GET /connections` dashboard read,
+  and the console's in-process reads reach the paced handlers uncharged. That section, *What it
+  does not charge*, says how.
+- **When acceptable:** a monitoring tool on one known account that polls faster than the default
+  allows, on a host no untrusted client can reach. Prefer a modest raise to turning it off.
+- **Compensating controls:** keep sessions short, and restrict who reaches the API with
+  `[security].allowed_client_networks`.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].admin_write_*` looser than its default — state-changing admin actions go less paced
@@ -1234,8 +1294,8 @@ count is above `0` (vault BACKLOG #2613).
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
-> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
-> is named as off; any cap above `5` is named as looser.
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` means unlimited, so it
+> is named as off; any cap above `5` is named as looser. A negative cap does not load (BACKLOG #5318).
 - **What you lose:** a new sign-in beyond the cap revokes the user's oldest live session. With a higher
   cap, or none, a stolen or forgotten session stays live beside the owner's for longer.
 - **When acceptable:** an account used from more devices or console instances than five, where each is
@@ -1246,8 +1306,8 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_flow_cache_max` above `512` — more pending federated sign-ins held in memory
 > **Conditional** on `[auth].oidc_enabled`, since the cache is built only with federation on
-> ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0` or
-> less refuses **every** federated sign-in. That is stricter, not looser, and it is not named. A cap above
+> ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0`
+> would refuse **every** federated sign-in; the load refuses a cap below `1` (BACKLOG #5318). A cap above
 > `512` is named. A very large one, such as `1e9`, removes the engine-wide bound in practice.
 - **What you lose:** each abandoned login start holds a slot until its time-to-live ends. A higher cap lets
   a flood of starts hold more memory before new ones are refused; the per-address cap still bounds one
@@ -1322,7 +1382,8 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].password_min_length` below `15` — a shorter local password
 > No other setting gates it: sign-in is always on, and every local account has a password (vault
-> BACKLOG #2600). `0` or less sets no length floor at all, and is named as off. The entry does not
+> BACKLOG #2600). `0` sets no length floor at all, and is named as off; a negative floor does not
+> load (BACKLOG #5318). The entry does not
 > quote the configured value.
 - **What you lose:** the password policy refuses a local password shorter than this when it is set. A
   lower floor leaves a guessing attack fewer candidates to try.
@@ -1335,7 +1396,7 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `[auth].oidc_*` lifetimes and skew looser than their defaults **with OIDC on** — federated sign-in accepts more
 > **Conditional** on `[auth].oidc_enabled` (vault BACKLOG #2600). With it off nothing reads these.
-> Each is named alone. Every entry but the `0`-or-less refetch one quotes the configured value and a
+> Each is named alone. Every entry but the `0` refetch one quotes the configured value and a
 > default.
 - **What you lose:**
   - `oidc_clock_skew_seconds` above `60` s accepts an expired id_token for that much longer, and lets
@@ -1600,9 +1661,13 @@ count is above `0` (vault BACKLOG #2613).
   no posture.
 - **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
-  carries its path token. **Setting the flag adds no check on the wire.**
+  URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
-  that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
+  that hop and adds a real check, where you hold the relay issuer's CRL, the `[tls]` policy reaches
+  the caller that builds the sink, and the relay's host is not loopback as `is_loopback_hop_host`
+  in `config/tls_policy.py` reads it, under which at least `localhost.` reads as remote; the
+  `alerts.email_tls_revocation_attested`
+  entry `security_loosenings()` prints names which callers hand that policy over. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
   its handshake fails. For the webhook no CRL can reach the hop, so the
   flag is the only way across, and the honest basis is the same as for the Vault hops: a
@@ -1631,11 +1696,21 @@ count is above `0` (vault BACKLOG #2613).
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
-  endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
-  to a `TlsSettings`.
+  endpoint's host, as `hop_url_host` takes it from the URL, is not loopback as
+  `is_loopback_hop_host` reads it, both in `config/tls_policy.py`. `hop_url_host` lowercases the
+  host and strips the brackets of an IPv6 host, so an endpoint URL holding `[::1]` reads as
+  loopback, though `is_loopback_hop_host` reads a raw `[::1]` as remote. Otherwise the host is
+  read as spelled, not where the endpoint runs: at least a spelling with a trailing dot, such as
+  `localhost.`, or a shortened IPv4 address such as `127.1` reads as remote, so an endpoint on
+  this machine spelled that way is judged below as any non-loopback endpoint is. In this entry,
+  "loopback" means this reading.
+  `messagefoundry serve`
+  hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
+  `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
+  embedder passes one as `tls_settings` or sets `app.state.tls_settings` to one.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
-  the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
+  the `[tls]` section never reached, such as a `create_managed_app` or a direct `create_app`
+  whose embedder handed it none.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
@@ -1644,14 +1719,18 @@ count is above `0` (vault BACKLOG #2613).
   unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
   crosses to whoever holds it. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527 a set
-  `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
-  endpoint on an engine started by `serve`, and there it is the other way across under
+  `[tls].crl_file` is checked on this hop where the first bullet says, for example a
+  non-loopback endpoint on an engine started by `serve`, and there it is the other way across under
   `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
-  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  issuer. It is instance-wide: once set, a non-loopback endpoint it reaches whose issuer has no CRL
   in that file fails its handshake, and this flag does not change that.
   For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
   main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
-  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
+  upstream's revocation itself needs no attestation when the endpoint URL spells its host as
+  loopback, in the first bullet's reading: a loopback endpoint is not refused. It is verified
+  against the OS roots alone, since a loopback endpoint takes neither `[tls]` file. Spelled so
+  that it reads as remote, it is judged like any non-loopback endpoint, and a proxy that applies
+  can carry it off the box.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
@@ -1666,7 +1745,7 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+- **Reversible:** yes. Delete both lines and restart. A non-loopback endpoint then refuses again,
   unless a set `[tls].crl_file` is checked on it, where the first bullet says (BACKLOG #5527):
   that hop crosses on its CRL, with or without this pair.
 
@@ -2099,9 +2178,11 @@ count is above `0` (vault BACKLOG #2613).
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
   `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
   prefix. The WARNING reads the resolved URL. The posture entry reads an `env()` URL against the
-  values the graph builds with, falling back to its literal `default=`. The `check` line does not
-  load the instance's environment values, so it reads the `default=` only, and misses a URL that
-  only the environment supplies. A lane the engine has not built (for example `auto_start=False`,
+  values the graph builds with, falling back to its literal `default=`. The `check` line reads it
+  against the environment values `build-check` loads, falling back the same way, when a settings
+  file or an environment declaration resolves and those values load. Otherwise it reads the
+  `default=` only, and misses a URL that only the environment supplies; its detail says which
+  reading ran. Both skip a URL whose value does not resolve, such as one whose cast fails. A lane the engine has not built (for example `auto_start=False`,
   or DR-parked) logs no WARNING until it is built or checked, though the posture entry and the
   `check` line still read its URL as above. A `deployed=False` outbound is never built or
   build-checked, so no WARNING fires for it, and both readers skip one whose `url` is `env()`, whose
@@ -2173,7 +2254,12 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
 - **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
   audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
-  `store_privilege` field carries the full observation.
+  `store_privilege` field carries the observation's status, excess list and detail. When the probe
+  also named grants it could not read, the entry lists them and says the excess list may be
+  incomplete (BACKLOG #6015). An entry without that clause is not proof the list is complete: at
+  least a failed SQL Server user-defined role enumeration is noted in the detail, and the audit
+  row's, rather than in the entry, and a SQL Server read with a fixed role unread skips that
+  enumeration without noting it.
 - **How it refuses:** by default under `enforce`. `[store].require_least_privilege = true`
   ([`CONFIGURATION.md`](CONFIGURATION.md)) makes the refusal outrank the opt-out and extends it to an
   unobservable probe. The refuse/warn split is `[security].enforcement`.
@@ -2365,10 +2451,12 @@ count is above `0` (vault BACKLOG #2613).
   - **Stopping can lose the last row and the last alert.** The read at stop has no later read.
     A row or an alert it cannot deliver is lost. Where the store or the sink refused it, its
     ERROR line still says the next pass will retry. The engine stops the reads late in its own
-    stop, after the message graph has stopped. It then gives them about 5 seconds to finish,
-    which covers a read already in progress as well as the read at stop. If they have not
-    finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING that
-    a row may be missing. A row cut off this way has no ERROR line. The engine then goes on
+    stop, after the message graph has stopped. It then gives them up to about 5 seconds to
+    finish, which covers a read already in progress as well as the read at stop. If they have
+    not finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING
+    that a row may be missing. Under `serve`, the shutdown's stop budget can cut each of those
+    two waits to about 0.1 seconds (BACKLOG #3191), so on a tight stop the read at stop may get
+    almost no time at all. [SERVICE.md](SERVICE.md#start--stop--status) says when, and which other stop waits the budget covers. The graph supervisor's wait is not one of them, but every stop step before the read, at least that wait and the stop of the message graph, leaves the read less of the budget. A row cut off this way has no ERROR line. The engine then goes on
     stopping, even if a read is still running. A read in progress that is cancelled this way
     keeps the read at stop from running at all. Refusals that no read had reached then get
     neither a row nor an alert. Their WARNING lines may remain, within the limits the **No file
@@ -2450,7 +2538,8 @@ count is above `0` (vault BACKLOG #2613).
   start has passed its remote-debugging gate, so a fleet refused at an earlier gate logs none.
   Where that gate refuses, `serve` and `supervise` log `remote_debug_unguarded` if the hook did not
   answer, and nothing for `remote_debug_enabled`. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
-  copy has it. No API reports that process afterwards. The engine's Python children start with the interface
+  copy has it. Where the gate refuses, `supervise` writes its `remote_debug_unguarded` line to
+  standard output, before the refusal, which goes to standard error. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
@@ -2602,7 +2691,8 @@ count is above `0` (vault BACKLOG #2613).
 ### `store_key_in_service_environment`, `service_environment_unobservable` and `secret_in_service_environment`: secrets in the Windows service's environment
 
 > **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
-> Windows service gets its environment. Vault BACKLOG #2595 and #2601.
+> Windows service gets its environment. Vault BACKLOG #2595 and #2601. A fourth entry,
+> `secret_from_outside_service_lists`, has its own bullet below.
 - **What they are about:** a Windows service's environment lists live in its registry key:
   NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
   `Environment` value. Who can read that key, and how that was measured, is stated once in
@@ -2630,17 +2720,17 @@ count is above `0` (vault BACKLOG #2613).
   credential in the secrets directory under the setting it stands for, or else to use
   `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
   the bare name `MEFOR_VALUE_`, rather than move it. They also
-  refuse a store key in their own environment when they found their service but could not read
-  its lists, since the key most likely came from there; another secret in their own environment is
-  not refused then.
+  refuse a store key or another engine secret in their own environment when they found their
+  service but could not read its lists, since it most likely came from there; a `MEFOR_VALUE_*`
+  variable in their own environment is not read then (vault BACKLOG #2595).
 - **`secret_in_service_environment`: what `serve` and `supervise` refuse, read where no refusal
   ran.** An application that builds the API without them, with `create_app` or
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
   is named, with the refusal's finding and remedy, only where the refusal would fire
   (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
   engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
-  variable is in that service's lists, or the lists could not be read and a store key is in the
-  engine's own environment. A
+  variable is in that service's lists, or the lists could not be read and a store key or another
+  engine secret is in the engine's own environment. A
   console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
   interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
   find its service there and this entry is not named. The reading is taken once per process, and
@@ -2658,8 +2748,9 @@ count is above `0` (vault BACKLOG #2613).
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
   service, an `nssm.exe` above a process that is neither Python nor `messagefoundry.exe`, or a
-  registry key it could not read. It starts unless the last case applies with a store key in its
-  environment. Check the lists yourself.
+  registry key it could not read. It starts unless the last case applies with a store key or
+  another engine secret in its environment, which refuses under every enforcement setting. Check
+  the lists yourself.
 - **How the engine finds its own service:** it walks up through the Python interpreter and
   `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks
   the Service Control Manager which service runs there. When that process is anything else, such
@@ -2676,11 +2767,21 @@ count is above `0` (vault BACKLOG #2613).
   it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
   environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
+- **`secret_from_outside_service_lists`: another engine secret reaches the service from outside
+  its lists.** An engine secret other than a store key is in the engine's own environment, the
+  engine read its service's lists, and it did not read the secret there, so it came from
+  somewhere else, such as the machine-wide environment or a `python.exe` wrapper. Where the
+  machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
+  factories refuse to start on it under `[security].enforcement = "enforce"`, and under `"warn"`
+  the engine starts and names it here. One the engine does not find there, such as a
+  `python.exe` wrapper's, is named here and not refused. A store key from outside the lists is named as
+  `store_key_in_service_environment` and not refused. The rule each follows is stated once, in
+  the `messagefoundry/serviceenv.py` module docstring. Move it to the secrets directory and
+  remove it from where it is set (vault BACKLOG #2595).
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   a variable named by a `[secrets].provider = "env"` reference, whose name only your config
-  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
-  other than a store key that reaches the engine from the machine-wide environment, which is
-  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable that
+  reaches the engine from the machine-wide environment, which is neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
   as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
   reference.
 
@@ -2730,7 +2831,7 @@ chapter was not part of the verification above.
 | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users`, `ad_session_revoke_max`, `ad_session_revoke_max_fraction` (directory revocation pace and its brake) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_reconcile_outage_passes` (the page on a directory outage, while revocation stops) | V7 Session Management · V16 Security Logging and Error Handling | **AC-2(3)** Disable Accounts · **SI-4(5)** System-Generated Alerts | §164.308(a)(3)(ii)(C) Termination Procedures · §164.312(b) Audit Controls |
 | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_jwks_min_refetch_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` (federated token acceptance) | V6 Authentication (6.8) | **IA-2** Identification and Authentication · **IA-8** Identification and Authentication (Non-Organizational Users) | §164.312(d) Person or Entity Authentication |
-| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
+| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, both `check_interval_seconds`, `[[alerts.rules]]` (credential reminders off, later, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (forwarded header trusted from a multi-address range, up to every peer) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
@@ -2744,7 +2845,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
-| `store_key_in_service_environment` / `service_environment_unobservable` / `secret_in_service_environment` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
+| `store_key_in_service_environment` / `service_environment_unobservable` / `secret_in_service_environment` / `secret_from_outside_service_lists` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

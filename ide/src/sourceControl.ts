@@ -11,7 +11,8 @@ import * as vscode from "vscode";
 import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
 import { configDir, run, workspaceDir, writerPathSetting } from "./cli";
-import { committedRelativePath } from "./workspaceContainment";
+import { CASE_RULE, committedRelativePath } from "./workspaceContainment";
+import { foldAsciiCase } from "./pathFold";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { sourceControlScript } from "./sourceControlWebview";
@@ -262,7 +263,8 @@ function hookPathValues(ws: string): { check: CheckPaths; hook: CheckPaths | und
   if (configRel === undefined || messagesRel === undefined) {
     const key = configRel === undefined ? "configDir" : "messageSetsDir";
     void vscode.window.showWarningMessage(
-      `MessageFoundry: messagefoundry.${key} names a path outside the workspace folder. The commit hook is ` +
+      `MessageFoundry: messagefoundry.${key} is not spelled as a path inside the workspace folder ${CASE_RULE}. ` +
+        "The commit hook is " +
         "committed to the repository, so it names folders inside the workspace only; no commit hook was set up.",
     );
     return { check, hook: undefined };
@@ -294,7 +296,7 @@ function isUncSpelling(p: string): boolean {
 }
 
 /**
- * Whether `ours` and `theirs` name one directory, compared by real path (case-folded on Windows).
+ * Whether `ours` and `theirs` name one directory, compared by real path (ASCII case folded on Windows).
  *
  * Asynchronous, so a slow or unreachable share cannot block the extension host (BACKLOG #5404 item
  * 1); the synchronous realpath did. `ours` is a path the extension derives from the workspace
@@ -304,10 +306,16 @@ function isUncSpelling(p: string): boolean {
  * workspace on a mapped drive still matches its UNC spelling, through the real path of `ours`.
  * Open limits: a `theirs` spelled locally that reaches a share is still opened when its real path is
  * read, at least through a link or a mapped drive letter, though no longer on the extension host's
- * own thread. Setup runs only in a trusted window, where the repository's code runs.
+ * own thread. Setup runs only in a trusted window, where the repository's code runs. Exported, with
+ * `win32` (by default, on Windows) choosing the fold, for the unit suite only.
  */
-async function sameDir(ours: string, theirs: string): Promise<boolean> {
-  const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
+export async function sameDir(
+  ours: string,
+  theirs: string,
+  win32: boolean = process.platform === "win32",
+): Promise<boolean> {
+  // ASCII A-Z only, not toLowerCase() (pathFold.ts, BACKLOG #5832).
+  const fold = (p: string): string => (win32 ? foldAsciiCase(p) : p);
   const real = async (p: string): Promise<string> => {
     try {
       return fold(await fs.promises.realpath(p));
@@ -595,13 +603,135 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
 // right before each baseline commit: staging before the prompts would leave the whole tree in the
 // index after a Cancel, one stray `git commit` away from history (BACKLOG #5413). The pre-flight
 // check reads the files on disk, not the index, so it needs nothing staged. The `.` pathspec keeps a
-// workspace that is a subfolder of a larger repository from staging its parent's changes.
+// workspace that is a subfolder of a larger repository from staging its parent's changes. Staged
+// files that setup's own gitignore entries match, and that the repository's own ignore rules still
+// ignore, are then taken back out ({@link unstageIgnored}).
 async function stageBaseline(bin: string, ws: string): Promise<boolean> {
   const res = await git(bin, ["add", "-A", "--", "."], ws);
   if (res.code !== 0) {
     logResult(`--- staging the baseline failed: git exit code ${res.code} ---`, res);
     void vscode.window.showErrorMessage(`MessageFoundry: could not stage the baseline — ${res.stderr.trim()}`);
     return false;
+  }
+  return unstageIgnored(bin, ws);
+}
+
+// The most paths, and the most characters of them, one `git rm --cached` call takes, so a long list
+// stays well under the Windows command-line limit of 32,767 characters.
+const UNSTAGE_BATCH_PATHS = 100;
+const UNSTAGE_BATCH_CHARS = 8000;
+
+/** `paths` in order, cut into batches of at most {@link UNSTAGE_BATCH_PATHS} paths and, where each
+ *  path is shorter than it, {@link UNSTAGE_BATCH_CHARS} characters. */
+function unstageBatches(paths: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let chars = 0;
+  for (const p of paths) {
+    if (batch.length > 0 && (batch.length >= UNSTAGE_BATCH_PATHS || chars + p.length > UNSTAGE_BATCH_CHARS)) {
+      batches.push(batch);
+      batch = [];
+      chars = 0;
+    }
+    batch.push(p);
+    chars += p.length + 1;
+  }
+  if (batch.length > 0) {
+    batches.push(batch);
+  }
+  return batches;
+}
+
+/** The exact names among setup's gitignore entries, with no wildcard or folder slash. */
+const LITERAL_ENTRIES = new Set(GITIGNORE_ENTRIES.filter((e) => !/[*?[\]/]/.test(e)));
+
+/** The Checks-channel summary of the paths left out: a count per top-level folder, and a top-level
+ *  file by name only when its name is one of setup's exact entries (such as the minted key). No
+ *  name below a top-level folder is printed. Open limit: a top-level folder's own name is printed
+ *  when it is printable ASCII, and a folder named from message data would show. */
+function unstagedSummary(paths: readonly string[]): string[] {
+  const counts = new Map<string, number>();
+  let otherFiles = 0;
+  for (const p of paths) {
+    const slash = p.indexOf("/");
+    if (slash >= 0) {
+      const head = `${p.slice(0, slash)}/`;
+      counts.set(head, (counts.get(head) ?? 0) + 1);
+    } else if (LITERAL_ENTRIES.has(p)) {
+      counts.set(p, 1);
+    } else {
+      otherFiles += 1;
+    }
+  }
+  const lines = [...counts].map(([head, n]) => {
+    // A folder name is shown only when it is printable ASCII, so it cannot forge or reorder a line.
+    const shown = /^[\x20-\x7e]+$/.test(head) ? head : "(a folder with an unprintable name)";
+    return head.endsWith("/") ? `  ${shown} (${n} file${n === 1 ? "" : "s"})` : `  ${shown}`;
+  });
+  if (otherFiles > 0) {
+    lines.push(`  ${otherFiles} other file(s) at the top level`);
+  }
+  return lines;
+}
+
+/** The paths `ls-files` printed with `-z`, or undefined after its failure is shown. Only the exit
+ *  code is logged: its output names paths, which can hold message content. */
+async function lsFiles(bin: string, ws: string, args: readonly string[]): Promise<Set<string> | undefined> {
+  const res = await git(bin, ["ls-files", "-z", "--cached", "--ignored", ...args, "--", "."], ws);
+  if (res.code !== 0) {
+    logChecks(`--- listing ignored staged files failed: git exit code ${res.code} ---`);
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not check the baseline for ignored files (git exit code ${res.code}).`,
+    );
+    return undefined;
+  }
+  return new Set(res.stdout.split("\0").filter((p) => p !== ""));
+}
+
+// `git add -A` never removes a path that is already in the index, so a file the user staged before
+// setup wrote the gitignore, such as the minted TLS key, would still go into the baseline (BACKLOG
+// #5413, #8237 item 2). So a staged path is taken back out of the index when both hold: the
+// repository's own ignore rules ignore it (`--exclude-standard`, so a `!` negation that re-includes
+// it, and each .gitignore's own base folder, are honoured), and one of setup's entries
+// (GITIGNORE_ENTRIES) matches it, so a file the user force-added under one of their own rules stays
+// staged. The file on disk is kept. Since the path is ignored, a later `git add -A` does not add it
+// back either: it stays out of every commit until someone runs `git add -f`. The Checks channel says
+// how many left before any is unstaged. A failure refuses the commit; the tree then stays staged, as
+// a failed commit already leaves it (#8237 item 4).
+async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
+  const byRules = await lsFiles(bin, ws, ["--exclude-standard"]);
+  if (byRules === undefined) {
+    return false;
+  }
+  const bySetup = byRules.size === 0 ? new Set<string>() : await lsFiles(bin, ws, GITIGNORE_ENTRIES.flatMap((p) => ["-x", p]));
+  if (bySetup === undefined) {
+    return false;
+  }
+  const ignored = [...byRules].filter((p) => bySetup.has(p));
+  if (ignored.length === 0) {
+    return true;
+  }
+  logChecks(
+    [
+      `Leaving out of the baseline ${ignored.length} staged file(s) that setup's .gitignore entries match ` +
+        "(kept on disk; `git add -f` adds one back):",
+      ...unstagedSummary(ignored),
+    ].join("\n"),
+  );
+  showChecks();
+  for (const batch of unstageBatches(ignored)) {
+    // --literal-pathspecs, so a file name holding `*` or `:(` names only itself. -f, because with no
+    // HEAD git refuses an index entry whose file changed since `add -A`, such as a live engine's log
+    // or store; --cached keeps the removal to the index, so the file itself is never touched.
+    const rm = await git(bin, ["--literal-pathspecs", "rm", "--cached", "-f", "-q", "--", ...batch], ws);
+    if (rm.code !== 0) {
+      // Only the exit code: git's message names the path it refused.
+      logChecks(`--- unstaging ignored files failed: git exit code ${rm.code} ---`);
+      void vscode.window.showErrorMessage(
+        `MessageFoundry: could not take ignored files out of the baseline (git exit code ${rm.code}).`,
+      );
+      return false;
+    }
   }
   return true;
 }

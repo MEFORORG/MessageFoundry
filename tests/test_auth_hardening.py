@@ -33,7 +33,7 @@ from starlette.datastructures import Address, Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _session_reaper
-from messagefoundry.auth import Role, hash_password
+from messagefoundry.auth import Role, hash_password, verify_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
 from messagefoundry.auth.service import (
@@ -763,7 +763,9 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     # leaking how many remain, which is the half an attacker with only the password can measure.
     codes = ["AAAA-1111", "BBBB-2222", "CCCC-3333"]
     # enable_totp needs a staged secret (BACKLOG #2224); this test never verifies a TOTP code.
-    staged_cell = await engine.store.set_totp_secret(user.id, secret="JBSWY3DPEHPK3PXP")
+    staged_cell = await engine.store.set_totp_secret(
+        user.id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
     assert await engine.store.enable_totp(
         user.id,
         expected_secret_cell=staged_cell,
@@ -1460,3 +1462,33 @@ def test_ldap_empty_password_never_binds(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(auth, "_service_conn", must_not_be_called)
     bind = auth.authenticate("someuser", "")
     assert bind.principal is None and bind.answer is None  # no lookup ran (BACKLOG #2434)
+
+
+async def test_login_with_an_unencodable_password_is_refused_at_the_boundary(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #6880: a JSON body's \ud800 escape decodes to a lone surrogate, which argon2-cffi's
+    # UTF-8 encode would refuse. The request model's ``str`` field refuses it first, so sign-in
+    # answers 422 and never reaches ``verify_password``; that function's own surrogate pre-check is
+    # defence in depth for any caller that skips the model. The raw body is sent by hand because httpx's own
+    # JSON encoder would refuse the surrogate before the request left.
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+    service = await _service(engine)
+    await _add(service, "dave", Role.VIEWER)
+    body = b'{"username": "dave", "password": "a-strong-\\ud800-passphrase", "provider": "local"}'
+    verified: list[str] = []
+
+    def _recording_verify(stored_hash: str, password: str) -> bool:
+        verified.append(password)
+        return verify_password(stored_hash, password)
+
+    monkeypatch.setattr("messagefoundry.auth.service.verify_password", _recording_verify)
+    async with _client(engine, service) as c:
+        r = await c.post("/auth/login", content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code == 422
+        # The one refusal is the password field's own unicode check, not some other field's rule.
+        errors = [(e["loc"], e["type"]) for e in r.json()["detail"]]
+        assert errors == [(["body", "password"], "string_unicode")]
+        assert verified == []  # refused before any verify ran
+        assert (await _login(c, "dave")).status_code == 200  # the account still signs in
+        assert verified == [PW]  # the probe sees a real sign-in, so the empty read above is real

@@ -8,21 +8,36 @@ for determinism."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import gzip
 import json
 import logging
 import os
 import sqlite3
+import stat
+import threading
 import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
     EgressSettings,
     RetentionSettings,
     StoreBackend,
     StoreSettings,
+)
+from messagefoundry.config.wiring import (
+    MLLP,
+    File,
+    Registry,
+    build_inbound_connection,
+    build_outbound_connection,
+    load_config,
 )
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -31,6 +46,7 @@ from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, OutboxStatus, open_store
 from messagefoundry.store.store import DbStatus, DiskFreeStatus
+from messagefoundry.transports.file import FileSource
 from tests._log_absence import assert_capture_sees
 
 DAY = 86_400.0
@@ -830,6 +846,69 @@ async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: Messa
     assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
 
 
+async def test_wal_cadence_survives_a_backward_wall_clock_step(store: MessageStore) -> None:
+    """BACKLOG #6526: the wall clock steps back a day after the first truncate, then both clocks
+    run forward a full cadence, and the third pass still truncates. Only the step makes the wall
+    clock read the cadence as unelapsed, so this fails on a wall-clock cadence for that reason
+    alone. The control is the second pass, one second short of the cadence, which does not."""
+    wall = {"t": 30 * DAY}
+    mono = {"t": 500.0}
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(wal_checkpoint_seconds=3600),
+        clock=lambda: wall["t"],
+        monotonic=lambda: mono["t"],
+    )
+    assert (await runner.run_once()).wal_checkpointed is True  # never run yet, so due at once
+    wall["t"] -= DAY
+    wall["t"] += 3599.0
+    mono["t"] += 3599.0
+    assert (await runner.run_once()).wal_checkpointed is False  # the control: not yet due
+    wall["t"] += 1.0
+    mono["t"] += 1.0
+    assert (await runner.run_once()).wal_checkpointed is True
+
+
+async def test_wal_cadence_ignores_an_explicit_now(store: MessageStore) -> None:
+    """``run_once(now=...)`` sets the retention windows, not the WAL cadence: two passes at the same
+    monotonic instant truncate once, whatever ``now`` each is handed."""
+    runner = RetentionRunner(
+        store, RetentionSettings(wal_checkpoint_seconds=3600), monotonic=lambda: 10.0
+    )
+    assert (await runner.run_once(now=30 * DAY)).wal_checkpointed is True
+    assert (await runner.run_once(now=40 * DAY)).wal_checkpointed is False
+
+
+async def test_a_capped_pass_leaves_the_wal_marker_unadvanced(store: MessageStore) -> None:
+    """A WAL truncate the #121 cap skips keeps the marker its last truncate set, so it stays due.
+    Pass 1 truncates at monotonic 0. Pass 2 is past the cadence but capped before the WAL phase,
+    and the marker stays 0. Pass 3 is uncapped and truncates, which it could not do had the skip
+    moved the marker to pass 2's reading."""
+    clock = {"start": 0.0, "later": 0.0, "first": True}
+
+    def mono() -> float:
+        # The pass reads `start` once as its start time; every later read is `later`.
+        if clock["first"]:
+            clock["first"] = False
+            return float(clock["start"])
+        return float(clock["later"])
+
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(max_pass_seconds=1, wal_checkpoint_seconds=3600),
+        monotonic=mono,
+    )
+    assert (await runner.run_once()).wal_checkpointed is True
+    assert runner._last_wal == 0.0
+    clock.update(start=5000.0, later=1e9, first=True)
+    result = await runner.run_once()
+    assert result.capped is True and result.wal_checkpointed is False
+    assert runner._last_wal == 0.0
+    clock.update(start=9000.0, later=9000.0, first=True)
+    result = await runner.run_once()
+    assert result.capped is False and result.wal_checkpointed is True
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -899,9 +978,9 @@ class _FollowerCoordinator(NullCoordinator):
 
 
 async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
-    """Track B Step 4: retention is a leader-only WRITE singleton. On a follower (is_leader False)
-    run_once returns an all-zero did-nothing pass and performs NO purge — so a delivered message that
-    is past the window stays intact, and no audit row is written."""
+    """Track B Step 4: retention's store phases are a leader-only WRITE singleton. On a follower
+    (is_leader False) run_once performs NO purge — so a delivered message that is past the window
+    stays intact — and, with no app-log phase configured, writes no audit row (BACKLOG #6526)."""
     mid, outbox_id = await _delivered(store, now=0.0)
     runner = RetentionRunner(
         store,
@@ -917,7 +996,7 @@ async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
     # Nothing purged: the raw body is still present, and no audit row was written.
     fetched = await store.get_message(mid)
     assert fetched is not None
-    assert fetched["raw"] is not None
+    assert fetched["raw"] == "MSH|^~\\&|raw-body"
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
 
 
@@ -933,7 +1012,8 @@ async def test_run_once_acts_as_leader_with_default_coordinator(store: MessageSt
 class _DemoteMidPurgeCoordinator(_FollowerCoordinator):
     """A coordinator that is leader for the FIRST ``is_leader()`` read (the top-of-pass gate) then NOT
     leader on subsequent reads — simulating leadership lost (a self-fence) BETWEEN the top gate and the
-    L1 pre-purge re-check, so the pass must abandon the purge without touching any PHI body."""
+    leadership read before the first purge phase (`_halt`, BACKLOG #6526), so the pass must abandon the
+    purge without touching any PHI body."""
 
     node_id = "demoting"
 
@@ -946,7 +1026,8 @@ class _DemoteMidPurgeCoordinator(_FollowerCoordinator):
 
 
 async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageStore) -> None:
-    """L1 pre-purge re-check: if leadership is lost BETWEEN the top-of-pass gate and the purges, the pass
+    """The read before the first purge phase: if leadership is lost BETWEEN the top-of-pass gate and the
+    purges, the pass
     returns a did-nothing result WITHOUT nulling any message body or writing an audit row — a demoted node
     must never purge PHI as a stale ex-leader (count-and-log: bodies stay for the new leader)."""
     mid, outbox_id = await _delivered(store, now=0.0)
@@ -962,7 +1043,7 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
 
     assert (
         coord._reads >= 2
-    )  # the top gate passed (leader) then the pre-purge re-check saw the demotion
+    )  # the top gate passed (leader) then the read before the first purge phase saw the demotion
     assert not result.did_work
     assert result.messages_purged == 0 and result.dead_purged == 0
     # The PHI body + the delivered payload are untouched; no audit row written.
@@ -972,6 +1053,1488 @@ async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageSt
     assert msg["summary"] is not None
     assert await _payload(store, outbox_id) == "OUT|delivered-body"  # payload intact
     assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
+
+
+async def _retention_audit_details(store: MessageStore) -> list[dict[str, Any]]:
+    return [json.loads(r["detail"]) for r in await store.list_audit(action="retention_purge")]
+
+
+def _hang_on_entry(
+    entered: asyncio.Event, release: asyncio.Event | None = None
+) -> Callable[..., Awaitable[int]]:
+    """A store call that sets ``entered`` and never returns, so a test can stop a pass in it.
+    Given ``release``, a cancelled call does not end until ``release`` is set."""
+
+    async def hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if release is not None:
+                await release.wait()
+            raise
+        return 0
+
+    return hangs
+
+
+async def test_a_pass_that_fails_after_a_purge_still_audits_the_purge(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: each purge phase commits on its own, so a later phase that raises must
+    not leave the earlier, already-committed body purge with no ``retention_purge`` row. The pass
+    still raises, and its row records the phases that finished and that it was interrupted."""
+    await _delivered(store, now=0.0)
+
+    async def state_purge_fails(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "purge_state", state_purge_fails)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [1]
+    assert details[0]["interrupted"] is True
+
+
+async def test_a_pass_stopped_after_a_purge_still_audits_the_purge(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: ``stop()`` cancels a running pass at once. A pass cancelled after its
+    body purge committed writes the ``retention_purge`` row for that purge before it ends."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+    finally:
+        await runner.stop()
+
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [1]
+    assert details[0]["interrupted"] is True
+
+
+class _SwitchableCoordinator(_FollowerCoordinator):
+    """A coordinator whose leadership a test flips between phases of one pass."""
+
+    node_id = "switchable"
+
+    def __init__(self) -> None:
+        self.leader = True
+
+    def is_leader(self) -> bool:
+        return self.leader
+
+
+async def test_leadership_lost_between_phases_stops_the_later_purges(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-45: every purge phase awaits the store, and leadership can be lost during
+    any of those awaits. A node demoted after its body purge must not go on to purge dead letters as
+    a stale ex-leader. The purge it already committed is still audited, and the row says why the
+    pass stopped."""
+    await _delivered(store, now=0.0)
+    _dead_mid, dead_row = await _dead(store, now=0.0)
+    coord = _SwitchableCoordinator()
+    real_purge = store.purge_message_bodies
+
+    async def purge_then_demote(*a: Any, **k: Any) -> int:
+        purged = await real_purge(*a, **k)
+        coord.leader = False
+        return purged
+
+    monkeypatch.setattr(store, "purge_message_bodies", purge_then_demote)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, dead_letter_days=1),
+        clock=lambda: 10 * DAY,
+        coordinator=coord,
+    )
+
+    result = await runner.run_once()
+
+    # The dead letter stays for the new leader.
+    assert await _payload(store, dead_row) == "OUT|dead-body"
+    # Both message rows were past the body window; the dead row's payload is the dead-letter phase's.
+    assert result.messages_purged == 2 and result.dead_purged == 0
+    assert result.leadership_lost
+    details = await _retention_audit_details(store)
+    assert [d["messages_purged"] for d in details] == [2]
+    assert details[0]["leadership_lost"] is True
+
+
+async def test_a_standby_sweeps_and_compresses_its_own_app_logs(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """BACKLOG #6526, S07-46: ``[logging].log_dir`` is each host's own directory, so a standby must
+    age out and compress its own application logs. It still purges nothing in the shared store: the
+    old message body stays for the leader. The deletion is audited like the leader's."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    to_delete = logs / "engine-old.log"
+    to_compress = logs / "engine-recent.log"
+    body = b"engine started\n" * 500
+    for p, age in ((to_delete, 10 * DAY), (to_compress, 5 * DAY)):
+        p.write_bytes(body)
+        os.utime(p, (now - age, now - age))
+    mid, _ = await _delivered(store, now=0.0)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, app_log_days=7, app_log_compress_days=3),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+
+    result = await runner.run_once()
+
+    assert not to_delete.exists()
+    assert not to_compress.exists()
+    assert gzip.decompress((logs / "engine-recent.log.gz").read_bytes()) == body
+    assert result.app_logs_deleted == 1 and result.app_logs_compressed == 1
+    assert result.standby and result.messages_purged == 0
+    msg = await store.get_message(mid)
+    assert msg is not None and msg["raw"] == "MSH|^~\\&|raw-body"
+    details = await _retention_audit_details(store)
+    assert len(details) == 1
+    assert details[0]["standby"] is True and details[0]["app_logs_deleted"] == 1
+    assert details[0]["messages_purged"] == 0
+
+
+async def test_a_standby_pass_that_fails_after_its_sweep_still_audits_the_sweep(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44 on a standby: the sweep's deletions are counted as soon as the sweep
+    ends, so compression failing after it still leaves a row recording them."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = logs / "engine-old.log"
+    old.write_text("x")
+    os.utime(old, (now - 10 * DAY, now - 10 * DAY))
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7, app_log_compress_days=3),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+
+    def compress_fails(*_a: object) -> tuple[int, int]:
+        raise OSError("volume went away")
+
+    monkeypatch.setattr(runner, "_compress_app_logs", compress_fails)
+
+    with pytest.raises(OSError, match="volume went away"):
+        await runner.run_once()
+
+    assert not old.exists()
+    details = await _retention_audit_details(store)
+    assert [d["app_logs_deleted"] for d in details] == [1]
+    assert details[0]["interrupted"] is True and details[0]["standby"] is True
+
+
+async def test_a_standby_pass_that_absorbed_its_cancel_deletes_no_log(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a standby whose disk-floor await swallowed the stop's cancel must not start
+    its app-log sweep once the stop may have returned, as the leader starts no further phase."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = logs / "engine-old.log"
+    old.write_text("x")
+    os.utime(old, (now - 10 * DAY, now - 10 * DAY))
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7),
+        clock=lambda: now,
+        coordinator=_FollowerCoordinator(),
+        log_dir=str(logs),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def absorbs_the_cancel() -> bool:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return False
+
+    monkeypatch.setattr(runner, "_check_disk_floor", absorbs_the_cancel)
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert old.exists()
+    assert await _retention_audit_details(store) == []
+
+
+async def test_a_pass_stopped_while_writing_its_audit_row_still_writes_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: a ``stop()`` that lands while the pass's own audit row is being
+    written cancels only the wait for the row, not the write."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(stopping, 10)  # stop() waits for the row still being written
+    finally:
+        release.set()
+        await runner.stop()
+
+    assert [d["messages_purged"] for d in await _retention_audit_details(store)] == [1]
+
+
+async def test_a_pass_stopped_inside_a_purge_names_the_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: a purge cancelled while its COMMIT is in flight may have committed,
+    and its count is lost with the call. The pass writes its row even with nothing else done,
+    naming the phase it ended in."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+
+    monkeypatch.setattr(store, "purge_message_bodies", _hang_on_entry(entered))
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+    finally:
+        await runner.stop()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["messages"]
+    assert details[0]["interrupted"] is True and details[0]["messages_purged"] == 0
+
+
+async def test_a_strip_that_raises_partway_is_audited_with_its_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-44: the embedded-document strip commits batch by batch, so one that
+    raises may have stripped documents its count never reports. The pass writes its row even with
+    nothing else done, naming the phase it ended in."""
+    runner = RetentionRunner(store, RetentionSettings(), clock=lambda: 10 * DAY)
+    monkeypatch.setattr(runner, "_resolve_document_prune", lambda: ({"c1": 1}, {"c1": 1024}, {}))
+
+    async def strip_fails(*_a: object, **_k: object) -> object:
+        raise RuntimeError("cipher ceiling reached")
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip_fails)
+
+    with pytest.raises(RuntimeError, match="cipher ceiling reached"):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["documents_strip"]
+    assert details[0]["interrupted"] is True and details[0]["documents_stripped"] == 0
+
+
+async def test_leadership_lost_during_one_strip_threshold_skips_the_next(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526, S07-45: each prune threshold is its own store call of many batches, so a
+    node demoted during one does not go on to strip the next as a stale ex-leader."""
+    from messagefoundry.store.document_strip import StripResult
+
+    coord = _SwitchableCoordinator()
+    runner = RetentionRunner(store, RetentionSettings(), clock=lambda: 10 * DAY, coordinator=coord)
+    monkeypatch.setattr(
+        runner,
+        "_resolve_document_prune",
+        lambda: ({"c1": 1, "c2": 1}, {"c1": 1024, "c2": 4096}, {}),
+    )
+    calls: list[int] = []
+
+    async def strip_then_demote(*_a: object, min_bytes: int, **_k: object) -> StripResult:
+        calls.append(min_bytes)
+        coord.leader = False
+        return StripResult(messages_stripped=1, documents_stripped=1, bytes_reclaimed=10)
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip_then_demote)
+
+    result = await runner.run_once()
+
+    assert calls == [1024]
+    assert result.leadership_lost and result.documents_stripped == 1
+
+
+@pytest.mark.parametrize(
+    ("settings", "method", "phase"),
+    [
+        (RetentionSettings(max_db_mb=1), "db_status", "size_check"),
+        (RetentionSettings(vacuum_at="00:00"), "vacuum", "vacuum"),
+    ],
+)
+async def test_a_read_only_phase_that_fails_writes_no_audit_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    settings: RetentionSettings,
+    method: str,
+    phase: str,
+) -> None:
+    """BACKLOG #6526: a size check or VACUUM changes no data, so one that keeps failing must not
+    add an interrupted row with zero counts every interval. The failure is logged instead."""
+
+    async def fails(*_a: object, **_k: object) -> object:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, method, fails)
+    runner = RetentionRunner(store, settings, clock=lambda: 10 * DAY)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=retention_mod.__name__),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        await runner.run_once()
+
+    assert await _retention_audit_details(store) == []
+    assert [r for r in caplog.records if f"in its {phase} phase" in r.getMessage()]
+
+
+async def test_stop_bounds_its_wait_for_a_hung_audit_write_to_one_budget(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: on a store that cannot take the audit write, ``stop()`` waits for the
+    interrupted pass's row once, within one budget, not once inside the pass and again in the drain,
+    so engine.stop() stays well inside NSSM's stop timeout."""
+    budget = 0.3
+    monkeypatch.setattr(retention_mod, "_AUDIT_WRITE_WAIT_SECONDS", budget)
+    monkeypatch.setattr(retention_mod, "_STOP_WAIT_SECONDS", budget)
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def record_hangs(*_a: object, **_k: object) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", record_hangs)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        started = time.monotonic()
+        await runner.stop()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert elapsed < budget * 1.7
+
+
+async def test_a_cancelled_stop_caller_still_drains_the_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a cancellation of the task awaiting ``stop()`` must not skip the wait for an
+    audit row still being written; the drain runs, within its budget, before the cancellation goes
+    on."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stopping = asyncio.create_task(runner.stop())
+        await asyncio.sleep(0)
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        # The row is written by the time the cancellation reaches the caller.
+        assert [d["messages_purged"] for d in await _retention_audit_details(store)] == [1]
+    finally:
+        release.set()
+        await runner.stop()
+
+
+async def test_a_second_concurrent_stop_waits_for_the_interrupted_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: two ``stop()`` calls at once share one stop, so the second does not return
+    before the cancelled pass has even started its interrupted audit row."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    written: list[str] = []
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> None:
+        await asyncio.sleep(0.05)
+        await real_record(*a, **k)
+        written.append("row")
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop())
+    second = asyncio.create_task(runner.stop())
+    try:
+        await second
+        # Read before anything else awaits: the second stop waited for the row to be written.
+        assert written == ["row"]
+    finally:
+        await asyncio.wait_for(first, 10)
+    details = await _retention_audit_details(store)
+    assert [d["interrupted"] for d in details] == [True]
+
+
+async def test_stop_holds_to_the_timeout_it_is_handed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: engine.stop() hands retention a share of its stop budget, which can be well
+    under ``_STOP_WAIT_SECONDS``; a hung audit write must not hold the stop past it."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def record_hangs(*_a: object, **_k: object) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", record_hangs)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        started = time.monotonic()
+        await runner.stop(timeout=0.2)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert elapsed < 0.2 * 1.7
+
+
+async def test_a_stop_after_a_restart_mid_stop_cancels_the_new_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: stop, start, stop. A start while the first stop is still draining spawns a
+    new loop, and the second stop must cancel that loop rather than share the first stop, which
+    took only the old one."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> Any:
+        await release.wait()
+        return await real_record(*a, **k)
+
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered))
+    monkeypatch.setattr(store, "record_audit", slow_record)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop())
+    for _ in range(100):
+        if runner._task is None:
+            break
+        await asyncio.sleep(0)
+    assert runner._task is None  # the first stop has taken the old loop
+    runner.start()
+    new_loop = runner._task
+    assert new_loop is not None
+    second = asyncio.create_task(runner.stop())
+    try:
+        release.set()
+        await asyncio.wait_for(second, 10)
+        assert new_loop.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await runner.stop()
+
+
+async def test_a_stop_cut_by_its_timeout_says_the_pass_may_still_be_running(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: the stop budget wins over the work it cuts (owner ruling 2026-11-22), so a
+    stop whose timeout runs out with the loop not ended returns anyway. The log must say the pass
+    may still be running and that its interrupted audit row may not be written."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            await runner.stop(timeout=0.1)
+        assert not loop_task.done()
+    finally:
+        release.set()
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [
+        m
+        for m in messages
+        if "may still be running" in m and "interrupted audit row may not be written" in m
+    ], messages
+
+
+async def test_a_stop_that_joins_a_stop_in_progress_holds_to_its_own_timeout(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop() that finds a stop already under way shares it, but returns within
+    its own timeout; the shared stop runs on for the earlier caller, within that caller's."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=2.0))
+    await asyncio.sleep(0)
+    try:
+        started = time.monotonic()
+        await runner.stop(timeout=0.1)
+        elapsed = time.monotonic() - started
+        assert not first.done()  # the shared stop is still running for the first caller
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    assert elapsed < 0.1 * 5
+
+
+async def test_a_cancelled_stop_caller_retrieves_the_loops_failure(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: when the caller of stop() is cancelled, the shared stop's exception (the
+    loop's failure) is retrieved and logged by retention, so no task exception goes unretrieved."""
+    entered = asyncio.Event()
+
+    async def sleep_then_fail(_delay: float) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            raise RuntimeError("the retention loop broke") from None
+
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    monkeypatch.setattr(runner, "_sleep", sleep_then_fail)
+    runner.start()
+    await asyncio.wait_for(entered.wait(), 10)
+    stopping = asyncio.create_task(runner.stop())
+    await asyncio.sleep(0)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.retention"):
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    shared = runner._stopping
+    assert shared is not None and shared.done()
+    # Retention's own log, not asyncio's "exception in shielded future" fallback.
+    messages = [
+        r.getMessage() for r in caplog.records if r.name == "messagefoundry.pipeline.retention"
+    ]
+    assert [m for m in messages if "the retention loop broke" in m], messages
+
+
+async def test_run_once_after_stop_waits_for_its_interrupted_row_as_a_normal_pass(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a pass ending partway skips its own wait for the audit row only while a stop
+    is in progress, since the stop's drain waits instead. Once stop() has returned, a run_once()
+    is a normal pass again and waits for its row before its exception goes on."""
+    await _delivered(store, now=0.0)
+    written: list[str] = []
+    real_record = store.record_audit
+
+    async def slow_record(*a: Any, **k: Any) -> None:
+        await asyncio.sleep(0.05)
+        await real_record(*a, **k)
+        written.append("row")
+
+    async def state_purge_fails(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    await runner.stop()
+    monkeypatch.setattr(store, "purge_state", state_purge_fails)
+    monkeypatch.setattr(store, "record_audit", slow_record)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.run_once()
+    assert written == ["row"]
+
+
+async def test_the_drain_error_names_the_time_it_waited(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: the drain gets what the loop's exit left of the stop's budget, so its ERROR
+    line names that wait, not the whole budget."""
+    budget = 0.4
+    monkeypatch.setattr(retention_mod, "_STOP_WAIT_SECONDS", budget)
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def purge_slow_to_cancel(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.25)
+            raise
+        return 0
+
+    async def record_hangs(*_a: object, **_k: object) -> None:
+        await release.wait()
+
+    monkeypatch.setattr(store, "purge_state", purge_slow_to_cancel)
+    monkeypatch.setattr(store, "record_audit", record_hangs)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.retention"):
+            await runner.stop()
+    finally:
+        release.set()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    [record] = [r for r in caplog.records if "audit row write" in r.getMessage()]
+    assert isinstance(record.args, tuple)
+    waited = record.args[0]
+    assert isinstance(waited, float) and waited < budget - 0.15, record.getMessage()
+
+
+@pytest.mark.parametrize("then", ["stop", "start"])
+async def test_a_loop_that_outlived_its_stop_is_not_released_by_a_later_one(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout leaves its loop running. A later stop() or start()
+    must not clear the signal that loop reads, or a loop whose cancel was absorbed goes round again
+    and purges after the engine has stopped. Each loop keeps the signal it was started with."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    callers: list[asyncio.Task[Any] | None] = []
+
+    async def absorbs_the_first_cancel(*_a: object, **_k: object) -> int:
+        callers.append(asyncio.current_task())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if len(callers) > 1:
+                raise
+            await release.wait()
+        return 0
+
+    monkeypatch.setattr(store, "purge_state", absorbs_the_first_cancel)
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    old_loop = runner._task
+    assert old_loop is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        assert not old_loop.done()
+        if then == "stop":
+            await runner.stop(timeout=0.1)
+        else:
+            runner.start()
+        release.set()
+        await asyncio.wait({old_loop}, timeout=5)
+        assert [t for t in callers if t is old_loop] == [old_loop]
+        assert old_loop.done()
+    finally:
+        release.set()
+        old_loop.cancel()
+        await asyncio.gather(old_loop, return_exceptions=True)
+        await runner.stop()
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
+async def test_a_pass_that_absorbed_its_cancel_starts_no_further_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout returns while the pass runs on. A pass whose store
+    call swallowed the cancel must not go on to start the phases after it once the stop may have
+    returned and the store may be closing."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    later: list[str] = []
+
+    async def absorbs_the_cancel(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return 0
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("connection_events")
+        return 0
+
+    monkeypatch.setattr(store, "purge_state", absorbs_the_cancel)
+    monkeypatch.setattr(store, "purge_connection_events", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(
+            messages_days=1, state_max_age_days=1, connection_event_retention_hours=1
+        ),
+        clock=lambda: 10 * DAY,
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert later == []
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [(d["interrupted"], d["messages_purged"]) for d in details] == [(True, 1)]
+
+
+async def test_a_stop_that_cannot_wait_out_an_earlier_stop_says_so(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: stop, start, stop. The second stop waits for the first only within its own
+    timeout; when it returns with the first still under way, it says the pass may still run. It
+    stopped the new loop rather than joining the first stop, so it does not say it joined one."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    old_loop = runner._task
+    assert old_loop is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=5.0))
+    await asyncio.sleep(0)
+    assert runner._task is None  # the first stop has taken the old loop
+    runner.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            await runner.stop(timeout=0.1)
+        assert not first.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({old_loop}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [m for m in messages if "joined a stop already under way" in m], messages
+    assert [m for m in messages if "earlier stop" in m and "may still be running" in m], messages
+
+
+async def test_run_once_after_a_cut_stop_waits_for_its_interrupted_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout leaves its own loop told to stop. A pass that
+    run_once() runs outside that loop is not that loop's, so it waits for its own row."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    written: list[str] = []
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        await _delivered(store, now=0.0, control="CID-AGAIN")
+        real_record = store.record_audit
+
+        async def slow_record(*a: Any, **k: Any) -> None:
+            await asyncio.sleep(0.05)
+            await real_record(*a, **k)
+            written.append("row")
+
+        async def state_purge_fails(*_a: object, **_k: object) -> int:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(store, "purge_state", state_purge_fails)
+        monkeypatch.setattr(store, "record_audit", slow_record)
+        with pytest.raises(sqlite3.OperationalError):
+            await runner.run_once()
+        assert written == ["row"]
+    finally:
+        release.set()
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("settings", "method"),
+    [
+        (RetentionSettings(messages_days=1), "purge_message_bodies"),
+        (RetentionSettings(state_max_age_days=1), "purge_state"),
+    ],
+)
+async def test_a_single_transaction_purge_that_fails_writes_no_audit_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: RetentionSettings,
+    method: str,
+) -> None:
+    """BACKLOG #6526: a purge that runs in one transaction and raises an error has rolled back,
+    so a pass that ends in it with nothing else done committed nothing. One failing every interval
+    must not add a row of zeros each time, nor hold each pass for the audit write. The error still
+    goes to the caller, which the loop logs."""
+
+    async def fails(*_a: object, **_k: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, method, fails)
+    runner = RetentionRunner(store, settings, clock=lambda: 10 * DAY)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await runner.run_once()
+
+    assert await _retention_audit_details(store) == []
+
+
+async def test_an_interrupted_pass_names_no_phase_that_never_ran(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: ``interrupted_phase`` names the phase that was working when the pass ended.
+    A fault between phases, resolving the document windows say, comes after the body purge ended
+    and before the strip began. It must not be blamed on the body purge, which finished, nor on the
+    dead-letter phase, which is off and never ran."""
+    await _delivered(store, now=0.0)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+
+    def resolve_fails() -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
+        raise RuntimeError("registry read failed")
+
+    monkeypatch.setattr(runner, "_resolve_document_prune", resolve_fails)
+
+    with pytest.raises(RuntimeError, match="registry read failed"):
+        await runner.run_once()
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == [None]
+    assert details[0]["interrupted"] is True and details[0]["messages_purged"] == 1
+
+
+async def test_a_cancelled_stop_that_joined_one_under_way_says_the_pass_may_still_run(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6526: a caller that joins a stop already under way and is cancelled returns
+    within its own timeout like one that is not, and must say so the same way."""
+    await _delivered(store, now=0.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(store, "purge_state", _hang_on_entry(entered, release))
+    runner = RetentionRunner(
+        store, RetentionSettings(messages_days=1, state_max_age_days=1), clock=lambda: 10 * DAY
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    await asyncio.wait_for(entered.wait(), 10)
+    first = asyncio.create_task(runner.stop(timeout=5.0))
+    await asyncio.sleep(0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+            joiner = asyncio.create_task(runner.stop(timeout=0.1))
+            await asyncio.sleep(0.02)
+            joiner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await joiner
+        assert not first.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(first, 10)
+        await asyncio.wait({loop_task}, timeout=10)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert [
+        m
+        for m in messages
+        if "joined a stop already under way" in m
+        and "cancelled" in m
+        and "may still be running" in m
+    ], messages
+
+
+async def test_a_late_demotion_seen_by_the_archive_worker_matches_the_row(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6526: the `.processed` sweep reads its stop callable on a worker thread, which runs
+    on after the pass is cancelled. A demotion that thread sees once the interrupted row is written
+    must not log the leadership loss that row does not record: the log and the row's
+    ``leadership_lost`` come from one value."""
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    in_worker = asyncio.Event()
+    let_worker_read = threading.Event()
+    worker_done = threading.Event()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        node_id = "late-demotion"
+
+        def __init__(self) -> None:
+            pass
+
+        def is_leader(self) -> bool:
+            if threading.get_ident() == loop_thread:
+                return True
+            loop.call_soon_threadsafe(in_worker.set)
+            let_worker_read.wait(10)
+            return False
+
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def prune(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        def work() -> int:
+            try:
+                deadline_hit()
+            finally:
+                worker_done.set()
+            return 0
+
+        return await asyncio.to_thread(work)
+
+    monkeypatch.setattr(src, "prune_processed_archive", prune)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=_WorkerSeesDemotion(),
+        archive_source=lambda: (src,),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        pass_task = asyncio.create_task(runner.run_once())
+        try:
+            await asyncio.wait_for(in_worker.wait(), 10)
+            pass_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pass_task
+            await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+        finally:
+            let_worker_read.set()
+            await asyncio.to_thread(worker_done.wait, 10)
+
+    details = await _retention_audit_details(store)
+    assert [d["interrupted_phase"] for d in details] == ["processed_archives"]
+    logged = [r for r in caplog.records if "lost cluster leadership" in r.getMessage()]
+    assert bool(logged) == details[0]["leadership_lost"], (logged, details)
+
+
+async def _stop_a_sweep_whose_archive_absorbs_it(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coordinator: NullCoordinator | None = None,
+    *,
+    then: int = 0,
+) -> list[dict[str, Any]]:
+    """Stop the loop while its first archive's sweep runs; that sweep reads its stop callable on a
+    worker thread, swallows the cancel and reports 2 deleted. ``then`` more archives follow it,
+    which must never be swept. Returns the retention audit rows."""
+    entered = asyncio.Event()
+    later: list[str] = []
+    sources = [
+        FileSource(
+            Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / f"in{i}")})
+        )
+        for i in range(1 + then)
+    ]
+
+    async def absorbs_the_cancel(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        await asyncio.to_thread(deadline_hit)
+        entered.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        return 2
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("later archive")
+        return 0
+
+    monkeypatch.setattr(sources[0], "prune_processed_archive", absorbs_the_cancel)
+    for src in sources[1:]:
+        monkeypatch.setattr(src, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=coordinator,
+        archive_source=lambda: tuple(sources),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=2)
+        assert loop_task.done()
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    assert later == []
+    return await _retention_audit_details(store)
+
+
+async def test_a_sweep_whose_only_archive_absorbed_the_stop_ends_the_pass_in_that_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: when the last archive's sweep swallows the cancel, the stop is re-read once
+    the sweep returns, so the pass ends inside the `.processed` phase with its count, rather than
+    at whichever later phase reads the stop next.
+
+    Mutation: delete the `_raise_if_stopped()` after `_prune_processed_archives` in `run_once`.
+    Red: the row names no phase."""
+    details = await _stop_a_sweep_whose_archive_absorbs_it(store, monkeypatch, tmp_path)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 2)]
+
+
+@pytest.mark.parametrize("then", [0, 1], ids=["after-the-sweep", "before-the-next-archive"])
+async def test_a_demotion_the_archive_worker_saw_before_the_stop_is_in_the_row(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    then: int,
+) -> None:
+    """BACKLOG #6526: a demotion the `.processed` sweep's worker read before the stop that ends the
+    pass inside that phase is latched on the way out, whether the stop is read once the sweep
+    returns or before its next archive, so the interrupted row records the loss and the loss is
+    logged."""
+    loop_thread = threading.get_ident()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        def is_leader(self) -> bool:
+            return threading.get_ident() == loop_thread
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        details = await _stop_a_sweep_whose_archive_absorbs_it(
+            store, monkeypatch, tmp_path, _WorkerSeesDemotion(), then=then
+        )
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 2)]
+    assert details[0]["leadership_lost"] is True
+    assert any("lost cluster leadership" in r.getMessage() for r in caplog.records)
+
+
+async def _stop_the_loop_once_entered(
+    runner: RetentionRunner, entered: asyncio.Event, store: MessageStore
+) -> list[dict[str, Any]]:
+    """Start ``runner``'s loop, stop it once ``entered`` is set, and return the retention audit
+    rows after every audit write has ended."""
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=2)
+        assert loop_task.done()
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    return await _retention_audit_details(store)
+
+
+async def test_a_demotion_the_archive_worker_saw_is_in_the_row_when_the_cancel_leaves_the_sweep(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6526: when the cancel is not absorbed, so `CancelledError` leaves the archive's
+    sweep and no count is reported, a demotion the sweep's worker read before it is still latched
+    on the way out of the phase.
+
+    Mutation: move the `_demoted(seen=True)` latch out of the `finally` and into `_archive_tally`.
+    Red: `leadership_lost` is False, because no archive's count is ever reported."""
+    loop_thread = threading.get_ident()
+
+    class _WorkerSeesDemotion(_FollowerCoordinator):
+        def is_leader(self) -> bool:
+            return threading.get_ident() == loop_thread
+
+    entered = asyncio.Event()
+    source = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")})
+    )
+
+    async def cancelled_inside(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        await asyncio.to_thread(deadline_hit)
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable: the wait above only ends on a cancel")
+
+    monkeypatch.setattr(source, "prune_processed_archive", cancelled_inside)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        coordinator=_WorkerSeesDemotion(),
+        archive_source=lambda: (source,),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        details = await _stop_the_loop_once_entered(runner, entered, store)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 0)]
+    assert details[0]["leadership_lost"] is True
+    assert any("lost cluster leadership" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_pass_a_phase_absorbed_the_stop_in_is_audited_as_interrupted_when_the_cap_halts_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6526: a phase other than the `.processed` sweep can absorb the stop's cancel and
+    return. If the cap then halts the pass, no later phase starts to re-read the stop, so the pass
+    re-reads it before it tallies: it ends on the cancellation and its row is marked interrupted,
+    rather than returning as a finished pass that audits after stop() may have returned."""
+    entered = asyncio.Event()
+    mono = {"t": 0.0}
+    orig_wal = store.wal_checkpoint
+
+    async def absorbs_the_cancel() -> bool:
+        finished = await orig_wal()
+        entered.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        mono["t"] = 100.0  # the phase overruns the 5s cap, so no later phase starts
+        return finished
+
+    monkeypatch.setattr(store, "wal_checkpoint", absorbs_the_cancel)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(max_pass_seconds=5, wal_checkpoint_seconds=1),
+        clock=lambda: 100 * DAY,
+        monotonic=lambda: mono["t"],
+    )
+    details = await _stop_the_loop_once_entered(runner, entered, store)
+    assert [(d["interrupted"], d["interrupted_phase"], d["capped"]) for d in details] == [
+        (True, None, True)
+    ]
+
+
+async def test_a_sweep_whose_archive_absorbed_the_cancel_starts_no_further_archive(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: a stop cut by its timeout returns while the `.processed` sweep runs on. When
+    one archive's sweep swallows the cancel, the sweep must not start the next archive once the
+    stop may have returned: it reads the loop's stop on the event loop before each archive."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    later: list[str] = []
+    first = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "a")}))
+    second = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "b")})
+    )
+
+    async def absorbs_the_cancel(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return 0
+
+    async def records(*_a: object, **_k: object) -> int:
+        later.append("second archive")
+        return 0
+
+    monkeypatch.setattr(first, "prune_processed_archive", absorbs_the_cancel)
+    monkeypatch.setattr(second, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (first, second),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        assert later == []
+        assert loop_task.done()
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [(d["interrupted"], d["interrupted_phase"]) for d in details] == [
+        (True, "processed_archives")
+    ]
+
+
+async def test_an_archive_that_absorbed_the_cancel_stops_its_worker_at_the_loops_stop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: an archive whose sweep swallows the cancel leaves the sweep's own cancel flag
+    clear, so the stop callable its worker thread reads between files must carry the loop's stop:
+    the worker stops once stop() has returned instead of deleting on."""
+    loop = asyncio.get_running_loop()
+    in_worker = asyncio.Event()
+    give_up = threading.Event()
+    saw_stop: list[bool] = []
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def absorbs_the_cancel(
+        _older_than: float, *, protected: object, deadline_hit: Callable[[], bool]
+    ) -> int:
+        def work() -> int:
+            loop.call_soon_threadsafe(in_worker.set)
+            while not give_up.is_set():
+                if deadline_hit():
+                    saw_stop.append(True)
+                    return 0
+                time.sleep(0.01)
+            saw_stop.append(False)
+            return 0
+
+        worker = asyncio.ensure_future(asyncio.to_thread(work))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            return await worker
+
+    monkeypatch.setattr(src, "prune_processed_archive", absorbs_the_cancel)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (src,),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(in_worker.wait(), 10)
+        await runner.stop(timeout=0.1)
+        await asyncio.wait({loop_task}, timeout=2)
+        assert saw_stop == [True], "the archive's worker swept on after the loop's stop"
+    finally:
+        give_up.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("absorbs", [True, False], ids=["absorbed", "cancelled"])
+async def test_a_sweep_stopped_partway_audits_what_it_deleted(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, absorbs: bool
+) -> None:
+    """BACKLOG #6526: a stop partway through the `.processed` sweep must not drop the count of the
+    archives that finished: the interrupted row states what was deleted."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sources = [
+        FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / n)}))
+        for n in ("a", "b", "c")
+    ]
+
+    async def deletes_three(*_a: object, **_k: object) -> int:
+        return 3
+
+    async def hangs(*_a: object, **_k: object) -> int:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if not absorbs:
+                raise
+            await release.wait()
+        return 0
+
+    async def deletes_one(*_a: object, **_k: object) -> int:
+        return 1
+
+    for src, prune in zip(sources, (deletes_three, hangs, deletes_one), strict=True):
+        monkeypatch.setattr(src, "prune_processed_archive", prune)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: tuple(sources),
+    )
+    runner.start()
+    loop_task = runner._task
+    assert loop_task is not None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await runner.stop(timeout=0.1)
+        release.set()
+        await asyncio.wait({loop_task}, timeout=5)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    finally:
+        release.set()
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+
+    details = await _retention_audit_details(store)
+    assert [
+        (d["interrupted"], d["interrupted_phase"], d["processed_archives_deleted"]) for d in details
+    ] == [(True, "processed_archives", 3)]
+
+
+async def test_a_pass_stopped_before_the_sweep_deletes_names_no_archive_phase(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6526: the `.processed` sweep's prelude only reads (it lists the directories it must
+    not reach). A pass stopped there has not started deleting, so it names no running phase, and
+    with nothing else done writes no audit row."""
+    in_prelude = threading.Event()
+    let_go = threading.Event()
+    real_keys = retention_mod._archive_keys
+
+    def slow_keys(*a: Any, **k: Any) -> Any:
+        in_prelude.set()
+        let_go.wait(10)
+        return real_keys(*a, **k)
+
+    swept: list[str] = []
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "in")}))
+
+    async def records(*_a: object, **_k: object) -> int:
+        swept.append("swept")
+        return 0
+
+    monkeypatch.setattr(retention_mod, "_archive_keys", slow_keys)
+    monkeypatch.setattr(src, "prune_processed_archive", records)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(processed_archive_days=30),
+        clock=lambda: 100 * DAY,
+        archive_source=lambda: (src,),
+    )
+    pass_task = asyncio.create_task(runner.run_once())
+    try:
+        await asyncio.to_thread(in_prelude.wait, 10)
+        pass_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pass_task
+        await asyncio.gather(*runner._audit_tasks, return_exceptions=True)
+    finally:
+        let_go.set()
+
+    assert swept == []
+    assert await _retention_audit_details(store) == []
 
 
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:
@@ -1074,7 +2637,7 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     result = await runner.run_once()
 
     assert result.wal_checkpointed is True  # ran before the deadline was hit
-    assert runner._last_wal == now  # the phase that RAN advanced its marker
+    assert runner._last_wal == 0.0  # the phase that RAN advanced its (monotonic) marker
     assert result.capped is True  # the pass hit the cap after WAL
     assert result.vacuumed is False  # the DUE vacuum was skipped by the cap
     assert vacuum_calls == 0  # ...and never even started
@@ -1754,6 +3317,576 @@ async def test_app_log_compression_survives_a_racing_rewrite_of_the_staging_file
     assert result.app_logs_compressed == 0  # and it is not reported as compressed
 
 
+_CHANGES = [
+    "append",
+    "replace",
+    "replace_same_size",
+    "rewrite_same_size",
+    "rewrite_same_size_same_mtime",
+    "metadata_only",
+]
+
+
+def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> bytes:
+    """Change ``old_log`` the way ``change`` names and return what it should then hold. Every case but
+    ``rewrite_same_size`` puts the old mtime back, so the size, the file id or the ctime must betray it;
+    the ``*_same_size`` cases keep the size, so only the file id (replace), the mtime (rewrite) or the
+    ctime alone (rewrite with the mtime put back) can."""
+    body = old_log.read_bytes()
+    if change == "metadata_only":
+        # Only the ctime moves (an attribute flip, as backup software clears the archive bit): the
+        # content and the mtime are untouched. Past a coarse ctime tick first, as below.
+        time.sleep(0.05)
+        os.chmod(old_log, stat.S_IREAD)
+        os.chmod(old_log, stat.S_IREAD | stat.S_IWRITE)
+        return body
+    if change == "append":
+        with open(old_log, "ab") as fh:
+            fh.write(late)
+        expected = body + late
+    elif change in ("replace", "replace_same_size"):
+        expected = late if change == "replace" else b"R" * len(body)
+        rotated = old_log.with_name("rotated.tmp")
+        rotated.write_bytes(expected)
+        os.replace(rotated, old_log)
+    else:
+        # Past a coarse ctime tick (Linux stamps ctime from a jiffy clock), so the rewrite's ctime is new.
+        time.sleep(0.05)
+        expected = b"W" * len(body)
+        with open(old_log, "r+b") as fh:
+            fh.write(expected)
+        if change == "rewrite_same_size":
+            os.utime(old_log, (old + 1, old + 1))
+            return expected
+    os.utime(old_log, (old, old))
+    return expected
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A log appended to, rewritten, or replaced (rotated) at the same path after its archive was placed
+    must NOT be unlinked: the validated archive describes only the bytes read at the START, so removing
+    the path would destroy whatever was written into it since. BACKLOG #6805.
+
+    RULE: the read-back at ``dest`` proves the archive matches ``data``; it says nothing about whether
+    ``source`` still holds only ``data``. The unlink must also check that the path is still the same
+    file (device + file id) with the same size and times as when it was read."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            # The window between the dest read-back and the unlink: a writer touches the source path
+            # (once; the code may read `dest` back again before removing a redundant archive).
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (
+        old_log.exists() and old_log.read_bytes() == expected[0]
+    )  # nothing written mid-pass is lost
+    archive = logs / "old.log.gz"
+    if change in ("append", "metadata_only"):
+        # The kept source still holds every archived byte, so the archive this pass placed is removed:
+        # left beside the source it would make every later pass skip this path, forever when no
+        # `app_log_days` window is set. The next pass retries.
+        assert not archive.exists()
+    else:
+        # The source no longer holds the archived bytes: under a replace the archive may be the only
+        # copy of the old content, so it is kept.
+        assert gzip.decompress(archive.read_bytes()) == body
+    assert result.app_logs_compressed == 0 and result.app_log_bytes_reclaimed == 0
+    assert "changed after its archive was placed" in caplog.text
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_places_nothing_for_a_source_that_changed_before_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A source that changed between the read and the rename gets no archive at all: a stale partial
+    ``<name>.gz`` would block every later compression of that path (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "changed during compression; nothing placed" in caplog.text
+
+
+async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A fresh file rotated into an aged path after the scan, and before the read, is not compressed:
+    the scan's age no longer describes it (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    fresh = b"fresh rotated content\n" * 200
+
+    def rotate_then_allow(self, size, *, name):
+        rotated = logs / "rotated.tmp"
+        rotated.write_bytes(fresh)
+        os.utime(rotated, (now, now))
+        os.replace(rotated, old_log)
+        return True
+
+    monkeypatch.setattr(RetentionRunner, "_has_free_space", rotate_then_allow)
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == fresh
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))  # rejected before anything was staged
+    assert result.app_logs_compressed == 0
+    assert "not the file the scan aged" in caplog.text
+
+
+async def test_app_log_compression_never_renames_over_an_archive_that_appeared_meanwhile(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A ``<name>.gz`` a peer compressor placed after the scan is never renamed over: it may be the
+    only copy of a longer read whose source the peer is about to remove (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    peer = gzip.compress(body + b"a longer read by a peer\n")
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_peer_places(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            (logs / "old.log.gz").write_bytes(peer)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_peer_places)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (logs / "old.log.gz").read_bytes() == peer
+    assert old_log.read_bytes() == body
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "an archive appeared meanwhile" in caplog.text
+
+
+async def test_app_log_compression_keeps_the_archive_when_the_source_goes_before_its_removal(
+    store: MessageStore, tmp_path, monkeypatch
+) -> None:
+    """Removing a redundant archive must not lose the last copy: if the source is removed (by a peer
+    compressor, say) between the check that it still holds every archived byte and the archive's
+    removal, the archive survives (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    mutated: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_append(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not mutated:
+            mutated.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    real_holds = retention_mod._source_still_holds
+    calls: list[bool] = []
+
+    def holds_then_peer_removes(source, read_st, data):
+        ok = real_holds(source, read_st, data)
+        if not calls:
+            old_log.unlink()  # the peer archived the longer read elsewhere and removed the source
+        calls.append(ok)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_append)
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_removes)
+
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+
+    assert calls and calls[0] is True  # the branch that removes a redundant archive was reached
+    assert not old_log.exists()
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body  # the last copy survives
+    assert not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+
+
+async def test_app_log_compression_reports_a_source_that_vanished_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A source removed (by a peer compressor, say) after the archive was placed keeps the archive and
+    is reported as vanished, not as kept (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_remove(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and old_log.exists():
+            old_log.unlink()
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_remove)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
+    assert result.app_logs_compressed == 0
+    assert "vanished after its archive was placed" in caplog.text
+
+
+async def test_app_log_sweep_ages_out_claimed_archives_with_the_archives(
+    store: MessageStore, tmp_path
+) -> None:
+    """A claimed archive (``<name>.gz.<pid>-<ns>.mfclaim``) holds log content, so the
+    ``app_log_days`` sweep ages it out on its own mtime, under the same gate as the ``.gz``
+    archives: only while compression is on, and only for a name the compressor produces
+    (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_claim = logs / "old.log.gz.4242-123456789.mfclaim"
+    old_txt_claim = logs / "OLD.TXT.GZ.1-2.MFCLAIM"
+    fresh_claim = logs / "fresh.log.gz.4242-987654321.mfclaim"
+    foreign = [
+        logs / "old.log.4242-1.mfclaim",  # not claimed from an archive
+        logs / "bundle.gz.4242-1.mfclaim",  # not an app-log archive
+        logs / "old.log.gz.x-1.mfclaim",  # not a pid
+        logs / "old.log.gz.4242.mfclaim",  # no time tag
+        logs / "old.log.gz.1-2.mfclaim.3-4.mfclaim",  # a claim of a claim is never produced
+    ]
+    for p in (old_claim, old_txt_claim, fresh_claim, *foreign):
+        p.write_bytes(b"x")
+        os.utime(p, (now - 10 * DAY, now - 10 * DAY))
+    os.utime(fresh_claim, (now - 1 * DAY, now - 1 * DAY))
+
+    # Compression off: no archive is swept, and neither is a claim.
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+    assert result.app_logs_deleted == 0 and old_claim.exists() and old_txt_claim.exists()
+
+    result = await RetentionRunner(
+        store,
+        RetentionSettings(app_log_days=7, app_log_compress_days=1),
+        clock=lambda: now,
+        log_dir=str(logs),
+    ).run_once()
+    assert result.app_logs_deleted == 2
+    assert not old_claim.exists() and not old_txt_claim.exists()
+    assert fresh_claim.exists()
+    assert all(p.exists() for p in foreign)
+
+
+def _claim_fixture(tmp_path: Path) -> tuple[Path, Path, os.stat_result, bytes]:
+    """A source log and a valid archive of it at ``dest``, with the ``fstat`` read through it."""
+    source = tmp_path / "old.log"
+    data = b"engine started\n" * 50
+    source.write_bytes(data)
+    dest = tmp_path / "old.log.gz"
+    dest.write_bytes(gzip.compress(data))
+    with open(source, "rb") as fh:
+        read_st = os.fstat(fh.fileno())
+    return source, dest, read_st, data
+
+
+def _remove_failing_on_claims(monkeypatch, error: OSError) -> None:
+    """Make ``os.remove`` raise ``error`` for a claim name and behave normally for anything else."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            raise error
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
+def _peer_removes_claims_first(monkeypatch) -> None:
+    """Make a peer's sweep win the race for every claim: the claim is gone when ``os.remove`` runs,
+    so it raises ``FileNotFoundError`` for real."""
+    real_remove = os.remove
+
+    def remove(path, *args, **kwargs):
+        if str(path).lower().endswith(".mfclaim"):
+            real_remove(path)
+        real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", remove)
+
+
+def test_drop_redundant_archive_is_false_when_the_claim_cannot_be_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim whose removal fails is NOT reported as removed: the archive's bytes are still on disk
+    under the claim name, a WARNING names it, and the sweep recognises the name the producer made
+    (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    claims = list(tmp_path.glob("*.mfclaim"))
+    assert len(claims) == 1 and gzip.decompress(claims[0].read_bytes()) == data
+    assert "could not be removed" in caplog.text
+    assert retention_mod._is_app_log_name(claims[0].name, include_archives=True)
+
+
+def test_drop_redundant_archive_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim already gone when its removal runs (a peer's ``app_log_days`` sweep took it) is
+    counted as removed, not logged as a failure (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is True
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "could not be removed" not in caplog.text
+
+
+@pytest.mark.parametrize("dest_gone", [True, False])
+def test_drop_redundant_archive_reports_an_archive_gone_before_its_claim(
+    tmp_path, monkeypatch, caplog, dest_gone: bool
+) -> None:
+    """An archive removed (by a peer engine shard's ``app_log_days`` sweep, say) after it was
+    validated and before it could be claimed is reported as already gone, never as kept: no file
+    remains to keep. A FileNotFoundError with the archive still there (Windows raises it for a claim
+    path too long, say) is still reported as kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    real_rename = os.rename
+
+    def peer_sweeps_then_rename(src, dst, *args, **kwargs):
+        if str(src) == str(dest):
+            if not dest_gone:
+                raise FileNotFoundError("the claim path is too long")
+            dest.unlink()  # the peer wins the race; the rename below raises FileNotFoundError
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", peer_sweeps_then_rename)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim"))
+    gone_line = (
+        "the archive 'old.log.gz' could not be found when it was to be claimed (already gone, or "
+        "its directory unreachable); this pass does not remove it"
+    )
+    if dest_gone:
+        assert not dest.exists()
+        assert gone_line in caplog.text
+        assert "it is kept" not in caplog.text and "could not be claimed" not in caplog.text
+    else:
+        assert gzip.decompress(dest.read_bytes()) == data
+        assert gone_line not in caplog.text
+        assert "could not be claimed for removal; it is kept" in caplog.text
+
+
+async def test_app_log_compression_does_not_say_a_gone_archive_holds_the_bytes(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """When the source changed after its archive was placed and the archive is gone (a peer engine
+    shard's ``app_log_days`` sweep, say) before the redundant-archive removal reads it, the WARNING
+    must not say the archive holds the bytes read: nothing is there, and the kept source holds them
+    (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    archive = logs / "old.log.gz"
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate_then_sweep(path, original, *, name):
+        if not path.endswith(".mftmp") and expected and archive.exists():
+            archive.unlink()  # the peer's sweep, before the removal's first read of `dest`
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            expected.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate_then_sweep)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]  # the source is kept
+    assert not archive.exists() and not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+    assert "changed after its archive was placed" in caplog.text
+    assert "holds the bytes" not in caplog.text
+    assert "may remain in the source" in caplog.text
+
+
+def test_drop_redundant_archive_reports_a_claim_gone_before_its_put_back(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A claim removed (by a peer's ``app_log_days`` sweep, say) before it could be put back is
+    reported as gone, not as KEPT under a name that no longer exists (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+
+    def holds_then_peer_sweeps(*args):
+        answer = next(answers)
+        if not answer:
+            for claim in tmp_path.glob("*.mfclaim"):
+                claim.unlink()
+        return answer
+
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_sweeps)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
+    assert "could not be found to put it back" in caplog.text
+    assert "KEPT as" not in caplog.text
+
+
+@pytest.mark.parametrize("fail", ["link", "remove"])
+def test_drop_redundant_archive_warns_when_a_put_back_leaves_the_claim(
+    tmp_path, monkeypatch, caplog, fail: str
+) -> None:
+    """When the post-claim re-check fails, the archive is put back. A put-back that cannot link, or
+    that links but cannot then remove the claim, leaves the claim and says so at WARNING, never at
+    DEBUG only (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+    monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
+
+    def refuse_link(*args, **kwargs):
+        raise OSError("no hard links here")
+
+    if fail == "link":
+        monkeypatch.setattr(os, "link", refuse_link)
+    else:
+        _remove_failing_on_claims(monkeypatch, PermissionError("locked"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert len(list(tmp_path.glob("*.mfclaim"))) == 1
+    if fail == "link":
+        assert not dest.exists()
+        assert "the source or the claimed archive changed" in caplog.text
+    else:
+        assert gzip.decompress(dest.read_bytes()) == data
+        assert "was linked back but could not be removed" in caplog.text
+
+
+def test_drop_redundant_archive_put_back_counts_a_claim_a_peer_already_removed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """After a put-back links the archive back to ``dest``, a claim a peer already removed is not
+    a failure: ``dest`` holds the archive and no WARNING says the claim was kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    answers = iter([True, False])  # holds before the claim, changed after it
+    monkeypatch.setattr(retention_mod, "_source_still_holds", lambda *a: next(answers))
+    _peer_removes_claims_first(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert gzip.decompress(dest.read_bytes()) == data
+    assert not list(tmp_path.glob("*.mfclaim"))
+    assert "could not be removed" not in caplog.text
+
+
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(
     store: MessageStore, tmp_path, monkeypatch
 ) -> None:
@@ -1950,3 +4083,221 @@ async def test_engine_without_retention_settings_has_no_runner(tmp_path) -> None
         assert engine._retention_runner is None
     finally:
         await engine.stop()
+
+
+# --- a reload that first sets a per-connection window starts passes (BACKLOG #6804) -------------
+
+# Every default-ON knob off, so only the graph can give the runner something to do.
+_ALL_OFF = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0, "audit_log_warn_rows": 0}
+
+
+def _write_retention_graph(cfg: Path, inbox: Path, outdir: Path, *, window: str = "") -> None:
+    """One file inbound -> router -> handler -> file outbound; ``window`` adds keyword arguments to
+    the inbound (a leading ``i:``) or the outbound (``o:``), such as a per-connection window."""
+    cfg.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ib_kw = f", {window[2:]}" if window.startswith("i:") else ""
+    ob_kw = f", {window[2:]}" if window.startswith("o:") else ""
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File\n"
+        f"inbound('IB_RET', File(directory={str(inbox)!r}, pattern='*.hl7', poll_seconds=0.05), "
+        f"router='r'{ib_kw})\n"
+        f"outbound('OB_RET', File(directory={str(outdir)!r}, filename='{{MSH-10}}.hl7'){ob_kw})\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_RET', msg)\n",
+        encoding="utf-8",
+    )
+
+
+def test_enabled_by_a_per_connection_window(store: MessageStore) -> None:
+    """A per-connection messages_days or dead_letter_days above 0 purges with the global window
+    off, so it gives the runner something to do on its own; 0 keeps forever and does not."""
+    off = RetentionSettings.model_validate(_ALL_OFF)
+
+    def enabled(*, messages_days: int | None = None, dead_letter_days: int | None = None) -> bool:
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2610), router="r", messages_days=messages_days)
+        )
+        reg.add_outbound(
+            build_outbound_connection(
+                "OB", File(directory="./out"), dead_letter_days=dead_letter_days
+            )
+        )
+        return RetentionRunner(store, off, registry_source=lambda: reg).enabled
+
+    assert enabled() is False
+    assert enabled(messages_days=3) is True
+    assert enabled(dead_letter_days=3) is True
+    assert enabled(messages_days=0, dead_letter_days=0) is False
+
+
+async def test_a_disabled_runner_with_a_registry_idles(store: MessageStore) -> None:
+    """With a registry wired, the loop runs even when nothing is set, and runs no pass until the
+    live graph sets a window; with no registry a disabled runner spawns no loop."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 0.01})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        assert runner._task is not None
+        await asyncio.sleep(0.1)
+        assert passes == [], "an idle runner ran a pass with nothing configured"
+        reg = Registry()
+        reg.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2611), router="r", messages_days=1)
+        )
+        holder["reg"] = reg
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "the loop did not pick up a window the live graph set"
+        holder["reg"] = Registry()
+        await asyncio.sleep(0.05)
+        settled = len(passes)
+        await asyncio.sleep(0.1)
+        assert len(passes) == settled, "the loop kept running passes after the window was cleared"
+    finally:
+        await runner.stop()
+    assert runner._task is None
+
+    bare = RetentionRunner(store, settings)
+    bare.start()
+    assert bare._task is None
+
+
+async def test_wake_runs_a_pass_only_when_it_makes_the_loop_active(store: MessageStore) -> None:
+    """A reload's wake() on an active loop adds no pass; one that gives an idle loop a window runs
+    one at once. The 3600 s interval means no pass below can come from the timer."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    window = Registry()
+    window.add_inbound(build_inbound_connection("IB", MLLP(port=2612), router="r", messages_days=1))
+    holder: dict[str, Registry] = {"reg": window}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1
+        runner.wake()  # a reload while active
+        await asyncio.sleep(0.1)
+        assert len(passes) == 1, "a reload added a pass to an already-active loop"
+    finally:
+        await runner.stop()
+
+    holder["reg"] = Registry()
+    passes.clear()
+    runner.start()
+    try:
+        await asyncio.sleep(0.1)
+        assert passes == [], "a restarted idle loop ran a pass (a stale wake was left set)"
+        holder["reg"] = window
+        runner.wake()  # the reload that makes it active
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1, "the reload that gave the idle loop a window ran no pass"
+    finally:
+        await runner.stop()
+
+
+async def test_a_wake_before_the_first_iteration_runs_one_pass(store: MessageStore) -> None:
+    """A reload that wakes the loop between start() and its first iteration gets one pass, not
+    two back to back: the 3600 s interval means a second pass could only come from a stale wake."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()  # idle: the task exists but has not run yet
+    try:
+        window = Registry()
+        window.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2613), router="r", messages_days=1)
+        )
+        holder["reg"] = window
+        runner.wake()  # the reload, before the loop's first iteration
+        await asyncio.sleep(0.15)
+        assert len(passes) == 1, f"expected one pass, got {len(passes)}"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize(
+    "window",
+    ["i:messages_days=1", "i:prune_documents_after=1", "o:dead_letter_days=1"],
+    ids=["messages_days", "prune", "dead_letter_days"],
+)
+async def test_reload_that_sets_a_window_runs_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: str
+) -> None:
+    """BACKLOG #6804: the engine started with nothing for retention to do, then a reload set a
+    per-connection window. A pass must run without a restart, on the same single loop."""
+    passes: list[None] = []
+    real_run_once = RetentionRunner.run_once
+
+    async def _counting_run_once(self: RetentionRunner, now: float | None = None) -> Any:
+        passes.append(None)
+        return await real_run_once(self, now)
+
+    monkeypatch.setattr(RetentionRunner, "run_once", _counting_run_once)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    idle_cfg, window_cfg = tmp_path / "idle", tmp_path / "window"
+    _write_retention_graph(idle_cfg, inbox, outdir)
+    _write_retention_graph(window_cfg, inbox, outdir, window=window)
+
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings.model_validate(
+            # An interval no test waits out: only the reload's wake can run the pass in time.
+            {**_ALL_OFF, "purge_interval_seconds": 3600}
+        ),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(load_config(idle_cfg))
+    await engine.start()
+    try:
+        runner = engine._retention_runner
+        assert runner is not None
+        task = runner._task
+        assert task is not None
+        await asyncio.sleep(0.1)
+        assert runner.enabled is False and passes == []
+
+        outcome = await engine.reload_detail(window_cfg)
+        assert outcome.applied is True and outcome.failures == ()
+        assert runner.enabled is True
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "a reload that set a per-connection window left retention off"
+        assert runner._task is task, "the reload started a second retention loop"
+    finally:
+        await engine.stop()
+    assert runner._task is None and task.done()

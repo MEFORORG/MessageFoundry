@@ -547,9 +547,9 @@ async def test_the_managed_teardown_drains_the_upload_stragglers_before_the_engi
             async def _drain(*_args: Any, **_kwargs: Any) -> None:
                 calls.append("uploads")
 
-            async def _stop() -> None:
+            async def _stop(**kwargs: Any) -> None:
                 calls.append("stop")
-                await real_stop[0]()
+                await real_stop[0](**kwargs)
 
             app.state.upload_store.drain_stragglers = _drain
             engine.stop = _stop

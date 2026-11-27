@@ -25,7 +25,7 @@ import string
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -722,6 +722,33 @@ def peer_othernames_intact(ssl_object: Any) -> bool:
             type(exc).__name__,
         )
         return False
+
+
+def peer_subject(ssl_object: Any) -> str | None:
+    """The RFC 4514 subject of a TLS connection's peer certificate, read from its DER, or ``None``
+    when there is none or it cannot be read (vault BACKLOG #2607, the intake context).
+
+    It runs after the listener admitted the peer, and the subject only names the peer, it decides
+    nothing, so a certificate that cannot be read stores the message without it rather than drop
+    it: ``ssl.SSLError``, and what ``cryptography`` raises for a certificate it cannot read, the
+    :data:`_UNREADABLE_CA` tuple, which holds ``ValueError`` (a handshake not done is one too).
+    An ``ssl_object`` with no ``getpeercert`` reads as no certificate. Any other exception is a
+    defect and raises. A fault is logged by its type alone, since a subject can name a person."""
+    getpeercert = getattr(ssl_object, "getpeercert", None)
+    if getpeercert is None:
+        return None
+    try:
+        der = getpeercert(binary_form=True)
+        if not der:
+            return None
+        # A SAN-only leaf has an empty subject, which names nobody, so it reads as none.
+        return x509.load_der_x509_certificate(der).subject.rfc4514_string() or None
+    except (*_UNREADABLE_CA, ssl.SSLError) as exc:  # the tuple is defined below; read at call
+        _log.warning(
+            "could not read a peer certificate's subject; the message is stored without it: %s",
+            type(exc).__name__,
+        )
+        return None
 
 
 #: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate
@@ -1448,35 +1475,142 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
     return missing
 
 
-def own_crl_reason(ca_ders: Iterable[bytes], crl_pem: bytes) -> str | None:
+def cas_not_reaching_a_root(ca_ders: Iterable[bytes]) -> list[str]:
+    """Each CA in ``ca_ders`` with no path through ``ca_ders`` to a self-signed root also in it,
+    named with its serial number, sorted (vault BACKLOG #5511). Each link needs the issuer's key
+    to verify the CA's signature, so a CA whose signature cannot be checked, or that does not
+    parse, is listed too, failing closed."""
+    named = []
+    pending = []
+    for index, der in enumerate(ca_ders, 1):
+        try:
+            pending.append(x509.load_der_x509_certificate(der))
+        except _UNREADABLE_CA:
+            named.append(f"CA certificate {index}, which does not parse")
+    rooted = [cert for cert in pending if _directly_issued(cert, cert)]
+    pending = [cert for cert in pending if cert not in rooted]
+    # A fixed point: each pass roots every pending CA that a rooted CA issued.
+    while reached := [c for c in pending if any(_directly_issued(c, r) for r in rooted)]:
+        rooted.extend(reached)
+        pending = [cert for cert in pending if cert not in reached]
+    named.extend(
+        f"{quoted_issuer(cert.subject.rfc4514_string())} (serial number {cert.serial_number:#x})"
+        for cert in pending
+    )
+    return sorted(named)
+
+
+#: The CA setting an outbound whole-chain hop loads its CAs from, as a refusal names it.
+_OUTBOUND_CA_SETTINGS = (
+    "such as a connection's tls_ca_file, [alerts].email_tls_ca_file, or "
+    "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
+)
+
+#: The no-partner-TLS case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection
+#: whose url is http, or a REST connection with ech_egress, sending through its ech_sidecar, makes
+#: no TLS connection of the engine's own to the partner, yet the engine still builds an https handler for it from its trust
+#: anchor, so the same rules apply. This refusal and the rooted-CA refusals in tls_policy carry it.
+OUTBOUND_NO_PARTNER_TLS_CASE = (
+    "A connection with an http url, or a REST connection with ech_egress, sending through its "
+    "ech_sidecar, makes no TLS connection of the engine's own to the partner, so no CRL is checked against the partner "
+    "there, but the engine still builds an https handler for that connection from its trust "
+    "anchor, and these rules apply to it"
+)
+
+
+class OwnCrlChainHop(NamedTuple):
+    """The settings of a hop in :data:`OWN_CRL_CHAIN_HOPS`, besides its CRL setting."""
+
+    chain: str  # the opt-in whole-chain setting
+    ca: str  # the CA setting whose CAs the start rule reads
+
+
+#: The server-auth hops with a CRL setting of their own and an opt-in whole-chain check (vault
+#: BACKLOG #5511): each hop's CRL setting, mapped to its chain setting and to the CA setting the
+#: start rule reads its CAs from. Each chain setting is refused at load without both files, and
+#: each builder refuses it with no CA, so the CAs come from the operator's own CA file and never
+#: from the OS trust store.
+OWN_CRL_CHAIN_HOPS: Mapping[str, OwnCrlChainHop] = {
+    "[auth].oidc_tls_crl_file": OwnCrlChainHop(
+        "[auth].oidc_tls_crl_check_chain", "[auth].oidc_tls_ca_cert_file"
+    ),
+    "[auth].ad_tls_crl_file": OwnCrlChainHop(
+        "[auth].ad_tls_crl_check_chain", "[auth].ad_tls_ca_cert_file"
+    ),
+}
+
+
+def own_crl_reason(
+    ca_ders: Iterable[bytes],
+    crl_pem: bytes,
+    *,
+    outbound: bool = False,
+    setting: str | None = None,
+) -> str | None:
     """Why a whole-chain CRL check on a hop listing ``ca_ders`` refuses ``crl_pem``, after the
     setting or the file, or ``None`` when every CA has a CRL of its own (vault BACKLOG #5627,
-    #5511). A start and the running-hop reload both ask this, so the rule and its words are one."""
+    #5511). A start and the running-hop reload both ask this, so the rule and its words are one.
+    ``outbound`` words it for an outbound hop under ``[tls].crl_check_chain``, which on a hop
+    that sends over TLS checks a server's chain against CAs from its own CA setting. A ``setting``
+    in :data:`OWN_CRL_CHAIN_HOPS` words it for that hop's server chain, naming its own chain and
+    CA settings, whatever ``outbound`` says."""
     try:
         missing = cas_without_own_crl(ca_ders, crl_pem)
     except ValueError as exc:
+        own = OWN_CRL_CHAIN_HOPS.get(setting) if setting is not None else None
+        if own is not None:
+            return (
+                f"it could not be checked against the CAs the hop loaded from {own.ca}: "
+                f"{str(exc).replace('loaded client CA', 'loaded CA')}"
+            )
+        if outbound:
+            return (
+                "it could not be checked against the CAs the hop loaded from its CA setting, "
+                f"{_OUTBOUND_CA_SETTINGS}: {str(exc).replace('loaded client CA', 'loaded CA')}"
+            )
         return (
             "it could not be checked against the client CAs the hop loaded from its client-CA "
             f"setting, such as tls_ca_file or [api].tls_client_ca_file: {exc}"
         )
-    return own_crl_refusal(missing) if missing else None
+    return own_crl_refusal(missing, outbound=outbound, setting=setting) if missing else None
 
 
-def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
+def own_crl_refusal(
+    missing: Iterable[tuple[str, int]], *, outbound: bool = False, setting: str | None = None
+) -> str:
     """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
     after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
     named with its serial number, since two CAs can share a name, in one order whatever order the
-    caller read them in."""
+    caller read them in. ``outbound`` and ``setting`` are :func:`own_crl_reason`'s."""
     named = ", ".join(
         f"{quoted_issuer(subject)} (serial number {serial:#x})"
         for subject, serial in sorted(missing)
     )
+    own = OWN_CRL_CHAIN_HOPS.get(setting) if setting is not None else None
+    if own is not None:
+        who = f"the CA(s) {named}, loaded from {own.ca},"
+        peers = "servers"
+        checked = f"{own.chain} checks the whole server chain against this file"
+        http_case = ""
+    elif outbound:
+        who = f"the CA(s) {named}, loaded from this hop's CA setting ({_OUTBOUND_CA_SETTINGS}),"
+        peers = "servers"
+        checked = (
+            "[tls].crl_check_chain checks the whole server chain against this file on a hop "
+            "that sends to its server over TLS"
+        )
+        http_case = f"{OUTBOUND_NO_PARTNER_TLS_CASE}. "
+    else:
+        who = f"the loaded client CA(s) {named}"
+        peers = "clients"
+        checked = "The whole client chain is checked against this file"
+        http_case = ""
     return (
-        f"the loaded client CA(s) {named} have no CRL of their own in it. Each needs a CRL that "
+        f"{who} have no CRL of their own in it. Each needs a CRL that "
         "carries its name and that its key signed, and every other CRL under its name that it "
-        "fits must be signed by it too, since OpenSSL may judge its clients by any of them. The "
-        "whole client chain is checked against this file, so every client under such a CA would "
-        "be refused. Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
+        f"fits must be signed by it too, since OpenSSL may judge its {peers} by any of them. "
+        f"{checked}, so every {peers[:-1]} under such a CA would "
+        f"be refused. {http_case}Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
         "authority key identifier that rules the other CA out: one naming the signing CA's key "
         "separates two CAs that each carry a subject key identifier, and one naming the signing "
         "CA's issuer and serial number separates two CAs unless they share both. A CA with no "
@@ -2686,8 +2820,10 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     and a block with a ``:`` in its label or in a body line, which OpenSSL reads as a header line.
     :class:`IssuerIndex` refuses such a file at least where the scan reads a certificate OpenSSL
     did not, because it checks this scan's result against what OpenSSL loaded
-    (:func:`_refuse_unless_openssl_loads`). A block of these shapes after the last certificate
-    hides nothing, and the file builds."""
+    (:func:`_refuse_unless_openssl_loads`). To :class:`IssuerIndex` alone, a block of these
+    shapes after the last certificate hides nothing, and the file builds. A configured trust anchor
+    holding one is refused earlier, by ``messagefoundry.auth.trust_anchors.anchor_cadata``, at
+    least where the TLS library stops loading at it (BACKLOG #5229)."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):

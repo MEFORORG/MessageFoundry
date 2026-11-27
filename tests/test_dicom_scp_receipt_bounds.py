@@ -393,6 +393,9 @@ _INVALID_MESSAGES = {
 }
 
 
+#: A line pynetdicom pins and this flow never writes, so the log screen keeps it: the capture control.
+_CAPTURE_CONTROL_LINE = "maximum_associations set to 1"
+
 #: The pynetdicom loggers that write a traceback, or one of the lines the quiet-end test looks for.
 _PYNETDICOM_LOGGERS = (
     "pynetdicom",
@@ -421,7 +424,7 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
                 # look for, so they are known to read a capture those records reach. It names none
                 # of the strings they look for.
                 for name in _PYNETDICOM_LOGGERS:
-                    logging.getLogger(name).warning("planted capture control")
+                    logging.getLogger(name).warning(_CAPTURE_CONTROL_LINE)
                 sock.sendall(sends)
                 answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
                 assert answer == _ABORT_INVALID, answer
@@ -431,7 +434,7 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
     # The bare assert stays although the next lines imply it: it is the guard
     # tests/test_vacuous_absence_assert_lint.py reads for the two absence asserts below.
     assert caplog.records
-    planted = sorted(r.name for r in caplog.records if r.getMessage() == "planted capture control")
+    planted = sorted(r.name for r in caplog.records if r.getMessage() == _CAPTURE_CONTROL_LINE)
     assert planted == sorted(_PYNETDICOM_LOGGERS), caplog.text
     # The SCP's own end of this association, so the abort the peer read came from that path and not
     # from pynetdicom's own AA-8, which sends the same bytes.
@@ -441,7 +444,10 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
         if r.name == _LOG and "ended an association with 127.0.0.1" in r.getMessage()
     ]
     assert len(ended) == 1, caplog.text
-    tracebacks = [r for r in caplog.records if r.exc_info and r.name.startswith("pynetdicom")]
+    # The log screen renders a library record's traceback into exc_text and clears exc_info.
+    tracebacks = [
+        r for r in caplog.records if (r.exc_info or r.exc_text) and r.name.startswith("pynetdicom")
+    ]
     assert tracebacks == [], [r.getMessage() for r in tracebacks]
     unthrottled = [
         r.getMessage()
@@ -543,10 +549,18 @@ async def test_a_command_set_past_its_bound_ends_the_association() -> None:
 def test_a_request_with_every_field_it_needs_gets_past_the_tally() -> None:
     # The CONTROL for the stream of requests that lack a field: the same command set with its
     # instance UID is a request pynetdicom would serve, and the tally lets it through.
-    whole = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    whole = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     command = _c_store_command(data_set_type=0x0101)
     assert whole.take(_p_data(0x03, command)[6:]) is None
-    lacking = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    lacking = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     command = _c_store_command(data_set_type=0x0101, instance_uid=None)
     assert lacking.take(_p_data(0x03, command)[6:]) == (
         dicom_module._ABORT_INVALID_MESSAGE,
@@ -559,7 +573,11 @@ def test_the_tally_splits_items_as_pynetdicom_does() -> None:
     bytes: every fragment but its control byte, in every item of the PDU."""
     from pynetdicom.pdu import P_DATA_TF
 
-    tally = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    tally = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     assert tally.take(_p_data(0x03, _c_store_command())[6:]) is None  # a data set follows
     body = (
         struct.pack(">IBB", 12, 1, 0x00)

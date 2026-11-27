@@ -10,10 +10,14 @@ replaces the one method that builds the context. The context comes from
 
 **What is copied from ldap3, and why.** The wrap step below is ldap3's own, for the arguments the
 engine passes: wrap the socket client-side, then, on a handshake with verification on, run ldap3's
-host name check. That check is ldap3's function, called, not copied. **One deliberate difference:**
-when that check refuses, this copy closes the TLS socket before it re-raises, where ldap3 leaves it
-open while the error's traceback is held. ldap3's ``Connection.open`` re-raises a copy without the
-traceback, so on that path it was freed promptly anyway (BACKLOG #3017; keep it when re-deriving).
+host name check. That check is ldap3's function, called, not copied. **Deliberate differences, at
+least these; keep each when re-deriving.** When that check refuses, this copy closes the TLS socket
+before it re-raises, where ldap3 leaves it open while the error's traceback is held. ldap3's
+``Connection.open`` re-raises a copy without the traceback, so on that path it was freed promptly
+anyway (BACKLOG #3017). The ClientHello names the host the connection dials, in the form
+:func:`_sni_name` gives, where ldap3 sends its ``sni`` attribute, normally none; this copy never
+reads ``sni``, and nothing in the engine sets it (BACKLOG #6879). The host name check still gets
+the host exactly as written, as ldap3's does.
 The alternative was to patch ``ldap3.core.tls.create_default_context`` for the length of one call.
 That is a module global, and ``AuthService`` runs binds on worker threads, so two concurrent binds
 could each see the other's patch. ``tests/test_ldap_tls.py`` pins the source of ldap3's
@@ -26,6 +30,7 @@ never loads it.
 from __future__ import annotations
 
 import logging
+import socket
 import ssl
 import threading
 from typing import Any
@@ -34,6 +39,7 @@ import ldap3
 from ldap3.core.tls import check_hostname
 
 from messagefoundry.config.tls_policy import assert_ldap3_tls_suites
+from messagefoundry.netaddr import host_address
 
 __all__ = ["NarrowedTls"]
 
@@ -57,6 +63,29 @@ def _warn_context_refusal(text: str) -> None:
         "Reported once per distinct reason until a bind's context builds again.",
         text.rstrip().rstrip("."),
     )
+
+
+def _sni_name(host: str) -> str | None:
+    """The ``server_name`` a ClientHello to ``host`` carries, or ``None`` for none (BACKLOG #6879).
+
+    RFC 6066 section 3 bars an IP literal and a trailing dot. These rules run on the IDNA form,
+    which ssl and ``getaddrinfo`` also use, so a full-width dot counts as a dot. An IP literal
+    includes a scoped IPv6 one and the legacy IPv4 spellings ``inet_aton`` reads, such as
+    ``127.1``, because glibc's resolver dials those as an address. A host with no IDNA form gets
+    none, and so does one longer than a DNS name's 253 bytes: that limit is the engine's choice,
+    under the 255 above which OpenSSL refuses the name at the wrap. Lower case is not an RFC rule:
+    it is there because some SNI routers match case-sensitively."""
+    try:
+        name = host.encode("idna").decode("ascii").rstrip(".")
+    except UnicodeError:
+        return None
+    if not name or len(name) > 253 or host_address(name) is not None:
+        return None
+    try:
+        socket.inet_aton(name)
+    except (OSError, ValueError):
+        return name.lower()
+    return None
 
 
 def _context_recovered() -> None:
@@ -89,9 +118,14 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
         ca_certs_data: str | None,
         connector: str,
         crl_file: str | None = None,
+        crl_check_chain: bool = False,
     ) -> None:
         self._context_factory = assert_ldap3_tls_suites(
-            validate=validate, ca_certs_data=ca_certs_data, connector=connector, crl_file=crl_file
+            validate=validate,
+            ca_certs_data=ca_certs_data,
+            connector=connector,
+            crl_file=crl_file,
+            crl_check_chain=crl_check_chain,
         )
         super().__init__(validate=validate, ca_certs_data=ca_certs_data)
 
@@ -120,14 +154,22 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
             _warn_context_refusal(str(exc))
             raise
         _context_recovered()
+        sni = _sni_name(connection.server.host)
         wrapped = context.wrap_socket(
             connection.socket,
             server_side=False,
             do_handshake_on_connect=do_handshake,
-            server_hostname=self.sni or None,
+            server_hostname=sni,
         )
         if do_handshake and self.validate in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL):
             try:
+                # The host exactly as written, as ldap3 checks it, not the SNI name: the IDNA
+                # form folds distinct names (sharp s to ``ss``), and dropping a trailing dot
+                # would accept ``host.`` against a certificate for ``host``. The raw host is not
+                # a safe check name either: ldap3's match does not split labels at a full-width
+                # dot, so ``dc1``, U+3002, ``corp.example.test`` matches a ``*.example.test``
+                # wildcard that the dialled ``dc1.corp.example.test`` would not. Not built:
+                # refusing a non-ASCII ``ad_server`` at settings load.
                 check_hostname(wrapped, connection.server.host, self.valid_names)
             except BaseException:
                 # ssl took the socket over, so ``connection.socket`` holds a detached one and

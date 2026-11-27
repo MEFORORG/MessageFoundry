@@ -37,6 +37,8 @@ from messagefoundry.config.settings import (
     _clamped_statement_timeout,
     _detection_margin_seconds,
     _sqlserver_renew_reach_seconds,
+    _sqlserver_shared_borrow_limit,
+    _sqlserver_statement_timeout_left,
     load_settings,
 )
 from messagefoundry.pipeline.cluster import build_coordinator
@@ -589,7 +591,12 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
             raise AssertionError("the paused read must be clamped at the driver")
 
         async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+            self,
+            sql: str,
+            params: tuple[object, ...],
+            *,
+            timeout_clamp: float,
+            share_deadline: bool = False,
         ) -> dict[str, object]:
             assert sql.startswith("SELECT owner"), "a paused node must not send the claim"
             clamps.append(timeout_clamp)
@@ -634,7 +641,12 @@ async def test_a_short_fence_halves_the_paused_read_budget_below_the_renew_clamp
 
     class _Store:
         async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+            self,
+            sql: str,
+            params: tuple[object, ...],
+            *,
+            timeout_clamp: float,
+            share_deadline: bool = False,
         ) -> dict[str, object]:
             clamps.append(timeout_clamp)
             return {"owner": "A"}
@@ -672,33 +684,135 @@ async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_tim
 # --- the two-times bound, and the loop's other statements (BACKLOG #5064, #6472) -----------
 
 
-async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice_the_clamp() -> (
-    None
-):
-    """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
-    by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
-    deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
-    inside twice the clamp, and the node takes nothing. The borrow takes half the clamp, which
-    leaves the acquire bound 1.0 s of headroom against a stalled loop, and the statement the whole
-    of it, so 1.5 x clamp is expected; the 0.5 s allowed over twice the clamp is timer slack on a loaded runner, not part
-    of the bound. The lower
-    bound shows both windows were spent, so this is the composite and not one window alone. The
-    COMMIT is outside both windows, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
-    fake's commit is immediate."""
-    clamp = 2.0
+async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_the_clamp() -> None:
+    """The shared deadline (BACKLOG #5064), pinned by timing: a claim that waits on a busy pool and
+    then meets a stalled server gets only the whole seconds the borrow left, so it resolves inside
+    the clamp, and the node takes nothing. Before #5064 the statement got the whole clamp again, so
+    this ran 0.5 + 3 = 3.5 s and recorded [3]; the 0.4 s allowed over the clamp is timer slack on a
+    loaded runner, not part of the bound. The COMMIT is outside the deadline, by a reading of
+    pyodbc, not a measurement (BACKLOG #6621); this fake's commit is immediate."""
+    clamp = 3.0
     conn = _Conn()
     conn.stalls = True
     store = _store(conn)
-    store._pool = _SlowPool(conn, delay=0.5 * clamp)
+    store._pool = _SlowPool(conn, delay=0.5)
     coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
         await coord._maintain_leadership()
     elapsed = time.monotonic() - started
-    assert 1.4 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
-    assert conn.statement_timeouts == [2]
+    # A slow runner can make the borrow take a whole second more, which only shortens the statement.
+    assert conn.statement_timeouts in ([2], [1]), conn.statement_timeouts
+    assert 1.4 <= elapsed < clamp + 0.4, elapsed
     assert coord.is_leader() is False
     assert not coord._leadership_lock.locked()
+
+
+@pytest.mark.parametrize(
+    ("clamp", "shared", "limit"),
+    [(3.0, True, "2s"), (1.5, True, "1s"), (1.5, False, "1.5s")],
+    ids=["claim-3", "claim-1.5", "unshared-1.5"],
+)
+async def test_the_claims_borrow_leaves_its_statement_a_second(
+    clamp: float, shared: bool, limit: str
+) -> None:
+    """A claim's borrow waits at most the clamp less 1 s, floored at 1 s, so a wedged pool fails it
+    with the deadline's last second unspent. Control: a statement that does not share its deadline,
+    such as the heartbeat, keeps the whole floored clamp for its borrow."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    store = _store(_Conn())
+    store._pool = _HangingPool()
+    with pytest.raises(StoreAcquireTimeout, match=f"after {limit} "):
+        await store._fetchone_clamped(
+            "MERGE leader_lease ...", ("k",), timeout_clamp=clamp, share_deadline=shared
+        )
+
+
+async def test_a_claim_whose_borrow_left_under_a_second_issues_no_statement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A borrow that returned with under 1 s of the deadline left (timer slack past its limit, or
+    a loop stall) cannot carry a whole-second statement inside the deadline, so the statement is
+    refused rather than run at 1 s past it: a renew refused here extends nothing (BACKLOG #5064).
+    The clock is faked, so the borrow's 2.3 s of a 3 s clamp costs no wall time."""
+    import messagefoundry.store.sqlserver as sqlserver_mod
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    conn = _Conn()
+    store = _store(conn)
+    clock = iter([100.0, 102.3])
+    monkeypatch.setattr(sqlserver_mod, "perf_counter", lambda: next(clock))
+
+    @contextlib.asynccontextmanager
+    async def borrow(_limit: float) -> Any:
+        yield conn
+
+    store._acquire_clamped = borrow
+    with pytest.raises(StoreAcquireTimeout, match="statement not issued") as caught:
+        await store._fetchone_clamped(
+            "MERGE leader_lease ...", ("k",), timeout_clamp=3.0, share_deadline=True
+        )
+    assert conn.statement_timeouts == []
+    assert conn.rolled_back == 0
+    # The advice survives the default log redaction whole.
+    assert safe_exc(caught.value).endswith("(docs/CONFIGURATION.md [cluster])")
+
+
+@pytest.mark.parametrize(
+    ("clamp", "elapsed", "cap", "expected"),
+    [
+        (4.5, 0.0, 4, 4),
+        (4.5, 0.6, 4, 3),  # the borrow spent the fraction and more: 3.9 s left runs as 3
+        (4.5, 3.4, 4, 1),
+        (4.5, 3.6, 4, None),  # 0.9 s left: refused
+        (4.5, 0.0, 2, 2),  # a shorter command_timeout cap still wins
+        (3.0, 0.001, 3, 2),  # a whole-number clamp runs its statement at least 1 s short
+        (2.0, 1.01, 2, None),
+        (1.9, 1.0, 1, 1),  # under 2 s no deadline is shared: the statement runs at 1 s
+        (1.0, 0.9, 1, 1),
+    ],
+)
+def test_the_statement_gets_the_whole_seconds_the_borrow_left(
+    clamp: float, elapsed: float, cap: int, expected: int | None
+) -> None:
+    assert _sqlserver_statement_timeout_left(clamp, elapsed, cap) == expected
+
+
+@pytest.mark.parametrize("clamp", [1.0, 1.2, 1.9, 2.0, 3.25, 4.5, 5.0, 8.9])
+def test_the_load_check_still_covers_the_shared_claim(clamp: float) -> None:
+    """The load check kept its two-window formula, so it must cover the latest a shared claim's
+    statement timeout can expire, over every borrow up to its limit, at the stock store timeouts."""
+    reach = _sqlserver_renew_reach_seconds(clamp, 30.0, 30)
+    borrow = _sqlserver_shared_borrow_limit(clamp)
+    cap = _clamped_statement_timeout(clamp, 30)
+    latest = 0.0
+    for step in range(201):
+        elapsed = borrow * step / 200
+        seconds = _sqlserver_statement_timeout_left(clamp, elapsed, cap)
+        if seconds is not None:
+            latest = max(latest, elapsed + seconds)
+    assert latest <= reach
+    assert latest <= max(clamp, 2.0)  # the clamp itself from 2 s up, 2 s below it
+
+
+@pytest.mark.parametrize("step", ["heartbeat", "refresh"])
+async def test_only_the_claim_shares_its_deadline(step: str) -> None:
+    """The heartbeat and the config-version refresh re-extend no lease, so they keep two windows:
+    after the same 0.5 s borrow that cuts the claim's statement to 2 s (the timing test above),
+    each still runs its statement at the whole 3 s clamp (BACKLOG #5064)."""
+    conn = _Conn()
+    conn.columns = ("config_version",)
+    conn.row = (1,)
+    store = _store(conn)
+    store._pool = _SlowPool(conn, delay=0.5)
+    coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=3.0)
+    if step == "heartbeat":
+        await coord.heartbeat_once()
+    else:
+        await coord._refresh_config_version()
+    assert conn.statement_timeouts == [3]
 
 
 async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> None:
@@ -970,12 +1084,16 @@ def test_the_settings_reach_is_what_the_store_applies(
 
 
 def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_path: Path) -> None:
-    """The defect: 5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, but on SQL Server the
-    claim waits up to 5 s for a connection and then runs a 5 s statement, 10 s past its issue."""
+    """5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, and on SQL Server the check counts
+    a 5 s wait plus a 5 s statement, 10 s. Since BACKLOG #5064 the claim shares one 5 s deadline,
+    so this refusal now over-counts it; it is kept so that no config the check refused loads."""
     with pytest.raises(ValidationError) as caught:
         _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
     text = str(caught.value)
-    assert "for up to 10 s, which reaches the demotion detection margin (9 s)" in text
+    assert "10 s counted as two windows, which reaches the demotion detection margin (9 s)" in text
+    # The message names the hazard the shared deadline leaves, not the one it removed.
+    assert "re-extend the lease it is standing down from" not in text
+    assert "its COMMIT run outside that deadline" in text
     # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
     assert "Lower lease_renew_timeout_seconds or unset it" in text
 
@@ -1176,9 +1294,8 @@ def test_loading_settings_logs_no_renew_bound_warning(
     assert not [r for r in caplog.records if _TWICE_THE_CLAMP in r.getMessage()]
 
 
-# Where ``serve`` logs the warning is pinned in tests/test_b1497_serve_warning_order.py. It reads
-# ``messagefoundry.__main__``, which this server-gated file must not import: the ``serverdb`` regex
-# does not admit ``messagefoundry/__init__.py`` (tests/test_serverdb_ci_coverage.py).
+# Where ``serve`` logs the warning is pinned in tests/test_b1497_serve_warning_order.py, which needs
+# no database. Its docstring says why it is not in this server-gated file.
 
 
 # --- against a real server -----------------------------------------------------
@@ -1210,3 +1327,63 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
         assert await store._fetchone("SELECT 1 AS x") == {"x": 1}
     finally:
         await store.close()
+
+
+# --- BACKLOG #6795: the release reads its match from OUTPUT, not the row count ----------------
+
+
+class _NoCountCursor(_Cursor):
+    """A cursor on a connection where ``SET NOCOUNT ON`` outlived the batch that set it: the driver
+    reports ``-1`` for every statement, a zero-match UPDATE included, and only the OUTPUT rowset
+    says what changed."""
+
+    rowcount = -1
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.sql = sql
+        await super().execute(sql, params)
+
+    async def fetchall(self) -> list[tuple[object, ...]]:
+        # pyodbc raises here when the statement returned no rowset; so does this fake.
+        if "OUTPUT inserted." not in self.sql:
+            raise RuntimeError("No results.  Previous SQL was not a query.")
+        return list(self._conn.output)  # type: ignore[attr-defined]
+
+
+class _NoCountConn(_Conn):
+    def __init__(self, output: list[tuple[object, ...]]) -> None:
+        super().__init__()
+        self.output = output
+        self.columns = ("owner",)
+
+    async def cursor(self) -> _Cursor:
+        return _NoCountCursor(self)
+
+
+@pytest.mark.parametrize(("output", "released"), [([], False), ([("A",)], True)])
+async def test_the_release_reads_its_match_from_output_not_the_row_count(
+    output: list[tuple[object, ...]], released: bool
+) -> None:
+    """The empty arm was red before #6795: the release read ``cursor.rowcount``, and
+    ``rows_affected`` reads ``-1`` as released, so a release whose row named another node reported
+    a drain. The matched arm is the control, green either way."""
+    conn = _NoCountConn(output)
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    coord._is_leader = True
+    store = coord._store
+    result = await coord._release_leadership(force_write=True)
+    assert (result[0], result[2], result[3]) == (True, True, released)
+    # A release that matched nothing is not counted as a durable write (BACKLOG #5675).
+    assert store.committed_txns == (1 if released else 0)
+
+
+async def test_a_stepdown_whose_row_names_another_node_reports_no_drain() -> None:
+    """The stepdown outcome the API returns: with nothing released it is not a drain, and the pause
+    this call armed is undone, as it is on Postgres, whose count is never ``-1`` (BACKLOG #1508)."""
+    conn = _NoCountConn([])
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    coord._last_renew_ok = 0.0  # may own the row, so the release is sent
+    outcome = await coord.step_down_leadership(sibling_acquire_delay_seconds=0.0)
+    assert conn.statement_timeouts == [3], "the release was not sent, so nothing was armed"
+    assert outcome.lease_released is False and not outcome.drained
+    assert coord._no_claim_until == 0.0

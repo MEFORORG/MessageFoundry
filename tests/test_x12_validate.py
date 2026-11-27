@@ -5,7 +5,8 @@ tolerant X12Peek/X12Message hot path (ADR 0012, BACKLOG #32).
 
 Covers: a clean interchange validates; a conformance-violating interchange reports structural errors +
 emits a 999 ack; non-X12 input raises X12ValidationError (not a generic crash); and the PHI guard —
-the offending data *value* never appears in the surfaced errors (only schema-label locators)."""
+an offending element *value* does not appear in the surfaced errors, and a segment id is kept only
+when pyx12's bundled maps define it. A sender value equal to a real id (``LIN``) is still kept."""
 
 from __future__ import annotations
 
@@ -13,20 +14,33 @@ import importlib
 import io
 import logging
 import threading
+import traceback
+import zipfile
+from collections import Counter
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 pytest.importorskip("pyx12")
 
+from messagefoundry._vendor.defusedxml.common import DTDForbidden  # noqa: E402
+from messagefoundry._vendor.defusedxml.ElementTree import ParseError  # noqa: E402
 from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     X12SegmentError,
     X12ValidationError,
     X12ValidationResult,
     validate,
 )
-from messagefoundry.parsing.x12._deps import load_x12_code_resolver  # noqa: E402
+from messagefoundry.parsing.x12._deps import (  # noqa: E402
+    _read_map_segment_ids,
+    load_x12_code_resolver,
+    load_x12_map_segment_ids,
+)
+from messagefoundry.redaction import safe_traceback  # noqa: E402
+from tests._content_free import assert_chain_severed  # noqa: E402
 
 _ISA = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       "
@@ -589,16 +603,615 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     assert "20*6" not in caplog.text and "20*6" not in _rendered(result)
 
 
-def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
+def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # pyx12 4.1.0 can raise X12Error on a segment longer than about 1,040,000 characters, as it
     # does on this unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass
-    # raises X12ValidationError, and neither its message nor the message of the pyx12 error it
-    # chains shows the segment's text.
+    # raises X12ValidationError, and neither its message nor the pyx12 error's message shows the
+    # segment's text. The pyx12 error is read from a spy, because it is no longer chained (#5370).
     import pyx12.errors
 
+    seen: list[Exception] = []
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _spying_validator(seen))
     body = "Q" * (1024 * 1024 + 100)
     with pytest.raises(X12ValidationError) as caught:
         validate(_ISA + _GS + "ST*837*0001*005010X222A1~BHT*0019*00*" + body)
-    cause = caught.value.__cause__
-    assert isinstance(cause, pyx12.errors.X12Error) and "terminator" in str(cause)
-    assert "QQQQ" not in str(caught.value) and "QQQQ" not in str(cause)
+    assert len(seen) == 1
+    assert isinstance(seen[0], pyx12.errors.X12Error) and "terminator" in str(seen[0])
+    assert "QQQQ" not in str(caught.value) and "QQQQ" not in str(seen[0])
+    assert_chain_severed(caught.value)
+
+
+# --- BACKLOG #5370: no interchange text through the exception chain, the repr or a segment id. ---
+
+_PLANT = "PLANTEDNAME"
+_PLANT_ISA02 = "AUTHPLANT1"
+_PLANT_ISA04 = "SECPLANT22"
+# 17 elements inside ISA's fixed 106 characters: ISA06 gives up padding for one more separator, so
+# pyx12 finds its terminators, reads the segment, and refuses it with the whole segment quoted.
+_ISA_17_ELEMENTS = (
+    f"ISA*00*{_PLANT_ISA02}*00*{_PLANT_ISA04}*ZZ*SENDER*X       *ZZ*RECEIVER       "
+    "*060501*1200*U*00401*000000001*0*P*:~"
+)
+_TAIL_270 = "ST*270*0001~SE*2*0001~GE*1*1~IEA*1*000000001~"
+# Each makes pyx12 raise an exception that quotes the planted values: X12Error, EngineError
+# ("Map not found", which quotes GS08) and ValueError (int() of GE01).
+_RAISING_INTERCHANGES = {
+    "isa17": (_ISA_17_ELEMENTS + _GS_270 + _TAIL_270, (_PLANT_ISA02, _PLANT_ISA04)),
+    "gs08": (
+        _ISA_270 + "GS*HS*SENDERAPP*RECVAPP*20060501*1200*1*X*PLANTGS08~" + _TAIL_270,
+        ("PLANTGS08",),
+    ),
+    "ge01": (
+        _ISA_270 + _GS_270 + "ST*270*0001~SE*2*0001~GE*PLANTGE01*1~IEA*1*000000001~",
+        ("PLANTGE01",),
+    ),
+}
+
+
+def _spying_validator(seen: list[Exception]) -> Callable[[], tuple[Any, Callable[[], Any]]]:
+    """A ``load_x12_validator`` whose walk records what pyx12 raised. The engine no longer chains it,
+    so this is how a test proves the fixture really made pyx12 quote the planted text."""
+    from messagefoundry.parsing.x12._deps import load_x12_validator
+
+    def load() -> tuple[Any, Callable[[], Any]]:
+        x12n_document, make_params = load_x12_validator()
+
+        def spy(*args: Any) -> Any:
+            try:
+                return x12n_document(*args)
+            except Exception as exc:
+                seen.append(exc)
+                raise
+
+        return spy, make_params
+
+    return load
+
+
+@pytest.mark.parametrize(
+    ("raw", "plants"), list(_RAISING_INTERCHANGES.values()), ids=list(_RAISING_INTERCHANGES)
+)
+def test_a_refused_interchange_chains_no_pyx12_text(
+    raw: str, plants: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Exception] = []
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _spying_validator(seen))
+    with pytest.raises(X12ValidationError) as caught:
+        validate(raw)
+
+    # Control: pyx12's own message holds the values, so their absence below is the engine's doing.
+    assert len(seen) == 1
+    assert all(plant in str(seen[0]) for plant in plants)
+
+    exc = caught.value
+    _assert_no_plant(exc, plants)
+    # What is kept of the pyx12 error is its class name, so a refusal can still be told apart.
+    assert type(seen[0]).__name__ in str(exc)
+
+
+def _270_with(segment: str) -> str:
+    """The conformant 270 with one extra segment ahead of the subscriber's NM1."""
+    return _conformant_270().replace("NM1*IL*", f"{segment}NM1*IL*", 1)
+
+
+def test_the_repr_of_a_result_leaves_out_the_ack_that_echoes_a_value() -> None:
+    result = validate(_270_with(f"NM1|IL|1|{_PLANT}|ROBERT~"))
+    assert result.ack is not None and _PLANT in result.ack  # control: this ack echoes the value
+    assert _PLANT not in repr(result)
+    # Exact, so a field added to the result later has to be read for the same exposure.
+    assert repr(result) == (
+        f"X12ValidationResult(valid=False, errors={result.errors!r}, "
+        f"ack_transaction={result.ack_transaction!r})"
+    )
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        f"NM1|IL|1|{_PLANT}|ROBERT~",  # the wrong element separator
+        f"NM1{_PLANT}~",  # no separator after the id
+        f"{_PLANT}~",  # the value alone
+        f"{_PLANT}*IL*1~",  # a value where the id goes
+    ],
+)
+def test_a_wrongly_delimited_segment_puts_no_value_in_an_error(segment: str) -> None:
+    result = validate(_270_with(segment))
+    assert result.valid is False
+    assert _PLANT not in repr(result)  # holds every field of every error
+    # The violation is still reported and located, without the id it could not trust.
+    dropped = [e for e in result.errors if e.segment_id is None and e.line is not None]
+    assert dropped, "the bad segment must still be reported"
+    assert all(e.message.startswith("segment ?: error ") for e in dropped)
+
+
+def test_a_well_delimited_unknown_segment_shows_no_id() -> None:
+    result = validate(_270_with(f"ZZZ*{_PLANT}*ROBERT~"))
+    assert "ZZZ" not in {e.segment_id for e in result.errors}
+    assert "segment ?: error 1" in [e.message for e in result.errors]
+    assert _PLANT not in _rendered(result)
+
+
+@pytest.mark.parametrize("template", ["NM1*IL*1*O~{}*A*B~", "{}~", "{}*A~"])
+@pytest.mark.parametrize("name", ["LEE", "KIM", "WU", "NG", "ZZZ", "DOE"])
+def test_sender_text_shaped_like_an_id_is_not_kept(
+    name: str, template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _270_with(template.format(name))
+    # Control: with the name in the map set it is kept, so pyx12 really put it where the id goes.
+    with monkeypatch.context() as patched:
+        patched.setattr(_X12_VALIDATE, "load_x12_map_segment_ids", lambda: frozenset({name}))
+        assert name in {e.segment_id for e in validate(raw).errors}
+
+    errors = validate(raw).errors
+    assert name not in {e.segment_id for e in errors}
+    assert not any(e.message.startswith((f"segment {name}:", f"element {name}")) for e in errors)
+    assert any(e.message.startswith("segment ?: error ") for e in errors)
+
+
+def test_a_sender_value_equal_to_a_real_id_is_still_kept() -> None:
+    # The known limit: the set is the union of every indexed map, so LIN is kept here although the
+    # 270's own map does not define it.
+    assert "LIN" in {e.segment_id for e in validate(_270_with("LIN*A~")).errors}
+
+
+def test_no_id_is_kept_when_the_map_set_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_map_segment_ids", frozenset)
+    assert _X12_VALIDATE._structural_segment_id({"seg_id": "NM1"}) is None
+
+
+def test_the_bundled_index_gives_real_ids_of_the_id_shape() -> None:
+    ids = load_x12_map_segment_ids()
+    assert {"ISA", "GS", "ST", "NM1", "N1", "SE", "GE", "IEA"} <= ids
+    assert all(_X12_VALIDATE._SEGMENT_ID.fullmatch(seg_id) for seg_id in ids)
+
+
+def test_a_failed_map_read_is_not_kept_and_is_retried_after_a_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = importlib.import_module("messagefoundry.parsing.x12._deps")
+    results = iter([frozenset[str](), frozenset({"NM1"})])
+    reads: list[object] = []
+    start = 1000.0
+    now = [start]
+
+    def read(map_dir: object) -> frozenset[str]:
+        reads.append(map_dir)
+        return next(results)
+
+    monkeypatch.setattr(deps, "_read_map_segment_ids", read)
+    monkeypatch.setattr(deps, "_map_ids", frozenset())
+    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)
+    # A clock only this module sees. The test moves the clock and never the deadline, so the
+    # deadline the failed read wrote is what decides whether the retry fires.
+    monkeypatch.setattr(deps, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    pause = deps._MAP_IDS_RETRY_SECONDS
+    assert pause > 0
+
+    assert load_x12_map_segment_ids() == frozenset()
+    now[0] = start + pause - 0.001
+    assert load_x12_map_segment_ids() == frozenset()  # inside the pause: no second read
+    assert len(reads) == 1
+
+    now[0] = start + pause  # the pause is over
+    assert load_x12_map_segment_ids() == {"NM1"}
+    assert load_x12_map_segment_ids() == {"NM1"}  # a good read is kept
+    assert len(reads) == 2
+
+
+_MAP_INDEX = "<maps><version><map>a.xml</map><map>b.xml</map></version></maps>"
+
+
+def test_the_map_reader_reads_only_the_maps_the_index_lists(tmp_path: Path) -> None:
+    (tmp_path / "maps.xml").write_text(_MAP_INDEX, encoding="utf-8")
+    (tmp_path / "a.xml").write_text("<map><segment xid='NM1'/></map>", encoding="utf-8")
+    (tmp_path / "b.xml").write_text("<map><segment xid='N1'/><loop xid='X1'/></map>", "utf-8")
+    (tmp_path / "unlisted.xml").write_text("<map><segment xid='ZZZ'/></map>", encoding="utf-8")
+    assert _read_map_segment_ids(tmp_path) == {"NM1", "N1"}
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        None,
+        {},
+        {"maps.xml": "<maps/>"},
+        {"maps.xml": "<maps"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map><segment xid='NM1'/></map>", "b.xml": "<map"},
+        {"maps.xml": _MAP_INDEX, "a.xml": "<map/>", "b.xml": "<map/>"},
+        {"maps.xml": "<?xml version='1.0' encoding='no-such-codec'?><maps/>"},  # LookupError
+        {"maps.xml": "<?xml version='1.0' encoding='utf-7'?><maps/>"},  # plain ValueError
+    ],
+    ids=[
+        "no-directory",
+        "no-index",
+        "empty-index",
+        "unparseable-index",
+        "listed-map-missing",
+        "listed-map-unparseable",
+        "no-segment",
+        "unknown-encoding",
+        "multibyte-encoding",
+    ],
+)
+def test_maps_that_cannot_be_read_give_no_ids(
+    contents: dict[str, str] | None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    map_dir = tmp_path / "map"
+    if contents is not None:
+        map_dir.mkdir()
+        for name, text in contents.items():
+            (map_dir / name).write_text(text, encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        assert _read_map_segment_ids(map_dir) == frozenset()
+    assert "no segment id" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("seg_id", "kept"),
+    [
+        ("NM1", "NM1"),
+        ("N1", "N1"),
+        ("ZZZ", None),  # the shape of an id, but no map defines it
+        ("TST", None),  # only in comp_test.xml, which pyx12's index does not list
+        ("UNU", None),  # likewise
+        ("nm1", None),  # lower case
+        ("A", None),  # too short
+        ("NM1X", None),  # too long
+        ("1NM", None),  # pyx12's own check requires a leading letter
+        ("N1\n", None),  # ``$`` would match before this newline
+        ("NM" + chr(0x661), None),  # a non-ASCII digit
+        ("", None),
+        (None, None),
+        (7, None),
+    ],
+)
+def test_only_a_segment_id_the_maps_define_is_kept(seg_id: Any, kept: str | None) -> None:
+    seg = {"seg_id": seg_id, "cur_line": 3, "name": "Subscriber Name"}
+    seg_err = _X12_VALIDATE._segment_error("1", seg, {})
+    ele_err = _X12_VALIDATE._element_error("8", seg, {"ele_pos": 2, "name": "Date"})
+    shown = kept or "?"
+    assert (seg_err.segment_id, seg_err.message) == (kept, f"segment {shown}: error 1")
+    assert (ele_err.segment_id, ele_err.message) == (kept, f"element {shown}02: error 8")
+
+
+# --- An install fault is not a parse fault, and a failed map read cannot cost a finished pass. ---
+
+
+def _walk_raising(
+    fault: Callable[[], Exception],
+) -> Callable[[], tuple[Any, Callable[[], Any]]]:
+    """A ``load_x12_validator`` whose walk raises ``fault()``."""
+
+    def document(*_args: Any) -> bool:
+        raise fault()
+
+    return lambda: (document, object)
+
+
+def _assert_no_plant(exc: BaseException, plants: tuple[str, ...] = (_PLANT,)) -> None:
+    assert_chain_severed(exc)
+    for text in (
+        safe_traceback((type(exc), exc, exc.__traceback__)),
+        "".join(traceback.format_exception(exc)),  # holds str(exc) too
+    ):
+        assert not any(plant in text for plant in plants)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: FileNotFoundError(2, "no such map", _PLANT),
+        lambda: PermissionError(13, "denied", _PLANT),
+        lambda: ImportError(_PLANT),
+        lambda: ModuleNotFoundError(_PLANT),
+        lambda: ParseError(_PLANT),
+        lambda: DTDForbidden(_PLANT, None, None),  # the engine's vendored copy
+        lambda: importlib.import_module("defusedxml.common").DTDForbidden(_PLANT, None, None),
+        lambda: importlib.import_module("defusedxml.common").EntitiesForbidden(
+            _PLANT, _PLANT, None, None, None, None
+        ),
+    ],
+    ids=[
+        "missing-map",
+        "denied-map",
+        "import",
+        "module",
+        "damaged-xml",
+        "vendored-refusal",
+        "pyx12s-dtd-refusal",
+        "pyx12s-entity-refusal",
+    ],
+)
+def test_a_damaged_install_is_not_reported_as_a_data_fault(
+    fault: Callable[[], Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _walk_raising(fault))
+    with pytest.raises(RuntimeError) as caught:
+        validate(_conformant_270())
+    exc = caught.value
+    # Exactly RuntimeError: a Handler's `except ValueError` must not dead-letter a good message.
+    assert type(exc) is RuntimeError
+    assert type(fault()).__name__ in str(exc)
+    assert "messagefoundry[x12]" in str(exc)
+    _assert_no_plant(exc)
+
+
+def test_a_map_file_gone_from_the_real_walk_is_an_install_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pyx12.map_if
+
+    def gone(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError(2, "no such map", _PLANT)
+
+    monkeypatch.setattr(pyx12.map_if, "load_map_file", gone)
+    with pytest.raises(RuntimeError, match="FileNotFoundError") as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is RuntimeError
+    _assert_no_plant(caught.value)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: ParseError(_PLANT),
+        lambda: IndexError(_PLANT),  # what pyx12's params raise on an empty sys.argv
+        lambda: ValueError(_PLANT),
+        lambda: AttributeError(_PLANT),
+        lambda: type("EngineError", (Exception,), {})("Map not found " + _PLANT),
+    ],
+    ids=["parse", "index", "value", "attribute", "no-map-text"],
+)
+def test_any_failure_building_pyx12s_params_is_an_install_fault(
+    fault: Callable[[], Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The params read no sender data, so none of their failures is a refusal of the interchange.
+    def make_params() -> Any:
+        raise fault()
+
+    def walk(*_args: Any) -> bool:
+        raise AssertionError("the walk must not run without its params")
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", lambda: (walk, make_params))
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is RuntimeError
+    assert type(fault()).__name__ in str(caught.value)
+    _assert_no_plant(caught.value)
+    assert _refusal_records(caplog) == []  # counted as an install fault, not as a refusal
+
+
+@pytest.fixture
+def fresh_refusal_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty per-class throttle, so a line an earlier test wrote cannot hold this test's back."""
+    monkeypatch.setattr(_X12_VALIDATE, "_walk_refusal_counts", Counter())
+    monkeypatch.setattr(_X12_VALIDATE, "_walk_refusal_logged_at", {})
+
+
+def _refusal_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _X12_VALIDATE.__name__]
+
+
+# BHT02 alone fails to select a map here: this GS01 and GS08 have index entries for 11 and 13.
+_BHT02_NO_MAP = (
+    _ISA_270 + "GS*HI*SENDERAPP*RECVAPP*20060501*1200*1*X*004010X094A1~ST*278*0001~"
+    "BHT*0078*99*1*20060501*1200~SE*3*0001~GE*1*1~IEA*1*000000001~"
+)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [*(raw for raw, _plants in _RAISING_INTERCHANGES.values()), _BHT02_NO_MAP],
+    ids=[*_RAISING_INTERCHANGES, "bht02"],
+)
+def test_a_sender_caused_failure_is_not_an_install_fault(raw: str) -> None:
+    with pytest.raises(X12ValidationError) as caught:
+        validate(raw)
+    assert type(caught.value) is X12ValidationError
+    assert "reinstall" not in str(caught.value)
+
+
+def test_a_passing_load_fault_cannot_turn_a_bad_interchange_into_an_install_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The classification reads the walk's own exception and loads nothing more, so a map file held
+    # by a scanner at that moment cannot change the answer for an interchange that was bad anyway.
+    import pyx12.map_if
+
+    def locked(*_args: Any, **_kwargs: Any) -> Any:
+        raise PermissionError(13, "denied", _PLANT)
+
+    monkeypatch.setattr(pyx12.map_if, "load_map_file", locked)
+    walk = _walk_raising(lambda: ValueError(_PLANT))
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", walk)
+    with pytest.raises(X12ValidationError) as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is X12ValidationError
+    _assert_no_plant(caught.value)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: AttributeError(_PLANT),
+        lambda: ValueError(_PLANT),
+        lambda: KeyError(_PLANT),
+        lambda: TypeError(_PLANT),
+        MemoryError,
+        lambda: RecursionError(_PLANT),
+    ],
+    ids=["attribute", "value", "key", "type", "memory", "recursion"],
+)
+@pytest.mark.usefixtures("fresh_refusal_log")
+def test_an_ordinary_error_reads_as_a_refusal_with_only_its_class_logged(
+    fault: Callable[[], Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _walk_raising(fault))
+    with caplog.at_level(logging.WARNING), pytest.raises(X12ValidationError) as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is X12ValidationError
+    _assert_no_plant(caught.value)
+
+    [record] = _refusal_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is None and record.stack_info is None
+    assert type(fault()).__name__ in record.getMessage()
+    assert _PLANT not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("raw", "plants"), list(_RAISING_INTERCHANGES.values()), ids=list(_RAISING_INTERCHANGES)
+)
+@pytest.mark.usefixtures("fresh_refusal_log")
+def test_nothing_in_the_refusal_log_line_is_sender_text(
+    raw: str, plants: tuple[str, ...], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING), pytest.raises(X12ValidationError):
+        validate(raw)
+    [record] = _refusal_records(caplog)
+    # Each argument is the class name, a count or the fixed interval, never a value from the input.
+    assert isinstance(record.args, tuple)
+    assert isinstance(record.args[0], str) and record.args[0].isidentifier()
+    assert all(isinstance(arg, (int, float)) for arg in record.args[1:])
+    assert record.exc_info is None
+    assert not any(plant in record.getMessage() for plant in plants)
+
+
+@pytest.mark.usefixtures("fresh_refusal_log")
+def test_the_refusal_log_line_is_limited_per_key(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A sender chooses how often a refusal runs, so it must not choose how much is logged, and a
+    # flood of one kind must not hide the first line of another.
+    now = [1000.0]
+    monkeypatch.setattr(_X12_VALIDATE, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    pause = _X12_VALIDATE._WALK_REFUSAL_LOG_SECONDS
+
+    def note(failure: str, *, no_map: bool = False) -> list[Any]:
+        caplog.clear()
+        _X12_VALIDATE._note_walk_refusal(failure, no_map=no_map)
+        return [r.args for r in _refusal_records(caplog)]
+
+    with caplog.at_level(logging.WARNING):
+        assert note("ValueError") == [("ValueError", 1, pause)]
+        assert note("ValueError") == []
+        now[0] += pause - 0.001
+        assert note("ValueError") == []
+        assert note("AttributeError") == [("AttributeError", 1, pause)]
+        now[0] += 0.001  # the window is over, and the line carries the volume it held back
+        assert note("ValueError") == [("ValueError", 4, pause)]
+
+
+@pytest.mark.usefixtures("fresh_refusal_log")
+def test_a_flood_of_no_map_refusals_cannot_hide_a_damaged_map(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A sender can raise EngineError at will with an unknown GS08, and a damaged map raises it too.
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            _X12_VALIDATE._note_walk_refusal("EngineError", no_map=True)
+        _X12_VALIDATE._note_walk_refusal("EngineError", no_map=False)
+    no_map_line, damage_line = _refusal_records(caplog)
+    assert "no map" in no_map_line.getMessage() and "damaged" not in no_map_line.getMessage()
+    assert "damaged" in damage_line.getMessage()
+    assert damage_line.args == ("EngineError", 1, _X12_VALIDATE._WALK_REFUSAL_LOG_SECONDS)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _RAISING_INTERCHANGES["gs08"][0],
+        _BHT02_NO_MAP,
+        _conformant_270().replace("004010X092A1", "005010X279A1"),  # conformant, but not bundled
+    ],
+    ids=["gs08", "bht02", "unbundled-guide"],
+)
+def test_a_no_map_refusal_says_so_and_blames_no_element(raw: str) -> None:
+    with pytest.raises(X12ValidationError, match="no map") as caught:
+        validate(raw)
+    message = str(caught.value)
+    assert "does not bundle" in message and "stopped partway" not in message
+    assert not any(name in message for name in ("ISA12", "GS01", "GS08", "BHT02"))
+
+
+@pytest.mark.parametrize("name", ["isa17", "ge01"])
+def test_a_refusal_with_a_map_does_not_claim_there_is_none(name: str) -> None:
+    with pytest.raises(X12ValidationError) as caught:
+        validate(_RAISING_INTERCHANGES[name][0])
+    assert "no map" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["parent", "subdirectory", "absolute"])
+def test_a_map_name_that_is_not_a_bare_file_name_gives_no_ids(
+    kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # pyx12's own load_map_file refuses these. Without the same check the reader would open a file
+    # outside the map directory and trust the ids in it.
+    map_dir = tmp_path / "map"
+    (map_dir / "sub").mkdir(parents=True)
+    for target in (tmp_path / "outside.xml", map_dir / "sub" / "inner.xml"):
+        target.write_text("<map><segment xid='ZZZ'/></map>", encoding="utf-8")
+    name = {
+        "parent": "../outside.xml",
+        "subdirectory": "sub/inner.xml",
+        "absolute": str(tmp_path / "outside.xml"),
+    }[kind]
+    (map_dir / "maps.xml").write_text(
+        f"<maps><version><map>{name}</map></version></maps>", encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING):
+        assert _read_map_segment_ids(map_dir) == frozenset()
+    assert "no segment id" in caplog.text
+    assert name not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("target", "fault"),
+    [
+        ("_read_map_segment_ids", MemoryError),
+        ("_read_map_segment_ids", lambda: zipfile.BadZipFile(_PLANT)),
+        ("files", lambda: ModuleNotFoundError(_PLANT)),
+        ("files", lambda: TypeError(_PLANT)),
+    ],
+    ids=["read-memory", "read-badzip", "files-module", "files-type"],
+)
+def test_a_finished_pass_survives_a_failed_map_read(
+    target: str,
+    fault: Callable[[], Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    deps = importlib.import_module("messagefoundry.parsing.x12._deps")
+    calls: list[object] = []
+
+    def failing(*args: object) -> Any:
+        calls.append(args)
+        raise fault()
+
+    start = 1000.0
+    monkeypatch.setattr(deps, target, failing)
+    monkeypatch.setattr(deps, "_map_ids", frozenset())
+    monkeypatch.setattr(deps, "_map_ids_retry_at", 0.0)
+    monkeypatch.setattr(deps, "time", SimpleNamespace(monotonic=lambda: start))
+
+    with caplog.at_level(logging.WARNING, logger=deps.__name__):
+        result = validate(_270_with("LIN*A~"))
+
+    # The pass's verdict and ack are kept; the id it could not check fails closed to `?`.
+    assert result.valid is False and result.ack is not None
+    assert "LIN" not in {e.segment_id for e in result.errors}
+    assert "segment ?: error 1" in [e.message for e in result.errors]
+    assert type(fault()).__name__ in caplog.text and "no segment id" in caplog.text
+    assert _PLANT not in caplog.text
+    # The retry pause still ran: inside it, a later use reads nothing.
+    assert deps._map_ids_retry_at == start + deps._MAP_IDS_RETRY_SECONDS
+    assert len(calls) == 1
+    assert load_x12_map_segment_ids() == frozenset()
+    assert len(calls) == 1

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -71,6 +71,7 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
     RETIRED_WITHOUT_ACTIVE,
     RETIRED_WITHOUT_ACTIVE_TRANSIT,
     AuditMacFn,
@@ -117,6 +118,7 @@ from messagefoundry.store.store import (
     EnrolmentCodeOutcome,
     FailOutcome,
     FederatedUnbind,
+    InjectAudit,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -137,6 +139,7 @@ from messagefoundry.store.store import (
     ResendError,
     ResendKeyConflict,
     ResendKeyRecord,
+    ResendOriginMetadataUnreadable,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
@@ -178,6 +181,7 @@ __all__ = [
     "MAX_SCAN_LIMIT",
     "MessageSearchResult",
     "OwnedLanes",
+    "ServerCipherWalk",
     "PoolStatus",
     "QueueStore",
     "ReingressOriginMissing",
@@ -185,6 +189,7 @@ __all__ = [
     "ResendError",
     "ResendKeyConflict",
     "ResendKeyRecord",
+    "ResendOriginMetadataUnreadable",
     "ResendOutcome",
     "ResendSourceAmbiguous",
     "ResendSourceEmpty",
@@ -208,6 +213,7 @@ __all__ = [
     "SchemaProvisionResult",
     "StoreGrantsMissingError",
     "backend_supports_reference_sets",
+    "check_walk_identifiers",
     "make_spec",
     "open_store",
     "probe_store_privileges",
@@ -451,7 +457,7 @@ class QueueStore(StoreLifecycle, Protocol):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -467,12 +473,10 @@ class QueueStore(StoreLifecycle, Protocol):
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
         message id, commits in the same transaction. A live receipt passes none. It stays optional
         in the type because this one method is both paths, so nothing at the type level holds a
-        direct caller here. At runtime an operator ``origin`` (``operator_edit``,
-        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written;
-        an operator inject whose audit builds no row raises inside the transaction, which rolls
-        the inject back (BACKLOG #5071,
-        ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
-        engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
+        direct caller here. The runtime refusals of ``audit``, ``origin`` and ``origin_actor`` are
+        stated once, on ``store.require_ingress_audit`` (BACKLOG #5071, #6589), with the limit that
+        it keys on ``origin``. The engine's inject,
+        :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its audit.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
@@ -1274,8 +1278,9 @@ class QueueStore(StoreLifecycle, Protocol):
     # by leaving the argument out, and each backend raises TypeError, before any write, on an
     # explicit ``None`` or anything not callable (BACKLOG #5069). ``enqueue_ingress`` keeps an
     # optional ``audit`` because it is also the live receipt path; see its docstring for what holds
-    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result,
-    # which records nothing: that is decided, and the reason is on ``store.OperatorAudit``.
+    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result that
+    # changed nothing, which records nothing; for a result that changed the store, a ``None``
+    # return raises inside the transaction. Both are decided on ``store.OperatorAudit``.
     async def replay(
         self,
         message_id: str,
@@ -1329,9 +1334,11 @@ class QueueStore(StoreLifecycle, Protocol):
         audit: OperatorAudit[int],
     ) -> int:
         """``audit`` is REQUIRED (vault BACKLOG #3217), so every caller has to say what the purge
-        records, and the row it returns commits in the cancel's own transaction. It is not a
-        guarantee that a row is written: an :data:`OperatorAudit` may return ``None``, which records
-        nothing. The API's purge paths both return a ``connection_purge`` row for every call."""
+        records, and the row it returns commits in the cancel's own transaction. An
+        :data:`OperatorAudit` may return ``None`` only for a purge that cancelled no row, which then
+        records nothing; for one that cancelled a row, a ``None`` raises :class:`TypeError` inside
+        the transaction (BACKLOG #5069). The API's purge paths both return a ``connection_purge``
+        row for every call."""
         ...
 
     # --- read helpers (API / console) ----------------------------------------
@@ -1591,11 +1598,14 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
         ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
-        (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set)."""
+        (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set).
+        ``suspended_until_after`` set reads only those whose ``suspended_until`` is later than it, so the
+        notifier's suspend prime is not crowded out by unsuspended rows (vault BACKLOG #3100 item 14)."""
         ...
 
     async def summarize_active_alert_instances(
@@ -1922,7 +1932,14 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
-        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set."""
+        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set.
+
+        The cutoff premise (BACKLOG #5734): the retention runner passes ``older_than`` at least a whole
+        day back (it calls this only when the integer ``state_max_age_days`` is above zero), so it lies
+        well behind every state write in flight, and such a write's row is newer than the cutoff and
+        survives the DELETE. The PostgreSQL and SQL Server backends rest one thing on that premise:
+        keeping cached a key published while the pass runs. A caller passing a cutoff near the present
+        could leave a cached value whose row the DELETE removed."""
         ...
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
@@ -2647,10 +2664,11 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # ``email`` here is the account's PROFILE address, and on an AD/OIDC account the directory's
-    # mirror: ``_upsert_ad_user`` calls this on every directory login and the write is unconditional,
-    # so whatever the directory's ``mail`` attribute says wins. IT IS NOT THE NOTIFICATION TARGET, and
-    # this method must never gain that column (BACKLOG #1139) -- handing the directory sync the
-    # notification address back is the whole defect the split removes.
+    # mirror: ``_upsert_ad_user`` calls this on every directory login whose profile values differ
+    # from the row's (BACKLOG #5653 item 1), so whatever the directory's ``mail`` attribute says
+    # wins. IT IS NOT THE NOTIFICATION TARGET, and this method must never gain that column (BACKLOG
+    # #1139) -- handing the directory sync the notification address back is the whole defect the
+    # split removes.
     async def update_user_profile(
         self,
         user_id: str,
@@ -3244,6 +3262,42 @@ class AuthStore(Protocol):
         written and this returns ``False``. The withdrawn row is marked ``"ad"``."""
         ...
 
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """Write a directory-derived scope, marked ``"ad"``, as a COMPARE-AND-SET on the scope AND
+        its source the AD sign-in decided from, and report whether it wrote (BACKLOG #6887).
+
+        The sign-in decides from a row it read several awaits earlier, and the per-process sign-in
+        queue orders neither a sign-in on another engine shard nor an administrator's write. If
+        ``expected_scope`` or ``expected_source`` (``None`` matching NULL) differs from the row
+        read, or the row is gone, nothing is written and this returns ``False``; how far that
+        compare holds against another process is the next paragraph's. It does not keep the
+        caller from replacing a newer scope: on a miss the caller reads the row again and decides
+        again from its own groups, which may be the older ones, and a scope written back to the
+        value read passes the compare. Nor does it stop concurrent sign-ins from revoking each
+        other's sessions; the caller's docstring, ``AuthService._sync_ad_channel_scope``, names at
+        least three revokes that remain under *WHAT THE COMPARE-AND-SET DOES NOT CLOSE*.
+
+        **What makes that compare hold differs per backend**, as for every user-record write. Each
+        reads the row, compares in Python, and writes with a compare on the seal it read. Whether a
+        row changed after the read then writes nothing depends on the backend. Postgres and SQL
+        Server also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK,
+        ROWLOCK``), so there it does, and the seal compare is a second guard. On SQLite the writer
+        lock holds the read and the write together within one process, but the read takes no lock
+        against ANOTHER process writing the same file. Across processes the only guard there is
+        the seal compare in the ``UPDATE``, and only under a row sealer: with one, a row changed in
+        any column after the read loses the compare, and the caller reads that as a miss. A
+        keyless store writes an empty seal on every row, so the compare always matches and nothing
+        stops another process's write landing between this read and this write."""
+        ...
+
     async def set_user_federated_subject(
         self,
         user_id: str,
@@ -3413,8 +3467,22 @@ class AuthStore(Protocol):
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
+
+        **``False`` is a refusal by the account, and has at least these causes**, with nothing
+        written: no row for ``user_id``; under ``require_federated_subject``, a binding other than
+        the one named; under ``require_sign_in_eligible``, a row disabled or holding either lock
+        live. Each is described below.
+
+        **Contention is not a refusal and is RAISED** as
+        :class:`~messagefoundry.store.SessionMintContended`, with nothing written (BACKLOG
+        #5653), once every bounded attempt met it: a revoke raised a session epoch the seal covers
+        before the attempt's locked read (``cause`` ``session_epoch_raised``, every backend), or
+        SQLite answered busy to its ``BEGIN IMMEDIATE`` (``cause`` ``busy``, SQLite under
+        ``require_sign_in_eligible`` only). A SQLite run whose attempts met both names
+        ``busy_and_session_epoch_raised``. Any other store error is raised as it arose.
 
         ``auth_mechanism`` records how the session was minted (``password``, ``kerberos`` or
         ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
@@ -3454,6 +3522,14 @@ class AuthStore(Protocol):
         :meth:`mark_session_mfa_verified` afterwards, a second transaction that wrote nothing on a
         row revoked in between and said nothing, so the sign-in went on to supersede the caller's
         prior session and return a dead token as a success.
+
+        ``require_sign_in_eligible`` also refuses, with ``False`` and nothing written, an account
+        that is disabled or holds either lock live at ``now`` (BACKLOG #5653), read in the same
+        locked transaction as the binding. A caller's own check of those states before the call
+        leaves a disable or a lockout free to commit between that check and the INSERT, and a
+        disable's session sweep cannot see a session that does not exist yet. The directory sign-in
+        passes it. The password sign-in does not, since a combined sign-in may complete on an
+        account under the sign-in lock (ADR 0197).
         """
         ...
 
@@ -3488,9 +3564,7 @@ class AuthStore(Protocol):
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
@@ -3514,8 +3588,9 @@ class AuthStore(Protocol):
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
-        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with
-        ``now`` or, when that is ``None``, the time the re-key landed, after any wait. The
+        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with the
+        DATABASE's own clock when the link's statement runs, after any wait, and never with an
+        engine process's clock (vault BACKLOG #4276; ``store/session_lineage.py`` says why). The
         session row itself carries nothing of its old hash, so the old hash still resolves to
         nothing. The link's one reader is :meth:`supersede_session`; ``store/session_lineage.py``
         says why it is unsealed. A re-key that did not land writes no link.
@@ -3555,9 +3630,11 @@ class AuthStore(Protocol):
         not met its factor. The decision is made inside the write's own transaction, on the row the
         write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
         SQLite's writer lock orders this process's writers, so a factor another request met first
-        leaves this a plain factor stamp. On SQLite a commit by another process between the read
-        and the write makes the write raise rather than replace anything, which the passkey leg
-        answers by ending the session (fail closed). When
+        leaves this a plain factor stamp. SQLite opens the write with ``BEGIN IMMEDIATE`` (vault
+        BACKLOG #2964 item 23), so another process cannot commit between the read and the write: a
+        writer there waits for the other process's lock under ``busy_timeout``, and one that
+        outlasts it raises before anything is read, which the passkey leg answers by ending the
+        session (fail closed). When
         applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
         and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
         ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
@@ -3572,7 +3649,7 @@ class AuthStore(Protocol):
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke the unrevoked session ``token_hash`` names, or the one it became, and return its
         row as revoked.
@@ -3589,16 +3666,18 @@ class AuthStore(Protocol):
         first, the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so
         the rotation fails closed.
 
-        **A rotation that committed FIRST is followed, when ``lineage_since`` is given (vault
+        **A rotation that committed FIRST is followed, when ``lineage_seconds`` is given (vault
         BACKLOG #3028, ADR 0210).** The presented hash then names no row, so the revoke steps along
         the links :meth:`rotate_session` wrote, up to ``LINEAGE_MAX_HOPS`` of them, and ends the
-        live end, inside one transaction. A link retired before ``lineage_since`` is not followed,
-        so a retired hash leads anywhere only for a bounded time; the caller chooses the bound,
-        because the store reads no settings. On Postgres and SQL Server a rotation can still commit
+        live end, inside one transaction. A link retired more than ``lineage_seconds`` before the
+        database's own clock, read in the walk's own statement, is not followed, so a retired hash
+        leads anywhere only for a bounded time; the caller chooses the bound, because the store
+        reads no settings. The stamp and the test both read the database's clock (vault BACKLOG
+        #4276); ``store/session_lineage.py`` says what that closes and what it leaves open. ``now`` stamps only the revoke. On Postgres and SQL Server a rotation can still commit
         between two steps; it costs the walk one more step, never the revoke, because each step
         revokes before it reads a link. ``store/session_lineage.py`` says why that order is the
         control. With
-        ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
+        ``lineage_seconds`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
 
@@ -3657,7 +3736,9 @@ class AuthStore(Protocol):
 
         In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
         every session minted before it whatever account it belongs to, raises the epoch of each
-        account its read of the account list returns, ends the sessions it finds, and re-seals the
+        account its read of the account list returns (an account whose raise a seal refusal
+        stops goes without it, and so does every account after a Vault Transit outage trips the
+        revoke: store.py's ``raise_account_epoch``), ends the sessions it finds, and re-seals the
         kept session under its account's new epoch and the new global one, only when it carried
         both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
         kept session an earlier sweep missed, or one whose account's record failed its seal, is
@@ -3753,7 +3834,9 @@ class AuthStore(Protocol):
         validator refuses them on presentation, so keeping them only grows the table.
 
         With ``lineage_seconds`` given, session lineage links retired more than that long before
-        ``now`` are deleted too (vault BACKLOG #3028). The supersession no longer follows them, so
+        the database's own clock are deleted too (vault BACKLOG #3028), never measured from
+        ``now``: the supersession measures its window on that clock (vault BACKLOG #4276), so the
+        two agree whichever engine process runs the purge. The supersession no longer follows them, so
         keeping them only grows the table. They are not counted in the return.
 
         The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
@@ -3833,7 +3916,7 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
         # caught error as its context; and the caught error is dropped, so the refusal's traceback
         # holds no frame local that reaches it.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
         finally:
             del caught  # dropped even where the call raises, at the recursion limit included
         raise refusal from None
@@ -3955,7 +4038,7 @@ def resolve_decrypt_keys(
         # As at :func:`resolve_active_key`, and with neither the caught error nor the refusal left
         # bound, even where the call raises, so no cycle through this frame keeps either.
         try:
-            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, InsecureHopRefused)
+            refusal = _in_place_of(caught, refusal, _KEY_SEAM_TEXTS, KeySeamHopRefused)
             raise refusal from None
         finally:
             del caught, refusal
@@ -4431,6 +4514,14 @@ class StoreCipherConfigError(ValueError):
     not it holds a codec error, and one whose judgement raised an ``Exception``."""
 
 
+class KeySeamHopRefused(InsecureHopRefused, KeyProviderError):
+    """A hop refusal at the key seam, :func:`resolve_active_key` and :func:`resolve_decrypt_keys`
+    (vault BACKLOG #8163 item 11). Still an ``InsecureHopRefused``, so a caller that reports a hop
+    refusal still does, and a ``KeyProviderError`` too, so a CLI key arm that catches a key that
+    could not be resolved reports it: ``restore`` and ``restore-verify`` exit 2 on it, where a
+    plain hop refusal reached the dispatch floor and exited 1."""
+
+
 def _build_store_cipher(
     settings: StoreSettings, posture: HopPosture | None, host_key: str | None = None
 ) -> Cipher:
@@ -4447,20 +4538,30 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = _split_retired(settings.encryption_keys_retired)
-    # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
-    # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement would
-    # print as :data:`_UNTEXTED`, is raised recorded there instead.
-    active = (
-        _checked_active_key(host_key, settings)
-        if host_key is not None
-        else resolve_active_key(settings, posture=posture)
-    )
-    return make_cipher(
-        active,
-        retired,
-        write_v2=settings.aad_bind,
-        allow_unmarked=settings.allow_unmarked_ciphertext,
-    )
+    try:
+        # A host key passes the same key check a resolved one does (BACKLOG #5310, #5308), so a
+        # refusal ``make_cipher`` would raise unrecorded, and the build's fixed-text replacement
+        # would print as :data:`_UNTEXTED`, is raised recorded there instead.
+        active = (
+            _checked_active_key(host_key, settings)
+            if host_key is not None
+            else resolve_active_key(settings, posture=posture)
+        )
+        return make_cipher(
+            active,
+            retired,
+            write_v2=settings.aad_bind,
+            allow_unmarked=settings.allow_unmarked_ciphertext,
+        )
+    finally:
+        # Vault BACKLOG #8163 item 21: an error leaving here keeps this frame on its traceback, so
+        # the key text it holds is dropped first, whatever raised. That matters where
+        # build_store_cipher does not replace the error, a BaseException that is not an Exception,
+        # and there the frames below this one, make_cipher's among them, still hold the key they
+        # were passed. Assigned, not deleted, since the call that raised may have left ``active``
+        # unset.
+        active = host_key = None
+        retired = []
 
 
 class StoreNotFoundError(RuntimeError):
@@ -4861,6 +4962,47 @@ def is_store_shape_error(exc: BaseException) -> bool:
     return state is not None and state.startswith("42")
 
 
+# --- the read-only cipher-cell walk the server stores share (BACKLOG #1719) --------------------
+# `cipher_cells.read_server_cipher_cells` reads a PostgreSQL or SQL Server store through four
+# methods, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
+# own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
+# once. Every identifier a walk read is given is a declared constant from `cipher_cells`, and only
+# values are bound as parameters. A read may run more than one statement. Each statement takes its
+# own connection borrow and ends its read transaction before it returns, so no read transaction
+# spans two chunks.
+
+
+def check_walk_identifiers(*names: str) -> None:
+    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
+    constants, so this only stops a caller that passed something else."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
+
+
+class _SurfaceReads(Protocol):
+    """The two dialect reads :meth:`ServerCipherWalk.cipher_walk_surface_sealed` asks a store for."""
+
+    async def _surface_keyed(self, table: str, column: str) -> bool: ...
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool: ...
+
+
+class ServerCipherWalk:
+    """The cipher-walk read both server stores answer alike, over their own dialect reads."""
+
+    async def cipher_walk_surface_sealed(
+        self: _SurfaceReads, table: str, column: str, *, keyed: bool
+    ) -> bool:
+        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked. Up to two
+        statements: the surface's marker row, then one marked value."""
+        check_walk_identifiers(table, column)
+        if keyed and await self._surface_keyed(table, column):
+            return True
+        return await self._surface_holds_ciphertext(table, column, f"{MARKER_PREFIX}%")
+
+
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     """The configured SQLite path when nothing is there, else ``None``.
 
@@ -5226,7 +5368,7 @@ async def _close_quietly(store: Store, exc: BaseException, cancels_before: int) 
     ``exc``. The close runs through :func:`~messagefoundry.store.store.cleanup_failed_open`, so a
     cancel cannot cut it short (BACKLOG #5720); that raises a cancel that landed meanwhile when
     ``exc`` is an ``Exception``. The ``Store`` protocol names no synchronous release, so past the
-    cancel's bound the close is left to finish on its own, and that is logged."""
+    cancel's bound the close is left to finish, if it does, and that is logged."""
     from messagefoundry.store.store import cleanup_failed_open
 
     await cleanup_failed_open(
@@ -5487,7 +5629,9 @@ class StoreAcquireTimeout(RuntimeError):
     cluster coordinator's clamped borrow whose clamp, floored at 1 s, is no longer than
     ``[store].acquire_timeout`` advises one fixed text that points to the docs/CONFIGURATION.md
     [cluster] paragraph instead
-    (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
+    (``SqlServerStore._acquire_clamped``, BACKLOG #5064). The SQL Server lease claim also raises it,
+    with no limit exceeded, when its borrow returned with under 1 s of the claim's shared deadline
+    left, so its statement was not issued (``SqlServerStore._statement_timeout_left``).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
@@ -5526,7 +5670,8 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
 
 
 #: Strong references to in-flight work nobody awaits: :func:`_salvage_late_borrow`'s releases (see
-#: the comment there), and the stuck warm-up borrows and releases :func:`_drain_and_release` abandons.
+#: the comment there), the borrows :func:`acquire_pooled` gives up on, and the stuck warm-up borrows
+#: and releases :func:`_drain_and_release` abandons.
 _LATE_RELEASES: set[asyncio.Future[Any]] = set()
 
 
@@ -5537,6 +5682,126 @@ def _discard_late_release(release: asyncio.Future[Any]) -> None:
     _LATE_RELEASES.discard(release)
     if not release.cancelled() and (exc := release.exception()) is not None:
         log.warning("abandoned pool release ended with %s", type(exc).__name__)
+
+
+def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unknown: bool) -> None:
+    """Cancel a pooled borrow its caller gave up on, but not while a value is on its way into the
+    borrow's next step (BACKLOG #5686).
+
+    ``Task.cancel()`` on a borrow that cannot take the cancel at a pending future throws it into the
+    borrow's next step in place of whatever that step would have received. If the pool has already
+    marked a connection in use for that step, nobody then holds it. :func:`_value_in_flight` names
+    the states this checks for. While the borrow is in one of them, the cancel is put off to the
+    next loop turn and checked again, at most ``_BORROW_CANCEL_MAX_DEFERRALS`` times; a borrow that
+    keeps stepping without parking, as a driver polling with bare yields does, is then cancelled
+    anyway, and a connection such a driver already holds at that point is lost. Otherwise the cancel
+    goes into the future the borrow is parked on, which is a suspension point of the driver's own,
+    and what the driver does there is the driver's. A state :func:`_value_in_flight` does not
+    check can still lose a connection to the cancel. Once the borrow is done, whoever holds it
+    returns what it handed over: :func:`acquire_pooled`'s done-callback, or the warm-up cleanup in
+    :func:`_drain_and_release` and, past its deadline, the same done-callback.
+
+    This is the one place that says which borrows the check can read, and what each caller does
+    where it cannot. It reads ``_fut_waiter`` on the borrow and on each future the borrow waits
+    on, directly or through a gather, whatever its type; the test suite pins the attribute on the
+    default asyncio task type and on the pure-Python task where the C task is in use, which is not
+    an ``asyncio.Task`` subclass there. A type that exposes the attribute is trusted to keep it
+    current. The check reads unknown at least where the borrow has no such attribute, or where a
+    pending ``asyncio.Task`` it waits on, directly or through a gather whose other pending children
+    read no value in flight, has none or holds something that is not a future there. It reads
+    parked, so the cancel goes in at once, at least for a future the borrow waits on through
+    another combinator such as a shield, and for a task it waits on that neither subclasses
+    ``asyncio.Task`` nor exposes the attribute, whatever the caller. The first time the check reads
+    unknown in a process, one WARNING says the check is off; no later read logs one. On unknown,
+    each caller keeps what it did before BACKLOG #5686, on the turn the check first reads unknown:
+    with ``defer_unknown`` (the warm-up) the cancel is put off one loop turn with
+    ``call_soon(borrow.cancel)``, and without it (:func:`acquire_pooled`) the borrow is cancelled
+    at once. Each can then lose a hand-over, at least: the deferred cancel one resolved after the
+    cancel is scheduled, or one the driver takes more than a step to finish; the immediate cancel
+    one whose borrow wake-up is already scheduled.
+
+    Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
+    ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
+    if borrow.done():
+        return
+    # Without this gate, _value_in_flight would read a borrow that has no _fut_waiter and does not
+    # subclass asyncio.Task as parked.
+    state: _Flight = _value_in_flight(borrow) if hasattr(borrow, "_fut_waiter") else "unknown"
+    if state == "unknown":
+        global _warned_no_waiter
+        if not _warned_no_waiter:
+            _warned_no_waiter = True
+            log.warning(
+                "a pool borrow, or a task it waits on, has no _fut_waiter, or one the check cannot "
+                "read; abandoned pool borrows like it are cancelled without checking for a hand-over "
+                "in flight"
+            )
+        if defer_unknown:
+            asyncio.get_running_loop().call_soon(borrow.cancel)
+        else:
+            borrow.cancel()
+        return
+    if state == "in_flight" and deferrals < _BORROW_CANCEL_MAX_DEFERRALS:
+        asyncio.get_running_loop().call_soon(
+            partial(_cancel_borrow, borrow, deferrals + 1, defer_unknown=defer_unknown)
+        )
+        return
+    borrow.cancel()
+
+
+_Flight = Literal["in_flight", "parked", "unknown"]
+
+
+def _value_in_flight(fut: asyncio.Future[Any]) -> _Flight:
+    """Whether cancelling ``fut`` now could throw the cancel in place of a value already on its way:
+    ``in_flight``, ``parked`` (it could not), or ``unknown`` (the check cannot read a task on the
+    way; :func:`_cancel_borrow` says where).
+
+    It reads these as in flight: a future already done with a result, a task that yielded with no
+    future or whose awaited future is in flight, and a gather future whose children are all done
+    (it refuses the cancel) or has a pending child in flight. A task whose awaited future failed or
+    was cancelled is parked, since no value is on its way. A gather with no pending child in flight
+    and a pending child that reads unknown reads unknown. Outside the check, at least: a gather with
+    a child done with a value beside a pending child (its cancel discards that value; it reads as
+    its pending children do), a shield or another combinator, a task that neither is an
+    ``asyncio.Task`` nor exposes ``_fut_waiter``, and a future that ignores its cancel; all but the
+    gather read parked. The
+    gather check reads ``_children``, a CPython detail the gather tests pin only through
+    behaviour."""
+    if fut.done():
+        return "parked" if fut.cancelled() or fut.exception() is not None else "in_flight"
+    # Duck-typed: any future exposing _fut_waiter is read as a task. A waiter that is not a future
+    # is not read further, so a call on it cannot raise and skip the cancel.
+    waiter: Any = getattr(fut, "_fut_waiter", _NO_WAITER_ATTR)
+    if waiter is not _NO_WAITER_ATTR:
+        if waiter is None:
+            return "in_flight"
+        return _value_in_flight(waiter) if asyncio.isfuture(waiter) else "unknown"
+    if isinstance(fut, asyncio.Task):
+        return "unknown"
+    children: list[asyncio.Future[Any]] | None = getattr(fut, "_children", None)
+    if children is None:
+        return "parked"
+    pending = [_value_in_flight(child) for child in children if not child.done()]
+    if not pending or "in_flight" in pending:
+        return "in_flight"
+    return "unknown" if "unknown" in pending else "parked"
+
+
+_NO_WAITER_ATTR: Final = object()
+
+#: Loop turns :func:`_cancel_borrow` waits for a borrow with a value in flight before it cancels
+#: anyway. A hand-over takes a few turns; the bound is for a borrow that never parks.
+_BORROW_CANCEL_MAX_DEFERRALS = 16
+_warned_no_waiter = False
+
+
+def _park_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -> None:
+    """Hold a borrow nobody will await strongly until it ends, and return any connection it hands
+    over (:func:`_salvage_late_borrow`)."""
+    _LATE_RELEASES.add(borrow)
+    borrow.add_done_callback(_LATE_RELEASES.discard)
+    borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
 
 
 async def acquire_pooled(
@@ -5556,22 +5821,26 @@ async def acquire_pooled(
     A bare ``asyncio.wait_for(pool.acquire(), timeout)`` cancels the borrow at the instant the timer
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
-    per retry. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if one
-    was actually handed over. The caller's own cancellation takes the same path — it must, or a
-    shutdown mid-borrow would strand a slot the pool never recovers."""
+    per retry. That cancel goes through :func:`_cancel_borrow`, which puts it off while a value is
+    on its way into the borrow where it can read that; it says where it cannot, and what this
+    caller does then. Whichever of the two wins, :func:`_salvage_late_borrow` returns the
+    connection if the borrow ends holding one; a connection the cancel replaced in a state
+    :func:`_cancel_borrow` does not check is lost before the borrow ends. The caller's own
+    cancellation takes the same path — it must, or a shutdown mid-borrow would strand a slot the
+    pool never recovers."""
     borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
     try:
         return await asyncio.wait_for(asyncio.shield(borrow), timeout)
     except TimeoutError as exc:
-        borrow.cancel()
-        borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+        _park_borrow(pool, backend, borrow)
+        _cancel_borrow(borrow, defer_unknown=False)
         raise StoreAcquireTimeout(
             f"{backend}: store pool acquire timed out after {timeout:g}s "
             f"(pool exhausted or database unresponsive); retune with {retune}"
         ) from exc
     except asyncio.CancelledError:
-        borrow.cancel()
-        borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+        _park_borrow(pool, backend, borrow)
+        _cancel_borrow(borrow, defer_unknown=False)
         raise
 
 
@@ -5591,11 +5860,11 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     no pool and overrides :meth:`QueueStore.warm_pool` with a no-op.
 
     Safe by construction: a per-connection connect failure is absorbed (the pool is left partially
-    warm), the whole warm-up is bounded by ``timeout``, and every connection actually acquired is
-    **always** released — even if a cancellation is delivered mid-cleanup — so warming can never strand a
-    connection out of the pool. Returns the number warmed. The caller leaves headroom below the pool
-    maximum so a concurrent startup caller is never starved while connections are held (see
-    :func:`warm_pool_target`).
+    warm), the whole warm-up is bounded by ``timeout``, and a connection the warm-up holds is
+    released even if a cancellation is delivered mid-cleanup. The exceptions are the bounded partial
+    strand below and the borrow states :func:`_cancel_borrow` does not check. Returns the number
+    warmed. The caller leaves headroom below the pool maximum so a concurrent startup caller is
+    never starved while connections are held (see :func:`warm_pool_target`).
 
     **Cancellation-safe, bounded cleanup** (reliability-core): a re-fire (demote→re-promote) or ``stop()``
     cancel can land while we are suspended in ``await pool.release(...)`` — a real suspension point for
@@ -5607,17 +5876,19 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     :func:`_release_held`.
 
     **Acquire-side leak-freedom** (BACKLOG #5686): each borrow runs as its own task behind a shield,
-    and the acquiring task only appends what that task returned. A cancel can still land in the same
-    loop turn the borrow resolves, and then the append never runs; awaiting the hand-off directly would
-    discard the connection there, because a pending cancel is thrown in instead of the resolved value.
-    So the cancel path defers the borrow's own cancel with ``call_soon``, so any step the borrow already
-    has scheduled runs first and finishes the hand-over, and hands the borrow to the cleanup. The
-    cleanup waits for those borrows under the same deadline as the releases, releases what they handed
-    over, and attaches :func:`_salvage_late_borrow` to any still pending at the deadline. That covers
-    a hand-over in the cancel's own loop turn; a borrow whose hand-over has not resolved when the
-    deferred cancel runs takes that cancel at one of the driver's own suspension points, and what that
-    does is the driver's: this rests on ``pool.acquire()`` marking the connection in-use atomically
-    with returning it, as ``asyncpg>=0.29`` and ``aioodbc>=0.5`` do.
+    and the acquiring task only appends what that task returned. A cancel can still land in the
+    same loop turn the borrow resolves, and then the append never runs; awaiting the hand-off
+    directly would discard the connection there, because a pending cancel is thrown in instead of
+    the resolved value. So the cancel path hands the borrow to the cleanup and cancels it through
+    :func:`_cancel_borrow`, which puts the cancel off while a value is on its way into the borrow
+    where it can read that; it says where it cannot, and what this caller does then. The cleanup
+    releases each abandoned borrow's connection as soon as that borrow lands, under the same
+    deadline as the other releases, so a borrow that lands is not kept waiting on a sibling still
+    stuck; it attaches :func:`_salvage_late_borrow` to any borrow still pending at the deadline, and
+    a borrow is returned by one of the two, not both. A borrow parked on the pool takes the cancel
+    at one of the driver's own suspension points, and what that does is the driver's: this rests
+    on ``pool.acquire()`` marking the connection in-use atomically with returning it, as
+    ``asyncpg>=0.29`` and ``aioodbc>=0.5`` do.
 
     **Acquire-and-release ONLY** — this deliberately opens NO cursor and runs NO statement, so it neither
     needs nor uses the EF-6 ``_cursor`` close-before-release discipline. If a liveness probe (``SELECT 1``)
@@ -5633,9 +5904,10 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
         try:
             conn = await asyncio.shield(borrow)
         except asyncio.CancelledError:
-            # See "Acquire-side leak-freedom" above for why the cancel is deferred one turn.
-            asyncio.get_running_loop().call_soon(borrow.cancel)
+            # See "Acquire-side leak-freedom" above: the cleanup returns what this borrow hands
+            # over.
             abandoned.append(borrow)
+            _cancel_borrow(borrow, defer_unknown=True)
             raise
         # No await between the hand-over and the append, so the cleanup below releases it even if the
         # gather is cancelled or times out mid-flight.
@@ -5699,31 +5971,40 @@ async def _drain_and_release(
     await asyncio.gather(*tasks, return_exceptions=True)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _CLEANUP_TIMEOUT_SECONDS
-    # The held releases start at once; the borrows the acquire tasks gave up on (see "Acquire-side
-    # leak-freedom") are waited for alongside them under the same deadline, and what they handed over
-    # is released too. A borrow still pending at the deadline is parked, strongly held, for the salvage.
+    # The held releases start at once. Each borrow the acquire tasks gave up on (see "Acquire-side
+    # leak-freedom") is released the moment it lands, under the same deadline, so a landed borrow is
+    # not kept waiting on a stuck sibling. A borrow still pending at the deadline is parked,
+    # strongly held, for the salvage; each borrow leaves ``borrows`` once, so its connection is
+    # released once.
     releases = [asyncio.ensure_future(_release_one(pool, conn, backend)) for conn in held]
-    if abandoned:
-        landed, late = await asyncio.wait(abandoned, timeout=_CLEANUP_TIMEOUT_SECONDS)
-        for borrow in landed:
+    borrows: set[asyncio.Future[Any]] = set(abandoned)
+    while borrows:
+        done, _pending = await asyncio.wait(
+            borrows,
+            timeout=max(deadline - loop.time(), 0.0),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            break  # the bound lapsed
+        for borrow in done:
+            borrows.discard(borrow)
             if borrow.cancelled():
                 continue
             if (exc := borrow.exception()) is not None:
                 log.debug("%s: an abandoned warm-up borrow failed: %s", backend, type(exc).__name__)
                 continue
             held.append(borrow.result())
-            releases.append(asyncio.ensure_future(_release_one(pool, borrow.result(), backend)))
-        if late:
-            log.warning(
-                "%s: %d warm-up borrow(s) still pending after %gs; leaving them to the salvage",
-                backend,
-                len(late),
-                _CLEANUP_TIMEOUT_SECONDS,
-            )
-        for borrow in late:
-            _LATE_RELEASES.add(borrow)
-            borrow.add_done_callback(_discard_late_release)
-            borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+            release = asyncio.ensure_future(_release_one(pool, borrow.result(), backend))
+            releases.append(release)
+    if borrows:
+        log.warning(
+            "%s: %d warm-up borrow(s) still pending after %gs; leaving them to the salvage",
+            backend,
+            len(borrows),
+            _CLEANUP_TIMEOUT_SECONDS,
+        )
+    for borrow in borrows:
+        _park_borrow(pool, backend, borrow)
     if not releases:
         return
     # ``asyncio.wait`` rather than ``wait_for``, and no await on the cancelled releases afterwards

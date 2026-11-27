@@ -184,6 +184,10 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
     ),
 )
 
+#: The first-member family's needle (BACKLOG #5030 added item 4), joined at runtime so no
+#: secret-shaped literal sits in source and gitleaks needs no allowlist entry.
+_FIRST_MEMBER_NEEDLE = "-".join(("wt", "Fm1_Memb", "94"))
+
 
 #: The quoted rows as families, so they inherit the three parametrized assertions below: the production
 #: chain scrubs them, the DECLARED pattern is what did it, and the admission gate does not change the
@@ -286,6 +290,13 @@ FAMILIES: tuple[Family, ...] = (
         patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
+        # The first member, with no ";" before it (BACKLOG #5030 added item 4).
+        name="connection_string_first_member",
+        line=f"odbc conn sslpassword={_FIRST_MEMBER_NEEDLE} x;Server=db",
+        secret=_FIRST_MEMBER_NEEDLE,
+        patterns=("_CONNECTION_STRING_FIRST_MEMBER",),
+    ),
+    Family(
         name="dsn_inline_password",
         line="store dsn postgres://svc:wt-D5n_Pass-61@db.invalid:5432/mefor",
         secret="wt-D5n_Pass-61",
@@ -324,7 +335,10 @@ def test_the_production_filter_chain_scrubs_every_credential_family(fam: Family)
     assert fam.secret not in out, f"{fam.name}: the credential survived the chain -- got {out!r}"
     # The member pass masks each word of a value with a bare word and no brackets, so a later pass
     # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
-    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    member_only = fam.patterns in (
+        ("_CONNECTION_STRING_MEMBER",),
+        ("_CONNECTION_STRING_FIRST_MEMBER",),
+    )
     marker = f"={secretscrub._MEMBER_MASK}" if member_only else CREDENTIAL_PLACEHOLDER
     assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 

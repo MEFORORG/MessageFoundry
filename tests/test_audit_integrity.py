@@ -1825,9 +1825,11 @@ def test_operator_guidance_survives_the_phi_scrubber() -> None:
 async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path) -> None:
     """PowerShell 5.1's `>` writes UTF-16LE, and this ships as a Windows service.
 
-    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so catching only the latter would let
-    it escape `_load_audit_anchor` as an unhandled traceback out of `Engine.start()` -- turning an
-    encoding mistake into a refusal to boot, on a path whose entire contract is alert-only.
+    `UnicodeDecodeError` subclasses `ValueError`, not `OSError`, so catching only the latter would
+    let it escape `_load_audit_anchor` as an unhandled traceback out of `Engine.start()` -- turning
+    an encoding mistake into a refusal to boot, on a path that is alert-only for the faults it
+    catches. A NUL in the path is not one of them; `test_startup_anchor_nul_path_raises_value_error`
+    pins that.
     """
     db = tmp_path / "utf16.db"
     await _aseed_audit_rows(db, 3)
@@ -1838,6 +1840,51 @@ async def test_startup_anchor_reads_a_utf16_file_without_crashing(tmp_path: Path
 
     assert sink.events == []
     assert "could not be read" in cap.text, cap.records
+
+
+async def test_startup_anchor_nul_path_raises_value_error(tmp_path: Path) -> None:
+    """A PIN OF CURRENT BEHAVIOUR, not a statement of the intended contract.
+
+    `_load_audit_anchor` catches only `OSError` and `UnicodeDecodeError`, so the `ValueError` a path
+    carrying a NUL character raises escapes it and `Engine.start()`, before any walk runs and with
+    no tamper alert: such a path fails startup rather than degrading to a bare walk. That failure
+    was kept, as the safer option, in a repair of this code that changed text only; whether it
+    should become alert-only is an open finding for the ledger, not settled here. If it changes,
+    change the `_load_audit_anchor` docstring and the `audit_anchor_file` row in
+    docs/CONFIGURATION.md together.
+    """
+    # Not "nul.db": NUL is a reserved DOS device name, and Windows Server 2022 opens NUL.<ext> as
+    # the device, so SQLite there cannot open the store at all.
+    db = tmp_path / "nul-anchor-path.db"
+    await _aseed_audit_rows(db, 1)
+    store = await MessageStore.open(db)
+    walks: list[object] = []
+
+    async def counting_verify(**kwargs: object) -> AuditVerdict:
+        walks.append(kwargs)
+        raise AssertionError
+
+    store.verify_audit_chain = counting_verify  # type: ignore[method-assign]
+    sink = _AnchorRecordingSink()
+    try:
+        eng = Engine(
+            store,
+            alert_sink=sink,
+            audit_verify_on_start=True,
+            audit_anchor_file=str(tmp_path / "anchor\x00.txt"),
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        try:
+            with pytest.raises(ValueError, match="null"):
+                await eng._load_audit_anchor()
+            with pytest.raises(ValueError, match="null"):
+                await eng.start()
+        finally:
+            await eng.stop()
+    finally:
+        await store.close()
+    assert walks == []
+    assert sink.events == []
 
 
 async def test_startup_anchor_accepts_a_utf8_bom(tmp_path: Path) -> None:
@@ -1947,7 +1994,9 @@ def test_parse_audit_anchor_refuses_an_empty_head_with_a_nonzero_count() -> None
 
 
 @pytest.mark.parametrize(
-    "head", ["a" * 64, "vault:v1:c3ludGhldGlj"], ids=["hex-digest", "isolated-module-mac"]
+    "head",
+    ["a" * 64, "vault:v1:" + base64.b64encode(b"\x02" * 32).decode("ascii")],
+    ids=["hex-digest", "isolated-module-mac"],
 )
 def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
     """The converse of the pairing above (vault BACKLOG #5987 item 1). A log with rows has a newest
@@ -1959,6 +2008,86 @@ def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
         "a zero row count is only producible from an EMPTY log, so it cannot carry a head"
     )
     assert parse_audit_anchor(f"1:{head}") == (1, head)  # the control: the head itself is legal
+
+
+_NOT_A_DECIMAL = "the row count is not a plain decimal integer of up to 19 digits"
+
+
+@pytest.mark.parametrize(
+    ("count", "reason"),
+    [
+        ("+5", _NOT_A_DECIMAL),
+        ("1_000", _NOT_A_DECIMAL),
+        (chr(0x0663), _NOT_A_DECIMAL),  # ARABIC-INDIC DIGIT THREE, which int() accepts
+        ("--5", _NOT_A_DECIMAL),
+        ("-0", "the row count is a signed zero, which no store prints"),
+        ("-" + "1" * 20, "the row count is negative"),
+        ("0" * 19 + "5", _NOT_A_DECIMAL),  # 20 digits, as the row pair refuses them
+        ("9" * 5000, _NOT_A_DECIMAL),
+        (str(2**63), "the row count is larger than any store can hold"),
+        ("-5", "the row count is negative"),
+    ],
+    ids=[
+        "plus-sign",
+        "underscore",
+        "arabic-indic-digit",
+        "double-minus",
+        "minus-zero",
+        "negative-twenty-digits",
+        "twenty-digits",
+        "long",
+        "past-int64",
+        "negative",
+    ],
+)
+def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reason: str) -> None:
+    """Vault BACKLOG #4790: the count is ASCII digits bounded by the signed 64-bit ``seq`` column,
+    not whatever ``int()`` takes; vault BACKLOG #5987: the reason names no part of it."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(f"{count}:{'a' * 64}")
+    assert caught.value.reason == reason
+    assert parse_audit_anchor(f"{2**63 - 1}:{'a' * 64}") == (2**63 - 1, "a" * 64)  # the bound
+    assert parse_audit_anchor(f" 7 :{'a' * 64}") == (7, "a" * 64)  # spaces around it, as before
+
+
+@pytest.mark.parametrize(
+    "head",
+    ["vault:v", "vault:v1:", "vault:v1:c3ludGhldGlj", "vault:v1:{b} x"],
+    ids=["prefix-only", "no-body", "short-digest", "inner-space"],
+)
+def test_parse_audit_anchor_passes_any_isolated_module_head_through(head: str) -> None:
+    """A ``vault:v`` head is opaque and is NOT held to the Transit MAC's shape (vault BACKLOG
+    #5987): ``audit-anchor`` prints a tampered ``vault:v`` head as stored, so a shape
+    check here would refuse an anchor that command printed. The CLI pin is
+    ``test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head``."""
+    body = base64.b64encode(bytes([4]) * 32).decode("ascii")
+    head = head.format(b=body)
+    assert parse_audit_anchor(f"3:{head}") == (3, head)
+
+
+@pytest.mark.usefixtures("keyless_verify")
+def test_audit_verify_walks_on_an_anchor_audit_anchor_printed_for_a_malformed_transit_head(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5987: a ``vault:v`` head ``audit-anchor`` prints, ``audit-verify`` takes as an
+    anchor and walks the chain. The newest row's hash is overwritten with a truncated
+    ``vault:v1:`` string, a head no Transit backend returns; the keyless walk FAILS on that row
+    because the stored hash differs from the one it recomputes (exit 1). Exit 2, a refusal of the
+    anchor as malformed before any walk, would leave the tampered row unreported."""
+    db = tmp_path / "transit_head.db"
+    _seed_audit_rows(db, 3)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("UPDATE audit_log SET row_hash = 'vault:v1:' WHERE id = 3")
+        conn.commit()
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    assert anchor == "3:vault:v1:", anchor
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    captured = capsys.readouterr()
+    assert "malformed audit anchor" not in captured.err, captured.err
+    assert "audit chain broken at seq=3" in captured.out, captured.out
 
 
 @pytest.mark.parametrize(

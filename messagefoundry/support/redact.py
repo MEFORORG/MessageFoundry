@@ -50,19 +50,38 @@ underscore so it cannot be reached by that sweep.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
+    _BEARER_TAILS,
+    _BYTES_PROBE,
+    _CONNECTION_STRING_FIRST_MEMBER,
     _CONNECTION_STRING_MEMBER,
+    _KEY_LINE,
+    _KEY_SEPARATOR,
+    _KV_TAILS,
+    _MEFOR_GLUED_BRANCH,
+    _MEFOR_TAILS,
+    _SHIPPED_TAILS,
     _braced_tail,
     _dsn_password_repl,
+    _keep_key_marker,
     _mask_member,
+    _mask_only,
+    _same,
+    _without_tails,
+    could_take_a_tail,
     scrub_credentials,
+    scrub_credentials_without_tails,
 )
 from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_NARROW_DSN_PASSWORD
+from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY_BLOCK
 from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
+    "key_body_mask_from",
+    "mask_key_body_lines",
     "redact_log_line",
     "redact_log_record",
     "redact_log_text",
@@ -326,10 +345,24 @@ _PLAIN_SCHEME_VALUE = (
 # never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote. A
 # QUOTED KEY is a label when a colon follows the quote, here and in ``_LABEL_HEAD`` (BACKLOG #3038);
 # why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
+#: This copy's scheme words with a marker on ``digest``, which the Digest tail reads (BACKLOG
+#: #5548). The tails themselves are secretscrub's fragments, imported, and the contract they hold
+#: is stated once, on ``_NO_LABEL_BEFORE`` there. This copy has no union behind it; the control on
+#: its tails is the comparison in :func:`redact_log_line`, which keeps the reading without them
+#: where the two differ at anything but an "x".
+_SCHEME_WORDS = r"(?:(?i:bearer|basic|digest)\s+)?"
+_MARKED_SCHEME_WORDS = r"(?:(?i:bearer|basic|(?P<digest>digest))\s+)?"
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?i:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
+    r"(?:['\"]\s*:|\s*[:=])\s*"
+    + _MARKED_SCHEME_WORDS
+    + _BYTES_PROBE
+    + r"(?:"
+    + _GUARDED_QUOTED_VALUE
+    + r"|"
+    + _PLAIN_VALUE
+    + r")"
+    + _BEARER_TAILS
 )
 
 # A bare auth scheme carrying its credential with no preceding header label — "Bearer <tok>" as it
@@ -361,12 +394,14 @@ _AUTH_SCHEME = re.compile(
 # a space does not; why is on the same pattern in ``messagefoundry/secretscrub.py``.
 _MEFOR_SECRET = re.compile(
     r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
-    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + rf"(?![^{_PLAIN_TERMINATORS}])|"
+    + _MEFOR_GLUED_BRANCH
     # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
     + r"|(?="
     + _GUARDED_QUOTED_VALUE
@@ -375,6 +410,7 @@ _MEFOR_SECRET = re.compile(
     + r"|"
     + _PLAIN_VALUE
     + r"['\"]?)"
+    + _MEFOR_TAILS
 )
 
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
@@ -403,8 +439,10 @@ _MEFOR_SECRET = re.compile(
 #
 # THE OTHER LABEL PATTERNS TAKE GUARDED FORMS OF THESE (BACKLOG #1685's remainder), each by a rule
 # that keeps it from printing anything its plain class used to hide. ``_MEFOR_SECRET`` and
-# ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole only when the closing "}" ends the
-# value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_BEARER`` takes a
+# ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole when the closing "}" ends the
+# value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_MEFOR_SECRET``
+# also takes a braced value holding a space with lower case text glued after its closer, in one narrow
+# shape (secretscrub's ``_MEFOR_GLUED_BRANCH``, imported; BACKLOG #2966 step 1). ``_BEARER`` takes a
 # quoted value and no braced one, because ``session=`` and ``token=`` carry dict and JSON reprs in this
 # engine's log text. Anything a guarded form refuses -- an unclosed quote, a closer that may belong to
 # a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
@@ -415,14 +453,17 @@ _MEFOR_SECRET = re.compile(
 # shared fragment or case fold; the widened one is built from secretscrub's query keys and label
 # words under its global fold, so a word added there reaches the bundle's last DSN pass too. This
 # module DOES call ``secretscrub`` now, as a second layer after this copy (BACKLOG
-# #2694), but it does not build this copy from that one's fragments. Doing so would change this
-# copy's case fold, and that change is what the comment above ``redact_log_line`` records as
-# printing values. The fragments themselves sit above ``_BEARER``, because every label pattern uses
-# them.
+# #2694), and it builds this copy from that one's fragments in only a few places: at least the masked
+# tails, the bytes probe and ``_MEFOR_GLUED_BRANCH`` (BACKLOG #2966), which carries secretscrub's
+# ``_PLAIN_TERMINATORS`` and ``_NO_QUOTED_LABEL_AFTER``; a test holds those two equal to this
+# copy's. The label fragments stay restated: importing them would change this copy's case fold,
+# and that change is what the comment above ``redact_log_line`` records as printing values. The
+# fragments themselves sit above ``_BEARER``, because every label pattern uses them.
 _CREDENTIAL_KV = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _ODBC_BRACED
     + r"|"
     + _KV_QUOTED_VALUE
@@ -431,6 +472,7 @@ _CREDENTIAL_KV = re.compile(
     + r"|"
     + _PLAIN_KV_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -503,13 +545,15 @@ _CREDENTIAL_KV = re.compile(
 _KEY_MATERIAL = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next))\b['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _PLAIN_KEY_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
@@ -548,6 +592,21 @@ _KEY_MATERIAL = re.compile(
 #: strict mypy lets a test name each on this module; a test disables each here by that name.
 _DSN_PASSWORD = _SHARED_NARROW_DSN_PASSWORD
 _WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
+#: A PRIVATE KEY block, its body masked (BACKLOG #5550): secretscrub's object, assigned under the
+#: same name so a test disables it in both layers by that name.
+_PRIVATE_KEY_BLOCK = _SHARED_PRIVATE_KEY_BLOCK
+
+# The tails each copy pattern holds, registered where secretscrub's ``_without_tails`` checks them,
+# so a strip of this copy that changes nothing raises rather than leaving the comparison in
+# :func:`redact_log_line` comparing a reading with itself.
+_SHIPPED_TAILS.update(
+    {
+        id(_BEARER): (_BEARER_TAILS, _BYTES_PROBE),
+        id(_MEFOR_SECRET): (_MEFOR_TAILS, _BYTES_PROBE),
+        id(_CREDENTIAL_KV): (_KV_TAILS, _BYTES_PROBE),
+        id(_KEY_MATERIAL): (_KV_TAILS, _BYTES_PROBE),
+    }
+)
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
@@ -591,7 +650,10 @@ _LEADING_TS = re.compile(
 #
 # * The shared pass runs AFTER the PHI pass. The PHI pass judges a line by its shape. Handed the
 #   shared pass's output, it changed its verdict and printed a value on 12 lines of that corpus. After
-#   it, the PHI pass sees exactly the text it always saw.
+#   it, the PHI pass sees the text this copy left. Since BACKLOG #5546 to #5550 that text can hold
+#   a masked tail, and a review found the PHI pass then printing a name the line before the tails
+#   hid; :func:`redact_log_line` compares the two readings on such a line and keeps the one without
+#   the tails where they differ at anything but an "x".
 # * The shared pass runs on the text BETWEEN this module's placeholders, one piece at a time. A second
 #   pass reads a placeholder as a value and runs on into the next label:
 #   ``pwd=[REDACTED]:password=[REDACTED]`` came out as ``pwd=[REDACTED]``. The value stays hidden, but
@@ -626,7 +688,8 @@ _LEADING_TS = re.compile(
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
-    Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
+    Two layers: (1) on a line holding "-----", secretscrub's PRIVATE KEY block pattern (BACKLOG
+    #5550), then the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
     bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
@@ -636,46 +699,86 @@ def redact_log_line(line: str) -> str:
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
     mask runs once more over the whole joined line (BACKLOG #5030), then secretscrub's widened DSN
-    reading, over the whole line too (BACKLOG #5386). A final long-base64 sweep catches
-    any residual key/token run.
+    reading, over the whole line too (BACKLOG #5386). On a line a masked tail could fire on, the
+    line is also read without the tails, the key-block pattern's included, and that reading is kept
+    unless the tailed one differs from it only by characters written as "x" (the comment on the
+    comparison below says why). A final long-base64 sweep catches any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
     ts = _LEADING_TS.match(line)
-    prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
-    logged_placeholder = REDACTION_PLACEHOLDER in body
-    body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
-    body = _MEFOR_SECRET.sub(_keep_label, body)
-    body = _BEARER.sub(_keep_label, body)
-    body = _AUTH_SCHEME.sub(_keep_scheme, body)
-    body = _CREDENTIAL_KV.sub(_keep_label, body)
-    body = _KEY_MATERIAL.sub(_keep_label, body)
-    body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
-    body = _redact_phi(
-        body
-    )  # shared engine PHI pass: generic HL7 segments/field runs + DOB + names
-    # The second credential layer; see the comment above this function.
-    pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
-    body = REDACTION_PLACEHOLDER.join(
-        scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
-    )
-    # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
-    # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second layer and
-    # before only the widened DSN pass and the long-base64 sweep below, so it reads what they left,
-    # and over the whole joined body, since this module's placeholder can sit inside the value
-    # (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
-    # this line read the same separators; secretscrub's comment on the pattern says why that matters.
-    if ";" in body:
-        body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
-    # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a password-only
-    # DSN, and a password holding an "@" that the narrow copy above cut at its first one; the comment
-    # on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not reach
-    # past a label a pass reads, a query key the write-time filter hides included, whether or not a
-    # pass above hid its value; the comment on _DSN_PASSWORD says which labels.
-    if "@" in body and "://" in body:
-        body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
+    prefix, original = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
+    logged_placeholder = REDACTION_PLACEHOLDER in original
+
+    def layers(
+        body: str, read: Callable[[re.Pattern[str]], re.Pattern[str]], scrub: Callable[..., str]
+    ) -> str:
+        # First, before the PHI pass rewrites a PRIVATE KEY block's markers (BACKLOG #5550).
+        if "-----" in body:
+            body = read(_PRIVATE_KEY_BLOCK).sub(_keep_key_marker, body)
+        body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
+        body = read(_MEFOR_SECRET).sub(_keep_label, body)
+        body = read(_BEARER).sub(_keep_label, body)
+        body = _AUTH_SCHEME.sub(_keep_scheme, body)
+        body = read(_CREDENTIAL_KV).sub(_keep_label, body)
+        body = read(_KEY_MATERIAL).sub(_keep_label, body)
+        body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
+        body = _redact_phi(body)  # shared engine PHI pass: HL7 segments/field runs + DOB + names
+        # The second credential layer; see the comment above this function.
+        pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
+        body = REDACTION_PLACEHOLDER.join(
+            scrub(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
+        )
+        # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
+        # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second
+        # layer and before only the widened DSN pass and the long-base64 sweep below, so it reads
+        # what they left, and over the whole joined body, since this module's placeholder can sit
+        # inside the value (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks
+        # words only, so the PHI pass and the labels of a later redaction of this line read the
+        # same separators; secretscrub's comment on the pattern says why that matters.
+        if ";" in body:
+            body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
+            body = _CONNECTION_STRING_FIRST_MEMBER.sub(_mask_member, body)
+        # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a
+        # password-only DSN, and a password holding an "@" that the narrow copy above cut at its
+        # first one; the comment on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not
+        # reach past a label a pass reads, a query key the write-time filter hides included,
+        # whether or not a pass above hid its value; the comment on _DSN_PASSWORD says which.
+        if "@" in body and "://" in body:
+            body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
+        return body
+
+    body = layers(original, _same, scrub_credentials)
+    # THE MASKED TAILS' CONTROL (BACKLOG #5546 to #5550), stated on ``_NO_LABEL_BEFORE`` in
+    # secretscrub. The first layer's tails mask text before the PHI pass reads it, and a masked
+    # token can end a name run or an HL7 segment that pass would have hidden. So on a line a tail
+    # could fire on, the line is read again without them, and the tailed reading is kept only where
+    # it is that reading with characters written as "x". Compared before the long-base64 sweep,
+    # which reads an "x" run as base64 and only ever hides more.
+    if could_take_a_tail(original):
+        before = layers(original, _without_tails, scrub_credentials_without_tails)
+        if not _mask_only(before, body):
+            body = before
+        elif body != before:
+            # The sweep reads a masked run as base64 and would join runs the reading before kept
+            # apart, so it hides exactly the runs it hides there, at the same places.
+            return prefix + _swept_as(before, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
+
+
+def _swept_as(before: str, after: str) -> str:
+    """``after``, which is ``before`` with characters written as "x", with the long-base64 sweep's
+    matches on ``before`` replaced at the same spans, so the result is the swept ``before`` with
+    characters written as "x"."""
+    out: list[str] = []
+    pos = 0
+    for run in _LONG_B64.finditer(before):
+        out.append(after[pos : run.start()])
+        out.append(REDACTION_PLACEHOLDER)
+        pos = run.end()
+    out.append(after[pos:])
+    return "".join(out)
 
 
 def split_log_lines(text: str) -> list[str]:
@@ -712,8 +815,100 @@ def redact_log_record(line: str) -> str:
 
 
 def redact_log_text(text: str) -> str:
-    """Redact every line of a multi-line block (the log tail), preserving line breaks."""
-    return "\n".join(redact_log_record(ln) for ln in split_log_lines(text))
+    """Redact every line of a multi-line block (the log tail), preserving line breaks.
+
+    A PRIVATE KEY block whose body lines are lines of their own is masked across them first
+    (:func:`mask_key_body_lines`), since no single line holds the whole block."""
+    lines = mask_key_body_lines(split_log_lines(text))
+    return "\n".join(redact_log_record(ln) for ln in lines)
+
+
+#: One line :data:`_PRIVATE_KEY_BLOCK` reads as body, whole, so that its body runs on past the line
+#: break after it: the block pattern's own body-line and separator fragments, under its flag, with
+#: an escaped line break between the pieces of one line.
+_KEY_BODY_PIECE = _KEY_LINE + r"[ \t]*+(?=" + _KEY_SEPARATOR + r"|\Z)"
+_WHOLE_KEY_BODY_LINE = re.compile(
+    r"(?i)" + _KEY_BODY_PIECE + r"(?:[ \t]*+" + _KEY_SEPARATOR + _KEY_BODY_PIECE + r")*+"
+)
+
+
+def key_body_mask_from(lines: list[str], start: int) -> int:
+    """The index to run :func:`mask_key_body_lines` from so that ``lines[start:]`` comes out as it
+    does from the whole list (BACKLOG #5550): the nearest line before ``start`` that a block's body
+    cannot run on past, or 0.
+
+    A block's body runs on from one line to the next only over a line it reads as body whole
+    (:data:`_WHOLE_KEY_BODY_LINE`), so a block that covers a line at or after ``start`` has its
+    BEGIN line at or after the nearest earlier line that is not one. Masking from there costs the
+    lines from there on, not the whole list. A run of whole body lines before ``start`` is scanned
+    back over to its first line, so there the cost is the run's length.
+
+    The list may be cut short at the end too, as ``GET /logs/tail`` cuts it at its page's end: a
+    body line is masked the same whatever follows it, since the pattern reads the end of the text
+    where it reads a line break, and the mask writes each line from that line alone.
+
+    The equivalence holds for ``lines`` as :func:`split_log_lines` returns them, where no element
+    holds a "\\n". An element outside the span masked, before the returned index or after an end
+    cut, that holds one breaks it: over the whole list :func:`mask_key_body_lines` then returns
+    every line unchanged, while over the span it may still mask a block, so the span errs toward
+    masking more, not less."""
+    index = min(start, len(lines))
+    while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
+        index -= 1
+    return max(index - 1, 0)
+
+
+def mask_key_body_lines(lines: list[str]) -> list[str]:
+    """``lines`` with each line after a BEGIN line that a PRIVATE KEY block's body covers whole
+    written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
+
+    ``lines`` is what :func:`split_log_lines` returns: no element holds a "\\n" (one that does is
+    returned unchanged, with every other line). :func:`redact_log_line` can mask a block inside one
+    line, and so one whose line breaks are escaped, but a block with real line breaks reaches it one
+    line at a time, where no line holds its BEGIN marker and its body together. A body line of 24 or
+    more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
+    last line, printed. So the block is found over the joined lines, and only the lines its body
+    covers from their first character to their last are replaced, each with what the mask writes for
+    it, so no character of the key itself is left on them. The mask writes as "x" every character
+    of such a line but these, which it leaves as they were: its spaces and tabs, an escaped line
+    break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole. So "=" padding, and a
+    letter the pattern's case-insensitive classes read beyond ASCII, become "x" too. A later pass still reads
+    the result: the long-base64 sweep reads a run of 24 or more "x" as base64 and replaces it.
+    Every other line stays as it was.
+
+    At least these still print as before: a last body line that shares its line with an escaped line
+    break, as in ``<body>\\n-----END ...``, and is too short for the sweep; a body whose lines each
+    carry a log record's own prefix, such as a timestamp, which the block pattern does not read as
+    body lines; a block whose BEGIN line is not among ``lines``; and every gap of secretscrub's
+    pattern, such as a body line ending in a label word. A block with no END marker is masked to its
+    last line boundary, so a line after it that reads as a base64 run, such as a single word, is
+    masked too."""
+    if not any("-----" in line for line in lines) or any("\n" in line for line in lines):
+        return lines
+    joined = "\n".join(lines)
+    out = lines
+    index, cursor = 0, 0
+    for block in _PRIVATE_KEY_BLOCK.finditer(joined):
+        start = block.start("key_body")
+        body = block.group("key_body")
+        if "\n" not in body:
+            continue  # every line break in it is escaped, so it sits on one line, left to that line's pass
+        masked = _braced_tail(block)  # the body masked, one character for one
+        # The first real line break in the body ends the BEGIN line, which the line pass masks
+        # itself; every later piece starts a line, and is that whole line unless it is the last
+        # and ends at an escaped line break inside it.
+        index += joined.count("\n", cursor, start) + 1
+        offset = body.index("\n") + 1
+        for piece in body[offset:].split("\n"):
+            if len(lines[index]) == len(piece):
+                if out is lines:
+                    out = list(lines)
+                out[index] = masked[offset : offset + len(piece)]
+            offset += len(piece) + 1
+            index += 1
+        index -= 1
+        cursor = block.end()
+    return out
 
 
 def _keep_label(m: re.Match[str]) -> str:

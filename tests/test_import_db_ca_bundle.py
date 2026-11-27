@@ -14,11 +14,12 @@ period. A root goes into the machine Root store and any other CA into the interm
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
 directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
 ``Get-CaChainCheck`` (and the console helpers they call) out of the script's AST and call them, as
-``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
-only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
-skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
-script's own elevation refusal rather than the machine Root store. Both halves need ``pwsh`` and
-skip where there is none.
+``tests/test_import_db_ca_console_text.py`` does. The whole-script tests but one run it with
+``-WhatIf``, where ``ShouldProcess`` declines every import, so the store is never opened. The one
+run without it is the elevation refusal test, which gives it a file the script refuses anyway.
+All of them are skipped in an elevated session, so even a regression that ignored ``-WhatIf``
+would meet the script's own elevation refusal rather than the machine Root store. Both halves need
+``pwsh`` and skip where there is none.
 """
 
 from __future__ import annotations
@@ -241,6 +242,19 @@ def files(
         "pem_key_usage": _pem(chain["no_cert_sign"][0], chain["cert_sign"][0]),
         # Bare base64 with no armour, and the AD CS shape: a base64 .p7b under a CERTIFICATE header.
         "b64_der": base64.encodebytes(root.public_bytes(der)),
+        # The same behind a byte-order mark, as a Windows editor saves it.
+        "b64_der_utf8_bom": b"\xef\xbb\xbf" + base64.encodebytes(root.public_bytes(der)),
+        "b64_der_utf16_bom": b"\xff\xfe"
+        + base64.encodebytes(root.public_bytes(der)).decode("ascii").encode("utf-16-le"),
+        "pem_utf8_bom": b"\xef\xbb\xbf" + _pem(root, inter),
+        # A .pfx under a CERTIFICATE header, which only the content check can tell apart.
+        "pfx_in_pem": b"-----BEGIN CERTIFICATE-----\n"
+        + base64.encodebytes(
+            pkcs12.serialize_key_and_certificates(
+                b"x", root_key, root, None, serialization.NoEncryption()
+            )
+        )
+        + b"-----END CERTIFICATE-----\n",
         "adcs_p7b": b"-----BEGIN CERTIFICATE-----\n"
         + base64.encodebytes(pkcs7.serialize_certificates([root, inter], der))
         + b"-----END CERTIFICATE-----\n",
@@ -351,6 +365,12 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert certs("der") == [(root, None)]
     assert certs("pem_one") == [(root, None)]
     assert certs("b64_der") == [(root, None)]
+    # A byte-order mark in front of bare base64 or PEM is not read as part of it.
+    assert certs("b64_der_utf8_bom") == [(root, None)]
+    assert certs("b64_der_utf16_bom") == [(root, None)]
+    assert sorted(full("pem_utf8_bom")) == sorted(
+        [(root, None, "Root"), (inter, None, "CertificateAuthority")]
+    )
     assert certs("der_armour_in_subject") == [(_thumb(chain["armour_in_subject"][0]), None)]
     for name in ("p7b_der", "p7b_pem", "pem_bundle", "pem_zero_first", "pem_utf16", "adcs_p7b"):
         assert sorted(full(name)) == sorted(
@@ -424,6 +444,7 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
         return str(entry["error"])
 
     assert "'Pfx' content" in error("pfx")
+    assert "'Pfx' content" in error("pfx_in_pem")
     assert "labelled 'PRIVATE KEY'" in error("pem_with_key")
     assert "labelled 'EC PRIVATE KEY'" in error("pem_zero_first_with_key")
     assert "not well formed" in error("pem_unterminated")
@@ -494,22 +515,27 @@ $out | ConvertTo-Json -Compress
     }
 
 
-def _run_whatif(
-    ca_path: Path, env: dict[str, str] | None = None
+#: What the wrapper in :func:`_run_script` writes in front of the terminating error's message.
+_MESSAGE = "TERMINATING-ERROR-MESSAGE: "
+
+
+def _run_script(
+    ca_path: Path, env: dict[str, str] | None = None, *, whatif: bool = True
 ) -> subprocess.CompletedProcess[str]:
+    """The script run on ``ca_path``, inside a wrapper that writes a terminating error's own
+    message to stderr behind :data:`_MESSAGE` and exits 1, so a test reads that message rather than
+    pwsh's rendered error view, whose source-line excerpt quotes the script's code.
+
+    ``whatif`` False drops ``-WhatIf``; only the elevation refusal test does that."""
     if _elevated():
         pytest.skip("SKIP (nothing run): elevated session; the script is run only unelevated")
+    whatif_flag = " -WhatIf" if whatif else ""
+    command = (
+        f"try {{ & {_psq(str(_SCRIPT))} -CaPath {_psq(str(ca_path))}{whatif_flag} }} "
+        f"catch {{ [Console]::Error.WriteLine({_psq(_MESSAGE)} + $_.Exception.Message); exit 1 }}"
+    )
     return subprocess.run(
-        [
-            _pwsh(),
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(_SCRIPT),
-            "-CaPath",
-            str(ca_path),
-            "-WhatIf",
-        ],
+        [_pwsh(), "-NoProfile", "-NonInteractive", "-Command", command],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -518,10 +544,17 @@ def _run_whatif(
     )
 
 
+def _message(proc: subprocess.CompletedProcess[str]) -> str:
+    """The terminating error's own message, or "" when the script raised none."""
+    lines = [ln for ln in proc.stderr.splitlines() if ln.startswith(_MESSAGE)]
+    assert len(lines) <= 1, proc.stderr
+    return lines[0].removeprefix(_MESSAGE) if lines else ""
+
+
 def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
 ) -> None:
-    proc = _run_whatif(files["p7b_der"])
+    proc = _run_script(files["p7b_der"])
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert "The file holds 2 certificate(s)" in out
@@ -560,11 +593,14 @@ def test_a_ca_without_a_valid_root_in_the_file_imports_nothing(
     files: dict[str, Path],
 ) -> None:
     cert = extra[key] if key in extra else chain[key][0]
-    proc = _run_whatif(files[name])
+    proc = _run_script(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    assert "Nothing was imported" in out
+    message = _message(proc)
+    assert message.startswith("Nothing was imported."), out
+    assert f"Refused: {_thumb(cert)}: {why}." in message, message
     assert f"  {_thumb(cert)}: {why}" in proc.stdout.splitlines(), out
+    assert "  Store      : none (refused)" in proc.stdout.splitlines(), out
     assert "What if" not in out
 
 
@@ -575,7 +611,7 @@ def test_not_after_is_printed_in_utc(
     # reads as a UTC time that is wrong by the zone's offset. TZ sets the zone for .NET on Linux and
     # macOS. Windows ignores it and uses the host's own zone, so on a Windows host running in UTC,
     # as hosted runners do, this test cannot fail for the bug it guards; the Linux leg guards it.
-    proc = _run_whatif(files["der"], dict(os.environ, TZ="Pacific/Chatham"))
+    proc = _run_script(files["der"], dict(os.environ, TZ="Pacific/Chatham"))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     want = chain["root"][0].not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%SZ")
     assert f"  Not after  : {want}" in proc.stdout.splitlines(), proc.stdout
@@ -592,17 +628,30 @@ _NO_CERT_SIGN = "its key usage does not allow it to sign certificates"
         ("pem_two_refused", [("leaf", _NOT_A_CA), ("no_cert_sign", _NO_CERT_SIGN)]),
     ],
 )
-def test_a_bundle_holding_a_non_ca_imports_nothing(
+def test_a_bundle_holding_a_certificate_that_cannot_sign_certificates_imports_nothing(
     name: str,
     refused: list[tuple[str, str]],
     chain: dict[str, tuple[x509.Certificate, _Key]],
     files: dict[str, Path],
 ) -> None:
-    proc = _run_whatif(files[name])
+    """A non-CA, or a CA whose key usage leaves out certificate signing, refuses the file."""
+    proc = _run_script(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    assert "Nothing was imported" in out
+    message = _message(proc)
+    assert message.startswith("Nothing was imported."), out
     thumbs = [_thumb(chain[key][0]) for key, _why in refused]
+    # The error's own message names each refused certificate with its reason, in file order, in
+    # the form the printed list uses, and nothing else.
+    assert message.endswith(
+        "Refused: "
+        + "; ".join(f"{t}: {why}" for t, (_key, why) in zip(thumbs, refused, strict=True))
+        + "."
+    ), message
+    # The listing names no store for a refused certificate, and the root's for the root.
+    stores = [ln for ln in proc.stdout.splitlines() if ln.startswith("  Store      : ")]
+    assert stores.count("  Store      : none (refused)") == len(refused), out
+    assert "  Store      : Cert:\\LocalMachine\\Root" in stores, out
     # The printed list holds each reason as a whole line, in file order, and nothing else: pwsh's
     # error view rewraps at the console width, and at a Linux runner's 80 columns that split a
     # thumbprint from its reason.
@@ -611,14 +660,21 @@ def test_a_bundle_holding_a_non_ca_imports_nothing(
     listed = itertools.takewhile(
         lambda ln: ln.startswith("  "), lines[lines.index("Refused:") + 1 :]
     )
+    # Each refused certificate is named by its Subject too, not by thumbprint alone (BACKLOG #5561
+    # item 27), on its own line under its reason.
+    # The attribute type admits bytes; a CN here is text, so narrow it and format the CN value by hand.
+    subjects: list[str] = []
+    for key, _why in refused:
+        cn = chain[key][0].subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        assert isinstance(cn, str), cn
+        subjects.append(cn)
     assert list(listed) == [
-        f"  {t}: {why}" for t, (_key, why) in zip(thumbs, refused, strict=True)
+        line
+        for t, (_key, why), cn in zip(thumbs, refused, subjects, strict=True)
+        for line in (f"  {t}: {why}", f"    Subject: CN={cn}")
     ], out
-    # The error names every refused thumbprint, in order, and not the root CA beside them. The
-    # error view's source-line excerpt shows code, not a thumbprint, so this reads the message.
-    at = [proc.stderr.find(t) for t in thumbs]
-    assert -1 not in at and at == sorted(at), proc.stderr
-    assert _thumb(chain["root"][0]) not in proc.stderr, proc.stderr
+    # The error does not name the root CA beside them.
+    assert _thumb(chain["root"][0]) not in message, message
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
 
@@ -675,4 +731,21 @@ def test_windows_powershell_is_refused_before_anything_is_read(files: dict[str, 
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert _NEEDS_PWSH_71 in " ".join(out.split()), out
+    assert "The file holds" not in out and "What if" not in out
+
+
+def test_an_unelevated_run_without_whatif_is_refused_before_the_file_is_read(
+    files: dict[str, Path],
+) -> None:
+    """Without ``-WhatIf`` the script writes the machine stores, so an unelevated run stops before
+    it reads the file. Run only unelevated (``_run_script`` skips an elevated session), and on a
+    file the script refuses anyway (a root beside a leaf), so even a regression that skipped the
+    elevation check would import nothing. The elevation check is Windows-only. A hosted Windows
+    runner is elevated, so this runs only on an unelevated Windows host, never in CI."""
+    if sys.platform != "win32":
+        pytest.skip("SKIP (nothing run): the elevation check reads a Windows identity")
+    proc = _run_script(files["p7b_with_leaf"], whatif=False)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "requires an elevated (Administrator) PowerShell" in _message(proc), out
     assert "The file holds" not in out and "What if" not in out

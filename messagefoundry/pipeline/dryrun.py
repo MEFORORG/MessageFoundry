@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
@@ -39,6 +39,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     StateValue,
+    accepts_verdict,
     handler_item_fault,
     handler_result_items,
 )
@@ -51,13 +52,14 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES, PEEK_READ_FAULTS
 from messagefoundry.parsing.split import _BOM, _BOM_BYTES, one_message_bytes
 from messagefoundry.parsing.validate import warm_validation
 from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
     carry_binary_ingress,
+    check_binary_size,
     decode_ingress,
     doc_ref_marker_refusal,
     peek_max_bytes,
@@ -82,6 +84,7 @@ __all__ = [
     "transform_one",
     "disposition_for",
     "dry_run",
+    "dry_run_reference_view",
     "select_inbound",
     "AmbiguousInboundError",
     "NoInboundError",
@@ -145,10 +148,13 @@ class TraceHook(Protocol):
 
     When a ``tracer`` is supplied, :func:`route_only` / :func:`transform_one` invoke the Router/Handler
     **through** the hook instead of calling it directly, so the hook can install ``sys.settrace`` around
-    exactly that call. The hook is a *pure observer* — it returns the callable's result unchanged and
-    re-raises any exception — so the traced path is byte-identical to the default (``tracer=None``). The
-    concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
-    ``dryrun`` free of any dependency on it (one-way import)."""
+    exactly that call. The hook is a *pure observer* — it re-raises any exception, and
+    ``trace_router``/``trace_handler`` return the callable's result unchanged — so the traced path is
+    byte-identical to the default (``tracer=None``). ``trace_accepts`` returns the verdict as a bool,
+    read through :func:`~messagefoundry.config.wiring.accepts_verdict` as the untraced path reads it,
+    so a verdict that function refuses raises ``TypeError`` there too (BACKLOG #5514). The concrete
+    implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps ``dryrun``
+    free of any dependency on it (one-way import)."""
 
     def trace_router(
         self, fn: RouterFn, name: str, payload: Message | RawMessage
@@ -235,10 +241,59 @@ def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMess
     high-fan-out non-HL7 feed. Because it IS shared, a consumer that broke the convention and mutated
     ``.raw`` would be visible to later consumers of the same message. An HL7 :class:`Message` is *mutable*
     (Handlers transform it in place), so it cannot be shared: this returns ``None`` and each consumer
-    re-parses (the optimal isolation strategy — see :func:`_payload`)."""
+    re-parses (the optimal isolation strategy — see :func:`_payload`).
+
+    The object is :func:`build_payload`'s, the one construction every consumer and the sandbox child
+    use, rather than a copy of its non-HL7 branch that could drift from it (BACKLOG #6819)."""
     if content_type == ContentType.HL7V2.value:
         return None
-    return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
+    return build_payload(raw, content_type)
+
+
+#: The ``content_type`` values whose bodies are base64-carried bytes (ADR 0028), as strings, since
+#: :func:`transform_one` takes the type by value and need not be handed a known one.
+_BINARY_CONTENT_TYPE_VALUES = frozenset(ct.value for ct in ContentType if ct.is_binary)
+
+
+def _carry_or_decode(raw: str | bytes, ic: InboundConnection) -> str:
+    """``raw`` carried or decoded for ``ic``: base64-carried for a binary type, otherwise decoded
+    with the declared charset and run through :func:`decode_ingress`'s post-decode checks
+    (BACKLOG #1689). Raises :class:`IngressGuardError` for a body either refuses. These are not
+    all of the listener's guards: at least the declared-type sniff, the HL7 peek, the HL7 size
+    bound, strict validation, the doc-ref marker refusal and document detach do not run here."""
+    return carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
+
+
+def _listener_body(raw: str | bytes, ic: InboundConnection) -> str | bytes:
+    """A ``bytes`` ``raw`` in the form the listener hands ``ic``'s Router (BACKLOG #6819).
+
+    The live engine routes only a ``str``, and :func:`build_payload` decodes ``bytes`` as UTF-8
+    (``Message.parse`` with replacement for HL7), so without this a DICOM or latin-1 body raised
+    ``UnicodeDecodeError``, a binary body that was valid UTF-8 reached the Handler uncarried, and a
+    latin-1 HL7 body reached it with its accented letters replaced. A ``str`` passes through
+    unchanged, taken to be in routed form already."""
+    if isinstance(raw, str):
+        return raw
+    return _carry_or_decode(raw, ic)
+
+
+def _handler_body(raw: str | bytes, content_type: str) -> str:
+    """A ``bytes`` ``raw`` in routed form for :func:`transform_one`, which has no inbound
+    (BACKLOG #6819).
+
+    A binary type's bytes need no charset, so they are size-bounded and base64-carried as
+    :func:`carry_binary_ingress` carries them. A text type's bytes, HL7 included, need the
+    inbound's charset, which does not reach this call, so they are refused with a ``TypeError``,
+    the caller's fault rather than the body's, instead of decoded by a guess."""
+    if isinstance(raw, str):
+        return raw
+    if content_type in _BINARY_CONTENT_TYPE_VALUES:
+        check_binary_size(raw)
+        return RawMessage.from_bytes(raw, content_type).raw
+    raise TypeError(
+        f"transform_one takes a {content_type!r} body as str: decoding bytes needs the inbound's "
+        "charset, so decode them with decode_ingress, or call route_message"
+    )
 
 
 @dataclass(frozen=True)
@@ -358,10 +413,16 @@ def _accepted(
                     origin=origin,
                 )
             )
-        elif tracer is not None:
-            verdict = tracer.trace_accepts(pred, hname, payload)
         else:
-            verdict = pred(payload)
+            # One refusal for both in-process branches (BACKLOG #5514): an awaitable or iterator
+            # verdict with no truth value of its own would read as True and accept every message,
+            # so it raises here instead; :func:`accepts_verdict` states which verdicts. The
+            # tracer applies it too, so it records no decline for a refused verdict; on its bool
+            # this call is one compare.
+            verdict = accepts_verdict(
+                hname,
+                pred(payload) if tracer is None else tracer.trace_accepts(pred, hname, payload),
+            )
         if verdict:
             kept.append(hname)
     return kept
@@ -413,6 +474,9 @@ def route_only(
     for the payload being a faithful, *isolated-where-mutable* view of ``raw``; ``None`` (the default)
     keeps the self-parsing behavior, so every existing call site is byte-identical.
 
+    A ``bytes`` ``raw`` is self-parsed carried or decoded as the listener decodes it, and a body
+    those guards refuse raises :class:`IngressGuardError` (BACKLOG #6819, :func:`_listener_body`).
+
     ``tracer`` (ADR 0072) is an optional observer: when given, the Router is invoked **through**
     ``tracer.trace_router`` (which installs ``sys.settrace`` around the call) instead of called directly.
     The hook returns the Router's result unchanged, so the routing decision is byte-identical.
@@ -429,6 +493,7 @@ def route_only(
     # API) is described as the object it actually is, never assumed to equal _payload(raw, ct).
     derived = payload is None
     if payload is None:
+        raw = _listener_body(raw, ic)  # also the body the sandbox child rebuilds from (#6819)
         payload = _payload(raw, ic.content_type.value)
     # Built only on the sandboxed branch (`_accepted` reads it only there too), so `mode=off` keeps
     # its "not even an allocation" promise rather than paying for a seam it never crosses.
@@ -518,6 +583,10 @@ def transform_one(
     and may be shared across a message's handlers; a mutable HL7 :class:`Message` must *not* be reused
     across handlers (the caller passes ``None`` for HL7 so each handler re-parses its own).
 
+    A ``bytes`` ``raw`` is base64-carried for a binary type, an oversize one raising
+    :class:`IngressGuardError`; for a text type, HL7 included, it is a ``TypeError``, since no
+    inbound names its charset here (BACKLOG #6819, :func:`_handler_body`).
+
     ``tracer`` (ADR 0072) is an optional observer: when given, the Handler is invoked **through**
     ``tracer.trace_handler`` (which installs ``sys.settrace`` around the call) instead of called
     directly. The hook returns the Handler's result unchanged, so the deliveries are byte-identical.
@@ -526,6 +595,7 @@ def transform_one(
     # See route_only: `origin` is passed only when this call derived the payload itself.
     derived = payload is None
     if payload is None:
+        raw = _handler_body(raw, content_type)  # also the body the sandbox child rebuilds from
         payload = _payload(raw, content_type)
     raw_result: HandlerResult
     if sandbox is not None and sandbox.mode is not SandboxMode.OFF:
@@ -594,21 +664,50 @@ def transform_one(
     return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
-#: The ``(set name, file path)`` pairs whose skip :func:`_dry_run_reference_view` has already logged
+#: The ``(set name, file path)`` pairs whose skip :func:`dry_run_reference_view` has already logged
 #: in this process; the path too, so another config's set of the same name still logs. A test resets it.
 _skipped_reference_sets_logged: set[tuple[str, str]] = set()
 
 
-def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
+class _PreviewReferenceSet(Mapping[str, Any]):
+    """One reference set of a preview view: each value kept as the JSON text the store encodes it
+    to, and decoded on every read, so every read returns its own copy, as a read of the live
+    engine's reference cache does. A Handler that edits a value it read changes neither the set
+    nor a later read of it, in this preview or another one given the same view (BACKLOG #6820)."""
+
+    __slots__ = ("_encoded",)
+
+    def __init__(self, encoded: dict[str, str]) -> None:
+        self._encoded = encoded
+
+    def __getitem__(self, key: str) -> Any:
+        return json.loads(self._encoded[key])
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._encoded
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._encoded)
+
+    def __len__(self) -> int:
+        return len(self._encoded)
+
+
+def dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
     declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
     store/environment, so they're omitted (a read of one then raises, as a preview error).
 
-    Each value goes through the same JSON encoding the store applies, so a preview reads what the live
-    engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
+    Each value goes through the JSON encoding the store applies, so a preview reads what the live
+    engine's reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. Each
+    read decodes its own copy, as the engine's does (:class:`_PreviewReferenceSet`). A
     set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
     a set whose file did not load (vault BACKLOG #3340); both log a warning naming it, the second once
-    per set per process."""
+    per set per process.
+
+    Every call reads every file again. A caller previewing many messages against one graph, as
+    ``check`` does, builds the view once and passes it to :func:`dry_run` as ``reference_view``
+    (BACKLOG #6820)."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -617,16 +716,16 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
         if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
             continue
         try:
-            view[spec.name] = {
-                k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
-            }
+            view[spec.name] = _PreviewReferenceSet(
+                {k: encode_reference_value(v) for k, v in load_code_set(path).items()}
+            )
         except CodeSetError:
             # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
             # missing with nothing to say why. The set name only, never the loader's text: that can
             # quote a KEY (a duplicate one), which may be PHI for a patient-keyed set, and `check`
             # writes this line into a CI log. No cause either: a guess from the path (missing versus
-            # malformed) misnames a permission or a directory. Once per set per process, since
-            # `check` reloads the view for every fixture on every inbound.
+            # malformed) misnames a permission or a directory. Once per set per process, since a
+            # caller that passes no view reloads it for every message it previews.
             if (spec.name, path) not in _skipped_reference_sets_logged:
                 _skipped_reference_sets_logged.add((spec.name, path))
                 log.warning("dry-run: reference set %r skipped, its file did not load", spec.name)
@@ -710,6 +809,7 @@ def route_message(
     tracer: TraceHook | None = None,
     sandbox: SandboxSession | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -724,6 +824,10 @@ def route_message(
     :func:`transform_one`). Router/Handler exceptions propagate to the caller, a ``SystemExit`` as
     :class:`UserCodeCalledSysExit`.
 
+    A ``bytes`` ``raw`` reaches the Router and every Handler carried or decoded as the listener
+    decodes it, and a body those guards refuse raises :class:`IngressGuardError` before any runs
+    or any reference file is read (BACKLOG #6819, :func:`_listener_body`).
+
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
 
@@ -737,6 +841,14 @@ def route_message(
     value here (falling back to the Settings-model default, ON, when none load — #230 P4); a
     programmatic caller or the Test Bench should likewise pass ``settings.pipeline.snapshot_on_send``
     where the site has set it.
+
+    ``reference_view`` is the reference sets the preview reads, as
+    :func:`dry_run_reference_view` builds them; a view built another way may share mutable
+    values between previews, which this one does not. ``None``, the default, builds them from the graph
+    on this call, reading every file-backed set again. A caller previewing many messages against
+    one graph builds it once and passes it, so each file is read once (BACKLOG #6820). The previews
+    then share one snapshot of each set, and each read of a value decodes its own copy, as a
+    read of the live engine's reference cache does.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -747,11 +859,13 @@ def route_message(
     # earlier handler in the same simulated message declared (a self-consistent preview), mirroring how
     # the live cache would reflect committed writes. It is local to this call (no global side effect).
     sim_state: dict[tuple[str, str], StateValue] = {}
-    # Reference sets (ADR 0006): there is no store/sync in a dry-run, so build a best-effort preview
-    # view from the graph's FILE-backed declarations (literal paths) so a reference(...) read resolves
+    raw = _listener_body(raw, ic)  # once, before the view and the fan-out (BACKLOG #6819)
+    # Reference sets (ADR 0006): there is no store/sync in a dry-run, so use the caller's view, or
+    # build a best-effort preview view from the graph's FILE-backed declarations (literal paths), so
+    # a reference(...) read resolves
     # during `check`/Test Bench. DB-backed or env()-path sets can't be reached in a pure dry-run and are
     # simply absent (a read of one then raises, surfaced as that message's preview error).
-    sim_reference = _dry_run_reference_view(registry)
+    sim_reference = dry_run_reference_view(registry) if reference_view is None else reference_view
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
     meta_ops: list[MetaOpPreview] = []
@@ -947,6 +1061,7 @@ def _dry_run_raw(
     *,
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> DryRunResult:
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage.
 
@@ -958,9 +1073,7 @@ def _dry_run_raw(
     latin-1 one raised ``UnicodeDecodeError`` straight out of ``dry_run`` instead of reporting ERROR."""
     ct = ic.content_type.value
     try:
-        body = (
-            carry_binary_ingress(raw, ic) if ic.content_type.is_binary else decode_ingress(raw, ic)
-        )
+        body = _carry_or_decode(raw, ic)
     except IngressGuardError as exc:
         return DryRunResult(
             inbound=ic.name,
@@ -977,6 +1090,7 @@ def _dry_run_raw(
             ingest_time=time.time(),
             tracer=tracer,
             snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
@@ -1087,6 +1201,7 @@ def dry_run(
     inbound: str | None = None,
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> DryRunResult:
     """Decode → guard → parse → (strict-validate) → route one message; return disposition + payloads.
 
@@ -1114,6 +1229,9 @@ def dry_run(
     ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
     default is ``True``, as the engine's is (BACKLOG #5794); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
 
+    ``reference_view`` is threaded to :func:`route_message` too; ``check`` builds it once per
+    graph and passes it for every fixture (BACKLOG #6820).
+
     **THIS FUNCTION TAKES NO ``sandbox`` ARGUMENT AND ALWAYS RUNS ROUTERS/HANDLERS IN-PROCESS.** It is
     therefore blind to ``[sandbox].mode``. That matches ``serve`` on the shipped default (``off``),
     and diverges from it at ``[sandbox].mode=subprocess``: ``messagefoundry check`` and
@@ -1131,7 +1249,14 @@ def dry_run(
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
-        return _dry_run_raw(registry, ic, raw, tracer=tracer, snapshot_on_send=snapshot_on_send)
+        return _dry_run_raw(
+            registry,
+            ic,
+            raw,
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
+        )
 
     try:
         text = decode_ingress(raw, ic)
@@ -1143,17 +1268,23 @@ def dry_run(
             error=exc.reason,
         )
 
+    # The peek's field reads and the marker check sit inside the guard with the parse, under the
+    # listener's PEEK_READ_FAULTS, so a parser fault in one is an ERROR naming its type alone, as the
+    # listener records it, rather than an exception out of the preview (BACKLOG #6821, #1594).
     try:
         peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
-    except HL7PeekError as exc:
+        mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
+        # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
+        marker_refused = doc_ref_marker_refusal(peek, text)
+    except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
         return DryRunResult(
             inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=f"parse error: {exc}"
         )
+    except PEEK_READ_FAULTS as exc:
+        fault = f"parse error: peek read failed ({type(exc).__name__})"
+        return DryRunResult(inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=fault)
 
-    mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
-
-    # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
-    if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
+    if marker_refused is not None:
         return DryRunResult(
             inbound=ic.name,
             disposition=MessageStatus.ERROR,
@@ -1190,6 +1321,7 @@ def dry_run(
             ingest_time=time.time(),
             tracer=tracer,
             snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(

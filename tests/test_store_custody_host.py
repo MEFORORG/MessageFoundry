@@ -75,6 +75,7 @@ def _clean(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MEFOR_STORE_ENCRYPTION_KEY",
         "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
         "MEFOR_SECRETS_DIRECTORY",
+        "MEFOR_CUSTODY_DIRECTORY",
     ):
         monkeypatch.delenv(name, raising=False)
     if sys.platform == "win32":
@@ -189,8 +190,647 @@ def test_the_custody_directory_is_the_secrets_directory_or_the_data_directory(
     assert custody_host.custody_directory(memory, environ={}) is None
     server = settings.model_copy(update={"backend": StoreBackend.POSTGRES})
     assert custody_host.custody_directory(server, environ={}) is None
-    with pytest.raises(HostCustodyRefused, match="MEFOR_SECRETS_DIRECTORY"):
+    with pytest.raises(HostCustodyRefused, match="MEFOR_CUSTODY_DIRECTORY"):
         load_host_custody(server, enforcing=True, environ={})
+
+
+# --- a custody directory of its own (vault BACKLOG #3411, ADR 0214's 2026-11-22 amendment) --------
+
+
+def _own_custody_directory(path: Path) -> Path:
+    """A directory no broad group reaches: mode 0700 on POSIX. On Windows it is made with no mode,
+    since there Python 3.13 and later turn a mode into explicit SYSTEM, Administrators and OWNER
+    RIGHTS full-control entries; it inherits the list of pytest's temporary folder instead."""
+    if sys.platform == "win32":
+        path.mkdir()
+    else:
+        path.mkdir(mode=0o700)
+    return path
+
+
+def test_a_custody_directory_of_its_own_wins_over_the_secrets_directory(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    custody_dir, secrets = tmp_path / "custody", tmp_path / "secrets"
+    both = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    assert custody_host.custody_directory(settings, environ=both) == custody_dir
+    # A blank one is unset, as the secrets directory's is.
+    blank = {**both, "MEFOR_CUSTODY_DIRECTORY": "  "}
+    assert custody_host.custody_directory(settings, environ=blank) == secrets
+    with pytest.raises(HostCustodyRefused, match="MEFOR_CUSTODY_DIRECTORY must be an absolute"):
+        custody_host.custody_directory(settings, environ={"MEFOR_CUSTODY_DIRECTORY": "rel"})
+    server = settings.model_copy(update={"backend": StoreBackend.POSTGRES})
+    assert (
+        custody_host.custody_directory(
+            server, environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+        )
+        == custody_dir
+    )
+
+
+@host_file_platforms
+def test_a_mint_writes_into_the_custody_directory_of_its_own(tmp_path: Path) -> None:
+    """The host file goes where MEFOR_CUSTODY_DIRECTORY points, not to the secrets directory or
+    beside the store, and a read finds it there."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    settings = _settings(tmp_path)
+    minted = mint_host_custody(
+        settings, service_account=None, enforcing=True, terminal=_Console(), environ=environ
+    )
+    assert minted.path == custody_dir / "master.key"
+    assert not (secrets / "master.key").exists() and not (tmp_path / "master.key").exists()
+    assert load_host_custody(settings, enforcing=True, environ=environ) == minted.blob
+
+
+def _grant(path: Path, *grants: str, reset: bool = False) -> None:
+    import subprocess
+
+    argv = ["icacls", str(path)]
+    if reset:
+        # Explicit entries survive /inheritance:r and /grant:r, so SYSTEM, Administrators and
+        # OWNER RIGHTS, the ones a mode would have written, go first.
+        subprocess.run(
+            [*argv, "/remove:g", "*S-1-5-18", "*S-1-5-32-544", "*S-1-3-4"],
+            check=True,
+            capture_output=True,
+        )
+        argv += ["/inheritance:r"]
+    subprocess.run([*argv, "/grant:r", *grants], check=True, capture_output=True)
+
+
+def _me() -> str:
+    """This token's own SID, never a name from the environment."""
+    sid = custody_host._engine_sid()
+    assert sid is not None
+    return f"*{sid}"
+
+
+def test_a_custody_directory_of_its_own_that_a_broad_group_reaches_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The secrets directory's check, applied to the custody directory: a broad group's right to
+    add a file there is refused, before a read and before a mint. The control is the same
+    directory without that right, which passes the check and finds no key."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    settings = _settings(tmp_path)
+    with pytest.raises(HostCustodyMissing):
+        load_host_custody(settings, enforcing=True, environ=environ)
+    if sys.platform == "win32":
+        _grant(custody_dir, "*S-1-5-32-545:(WD)")  # Users may add a file
+    else:
+        custody_dir.chmod(0o733)  # other may add a file
+    try:
+        with pytest.raises(
+            HostCustodyRefused, match="MEFOR_CUSTODY_DIRECTORY names is not restricted"
+        ):
+            load_host_custody(settings, enforcing=True, environ=environ)
+        with pytest.raises(HostCustodyRefused, match="is not restricted"):
+            mint_target(settings, service_account=None, enforcing=True, environ=environ)
+    finally:
+        if sys.platform == "win32":
+            import subprocess
+
+            subprocess.run(
+                ["icacls", str(custody_dir), "/remove:g", "*S-1-5-32-545"],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            custody_dir.chmod(0o700)
+
+
+def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_path: Path) -> None:
+    """With MEFOR_CUSTODY_DIRECTORY set, a handoff a mint without it left in the secrets directory
+    refuses the read, rather than reading as no key minted, which would lead to a second key."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    (secrets / "handoff.key").write_bytes(b"not read")
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ=environ)
+    assert not isinstance(refused.value, HostCustodyMissing)
+    assert f"handoff.key in {secrets}" in str(refused.value)
+    # The control: without the variable the secrets directory is the custody directory, and the
+    # same file is read there (and refused as no handoff).
+    with pytest.raises(HostCustodyRefused) as read:
+        load_host_custody(
+            _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+        )
+    assert "host custody was found elsewhere" not in str(read.value)
+    # With no secrets directory, beside a SQLite store, where a mint with neither variable writes.
+    (secrets / "handoff.key").unlink()
+    beside = tmp_path / "handoff.key"
+    beside.write_bytes(b"not read")
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    assert f"{beside.name} in {beside.parent}" in str(refused.value)
+    # A mint is stopped the same way, before anything is minted.
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere"):
+        mint_target(
+            _settings(tmp_path),
+            service_account=None,
+            enforcing=True,
+            environ={
+                "MEFOR_CUSTODY_DIRECTORY": str(custody_dir),
+                "MEFOR_SECRETS_DIRECTORY": str(secrets),
+            },
+        )
+
+
+@pytest.mark.parametrize("where", ["custody", "secrets", "beside the store"])
+def test_a_host_blob_anywhere_the_host_provider_reads_refuses_every_other_key_provider(
+    tmp_path: Path, where: str
+) -> None:
+    """Rule 13 reads the custody directory of its own and the directory the host provider reads
+    without it, so a key file left in either refuses another provider. A custody variable that is
+    not an absolute path does not turn the check off."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    target = {"custody": custody_dir, "secrets": secrets, "beside the store": tmp_path}[where]
+    (target / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    if where != "beside the store":
+        environ["MEFOR_SECRETS_DIRECTORY"] = str(secrets)
+    refusal = foreign_custody_refusal(settings, environ=environ)
+    assert refusal is not None and str(target) in refusal, refusal
+    if where != "custody":
+        unusable = {**environ, "MEFOR_CUSTODY_DIRECTORY": "relative"}
+        assert foreign_custody_refusal(settings, environ=unusable) is not None
+
+
+def test_a_file_beside_the_store_refuses_another_provider_and_the_way_on_leaves_it(
+    tmp_path: Path,
+) -> None:
+    """A host mint with neither variable writes beside the store, so a file there refuses another
+    provider whatever is set. The refusal names the file and tells nobody to change it, and its
+    way on for a file that is not this store's, docs/SERVICE.md's new data directory, clears it
+    with the file still where it was."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    beside = tmp_path / "master.key"
+    beside.write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    environ = {
+        "MEFOR_SECRETS_DIRECTORY": str(secrets),
+        "MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody")),
+    }
+    refusal = foreign_custody_refusal(settings, environ=environ)
+    assert refusal is not None and f"master.key in {tmp_path}" in refusal, refusal
+    assert "where it is, and delete nothing" in refusal, refusal
+    assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
+    # Following it: the store in a new data directory that holds neither file.
+    copied = _own_custody_directory(tmp_path / "copied")
+    moved_store = settings.model_copy(update={"path": str(copied / "store.db")})
+    assert foreign_custody_refusal(moved_store, environ=environ) is None
+    assert beside.exists()
+
+
+def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build_store_cipher and resolve_active_key replace a refusal they did not see recorded with a
+    fixed text (BACKLOG #4882), so resolve_key_provider records this one: the file it names and
+    the way on reach the operator through them too."""
+    from messagefoundry.store.base import build_store_cipher, resolve_active_key
+
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    for seam in (build_store_cipher, resolve_active_key):
+        with pytest.raises(KeyProviderError) as refused:
+            seam(settings)
+        text = str(refused.value)
+        assert f"master.key in {tmp_path}" in text, (seam.__name__, text)
+        assert "where it is, and delete nothing" in text, (seam.__name__, text)
+
+
+@pytest.mark.parametrize("where", ["same", "inside", "around"])
+def test_a_custody_directory_overlapping_the_secrets_directory_is_refused(
+    tmp_path: Path, where: str
+) -> None:
+    """The custody directory must stay apart from the secrets directory (ADR 0214's amendment), so
+    one that is, sits inside or holds it is refused, and the remedy never tells anyone to give the
+    service add-file there. The control: two sibling directories pass this rule."""
+    secrets = tmp_path / "secrets"
+    custody_dir = {"same": secrets, "inside": secrets / "custody", "around": tmp_path}[where]
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets), "MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    with pytest.raises(HostCustodyRefused, match="is, holds or sits inside") as refused:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ=environ)
+    assert "add a file to it" not in str(refused.value), refused.value
+    siblings = {**environ, "MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
+    assert custody_host._own_directory_refusal(siblings) is None
+
+
+def test_the_stores_own_key_file_beside_it_is_not_taken_for_a_host_blob(tmp_path: Path) -> None:
+    """The beside-store directory is read whatever is set, so a store's own key file there named
+    master.key is passed over; the control is the same file with no key file setting."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    own = tmp_path / "master.key"
+    own.write_bytes(b"not read")
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file=str(own))
+    assert foreign_custody_refusal(settings, environ=environ) is None
+    other = _settings(tmp_path, key_provider="auto", encryption_key_file=str(tmp_path / "k.bin"))
+    assert foreign_custody_refusal(other, environ=environ) is not None
+
+
+def test_the_left_behind_refusal_gives_a_way_on_that_leaves_another_stores_file(
+    tmp_path: Path,
+) -> None:
+    """The refusal names the file and leaves it, and its way on is docs/SERVICE.md's procedure."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    (tmp_path / "handoff.key").write_bytes(b"not read")
+    with pytest.raises(HostCustodyRefused) as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    text = str(refused.value)
+    assert f"handoff.key in {tmp_path}" in text, text
+    assert custody_host._LEAVE_KEY_FILES_STEP in text, text
+    assert not _advises_changing(text), text
+
+
+def _service_md_section(title: str) -> str:
+    """The text of docs/SERVICE.md's section headed ``title``, up to the next heading of its level
+    or above; fails when no such heading is there."""
+    text = (Path(__file__).resolve().parents[1] / "docs" / "SERVICE.md").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.lstrip("#").strip() == title]
+    assert len(heads) == 1 and lines[heads[0]].startswith("#"), (title, heads)
+    level = len(lines[heads[0]]) - len(lines[heads[0]].lstrip("#"))
+    body = []
+    for line in lines[heads[0] + 1 :]:
+        if line.startswith("#") and len(line) - len(line.lstrip("#")) <= level:
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_file_steps(
+    tmp_path: Path,
+) -> None:
+    """Manager design rule 2026-11-22 (vault BACKLOG #3411): a refusal that found a key file it
+    cannot tie to this store names it, says to leave every key file and delete nothing, and points
+    at one docs/SERVICE.md procedure by its title, which is there. It carries no file procedure of
+    its own: no copy of a directory's contents, no move. The other-provider refusal's closing is
+    that procedure, not keep_the_key_step's new-secrets-directory step, which does not clear a
+    file beside the store (review round-001caa04b0 item 3)."""
+    title = custody_host._SERVICE_PROCEDURE_TITLE
+    assert f"'{title}'" in custody_host._LEAVE_KEY_FILES_STEP
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    foreign = foreign_custody_refusal(settings, environ={})
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    with pytest.raises(HostCustodyRefused) as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    assert foreign is not None
+    for text in (foreign, str(refused.value)):
+        flat = " ".join(text.split())
+        assert f"master.key in {tmp_path}" in flat, flat
+        assert "Leave each key file named here where it is, and delete nothing" in flat, flat
+        assert f"docs/SERVICE.md, '{title}'" in flat, flat
+        for step in ("copy everything", "copy into it", "same volume", "move that file"):
+            assert step not in flat, (step, flat)
+    assert "To go on without it" not in foreign, foreign
+    assert custody_host.keep_the_key_step(settings, new_store=False) not in foreign, foreign
+    # The procedure states what clears each place: a new data directory for a file beside the
+    # store, and the move rule within one volume and across volumes.
+    section = " ".join(_service_md_section(title).split())
+    for needed in ("-DataDir", "-SecretsDir", "-CustodyDir", "Delete nothing", "Across volumes"):
+        assert needed in section, (needed, section)
+    # PR 3168 hold, items 2 and 4 to 8: a new data directory takes only this store's own files,
+    # the certificate pair together; a kept master.key original has its list set, not only moved;
+    # a handoff original goes once the service has started; machine-scope DPAPI does not unwrap on
+    # another host without this host's machine keys; and its readers are an "at least" list.
+    for needed in (
+        "only files you know are this store's or this service's",
+        "any other database with its `-wal` and `-shm` files",
+        "`api-generated-cert.pem` with `api-generated-key.pem`. Move the pair together",
+        "Moving a file into another folder does not do that",
+        "/remove:g",
+        "/setowner",
+        "A `handoff.key` original:** delete it once the service has started from the copy",
+        "though it does not unwrap on another host",
+        "It is still read by at least SYSTEM",
+        "SeBackupPrivilege",
+        "in this step they may be another store's",
+        # PR 3168 hold at comment 7111305444, items 4, 7 and 8.
+        "leave this store's database, with its `-wal` and `-shm` files, out of that move",
+        "a new data directory for a SQLite store, a new database for a server store",
+        "`chown root:root <file>`",
+        "into a directory root owns with mode 0700",
+    ):
+        assert needed in section, (needed, section)
+    for gone in (
+        "Never delete it",
+        "anyone who already has its bytes",
+        "move everything the engine keeps",
+        "or follow step 3",
+        "delete each original",
+        "by any account",
+    ):
+        assert gone not in section, (gone, section)
+
+
+def test_the_custody_and_secrets_overlap_is_compared_where_each_resolves(tmp_path: Path) -> None:
+    """Review round-001caa04b0 item 4: a custody directory reached through a link into the secrets
+    directory, or spelled in another case where the platform folds case, is refused; the control is
+    a sibling reached the same way."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    alias = tmp_path / "alias"
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(secrets), str(alias))
+    else:
+        alias.symlink_to(secrets, target_is_directory=True)
+    linked = {"MEFOR_SECRETS_DIRECTORY": str(secrets), "MEFOR_CUSTODY_DIRECTORY": str(alias / "c")}
+    refusal = custody_host._own_directory_refusal(linked)
+    assert refusal is not None and "is, holds or sits inside" in refusal, refusal
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    (tmp_path / "other").mkdir()
+    if sys.platform == "win32":
+        _winapi.CreateJunction(str(sibling), str(tmp_path / "salias"))
+    else:
+        (tmp_path / "salias").symlink_to(sibling, target_is_directory=True)
+    control = {**linked, "MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "salias" / "c")}
+    assert custody_host._own_directory_refusal(control) is None
+    if os.path.normcase("A") == os.path.normcase("a"):
+        cased = {**linked, "MEFOR_CUSTODY_DIRECTORY": str(secrets).upper() + os.sep + "c"}
+        assert custody_host._own_directory_refusal(cased) is not None
+
+
+def test_the_custody_texts_name_the_directory_variables_as_literals() -> None:
+    """Review round-001caa04b0 item 11: a variable name reaching stderr is written as a literal,
+    never through SECRETS_DIRECTORY_VARIABLE (CodeQL alert 315 reads that constant as a secret).
+    The literals are pinned to the constants the engine reads."""
+    from messagefoundry.engine_secrets import (
+        CUSTODY_DIRECTORY_VARIABLE,
+        SECRETS_DIRECTORY_VARIABLE,
+    )
+
+    source = Path(custody_host.__file__).read_text(encoding="utf-8")
+    for constant in ("SECRETS_DIRECTORY_VARIABLE", "CUSTODY_DIRECTORY_VARIABLE"):
+        assert "{" + constant + "}" not in source, constant
+    assert (SECRETS_DIRECTORY_VARIABLE, CUSTODY_DIRECTORY_VARIABLE) == (
+        "MEFOR_SECRETS_DIRECTORY",
+        "MEFOR_CUSTODY_DIRECTORY",
+    )
+    with pytest.raises(HostCustodyRefused, match="^MEFOR_CUSTODY_DIRECTORY must be an absolute"):
+        custody_host.custody_directory(
+            StoreSettings(), environ={"MEFOR_CUSTODY_DIRECTORY": "relative"}
+        )
+
+
+def test_a_relative_secrets_variable_counts_as_unset_for_the_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MEFOR_SECRETS_DIRECTORY that is not an absolute path names no directory to search, even
+    one that exists relative to the working directory and holds a key file. The control: the same
+    directory named absolutely is searched."""
+    monkeypatch.chdir(tmp_path)
+    relative = _own_custody_directory(tmp_path / "rel")
+    (relative / "master.key").write_bytes(b"not read")
+    data = _own_custody_directory(tmp_path / "data")
+    settings = _settings(data, key_provider="auto", encryption_key_file="k.bin")
+    assert foreign_custody_refusal(settings, environ={"MEFOR_SECRETS_DIRECTORY": "rel"}) is None
+    named = foreign_custody_refusal(settings, environ={"MEFOR_SECRETS_DIRECTORY": str(relative)})
+    assert named is not None and str(relative) in named, named
+
+
+def test_the_left_behind_check_reads_beside_the_store_with_both_variables_set(
+    tmp_path: Path,
+) -> None:
+    """Under the host provider with both variables set, the installer's environment, a key file
+    beside the store refuses a read and a mint rather than reading as no key. With only
+    MEFOR_SECRETS_DIRECTORY set it is not read there, so the PR 2804 fifth hold's way on, a new
+    secrets directory and a new SQLite path beside the old key, still goes ahead."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    beside = tmp_path / "handoff.key"
+    beside.write_bytes(b"not read")
+    both = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere") as refused:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ=both)
+    assert not isinstance(refused.value, HostCustodyMissing)
+    assert f"handoff.key in {tmp_path}" in str(refused.value), refused.value
+    with pytest.raises(HostCustodyRefused, match="host custody was found elsewhere"):
+        mint_target(_settings(tmp_path), service_account=None, enforcing=True, environ=both)
+    with pytest.raises(HostCustodyMissing):
+        load_host_custody(
+            _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+        )
+
+
+def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> None:
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
+    step = custody_host.keep_the_key_step(_settings(tmp_path), new_store=False, environ=environ)
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in step, step
+    # No other secret lives there, so none is to be copied, and the secrets directory is not named.
+    assert "Copy into it" not in step and "MEFOR_SECRETS_DIRECTORY" not in step, step
+    secrets = custody_host.keep_the_key_step(_settings(tmp_path), new_store=False, environ={})
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in secrets, secrets
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
+@pytest.mark.parametrize(
+    "named", ["custody", "secrets", "neither", "custody is the data directory"]
+)
+def test_the_way_on_moves_off_every_directory_the_left_behind_check_reads(
+    tmp_path: Path, backend: StoreBackend, named: str
+) -> None:
+    """PR 3168 hold, items 1 and 9: once MEFOR_CUSTODY_DIRECTORY is set, a key file in the secrets
+    directory or beside a SQLite store refuses a mint, so the step names a new one of each that
+    holds the key file it leaves in place, even where its caller keeps the store location; where
+    the variable names the store's own directory, that is beside the store too."""
+    settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    environ = {
+        "custody": {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")},
+        "secrets": {"MEFOR_SECRETS_DIRECTORY": str(tmp_path / "secrets")},
+        "neither": {},
+        "custody is the data directory": {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path)},
+    }[named]
+    step = custody_host.keep_the_key_step(settings, new_store=False, environ=environ)
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in step, step
+    assert ("a new secrets directory, named by MEFOR_SECRETS_DIRECTORY" in step) is (
+        named == "secrets"
+    ), step
+    beside = named in ("neither", "custody is the data directory") and (
+        backend is StoreBackend.SQLITE
+    )
+    assert ("a new SQLite path in a directory with no master.key" in step) is beside, step
+    assert ("Point [store]" in step) is beside, step
+    # PR 3168 review round-ddf319bc80: with no key file left in place, as provision-admin's
+    # missing-key refusal has, nothing but a new custody directory and the caller's own ask.
+    none_left = custody_host.keep_the_key_step(
+        settings, new_store=False, environ=environ, key_file_left=False
+    )
+    assert "MEFOR_SECRETS_DIRECTORY" not in none_left and "Point [store]" not in none_left
+
+
+@host_file_platforms
+@pytest.mark.parametrize("named", ["neither", "custody is the data directory"])
+def test_the_way_on_from_a_key_file_beside_the_store_reaches_a_mint(
+    tmp_path: Path, named: str
+) -> None:
+    """PR 3168 review round-ddf319bc80: mint_target's refusal of a key file beside the store keeps
+    the store location by its caller, so the step moves it; following the step's text reaches a
+    mint, through mint_target, with the key file left in place."""
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    if named == "neither":
+        environ: dict[str, str] = {}
+    else:
+        environ = {"MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(store_dir / "c"))}
+        store_dir = Path(environ["MEFOR_CUSTODY_DIRECTORY"])
+    settings = _settings(store_dir)
+    kept = store_dir / custody_host.HOST_FILE_NAME
+    kept.write_bytes(b"not read")
+    with pytest.raises(FileExistsError) as refused:
+        mint_target(settings, service_account=None, enforcing=True, environ=environ)
+    text = " ".join(str(refused.value).split())
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in text, text
+    assert "a new SQLite path in a directory with no master.key" in text, text
+    followed = {"MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody"))}
+    (tmp_path / "new").mkdir()
+    moved = settings.model_copy(update={"path": str(tmp_path / "new" / "store.db")})
+    target = mint_target(moved, service_account=None, enforcing=True, environ=followed)
+    assert target == tmp_path / "custody" / custody_host.HOST_FILE_NAME
+    assert kept.read_bytes() == b"not read"
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "win32"), reason="mints on Linux and Windows")
+@pytest.mark.parametrize("named", ["MEFOR_CUSTODY_DIRECTORY", "MEFOR_SECRETS_DIRECTORY", None])
+def test_the_unusable_directory_refusals_name_their_own_way_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: str | None
+) -> None:
+    """PR 3168 hold items 12 and 13: a missing custody directory may be created with its access
+    list, and nothing else is offered for making by hand; the --db alternative keeps "on a local
+    file system" where the volume is refused; the secrets directory is not offered for writing."""
+    from messagefoundry import restricted_file
+
+    missing = tmp_path / "missing"
+    with pytest.raises(HostCustodyRefused) as refused:
+        custody_host._refuse_an_unusable_directory(missing, service_account=None, named=named)
+    text = " ".join(str(refused.value).split())
+    # None is offered for making by hand: the install script makes and restricts each one.
+    assert "create it" not in text.lower(), text
+    monkeypatch.setattr(restricted_file, "can_add_a_file", lambda _d: True)
+    monkeypatch.setattr(
+        restricted_file, "key_directory_volume_problem", lambda _d: "a network share"
+    )
+    with pytest.raises(HostCustodyRefused) as volume:
+        custody_host._refuse_an_unusable_directory(tmp_path, service_account=None, named=named)
+    text = " ".join(str(volume.value).split())
+    assert "can add a file to, on a local file system" in text, text
+    assert ("in a new data directory, on a local file system" in text) is (named is None), text
+    monkeypatch.setattr(restricted_file, "can_add_a_file", lambda _d: False)
+    with pytest.raises(HostCustodyRefused) as no_add:
+        custody_host._refuse_an_unusable_directory(tmp_path, service_account=None, named=named)
+    text = str(no_add.value)
+    assert ("Let this account add files there" in text) is (named != "MEFOR_SECRETS_DIRECTORY"), (
+        text
+    )
+    assert ". To go on, set MEFOR_CUSTODY_DIRECTORY" in text or named != "MEFOR_SECRETS_DIRECTORY"
+
+
+@host_file_platforms
+def test_the_way_on_moves_off_every_directory_holding_a_key_file(tmp_path: Path) -> None:
+    """PR 3168 review round-1d986c2c9d: a key file in the secrets directory and an older one beside
+    the store. The step names a new one of each, and following it reaches a mint."""
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    settings = _settings(store_dir)
+    for kept in (secrets / custody_host.HOST_FILE_NAME, store_dir / custody_host.HOST_FILE_NAME):
+        kept.write_bytes(b"not read")
+    with pytest.raises(FileExistsError) as refused:
+        mint_target(settings, service_account=None, enforcing=True, environ=environ)
+    text = " ".join(str(refused.value).split())
+    assert "a new secrets directory, named by MEFOR_SECRETS_DIRECTORY" in text, text
+    assert "a new SQLite path in a directory with no master.key" in text, text
+    followed = {
+        "MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody")),
+        "MEFOR_SECRETS_DIRECTORY": str(_own_custody_directory(tmp_path / "new-secrets")),
+    }
+    (tmp_path / "new").mkdir()
+    moved = settings.model_copy(update={"path": str(tmp_path / "new" / "store.db")})
+    target = mint_target(moved, service_account=None, enforcing=True, environ=followed)
+    assert target == tmp_path / "custody" / custody_host.HOST_FILE_NAME
+
+
+@windows_only
+async def test_the_first_start_converts_into_a_directory_it_may_only_read_and_add_a_file_to(
+    tmp_path: Path,
+) -> None:
+    """The installer's grant, measured: an engine account holding only read and add-file on its
+    custody directory converts the handoff there, writing master.key and deleting the handoff
+    through the handle it read it with. Nothing lands in the secrets directory."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    data = tmp_path / "data"
+    data.mkdir()
+    settings = _settings(data)
+    blob = _proved_blob()
+    _WRAPS[blob.store_id.value] = wrap_master_key(
+        blob.master_key, RecoveryKey.mint(), blob.store_id
+    )
+    await _create(settings, blob)
+    _handoff(custody_dir / "handoff.key", blob)
+    # No Administrators entry, unlike the installer's list: on an elevated runner it would give
+    # this token full control, and the case would no longer measure read and add-file alone.
+    _grant(custody_dir, "*S-1-5-18:(OI)F", f"{_me()}:(RX,WD)", reset=True)
+    try:
+        # The grant took: this account may add a file there, and holds nothing more through any
+        # entry: SYSTEM's full control and this account's read and add-file are the whole list.
+        assert restricted_file.can_add_a_file(custody_dir) is True
+        # Read by SID, not by a localized account name or icacls's console text.
+        import subprocess
+
+        quoted = str(custody_dir).replace("'", "''")
+        read = (
+            f"@((Get-Acl -LiteralPath '{quoted}').Access | ForEach-Object {{ [pscustomobject]@{{ "
+            "sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; "
+            'rights = [int64]$_.FileSystemRights; inherit = "$($_.InheritanceFlags)"; '
+            'kind = "$($_.AccessControlType)" } }) | ConvertTo-Json -Compress -AsArray'
+        )
+        listed = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", read], check=True, capture_output=True, text=True
+        ).stdout
+        entries = sorted(
+            (e["sid"], e["rights"], e["inherit"], e["kind"]) for e in json.loads(listed)
+        )
+        me = _me().removeprefix("*")
+        # FullControl inherited by files, and ReadAndExecute | CreateFiles | Synchronize.
+        assert entries == sorted(
+            [("S-1-5-18", 0x1F01FF, "ObjectInherit", "Allow"), (me, 0x1200AB, "None", "Allow")]
+        ), listed
+        env = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+        with pytest.MonkeyPatch.context() as patch:
+            for name, value in env.items():
+                patch.setenv(name, value)
+            store = await open_store(settings)  # the service's first start
+            await store.close()
+        assert not (custody_dir / "handoff.key").exists()
+        assert custody.read_host_file(custody_dir / "master.key") == blob
+        assert not list(secrets.iterdir())
+    finally:
+        # The owner keeps the right to change the list, so pytest can remove the directory.
+        _grant(custody_dir, f"{_me()}:(OI)(CI)F")
 
 
 @pytest.mark.parametrize(
@@ -233,7 +873,10 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     assert condition < low.index(keep), refusal
     assert ". " not in low[condition : low.index(_KEY_SETTINGS_OUT)], refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
-    assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
+    assert custody_host.keep_the_key_step(settings, new_store=False) not in refusal, refusal
+    # The file is left in place, and the way on is docs/SERVICE.md's procedure (Manager
+    # ruling 2026-11-22, vault BACKLOG #3411).
+    assert custody_host._LEAVE_KEY_FILES_STEP in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
     with pytest.raises(HostCustodyRefused, match=name):
         await open_store(settings, create=True)
@@ -417,6 +1060,53 @@ async def test_a_recorded_error_that_is_no_custody_refusal_is_still_replaced_at_
     assert type(refusal) is HostCustodyRefused
     assert "RECORDED-custody-text" in str(refusal)
     assert refusal.__cause__ is None and refusal.__context__ is None
+
+
+@pytest.mark.parametrize("link", ["the error itself", "its cause", "its context"])
+async def test_a_codec_error_on_the_custody_path_is_a_host_custody_refusal_with_no_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    link: str,
+) -> None:
+    """At the open's custody guard, a codec error the custody settings check raises, or a
+    ``ValueError`` it raises with one as its cause or context, is replaced by a
+    ``HostCustodyRefused``, never the cipher build's ``StoreCipherConfigError``, and the byte the
+    codec error quotes stays out of the refusal, its traceback and the log (BACKLOG #4882; vault
+    BACKLOG #8119 item 139)."""
+    import traceback
+
+    codec = UnicodeDecodeError("utf-8", b"\xfe-SENTINEL-codec", 0, 1, "invalid start byte")
+    built = ValueError(f"built from {codec} {codec!r}")
+    needles = ("0xfe", "\\xfe", "SENTINEL")
+    # The positive controls: the error built from the codec error quotes every needle.
+    for needle in needles:
+        assert needle in str(built)
+
+    def _raise(*args: object, **kwargs: object) -> Any:
+        if link == "the error itself":
+            raise codec
+        if link == "its cause":
+            raise built from codec
+        try:
+            raise codec
+        except UnicodeDecodeError:
+            raise built  # noqa: B904 - the codec error is its context, not its cause
+
+    monkeypatch.setattr(custody_host, "check_host_custody_settings", _raise)
+    with caplog.at_level(logging.DEBUG), pytest.raises(HostCustodyRefused) as excinfo:
+        await open_store(_settings(tmp_path), create=True, custody=_proved_blob())
+    refusal = excinfo.value
+    # Exactly this class, so not the cipher build's StoreCipherConfigError, a ValueError.
+    assert type(refusal) is HostCustodyRefused
+    assert "[store].key_provider" in str(refusal)
+    assert refusal.__cause__ is None and refusal.__context__ is None
+    replaced = "UnicodeDecodeError" if link == "the error itself" else "ValueError"
+    assert f"a host custody error was replaced ({replaced})" in caplog.text
+    rendered = f"{refusal!r} {''.join(traceback.format_exception(refusal))}"
+    for needle in needles:
+        assert needle not in rendered
+        assert needle not in caplog.text
 
 
 @pytest.mark.parametrize("raised", ["left behind", "refused"])
@@ -1602,7 +2292,9 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
         assert "run with the custody directory that holds the store's host blob" in flat, err
         # A server backend: the other secret files are carried over, and the external schema is
         # provisioned first.
-        assert "new, empty" not in flat and "Copy into it every secret file" in flat, err
+        assert (
+            "new, empty" not in flat and "When a refusal names master.key or handoff.key" in flat
+        ), err
         assert "a new database, whose schema a DDL-capable login provisions first" in flat, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
@@ -1690,9 +2382,10 @@ async def _never_started_pin_text(directory: Path) -> str:
     return str(refused.value)
 
 
-#: Phrases the guard takes out of every text first: one reports what failed, and one forbids a
-#: change (the kept-key warning's "Keep both, and do not delete either").
-_NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either")
+#: Phrases the guard takes out of every text first: one reports what failed, and the others forbid
+#: a change (the kept-key warning's "Keep both, and do not delete either", and the key-file
+#: refusals' "and delete nothing").
+_NOT_CHANGING_WHAT_EXISTS = ("could not be removed", "do not delete either", "and delete nothing")
 
 #: foreign_custody_refusal's own remedy, which changes settings only. Allowed for that text alone.
 _KEY_SETTINGS_OUT = "remove every other store key setting"
@@ -1710,10 +2403,10 @@ def _advises_changing(text: str, *, allowed: tuple[str, ...] = ()) -> bool:
 def test_the_keep_the_key_step_names_the_variable_the_engine_reads(tmp_path: Path) -> None:
     # The step writes the variable's name as a literal (CodeQL alert 315), so pin it to the
     # constant the engine reads.
-    from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+    from messagefoundry.engine_secrets import CUSTODY_DIRECTORY_VARIABLE
 
     step = custody_host.keep_the_key_step(_settings(tmp_path), new_store=True)
-    assert f"named by {SECRETS_DIRECTORY_VARIABLE} here" in step
+    assert f"named by {CUSTODY_DIRECTORY_VARIABLE} here" in step
 
 
 @pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
@@ -1729,7 +2422,7 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
         settings, new_store=True, service_account="NT SERVICE\\MessageFoundry"
     )
     assert "empty directory" not in step and "new, empty" not in step
-    assert "Copy into it every secret file" in step, step
+    assert "When a refusal names master.key or handoff.key" in step, step
     # Quoted, since a service account name can hold a space.
     command = (
         "run `messagefoundry provision-admin` again to mint this store's key in the new custody "
@@ -1737,19 +2430,21 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
         '\\MessageFoundry" among them'
     )
     assert command in step, step
-    assert "restricted and writable by the service as a secrets directory must be" in step, step
+    assert "writable by the service" not in step, step
     assert "The new store starts empty" in step, step
-    assert "other than master.key and handoff.key" in step, step
+    assert "MEFOR_SECRETS_DIRECTORY" not in step, step
     assert "recovery key shown when an existing key file was minted goes with that file" in step
     schema = "whose schema a DDL-capable login provisions first"
     assert (schema in step) is (backend is StoreBackend.POSTGRES), step
     assert ("a new database" in step) is (backend is StoreBackend.POSTGRES), step
     monkeypatch.setattr(sys, "platform", "win32")
-    windows = custody_host.keep_the_key_step(settings, new_store=False)
+    # A custody directory of its own is in use, so the store location may stay.
+    own = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
+    windows = custody_host.keep_the_key_step(settings, new_store=False, environ=own)
     assert "add --service-account with that account" in windows, windows
     assert "Point [store]" not in windows, windows
     auto = custody_host.keep_the_key_step(
-        settings.model_copy(update={"key_provider": "auto"}), new_store=False
+        settings.model_copy(update={"key_provider": "auto"}), new_store=False, environ=own
     )
     assert "provision-admin" not in auto and "run the command again" in auto, auto
     # No key is minted there, so no new key or recovery key is spoken of.
@@ -1772,8 +2467,9 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     # [store].server/database, here and for the service. With the store kept, the re-run keeps
     # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    own = {"MEFOR_CUSTODY_DIRECTORY": str(tmp_path / "custody")}
     step = custody_host.keep_the_key_step(
-        settings, new_store=new_store, service_account=service_account
+        settings, new_store=new_store, service_account=service_account, environ=own
     )
     assert "same arguments" not in step, step
     command = (
@@ -1985,7 +2681,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback, "run with the custody directory that holds the store's host blob"),
         ("which names the way on",),
         (fallback,),
-        (fallback, "set [store].key_provider = 'host'"),
+        ("set [store].key_provider = 'host'", "where it is, and delete nothing", "docs/SERVICE.md"),
         (fallback, "leaves it in place"),
         ("Run the command again with that file in place",),
         (fallback, "This run minted it and nothing was written under it"),
@@ -2124,7 +2820,7 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     assert code == 2
     err = capsys.readouterr().err
     assert not _advises_changing(err) and "leaves it and the store in place" in err, err
-    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(err.split()), err
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in " ".join(err.split()), err
     assert kept.exists()
     # B's pre-check was refused before its first write, so nothing was bound under A's key.
     import sqlite3
@@ -2139,35 +2835,56 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
 
 
 @host_file_platforms
+@pytest.mark.parametrize("kept_in", ["beside the store", "the secrets directory"])
 def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kept_in: str,
 ) -> None:
-    # PR 2804 fifth hold, item 4: follow the refusal's one way on, a new, empty custody directory
-    # and a new store location, and the re-run mints this store's key there through mint_target
-    # and provisions it. The key file and the store left in place are untouched.
+    # PR 2804 fifth hold, item 4, and PR 3168's hold, items 1 and 9: follow the refusal's way on as
+    # it reads, wherever the key file it leaves in place sits, and the re-run mints this store's
+    # key in the new custody directory MEFOR_CUSTODY_DIRECTORY names, through mint_target, and
+    # provisions it. With that variable set, a key file in the secrets directory or beside the
+    # store refuses a mint (_left_outside_the_custody_directory), so the way on must name new ones
+    # too. The key file and the store left in place are untouched.
     import asyncio
 
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
 
-    settings = _settings(tmp_path)
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    settings = _settings(store_dir)
     store_path = Path(settings.path)
 
     async def _unstarted() -> None:
         await (await _keyless_store(store_path)).close()
 
     asyncio.run(_unstarted())
+    if kept_in == "beside the store":
+        kept_dir = store_dir
+    else:
+        kept_dir = _own_custody_directory(tmp_path / "secrets")
+        monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(kept_dir))
     _mint(settings)
-    kept = tmp_path / custody_host.HOST_FILE_NAME
+    kept = kept_dir / custody_host.HOST_FILE_NAME
+    assert kept.exists()
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
-    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(capsys.readouterr().err.split())
+    err = " ".join(capsys.readouterr().err.split())
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in err, err
+    assert "a new SQLite path in a directory with no master.key" in err, err
+    new_secrets = "a new secrets directory, named by MEFOR_SECRETS_DIRECTORY"
+    assert (new_secrets in err) is (kept_in == "the secrets directory"), err
     left = {path: path.read_bytes() for path in (kept, store_path)}
-    secrets = tmp_path / "new-secrets"
-    secrets.mkdir()
-    if sys.platform != "win32":
-        secrets.chmod(0o700)
-    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
-    new_store = tmp_path / "new-store.db"
+    custody = _own_custody_directory(tmp_path / "custody")
+    monkeypatch.setenv("MEFOR_CUSTODY_DIRECTORY", str(custody))
+    if kept_in == "the secrets directory":
+        monkeypatch.setenv(
+            "MEFOR_SECRETS_DIRECTORY", str(_own_custody_directory(tmp_path / "new-secrets"))
+        )
+    (tmp_path / "new").mkdir()
+    new_store = tmp_path / "new" / "store.db"
     minted: list[Path] = []
     real_target = custody_host.mint_target
 
@@ -2183,7 +2900,7 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     monkeypatch.setattr(cli, "_RecoveryKeyConsole", lambda: _Console("", "wrong"))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     assert main([*argv, "--db", str(new_store)]) == 0, capsys.readouterr().err
-    assert minted and set(minted) == {secrets / custody_host.HOST_FILE_NAME}, minted
+    assert minted and set(minted) == {custody / custody_host.HOST_FILE_NAME}, minted
     assert minted[0].exists()
     assert new_store.exists()
     assert {path: path.read_bytes() for path in left} == left
@@ -2280,7 +2997,7 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     assert _advises_changing(cli._REMOVE_THE_VOID_KEY) and _advises_changing(warning), warning
     assert not _advises_changing(warning, allowed=(cli._REMOVE_THE_VOID_KEY,)), warning
     assert "cannot tell whose key" not in warning, warning
-    assert "Copy into it every secret file" in " ".join(warning.split()), warning
+    assert "When a refusal names master.key or handoff.key" in " ".join(warning.split()), warning
 
 
 @pytest.mark.parametrize("service_account", [None, "NT SERVICE\\MessageFoundry"])
@@ -3701,3 +4418,37 @@ def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
     else:
         assert not host_file.exists(), err
         assert "was removed from" in err and "Keep both" not in err, err
+
+
+def test_a_custody_directory_that_could_not_be_checked_says_so_with_its_own_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the check of the custody directory could not be made, the refusal says it could not
+    be checked, not that it is not restricted, and carries the refusal's own remedy, not the
+    owner-and-mode remedy, which would not clear it (vault BACKLOG #5657). The control is an
+    ordinary finding, which keeps "is not restricted" and that remedy."""
+    custody_dir = tmp_path / "custody"
+    custody_dir.mkdir()
+    environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)}
+    reason = restricted_file.MOUNT_TABLE_UNREAD
+    monkeypatch.setattr(
+        restricted_file,
+        "broad_access_problem",
+        lambda *a, **k: restricted_file.UncheckedProblem(reason),
+    )
+    refusal = custody_host._own_directory_refusal(environ)
+    assert refusal == (
+        f"the custody directory MEFOR_CUSTODY_DIRECTORY names could not be fully checked: {reason}"
+    ), refusal
+    assert "mode 0700" not in refusal and "Restrict it" not in refusal, refusal
+
+    monkeypatch.setattr(
+        restricted_file, "broad_access_problem", lambda *a, **k: "Everyone may read it"
+    )
+    control = custody_host._own_directory_refusal(environ)
+    assert control is not None
+    assert control.startswith(
+        "the custody directory MEFOR_CUSTODY_DIRECTORY names is not restricted: "
+        "Everyone may read it. "
+    ), control
+    assert "mode 0700" in control or "Restrict it" in control, control

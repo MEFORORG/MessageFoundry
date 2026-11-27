@@ -2,19 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``new.ps1``'s cleanup advice must be runnable as written (BACKLOG #1078).
 
-THE DEFECT. ``new.ps1`` anchors on ``$PSScriptRoot``, so run from a linked worktree it creates the
-new tree beside **itself** -- e.g. under ``.claude/worktrees/`` -- and then printed *"When done (run
-from the MAIN checkout): scripts\\worktree\\remove.ps1 -Name <name>"*. ``remove.ps1`` anchors on its
-own location too, so the main checkout's copy derives ``<main-parent>/<main-leaf>-<name>``, which
-does not exist, and it throws ``No such worktree``. The anchoring is correct (BACKLOG #1060); the
-sentence was wrong.
+THE RULE. Both scripts anchor the sibling on the MAIN worktree, whichever copy runs (BACKLOG #1894),
+and the advice names the main worktree's root explicitly, so it runs from any cwd. Historically
+(BACKLOG #1078) both anchored on ``$PSScriptRoot`` and the advice told the reader to run a root-less
+command from the main checkout, which then looked for a sibling that did not exist.
 
 THE INSTRUMENT. A text assertion that the advice "mentions $RepoRoot" would pass on advice that is
 still unrunnable, so the commands are **extracted from the script and executed** against a synthetic
-repo. ``test_the_advice_that_used_to_be_printed_still_throws_today`` carries the live positive
-control in the same test as the fix: the old ``main checkout`` form is run against the very fixture
-the new form then cleans up successfully, so a green here is evidence that the assertion can see the
-class rather than evidence that nothing was checked.
+repo. ``test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_removes_it``
+drives a linked copy of new.ps1 and runs what it printed; it is red on the pre-#1894 scripts.
 
 THE EXTRACTION CONTRACT, which ``new.ps1`` states on its side too: inside ``Show-NextSteps`` an
 advice line whose text begins ``"  #   "`` (hash, then THREE spaces) is a command meant to be run
@@ -33,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_worktree_remove_path import REAL_SCRIPTS, copy_real_scripts, settle_worktrees
+from tests.test_worktree_remove_path import _ENV, REAL_SCRIPTS, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
 _NEW_PS1 = _REPO / "scripts" / "worktree" / "new.ps1"
@@ -73,6 +69,7 @@ def _render(cmd: str, *, repo_root: Path, worktree: Path, name: str) -> list[str
     text = cmd.replace('`"', '"')
     for token, value in (
         ("$WorktreePath", str(worktree)),
+        ("$MainRoot", str(repo_root)),
         ("$RepoRoot", str(repo_root)),
         ("$Name", name),
     ):
@@ -111,8 +108,11 @@ class Fixture:
 
     def worktree(self, path: Path, branch: str) -> Path:
         _git(self.primary, "worktree", "add", "-q", "-b", branch, str(path))
-        # The untracked entry every real worktree carries. `git worktree remove` refuses on it
-        # without --force, so advice that omits --force would fail here -- which is the point.
+        # The entry every real worktree carries, gitignored as it is in this repository (the fixture
+        # ignores it in info/exclude). It was untracked and NOT ignored here until BACKLOG #2554
+        # finding 3, when remove.ps1 -Name began refusing such a file without -Force, which is
+        # right for real work and wrong for a stand-in for the .venv. Measured with git on Windows:
+        # plain `git worktree remove` does not refuse a tree whose only extra content is ignored.
         (path / ".venv").mkdir()
         (path / ".venv" / "marker.txt").write_text("untracked", encoding="utf-8")
         return path
@@ -127,6 +127,7 @@ def fx(tmp_path: Path) -> Fixture:
     _git(f.primary, "config", "user.name", "t")
     _git(f.primary, "add", "--", *REAL_SCRIPTS)
     _git(f.primary, "commit", "-qm", "seed")
+    (f.primary / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
     _git(
         f.primary,
         "update-ref",
@@ -137,10 +138,10 @@ def fx(tmp_path: Path) -> Fixture:
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    # Without git config carried in the environment, which remove.ps1 refuses on every route (vault
-    # BACKLOG #8225 item 2): a run under `git -c` exports GIT_CONFIG_PARAMETERS.
-    env = {k: v for k, v in os.environ.items() if not re.match(r"GIT_CONFIG(_|$)", k, re.I)}
-    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=env)
+    # The shared isolated environment: no GIT_* variable (remove.ps1 refuses config carriers and
+    # redirects on every route, vault BACKLOG #8225 item 2), and no CLAUDE_CONFIG_DIR or
+    # MEFOR_COORD_ROOT, so the claim and allocation reads stay inside the fixture.
+    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=_ENV)
 
 
 def test_the_advice_is_a_non_empty_set_of_commands_naming_the_checkout(fx: Fixture) -> None:
@@ -151,7 +152,7 @@ def test_the_advice_is_a_non_empty_set_of_commands_naming_the_checkout(fx: Fixtu
         f"{_NEW_PS1.name} prints no cleanup command in the extractable form. If Show-NextSteps was "
         "restructured, re-point this guard rather than letting it pass on an empty set."
     )
-    rootless = [c for c in commands if "$RepoRoot" not in c]
+    rootless = [c for c in commands if "$RepoRoot" not in c and "$MainRoot" not in c]
     assert not rootless, (
         "a cleanup command does not name the checkout the worktree belongs to:\n  "
         + "\n  ".join(rootless)
@@ -193,47 +194,45 @@ def test_every_printed_cleanup_command_actually_removes_the_worktree(fx: Fixture
         )
 
 
-def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> None:
-    """The live positive control, in the shape that produced the item.
+def test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_removes_it(
+    fx: Fixture,
+) -> None:
+    """The shape that produced both items, run as printed.
 
-    ``inner`` stands in for a linked worktree new.ps1 was run from; ``inner-feature`` is the tree it
-    would then create beside itself. The retired advice -- the MAIN checkout's own relative
-    ``remove.ps1 -Name feature`` -- is run against that tree and must still fail, and the advice
-    printed today must then clean it up. One test, both directions.
+    ``inner`` is a linked worktree under ``.claude/worktrees``, as a harness session's is. Red before
+    BACKLOG #1894: new.ps1's copy there made ``inner-feature`` beside ITSELF, under
+    ``.claude/worktrees``, where remove.ps1 -Path refuses to reach. It must land at ``repo-feature``
+    beside the primary, and the advice it prints -- naming the MAIN worktree's copy of remove.ps1,
+    which outlives ``inner`` -- must remove it.
     """
     inner = fx.primary / ".claude" / "worktrees" / "inner"
     _git(fx.primary, "worktree", "add", "-q", "-b", "inner", str(inner))
-    target = fx.worktree(inner.parent / "inner-feature", "feature")
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = inner / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, dst)
 
-    retired = _run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(fx.primary / "scripts" / "worktree" / "remove.ps1"),
-            "-Name",
-            "feature",
-        ]
+    made = _run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File"]
+        + [str(inner / "scripts" / "worktree" / "new.ps1"), "-Name", "feature", "-NoInstall"]
     )
 
-    assert retired.returncode != 0, (
-        "the retired advice succeeded, so this control proves nothing -- re-derive it before trusting "
-        "the assertions above"
-    )
-    assert "No such worktree" in retired.stderr
-    assert str(fx.primary.parent / "repo-feature") in retired.stderr
-    assert target.exists()
+    assert made.returncode == 0, f"{made.stdout}\n{made.stderr}"
+    target = fx.primary.parent / "repo-feature"
+    assert target.is_dir(), f"new.ps1 did not make the sibling of the primary:\n{made.stdout}"
+    assert not (inner.parent / "inner-feature").exists(), "it made the tree beside the linked copy"
+    advice = _printed_advice(made.stdout)
+    assert any("remove.ps1" in a for a in advice), advice
+    assert all(str(fx.primary) in a and str(inner) not in a for a in advice), advice
 
     settle_worktrees(fx.primary)
-    for cmd in _advice_commands():
-        if not target.exists():
-            break
-        proc = _run(_render(cmd, repo_root=inner, worktree=target, name="feature"))
-        assert proc.returncode == 0, f"advice failed: {cmd}\n{proc.stdout}\n{proc.stderr}"
+    cmd = next(a for a in advice if "remove.ps1" in a)
+    proc = _run([t.strip('"') for t in shlex.split(cmd, posix=False)])
 
+    assert proc.returncode == 0, f"advice failed: {cmd}\n{proc.stdout}\n{proc.stderr}"
     assert not target.exists()
     assert str(target).replace("\\", "/") not in _registered(fx.primary)
+    assert inner.is_dir()
 
 
 # --- BACKLOG #1038: a -Nested tree, made by new.ps1 itself, then torn down by its own advice -------
@@ -271,6 +270,9 @@ def test_new_ps1_NESTED_lands_under_dot_claude_worktrees_and_its_own_advice_remo
     assert "remove.ps1" not in made.stdout, "a nested tree has no scripted teardown to name"
     assert "--force" not in advice[0]
     assert "nothing checks whether a session is still in it" in made.stdout
+    # BACKLOG #2554 finding 1: the advice also names the guards plain git skips.
+    for guard in ("work claim", "ledger number", "detached HEAD"):
+        assert guard in made.stdout, f"the nested advice does not name the {guard} guard"
 
     wt = fx.primary / ".claude" / "worktrees" / "probe"
     assert wt.is_dir()

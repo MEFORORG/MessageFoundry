@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,51 @@ async def test_patch_answers_423_for_a_failing_record(keyed: tuple[Engine, Path]
     assert absent.status_code == 404
     assert served.status_code == 200, served.text
     assert await _seal_failures(engine, victim) >= 1
+
+
+#: The admin writes that decide on the account's record before they write (#5520 items 2 and 13):
+#: (method, path suffix, JSON body, step-up action or None for the session window).
+_CHECKED_WRITES = {
+    "roles": ("PUT", "roles", {"roles": [Role.VIEWER.value]}, None),
+    "channel-scope": ("PUT", "channel-scope", {"channels": ["*"]}, None),
+    "reset-password": ("POST", "reset-password", None, "admin_reset_password"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CHECKED_WRITES))
+async def test_an_admin_write_answers_423_for_a_failing_record(
+    keyed: tuple[Engine, Path], name: str
+) -> None:
+    """#5520 items 2 and 13: ``PUT /users/{id}/roles``, ``PUT /users/{id}/channel-scope`` and
+    ``POST /users/{id}/reset-password`` read the account through the checked read, so a record
+    that fails its seal answers the 423 the reads answer, reported, rather than a 409 from the
+    write's own seal check or a 404 from the service's loader. Controls: an unknown id is still a
+    404, and an intact account is written."""
+    method, suffix, body, action = _CHECKED_WRITES[name]
+    engine, path = keyed
+    service, alerts, intact, victim = await _setup(engine)
+    await _tamper(path, victim)
+
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+
+        async def send(user_id: str) -> httpx.Response:
+            nonlocal token
+            _, token = await _reauth(c, token, purpose=action)
+            return await c.request(
+                method, f"/users/{user_id}/{suffix}", json=body, headers=_auth(token)
+            )
+
+        refused = await send(victim)
+        absent = await send(ABSENT_USER_ID)
+        served = await send(intact)
+    assert refused.status_code == 423, refused.text
+    assert refused.json()["detail"] == USER_SEAL_REFUSED
+    assert _PLANTED not in refused.text
+    assert await _seal_failures(engine, victim) >= 1
+    assert any(victim in alert for alert in alerts)
+    assert absent.status_code == 404, absent.text
+    assert served.status_code == 200, served.text
 
 
 async def test_checked_user_tells_a_failing_record_from_a_missing_one(
@@ -478,11 +524,80 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Each engine process sharing the store keeps its own interval",
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
+        "the single-use `admin_reset_password` grant, so its 423, its 404 and the 503",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
     ):
         assert fact in body, fact
     rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
-    assert len(rows) == 5, rows
+    assert len(rows) == 8, rows
     for row in rows:
         assert "*What an admin user read reports* below this table" in row, row
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
+
+
+#: The console sentences this PR's code change needs in that statement (Lander hold 7090810151,
+#: narrowed by decision d20261123T104714846-26b436 to main's text plus these): the users list
+#: links a failing account's delete, for a ``users:manage`` holder only, to the confirmation page,
+#: which shows a page in place of the 423 its checked read answers for that record; the page's
+#: own-account case; and the interval sentence, which main had answering every refusal 423 or
+#: listed as failed, names the confirmation's page. Case-insensitive regexes over the
+#: whitespace-normalised statement.
+_CONSOLE_SENTENCES = {
+    "the list's delete is the confirmation's, for users:manage": (
+        r"to a caller holding `users:manage` it links that account's delete to "
+        r"`GET /ui/users/\{user_id\}/delete-confirm`"
+    ),
+    "the confirmation answers a refused record rather than the 423": (
+        r"delete-confirm`, which, for a record its checked read refuses with 423, shows a "
+        r"confirmation naming the id alone rather than the 423 this paragraph gives a failing "
+        r"record"
+    ),
+    # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the sentence
+    # that said every refusal inside the interval answers 423 or is listed as failed names it.
+    "the interval sentence names the confirmation's page": (
+        r"answers 423, lists the account as failed or, on the delete confirmation, shows its page"
+    ),
+    "the confirmation for the caller's own account has no form": (
+        r"Where the id in its path is the caller's own, that page shows a note that the caller "
+        r"cannot delete their own account, and no delete form"
+    ),
+}
+
+#: Main's wording of the interval and Vault transit sentences (Lander hold 7091484059), each
+#: regex beside the sentence it was written against: it must match that sentence, its positive
+#: control, and must not match the statement, since the confirmation answers 200 rather than
+#: either.
+_UNSCOPED = {
+    r"answers 423 or lists the account as failed": (
+        "A refusal inside that interval, from any of these routes or any other reader of the same "
+        "account in that process, answers 423 or lists the account as failed and adds no row and "
+        "no alert."
+    ),
+    r"answered the same way, a 423 or listed as failed": (
+        "a record Vault transit cannot verify is answered the same way, a 423 or listed as "
+        "failed, but reported under `integrity.authority_seal_unverifiable`"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CONSOLE_SENTENCES))
+def test_the_security_doc_states_the_console_sentences(name: str) -> None:
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert re.search(_CONSOLE_SENTENCES[name], body, re.IGNORECASE), name
+
+
+def test_the_security_doc_no_longer_offers_the_delete_on_the_list_itself() -> None:
+    """Main's "with its delete" described a delete form on the users list; this PR moved it behind
+    the confirmation page (Lander hold 7090810151)."""
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(r"by its id alone, with its delete\b", body, re.IGNORECASE)
+
+
+@pytest.mark.parametrize("overclaim", sorted(_UNSCOPED))
+def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overclaim: str) -> None:
+    assert re.search(overclaim, _UNSCOPED[overclaim], re.IGNORECASE), overclaim
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(overclaim, body, re.IGNORECASE), overclaim

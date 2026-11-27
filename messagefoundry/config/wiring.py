@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import decimal
+import dis
 import errno
+import fractions
 import functools
 import hashlib
 import importlib.abc
@@ -40,10 +43,13 @@ import importlib.util
 import inspect
 import io
 import ipaddress
+import itertools
 import json
 import logging
 import math
 import ntpath
+import numbers
+import operator
 import os
 import re
 import stat
@@ -52,7 +58,15 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -342,6 +356,20 @@ class EnvRef:
         # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
         if self.cast is bool:
             object.__setattr__(self, "cast", _cast_bool)
+        # vault BACKLOG #1650: the builtin ``int`` reads a TOML ``true`` in ``environments/<env>.toml``
+        # as 1 and ``2575.9`` as 2575, so ``env("p", cast=int)`` built a port nobody wrote, and the
+        # connector's own check saw only the cast's result. The same swap, for the same reason.
+        elif self.cast is int:
+            object.__setattr__(self, "cast", _cast_int)
+        # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
+        elif self.cast is float:
+            object.__setattr__(self, "cast", _cast_float)
+        # Some other numeric builtins and number types (``abs``, ``round``, ``decimal.Decimal``) read
+        # a TOML ``true`` as 1 the same way, so those named in _NUMERIC_BUILTIN_FUNCTIONS, and
+        # classes with one of _NUMBER_TYPES in their MRO, get a bool refused ahead of them. Both
+        # lists are partial.
+        elif self.cast is not None and _is_numeric_builtin_cast(self.cast):
+            object.__setattr__(self, "cast", _bool_refusing_cast(self.cast))
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -401,7 +429,17 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
+    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
+    (:func:`_cast_float`). At least ``abs`` and ``round`` among the numeric builtins, and a number
+    type such as ``decimal.Decimal``, refuse a TOML bool read from the environment
+    (:func:`_is_numeric_builtin_cast` says which). A ``default=`` is neither cast nor checked by
+    that refusal, so ``env("p", cast=Decimal, default=True)`` with the key unset returns ``True``,
+    and a number subclass such as ``class Port(int)`` is refused only a bool, so it still cuts
+    ``2575.9`` to 2575. The builtin list is partial, so at least
+    ``math.sqrt`` and ``operator.neg`` still read ``true`` as 1. Any other callable runs as given, on the
+    environment value as it arrives, a TOML bool included, so ``cast=lambda v: int(v)`` still
+    reads ``true`` as 1; the connector's own check sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -473,12 +511,134 @@ def _cast_bool(raw: Any) -> bool:
 _cast_bool.__name__ = "bool"
 
 
+def _cast_int(raw: Any) -> int:
+    """Read an environment value as a whole number: the ``cast = "int"`` named cast, and what a
+    code-first ``env(..., cast=int)`` runs, since :class:`EnvRef` swaps the builtin ``int`` for it
+    (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1 and ``2575.9`` into 2575. ``environments/<env>.toml`` is TOML,
+    so either one reaches a cast typed, and a port read that way would have dialled a port nobody
+    named. So a bool is refused, ``False`` as well as ``True``, and so is a number that is not whole
+    or not finite. Text is read by ``int()``, as before. An integer passes, and so does another
+    number that is whole, such as ``2575.0`` or ``Decimal("2575")``. Anything else is refused.
+
+    Raises ``ValueError`` with the value withheld, by the rule :func:`_cast_bool` states, outside the
+    handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``."""
+    reason: str
+    if isinstance(raw, bool):
+        reason = "a bool is not a whole number"
+    elif isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            reason = "text must be a whole number in digits"
+    elif isinstance(raw, numbers.Integral):
+        return operator.index(raw)
+    elif isinstance(raw, numbers.Number):
+        number: Any = raw  # numbers.Number promises no int(); a complex makes it raise TypeError
+        try:
+            whole: int = int(number)
+        except (TypeError, ValueError, OverflowError):
+            reason = "not a finite real number"
+        else:
+            if whole == number:
+                return whole
+            reason = "not a whole number, and int() would truncate it"
+    else:
+        reason = f"a {type(raw).__name__} is not a number or text"
+    raise ValueError(f"{reason} (value withheld)")
+
+
+# Named "int" for the reason ``_cast_bool`` is named "bool": the resolver's message names the cast.
+_cast_int.__name__ = "int"
+
+
+def _cast_float(raw: Any) -> float:
+    """Read an environment value as a number: the ``cast = "float"`` named cast, and what a
+    code-first ``env(..., cast=float)`` runs, since :class:`EnvRef` swaps the builtin ``float`` for
+    it (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1.0, and a TOML ``true`` in ``environments/<env>.toml`` reaches
+    the cast typed. It also takes ``"nan"`` and ``"inf"``, and rounds ``"1e-400"`` to 0.0, so a
+    float cap read through the cast could turn off from a value nobody wrote as zero. So the value
+    is read by the rule ``transports.base.float_setting`` holds, which refuses each of those with a
+    ``ValueError`` that withholds the value, by the rule :func:`_cast_bool` states."""
+    from messagefoundry.transports.base import float_setting
+
+    return float_setting(raw, knob="value", transport="env()")
+
+
+# Named "float" for the reason ``_cast_bool`` is named "bool".
+_cast_float.__name__ = "float"
+
+
+#: Numeric builtins that read a bool as the number 1 or 0. A number TYPE is matched by
+#: :func:`_is_numeric_builtin_cast` against :data:`_NUMBER_TYPES` instead.
+_NUMERIC_BUILTIN_FUNCTIONS: Final = (
+    abs,
+    round,
+    math.floor,
+    math.ceil,
+    math.trunc,
+    math.fabs,
+    operator.index,
+)
+
+#: Number types that read a bool as the number 1 or 0. A cast class with one of these in its MRO
+#: counts, so ``class Port(int)`` and ``enum.IntEnum`` are refused a bool. ``numbers.Number`` is
+#: here for a class that inherits it; a type only REGISTERED with it, such as ``numpy.int64``, is
+#: not in its MRO and is not matched.
+_NUMBER_TYPES: Final = (int, float, complex, decimal.Decimal, fractions.Fraction, numbers.Number)
+
+#: ``type``'s own MRO reader. A metaclass cannot replace it, and reading it runs no author code.
+_READ_MRO: Final = type.__dict__["__mro__"].__get__
+
+
+def _is_numeric_builtin_cast(cast: Callable[[Any], Any] | None) -> bool:
+    """Whether ``cast`` is a numeric builtin or a number type, other than the ``int``, ``float`` and
+    ``bool`` that :class:`EnvRef` swaps for its own reads. Each reads a TOML ``true`` as 1 (vault
+    BACKLOG #1650).
+
+    No author code runs here and nothing is hashed, since an author's cast need not be hashable.
+    ``type(cast)`` reads the object's own type, never an author ``__class__``, and
+    ``issubclass(..., type)`` against the exact ``type`` compares MROs without a hook. Every
+    comparison is by identity, since an equality test would run a metaclass ``__eq__``. Returns
+    ``bool``, not ``TypeIs``: a False result says nothing about whether ``cast`` is None."""
+    if issubclass(type(cast), type):
+        if any(cast is own for own in (bool, int, float)):
+            return False
+        return any(base is known for base in _READ_MRO(cast) for known in _NUMBER_TYPES)
+    return any(cast is known for known in _NUMERIC_BUILTIN_FUNCTIONS)
+
+
+class _bool_refusing_cast:  # noqa: N801 -- read as the function it stands in for
+    """``cast`` with a bool refused ahead of it, by the rule :func:`_cast_int` holds, value
+    withheld. Equal when the casts are, so two references written with one cast still compare
+    equal; no cache, which would keep a config module's own number class alive past a reload."""
+
+    def __init__(self, cast: Callable[[Any], Any]) -> None:
+        self.cast = cast
+        # Named as the cast the author wrote, for the reason ``_cast_bool`` is named "bool".
+        self.__name__ = _cast_name(cast)
+
+    def __call__(self, raw: Any) -> Any:
+        if isinstance(raw, bool):
+            raise ValueError("a bool is not a number (value withheld)")
+        return self.cast(raw)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _bool_refusing_cast) and other.cast is self.cast
+
+    def __hash__(self) -> int:
+        return id(self.cast)
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
-    "int": int,
-    "float": float,
+    "int": _cast_int,
+    "float": _cast_float,
     "bool": _cast_bool,
     "str": str,
 }
@@ -917,7 +1077,8 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 def _tls_off_reason(tls: object) -> str | None:
     """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
     :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
-    ``tls`` is truthy, so it reads as on until it resolves."""
+    ``tls`` reads as on until it resolves, by ``unread_ca_reason``'s own rule, since
+    ``bool_setting`` refuses one."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
@@ -925,8 +1086,9 @@ def _tls_off_reason(tls: object) -> str | None:
 
 def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
     """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
-    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
-    reason reads it by truthiness."""
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, so the refusal names
+    the factory: the unread reason reads ``tls`` strictly and would raise a bare ``ValueError``
+    that does not (vault BACKLOG #3234)."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
         refuse_bool_literals({"tls": tls}, factory)
@@ -1783,10 +1945,10 @@ def _bool_settings() -> _BoolSettings:
 
 
 def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
-    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, as
-    :func:`~messagefoundry.config.models.bool_setting` does, so a connector that reads the flag with
-    plain ``bool()`` cannot turn a default-on check off on a ``None``. Anything else is
-    :func:`_cast_bool`, which raises ``ValueError`` with the value withheld."""
+    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, so a
+    connector that reads the flag with plain ``bool()`` cannot turn a default-on check off on a
+    ``None``. Anything else is :func:`_cast_bool`, which raises ``ValueError``, with the value
+    withheld, on a spelling it does not know, an empty string included."""
     return default if value is None else _cast_bool(value)
 
 
@@ -2027,6 +2189,29 @@ def resolve_env_settings(
     if parts:
         raise WiringError("; ".join(parts))
     return resolved
+
+
+#: What :func:`_resolved_setting` returns for an ``env()`` reference it cannot resolve.
+_UNRESOLVED = object()
+
+
+def _resolved_setting(
+    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
+) -> object:
+    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
+    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
+    values, a key the values do not hold and no default, or a value the resolution refuses, such
+    as one whose cast fails, with no fall back to the default. The graph readers share it, at least
+    the DATABASE, ECH, FHIR path-form and query-credential ones (vault BACKLOG #3766 item 32)."""
+    value = settings.get(key, default)
+    if not isinstance(value, EnvRef):
+        return value
+    if env_values is None:
+        return _UNRESOLVED
+    try:
+        return resolve_env_settings({key: value}, env_values)[key]
+    except WiringError:
+        return _UNRESOLVED
 
 
 #: The ``env()`` values the graph a registry guard is judging resolves against, set only while
@@ -2342,7 +2527,7 @@ def connector_secret_env_values(
     * a URL setting (:func:`_is_url_setting`) whose value carries userinfo or a query parameter
       ``secretscrub`` reads as a credential.
 
-    The last two are resolved as the build resolves them (:func:`_db_setting`, so the reference's
+    The last two are resolved as the build resolves them (:func:`_resolved_setting`, so the reference's
     ``cast`` runs and a missing key falls back to its ``default=``), and only the credential VALUES
     are MAC'd, in a fixed encoding, so a renamed header or parameter, a harmless header or a new host
     is not read as a rotation. Values are returned **transiently** to be MAC'd — never persisted or
@@ -2366,7 +2551,9 @@ def connector_secret_env_values(
                 material = raw if isinstance(raw, str) and raw else None
             elif name == "headers" or _is_url_setting(name):
                 # Resolved only for these two, so no other setting's cast runs here.
-                material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
+                material = _env_secret_material(
+                    name, _resolved_setting(settings, name, None, env_values)
+                )
             else:
                 continue
             if material:
@@ -4704,10 +4891,10 @@ class _RoleDefault:
         return "<each role's default>"
 
 
-#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
-#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
-#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
-#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: ``DICOM(max_object_bytes=...)`` or ``min_message_bytes_per_second`` left unset. One factory builds
+#: both roles and the transport holds each default (``transports/dicom.py``; vault BACKLOG #4908,
+#: #6637), so the factory writes no value it was not given. Typed ``Any`` so that the parameter's
+#: annotation stays what an author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
 #: Not ``_UNSET``, which is ``env()``'s.
 _ROLE_DEFAULT: Any = _RoleDefault()
 
@@ -4758,6 +4945,9 @@ def DICOM(
     max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
+    min_message_bytes_per_second: int = _ROLE_DEFAULT,  # SCP: the rate in each message's deadline;
+    # unset = 64 KiB a second. Lower it for a slower link. At least 16 KiB a second: it cannot be
+    # off. Refused on an outbound.
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
@@ -4845,6 +5035,8 @@ def DICOM(
     }
     if max_object_bytes is not _ROLE_DEFAULT:
         settings["max_object_bytes"] = max_object_bytes
+    if min_message_bytes_per_second is not _ROLE_DEFAULT:
+        settings["min_message_bytes_per_second"] = min_message_bytes_per_second
     return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 
@@ -5945,9 +6137,12 @@ def _accepts_callees(obj: object) -> list[object]:
     function, a ``__wrapped__`` it carries, and a callable instance's ``__call__``. Empty for a plain
     function with no ``__wrapped__``.
 
-    Every read is static, as ``reachability._function_of`` reads (``type()``, ``__dict__`` and
-    ``inspect.getattr_static``), so no author ``__class__``, ``__getattr__`` or
-    ``__getattribute__`` runs at load. A class-based wrapper that calls ``functools.update_wrapper``
+    A callable instance's ``__call__`` and ``__wrapped__`` are looked up with
+    ``inspect.getattr_static``, so no author ``__getattr__`` or ``__getattribute__`` runs for
+    them. Not every read here is free of author code: at least the ``func`` read off a
+    ``functools.partial`` runs a subclass's override, and a function's ``__wrapped__`` is read with
+    ``.get`` on its ``__dict__``, which an author can replace with a ``dict`` subclass whose
+    ``get`` runs. A class-based wrapper that calls ``functools.update_wrapper``
     yields both its own ``__call__`` and the function it wraps, since either may run."""
     kind = type(obj)
     if issubclass(kind, functools.partial):
@@ -5966,6 +6161,45 @@ def _accepts_callees(obj: object) -> list[object]:
     with suppress(AttributeError):
         out.append(inspect.getattr_static(obj, "__wrapped__"))
     return out
+
+
+#: Objects the run-scoped walk always follows, then judges their targets (BACKLOG #5514).
+_ACCEPTS_ALWAYS_FOLLOWED: Final = (functools.partial, MethodType, staticmethod, classmethod)
+
+#: Containers the run-scoped walk reads the items of, by EXACT type: a subclass could run author
+#: code from its ``__iter__`` (BACKLOG #5514, engine PR 2997's left list).
+_ACCEPTS_CONTAINER_TYPES: Final = (tuple, list, dict, set, frozenset)
+
+
+def _is_accepts_container(kind: type) -> bool:
+    """Whether ``kind`` is exactly one of :data:`_ACCEPTS_CONTAINER_TYPES`. By identity: ``kind in``
+    the tuple would test equality and run an author metaclass's ``__eq__`` during the walk."""
+    return any(kind is container for container in _ACCEPTS_CONTAINER_TYPES)
+
+
+#: The instructions that load a local, the first parameter included.
+_LOCAL_LOADS: Final = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
+
+
+def _first_argument_attributes(code: CodeType) -> set[str]:
+    """The attribute names ``code`` loads straight off its first parameter (``self.getter``), read
+    from the bytecode, where a plain local load of it comes right before the ``LOAD_ATTR``. Empty
+    for code with no parameter. Nested code is not read: there ``self`` is a closure cell, not the
+    first parameter. It misses at least a ``self`` loaded by Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW`` (as in ``return x, self.getter``), by ``LOAD_DEREF``
+    (when a nested function also uses ``self``), or with an ``EXTENDED_ARG`` before the
+    ``LOAD_ATTR``."""
+    if not code.co_argcount:
+        return set()
+    first = code.co_varnames[0]
+    return {
+        ins.argval
+        for previous, ins in itertools.pairwise(dis.get_instructions(code))
+        if ins.opname == "LOAD_ATTR"
+        and isinstance(ins.argval, str)
+        and previous.opname in _LOCAL_LOADS
+        and previous.argval == first
+    }
 
 
 def _accepts_walk(start: object, expand: Callable[[object], Iterable[object]]) -> Iterator[object]:
@@ -6014,17 +6248,38 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     ``def``), names one, as the earlier one-level check did. A function or instance defined
     elsewhere that carries a ``__wrapped__`` chain, such as a ``functools.lru_cache`` or a library
     decorator around a config helper, is judged by the function at the end of the chain
-    (``reachability._function_of``). The walk's own reads are static (:func:`_accepts_callees`), but
-    ``captured_values`` tests a global with ``isinstance``, which can run an object's ``__class__``;
-    :func:`_check_accepts_predicate` refuses a predicate whose walk raises. It does not see at
-    least: a call through ``getattr`` or another computed name, a function in any other module, an
-    object's other methods, or a value the predicate builds while it runs."""
+    (``reachability._function_of``). The walk's attribute lookups by name use
+    ``inspect.getattr_static``, but it is not free of author code: at least the ``func``, ``args``
+    and ``keywords`` it reads off a ``functools.partial`` and the ``__func__`` it reads off a
+    ``staticmethod`` or ``classmethod`` are plain attribute reads, which a subclass can override,
+    a function's ``__wrapped__`` is read off a ``__dict__`` an author can replace (see
+    :func:`_accepts_callees`), and ``captured_values`` tests a global with ``isinstance``, which can run an object's
+    ``__class__``; :func:`_check_accepts_predicate` refuses a predicate whose walk raises.
+
+    Engine PR 2997's left list adds these edges (vault BACKLOG #5514): an attribute a function
+    reads as ``Name.attr`` off a class or an instance, not only off a module; the items of a
+    ``tuple``, ``list``, ``dict`` (keys and values), ``set`` or ``frozenset`` the walk reaches,
+    by exact type; a ``staticmethod`` or ``classmethod``'s function, so ``staticmethod(state_get)``
+    is caught; any wrapper whose ``__wrapped__`` chain ends at the accessor itself; and
+    the attributes a config bound method, or a callable instance's ``__call__``, reads straight off
+    its first parameter (``self.getter``) in the bytecode forms :func:`_first_argument_attributes`
+    reads, looked up on the bound ``__self__`` or the instance, a method found there bound to it in
+    turn, read with ``inspect.getattr_static``. It does not see at least: a call through
+    ``getattr`` or another computed name, a function in any other module, an attribute read off a
+    local or off an attribute (``self.a.b``), a subclass of a container, an object's methods the
+    walk does not reach by name, a value the predicate builds while it runs, a ``self`` load that
+    :func:`_first_argument_attributes` misses (Python 3.14's combined
+    ``LOAD_FAST_BORROW_LOAD_FAST_BORROW``, ``LOAD_DEREF``, an ``EXTENDED_ARG``), the reads off
+    ``self`` of a method reached as ``Name.attr`` off a module-level instance or class
+    (``FILTER.check(msg)``), since that edge is the plain function with no ``self`` to look them up
+    on, and a classmethod's ``cls.getter``."""
     # Lazy: both accessor modules are imported by handler code, not by the loader, and reachability
     # imports this module at its top level.
     from messagefoundry.config.reachability import (
         _function_of,
         _is_config_module,
         captured_values,
+        code_names,
     )
     from messagefoundry.config.response import response_get
     from messagefoundry.config.state import state_get
@@ -6044,27 +6299,83 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
 
     def followed(value: object) -> bool:
         kind = type(value)
-        if id(value) in accessors or issubclass(kind, (functools.partial, MethodType)):
+        if id(value) in accessors or issubclass(kind, _ACCEPTS_ALWAYS_FOLLOWED):
+            return True
+        if _is_accepts_container(kind):  # exact types, so no author __iter__ runs
             return True
         if issubclass(kind, type) or not callable(value):
             return False
         own = cast("FunctionType", value) if issubclass(kind, FunctionType) else None
         if _is_config_module(own.__module__ if own else kind.__module__, home):
             return True
-        # A cache or a library decorator around a config helper: judge the function it wraps.
+        # A cache or a library decorator around a config helper, or a functools.wraps wrapper
+        # around an accessor itself: judge the function it wraps.
         inner = _function_of(value)
-        return inner is not None and _is_config_module(inner.__module__, home)
+        return inner is not None and (
+            id(inner) in accessors or _is_config_module(inner.__module__, home)
+        )
+
+    bound: dict[tuple[int, int], MethodType] = {}
+
+    def attribute(holder: object, name: str) -> object:
+        # Static, so no author __getattr__ runs for this lookup.
+        return inspect.getattr_static(holder, name, None)
+
+    def self_reads(func: object, owner: object) -> list[object]:
+        # What ``func``, a config function, reads off its first parameter, looked up on ``owner``.
+        # A followed plain function found there is bound to ``owner``, so its own reads off
+        # ``self`` are followed too. Engine and library code is not read, as elsewhere here.
+        if not (issubclass(type(func), FunctionType) and followed(func)):
+            return []
+        edges: list[object] = []
+        for name in _first_argument_attributes(cast("FunctionType", func).__code__):
+            value = attribute(owner, name)
+            if not followed(value):
+                continue
+            if issubclass(type(value), FunctionType):
+                # One bound object per pair, kept alive here, so the walk's seen-by-id set ends
+                # a method that reads itself off ``self`` rather than looping on fresh bindings.
+                key = (id(value), id(owner))
+                value = bound.setdefault(key, MethodType(cast("FunctionType", value), owner))
+            edges.append(value)
+        return edges
 
     def expand(obj: object) -> list[object]:
         if id(obj) in accessors:
             return []
+        kind = type(obj)
         edges = [edge for edge in _accepts_callees(obj) if obj is pred or followed(edge)]
-        if issubclass(type(obj), functools.partial):
+        if _is_accepts_container(kind):
+            items = cast("Iterable[object]", obj)
+            if kind is dict:
+                table = cast("dict[object, object]", obj)
+                items = itertools.chain(table.keys(), table.values())
+            edges += [item for item in items if followed(item)]
+        elif issubclass(kind, (staticmethod, classmethod)):
+            inner = cast("staticmethod[..., object]", obj).__func__
+            if followed(inner):
+                edges.append(inner)
+        elif issubclass(kind, functools.partial):
             part = cast("functools.partial[object]", obj)
             edges += [value for value in (*part.args, *part.keywords.values()) if followed(value)]
-        if issubclass(type(obj), FunctionType):
+        elif issubclass(kind, MethodType):
+            method = cast("MethodType", obj)
+            edges += self_reads(method.__func__, method.__self__)
+        elif issubclass(kind, FunctionType):
             func = cast("FunctionType", obj)
             edges += [c.value for c in captured_values(func, home) if followed(c.value)]
+            # ``Global.attr`` off a class or an instance: captured_values reads it off a module only.
+            # A method found here is never bound (a plain function, or a classmethod whose function
+            # is followed unbound), so self_reads does not run on it: ``FILTER.check``'s reads off
+            # ``self`` and a classmethod's reads off ``cls`` are missed.
+            for holder_name, name in code_names(func.__code__)[1]:
+                holder = func.__globals__.get(holder_name)
+                if holder is not None and not issubclass(type(holder), ModuleType):
+                    value = attribute(holder, name)
+                    if followed(value):
+                        edges.append(value)
+        elif callable(obj) and not issubclass(kind, type):
+            edges += self_reads(attribute(kind, "__call__"), obj)
         return edges
 
     found: set[str] = set()
@@ -6080,6 +6391,57 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+# The verdict types :func:`accepts_verdict` refuses unless the class has a truth value of its own:
+# each otherwise reads as True without being awaited or iterated.
+_ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
+
+
+def accepts_verdict(hname: str, verdict: object) -> bool:
+    """The truth value of ``verdict``, the value an ``accepts=`` predicate returned, or
+    :class:`TypeError` when it is an awaitable, an iterator or an async iterator (BACKLOG #5514).
+
+    The router stage reads the verdict as a truth value without awaiting or iterating it. A coroutine,
+    a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
+    True, so the handler would accept every message. The static check in
+    :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The text names
+    the handler and the verdict's type, never its value. Every mode applies this one rule, so
+    ``[sandbox].mode`` does not change the verdict (ADR 0087).
+
+    The refusal neither consumes nor closes the object, because the predicate may share it, for
+    example a module-level generator, and closing it would end it for its other holders. It drops its
+    own reference before raising. ``dryrun._accepted`` and the sandbox worker pass the verdict straight
+    in rather than binding it to a local, so on those paths an object the predicate made for this
+    call, and that is in no reference cycle, is collected before the error leaves this function, on
+    the calling thread and inside whatever run context the caller holds. The dry-run tracer's
+    recorder keeps the predicate's frame, so on the traced path the object waits for the cyclic
+    collector, as does an object in a cycle on any path. When Python finalizes it, a started
+    generator's ``finally`` runs, a raise from that ``finally`` goes to Python's unraisable-exception
+    hook rather than into this error, and a coroutine draws Python's "never awaited" warning.
+
+    An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
+    read by that value as before, iterator or not."""
+    if verdict is None or type(verdict) is bool:  # the contract's shapes: the routing hot path
+        return bool(verdict)
+    cls = type(verdict)
+    if (
+        isinstance(verdict, _ALWAYS_TRUE_VERDICT_TYPES)
+        and not hasattr(cls, "__bool__")
+        and not hasattr(cls, "__len__")
+    ):
+        # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
+        # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
+        type_name = scrub_log_argument(cls.__name__)
+        del verdict, cls  # see the docstring: the traceback must not keep the verdict alive
+        raise TypeError(
+            f"accepts= predicate for handler {hname!r} returned an object of type "
+            f"{type_name}, which the router stage cannot await or iterate "
+            "and would read as True; it must return a value whose truth value is the verdict, "
+            "such as a bool"
+        )
+    return bool(verdict)
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
@@ -6092,7 +6454,9 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
     * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
-      an awaitable is not seen.
+      an awaitable, an iterator or an async iterator is not seen here; :func:`accepts_verdict`
+      refuses such a verdict at run time instead, as a router-stage error, unless its class has a
+      truth value of its own.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
@@ -7098,7 +7462,11 @@ class Registry:
         ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
         ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
         check after resolution refuses it then."""
-        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+        from messagefoundry.auth.trust_anchors import (
+            unread_ca_flags_refused,
+            unread_ca_reason,
+            unread_pin_message,
+        )
 
         dialling = [
             ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
@@ -7112,6 +7480,11 @@ class Registry:
         problems: list[str] = []
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if unread_ca_flags_refused(settings):
+                # The strict read in unread_ca_reason may raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal. The skip covers all four
+                # flags, read or not, so an unread-CA problem here shows once the literal is fixed.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7227,7 +7600,7 @@ class Registry:
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
 
-        Caught statically, naming the connection and the offending string, the way
+        Caught statically, naming the connection and withholding the offending string, the way
         :meth:`port_collisions` catches a duplicate port before it becomes a bare bind ``OSError``
         (see the section comment above for the runtime failure this pre-empts).
 
@@ -7303,10 +7676,12 @@ class Registry:
                 )
                 continue
             if not _is_text_codec(value):
+                # The literal is config-module text, which a load error does not quote (BACKLOG
+                # #3765 item 1): the connection names where to look, and the value is withheld.
                 problems.append(
-                    f"{kind} {name!r}: encoding {value!r} is not a Python text codec — every "
-                    f"message would fail at decode/encode; use a codec name such as 'utf-8', "
-                    f"'latin-1' or 'cp1252'"
+                    f"{kind} {name!r}: encoding is not a Python text codec (value withheld) — "
+                    f"every message would fail at decode/encode; use a codec name such as "
+                    f"'utf-8', 'latin-1' or 'cp1252'"
                 )
         return problems
 
@@ -7769,10 +8144,16 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+    # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
+    # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
+    # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
+    # read listed. That is a deliberate second reading beside bool_setting's: the connectors refuse
+    # a non-bool where they read the key, and a Registry build refuses one, but the settings dict
+    # stays mutable after the build, so this reader can still meet one and must not raise on it.
+    value = settings.get("tls_check_hostname")
+    if isinstance(value, EnvRef):
         return True
-    return not bool_setting(settings, "tls_check_hostname", default=True)
+    return value is not None and not (isinstance(value, str) and value == "") and not bool(value)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -7831,7 +8212,9 @@ def query_credential_hops(
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
     0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
-    ``env()`` URL's operator ``cast``, as the build does. An outbound whose type is in
+    ``env()`` URL's operator ``cast``, as the build does. The cast runs synchronously in the
+    caller's thread, so ``GET /security/posture`` runs each one on the event loop, once per request
+    (vault BACKLOG #3766 item 46). An outbound whose type is in
     ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS`` is left off: its build refuses any url
     query (vault BACKLOG #5358), so the hop never exists."""
     from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
@@ -7841,12 +8224,12 @@ def query_credential_hops(
         *(
             (oc.name, oc.spec.settings)
             for oc in registry.outbound.values()
-            if (oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef))
+            if not _dark_env_setting(oc, "url")
             and oc.spec.type not in URL_QUERY_REFUSED_DESTINATIONS
         ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = _db_setting(settings, "url", None, env_values or {})
+        url = _resolved_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
@@ -7895,20 +8278,20 @@ def path_form_fhir_updates(
         if oc.spec.type != ConnectorType.FHIR:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and isinstance(settings.get("update_url_form"), EnvRef):
+        if _dark_env_setting(oc, "update_url_form"):
             continue
         # A not-deployed connection's values are never resolved (ADR 0111 AC-1), so none are read
         # for it: a literal path form beside an env() interaction or conditional is named possibly.
         values = env_values if oc.deployed else None
-        form = _db_setting(settings, "update_url_form", "transaction", values)
+        form = _resolved_setting(settings, "update_url_form", "transaction", values)
         # FhirDestination's own read: an unset or empty value is the transaction form.
         if form is not _UNRESOLVED and str(form or "transaction") != "path":
             continue
-        kind = _db_setting(settings, "interaction", "create", values)
-        cond = _db_setting(settings, "conditional", None, values)
+        kind = _resolved_setting(settings, "interaction", "create", values)
+        cond = _resolved_setting(settings, "conditional", None, values)
         # A list this cannot resolve rules nothing out; one that resolves to None is unset.
         lists = [
-            _db_setting(settings, key, None, values)
+            _resolved_setting(settings, key, None, values)
             for key in ("allowed_entry_methods", "allowed_entry_types")
         ]
         lists_set = any(value is not None and value is not _UNRESOLVED for value in lists)
@@ -8059,12 +8442,10 @@ def ech_cleartext_sidecar_hops(
         if oc.spec.type not in _ECH_ROUTING_DESTINATIONS:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and any(
-            isinstance(settings.get(key), EnvRef) for key in ("ech_egress", "ech_sidecar")
-        ):
+        if _dark_env_setting(oc, "ech_egress", "ech_sidecar"):
             continue
-        egress = _db_setting(settings, "ech_egress", None, env_values)
-        sidecar = _db_setting(settings, "ech_sidecar", None, env_values)
+        egress = _resolved_setting(settings, "ech_egress", None, env_values)
+        sidecar = _resolved_setting(settings, "ech_sidecar", None, env_values)
         if not egress:
             continue
         if sidecar is _UNRESOLVED:
@@ -8114,10 +8495,9 @@ def listener_trusted_proxy_hops(
     for ic in registry.inbound.values():
         if ic.spec.type != ConnectorType.HTTP:
             continue
-        raw = ic.spec.settings.get("trusted_proxies")
-        if not ic.deployed and isinstance(raw, EnvRef):
+        if _dark_env_setting(ic, "trusted_proxies"):
             continue
-        value = _db_setting(ic.spec.settings, "trusted_proxies", None, env_values)
+        value = _resolved_setting(ic.spec.settings, "trusted_proxies", None, env_values)
         if value is _UNRESOLVED:
             out.append((ic.name, UNRESOLVED_LISTENER_PROXIES))
             continue
@@ -8150,27 +8530,6 @@ REFUSED_DRIVER_REASON = "refused at build: odbc_driver is not one the generic di
 UNRESOLVED_REFUSED_DRIVER_REASON = "possibly refused: odbc_driver is an unresolved env() reference"
 
 
-#: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
-_UNRESOLVED = object()
-
-
-def _db_setting(
-    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
-) -> object:
-    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
-    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
-    values, or a key the values do not hold and no default."""
-    value = settings.get(key, default)
-    if not isinstance(value, EnvRef):
-        return value
-    if env_values is None:
-        return _UNRESOLVED
-    try:
-        return resolve_env_settings({key: value}, env_values)[key]
-    except WiringError:
-        return _UNRESOLVED
-
-
 def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
     """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
     this reader cannot resolve.
@@ -8179,7 +8538,7 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     values, so a reader handed those values resolves it the same way, default included. With no
     values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
     guess an arm, since each arm reads the same settings differently."""
-    dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
+    dialect = _resolved_setting(settings, "dialect", "sqlserver", env_values)
     return None if dialect is _UNRESOLVED else str(dialect).lower()
 
 
@@ -8191,7 +8550,20 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     operator's ``cast`` never runs for it, and the engine never builds it. Skipped rather than read as
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
-    return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+    return _dark_env_setting(conn, "dialect")
+
+
+def _dark_env_setting(conn: InboundConnection | OutboundConnection, *keys: str) -> bool:
+    """Whether ``conn`` is ``deployed=False`` and any of ``keys`` is an ``env()`` reference, which
+    the graph readers skip before resolving it (vault BACKLOG #3766 item 31): at least the DATABASE,
+    ECH, FHIR path-form, listener-proxy and query-credential ones.
+
+    ADR 0111 AC-1: a not-deployed connection's ``env()`` values are never resolved on any path, so
+    an operator's ``cast`` never runs for it, and the engine never builds it."""
+    if conn.deployed:
+        return False
+    settings = conn.spec.settings
+    return any(isinstance(settings.get(key), EnvRef) for key in keys)
 
 
 def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
@@ -8214,7 +8586,7 @@ def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None
     from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
 
     def driver(settings: Mapping[str, Any]) -> str | None:
-        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        value = _resolved_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
         return None if value is _UNRESOLVED else str(value)
 
     connections = [
@@ -8316,7 +8688,7 @@ def unverified_generic_db_hops(
         # for an advisory list, under a reason that says the name was not read.
         # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
         # env() driver stays unread; a no-TLS value beside it is still reported.
-        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        driver = _resolved_setting(settings, "odbc_driver", None, env_values if deployed else None)
         # Possibly delegated only where some family would clear the params: a hop at risk on
         # every driver keeps the reason they all give.
         reason: str | None
@@ -8386,7 +8758,7 @@ def refused_generic_db_drivers(
         raw_driver = settings.get("odbc_driver")
         # ADR 0111 AC-1: a not-deployed connection's env() values are never resolved, so its
         # env() driver stays unread and is listed as such, as unverified_generic_db_hops lists it.
-        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        driver = _resolved_setting(settings, "odbc_driver", None, env_values if deployed else None)
         # Only an env() reference resolves to _UNRESOLVED, so raw_driver has a key to name.
         if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
             reason = (
@@ -9917,12 +10289,15 @@ def _with_link_targets(
     with none given it raises ``OSError`` naming the link. The load's check hands it
     :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
 
-    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
-    links outside the config directory, from which a writer could re-point one, the folders above
-    each target's folder, as the folders above the config directory are not, and on Windows a
-    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
-    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
-    of its own files further. A path already listed is not repeated."""
+    Each such link is then walked as the ``serve`` start check walks its own files
+    (:func:`_member_link_chain`): what :func:`_link_chain` names is listed too, the real folder
+    holding each link the walk follows, the folder holding the config directory's own link
+    included, each link itself on Windows, and the object it reaches. A walk that cannot run, that
+    reaches nothing, or that reaches another object than an open of the link, is refused the same way.
+
+    **Not vetted**, at least: the folders above each target's folder and above each folder
+    holding a link, as the folders above the config directory are not. A path already listed is
+    not repeated."""
     out: list[Path] = []
     for path in paths:
         out.append(path)
@@ -9937,7 +10312,36 @@ def _with_link_targets(
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
+        chain = _member_link_chain(path)
+        if isinstance(chain, str):
+            if refuse is None:
+                raise OSError(errno.EINVAL, chain, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {chain}")
+            continue
+        out += chain
     return list(dict.fromkeys(out))
+
+
+def _member_link_chain(path: Path) -> list[Path] | str:
+    """What :func:`_link_chain` names for the trust-list link at ``path``, or the reason as text
+    where the walk cannot vouch for it: the walk could not run, or reached nothing, or reached
+    another object than an open of ``path`` does (``os.path.samefile``, as
+    :func:`_file_and_folder` checks it; vault BACKLOG #2596 step 4).
+
+    The walk names the real folder holding each link it follows, each link itself on Windows, and
+    the object it reaches, so a link in between, the folder holding it outside the config
+    directory, and a Windows reparse point the walk cannot follow are vetted or refused, as the
+    ``serve`` start check vets its own files (:func:`_file_and_folder`)."""
+    try:
+        chain, end = _link_chain(path)
+        same = end is not None and os.path.samefile(path, end)
+    except (OSError, ValueError) as exc:  # ValueError: a link target holding a NUL
+        return f"its link chain could not be walked ({getattr(exc, 'strerror', None) or type(exc).__name__})"
+    if end is None:
+        return "the walk of its link chain reaches nothing where the link resolves to an object"
+    if not same:
+        return "the walk of its link chain reaches another object than the open of the link"
+    return chain
 
 
 def _resolved_link(path: Path) -> Path | str | None:
@@ -10659,6 +11063,13 @@ _WIN_WRITE_MASK = (
     | 0x40000000  # GENERIC_WRITE
 )
 
+# What the config-source check refuses: the write class above, plus FILE_DELETE_CHILD (0x40). On a
+# folder that bit lets its holder delete any file in it whatever that file's own access list says,
+# so a holder on the config directory can drop a module from the graph the engine runs (BACKLOG
+# #5622, #8251 item 13). On a file it means nothing, so it is checked on every path, with no stat to
+# tell the two apart; ``_WIN_WRITE_MASK`` stays equal to ``anchor_path.WIN_FILE_MASK``.
+_WIN_CONFIG_WRITE_MASK = _WIN_WRITE_MASK | 0x00000040  # FILE_DELETE_CHILD
+
 # Broad/low-privilege well-known SIDs that must never hold a write-class right on executed config.
 _WIN_REJECTED_SIDS = frozenset(
     {
@@ -10804,7 +11215,8 @@ def _evaluate_config_dacl(
     (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
     (compound, object, callback) carrying a write-class right refuses too, because its trustee or
     condition cannot be judged here. A LocalService or NetworkService process user is not
-    self-trusted: other services share that SID (BACKLOG #5622).
+    self-trusted: other services share that SID (BACKLOG #5622). The write class also holds
+    FILE_DELETE_CHILD (:data:`_WIN_CONFIG_WRITE_MASK`).
 
     The **owner** is then vetted in its own right (CONFIG-2), mirroring the POSIX arm's refusal of a
     foreign uid: an owner holds WRITE_DAC implicitly, so a low-privilege owner can rewrite the code
@@ -10839,7 +11251,7 @@ def _evaluate_config_dacl(
     for ace_type, access_mask, trustee_sid in aces:
         if ace_type not in _WIN_GRANTING_ACE_TYPES:
             continue  # DENY ACEs never grant a right
-        if not access_mask & _WIN_WRITE_MASK:
+        if not access_mask & _WIN_CONFIG_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
         if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
             unsure = unsure or (
@@ -11093,8 +11505,11 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    from messagefoundry import win32_sid
+
+    # The SID, entry, account and token prototypes come from the leaf win32_sid, which
+    # auth/anchor_path.py's reader also uses.
+    advapi32, kernel32 = win32_sid.sid_libraries()
 
     # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an
     # OverflowError on a high address). PVOID = c_void_p; PSID/PACL/PSECURITY_DESCRIPTOR are pointers.
@@ -11109,45 +11524,6 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         ctypes.POINTER(ctypes.c_void_p),  # ppSacl
         ctypes.POINTER(ctypes.c_void_p),  # ppSecurityDescriptor
     ]
-    advapi32.GetAce.restype = wintypes.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSidToSidW.argtypes = [
-        wintypes.LPCWSTR,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
-        ctypes.c_void_p,  # Sid
-        wintypes.LPWSTR,  # Name
-        ctypes.POINTER(wintypes.DWORD),  # cchName
-        wintypes.LPWSTR,  # ReferencedDomainName
-        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
-        ctypes.POINTER(ctypes.c_int),  # peUse (SID_NAME_USE)
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,  # TOKEN_INFORMATION_CLASS
-        ctypes.c_void_p,  # TokenInformation (buffer)
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
     # GetNamedSecurityInfoW(pObjectName, SE_FILE_OBJECT=1, SecurityInfo, ppOwner, ppGroup, ppDacl,
     # ppSacl, ppSecurityDescriptor). We request OWNER (0x1) | DACL (0x4). The SD is allocated by the
     # API and must be LocalFree'd; the owner/DACL pointers point INTO that buffer (do not free them).
@@ -11180,40 +11556,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         )
 
     def _sid_to_str(sid_ptr: int) -> str | None:
-        out = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
-            return None
-        try:
-            return out.value
-        finally:
-            # ConvertSidToStringSidW allocates the string with LocalAlloc; free its address.
-            if out:
-                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
-
-    def _self_sid() -> str | None:
-        # Current process user SID, so a config dir the service account itself owns/controls passes.
-        token = wintypes.HANDLE()
-        _TOKEN_QUERY = 0x0008
-        _TokenUser = 1
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
-        ):
-            return None
-        try:
-            size = wintypes.DWORD(0)
-            advapi32.GetTokenInformation(token, _TokenUser, None, 0, ctypes.byref(size))
-            if size.value == 0:
-                return None
-            buf = ctypes.create_string_buffer(size.value)
-            if not advapi32.GetTokenInformation(
-                token, _TokenUser, buf, size.value, ctypes.byref(size)
-            ):
-                return None
-            # TOKEN_USER = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; Sid is the first pointer.
-            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-            return _sid_to_str(sid_ptr) if sid_ptr else None
-        finally:
-            kernel32.CloseHandle(token)
+        return win32_sid.sid_text(advapi32, kernel32, sid_ptr)
 
     # LOCALGROUP_MEMBERS_INFO_0 — level 0 of NetLocalGroupGetMembers returns member SIDs only. Levels
     # 1..3 return NAMES, and translating a domain member's SID to a name is what reaches out to a domain
@@ -11414,9 +11757,11 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
                     return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                 header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
-                # Every ACE type carries its access mask right after the 4-byte header, so the mask
-                # is read for all of them: the policy refuses a callback or object entry granting a
-                # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
+                # Every ACE type Windows defines carries its access mask right after the 4-byte
+                # header, so the mask is read for all of them: the policy refuses a callback or
+                # object entry granting a write-class right, and recording it as 0 would hide that
+                # (BACKLOG #5622). An entry of an undefined type may be its header alone, and this
+                # read does not check AceSize first, unlike anchor_path's (BACKLOG #6281).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
                 trustee = ""  # parsed for type 0x00 only
                 if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
@@ -11434,7 +11779,10 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 kernel32.LocalFree(sd_ptr)
 
     return _WinConfigSourceProbes(
-        self_sid=_self_sid(), read_path=_read_path, owner_in_admins=_owner_in_admins
+        # The run-as account's SID, so a config dir the service account itself owns passes.
+        self_sid=win32_sid.process_user_sid(advapi32, kernel32),
+        read_path=_read_path,
+        owner_in_admins=_owner_in_admins,
     )
 
 
@@ -11773,12 +12121,18 @@ def _windows_link_target(text: str) -> str:
     """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
     Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
     device path, a drive with no separator after it (``D:x``), read from that drive's own working
-    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
-    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace.
 
-    plain = _strip_win_prefix(text)
+    Read through the anchor walk's own reader of a link target (``anchor_path._strip_nt_target``),
+    so a device prefix that walk refuses is refused here too: any prefix but an all-backslash
+    ``\\\\?\\`` or ``\\??\\``, and a verbatim one holding a ``/``, a ``.`` or ``..`` name, or an
+    empty name. Win32 rewrites a ``\\\\.\\`` or forward-slash prefix before the open, so
+    stripping one, as this once did, walked a path the open may not reach (vault BACKLOG #5515)."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_nt_target
+
+    plain = _strip_nt_target(text)
     if plain is None:
-        raise OSError(errno.EINVAL, "a link leads to a device path")
+        raise OSError(errno.EINVAL, "a link leads to a device path this check does not read")
     if _drive_relative(plain):
         raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
     if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
@@ -11855,8 +12209,10 @@ def _file_and_folder(
             chain, end = _link_chain(path)
             # The kernel's own answer, against the walk's, for any gap left in the walk's model:
             # a final link naming a file with a trailing separator, for one, which the open
-            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
-            # literally. Where they disagree the walk vetted another route than the open takes.
+            # refuses (ENOTDIR) and the walk's split drops. A device-prefixed link target the walk
+            # would read as another path than the open is refused before this, by
+            # _windows_link_target. Where they disagree the walk vetted another route than the
+            # open takes.
             if mode is not None and end is None:
                 raise OSError(
                     errno.EINVAL, "the open reaches an object where the walk reaches none"
@@ -11951,13 +12307,18 @@ _CONFIG_MODULE_SUFFIX_LEN: Final = 13
 #: Why the loader's diagnostic for author code carries no exception text.
 _WITHHELD: Final = "its message is withheld: it can carry a value the module held"
 
+#: What :func:`_failure_detail` adds when a folder :func:`_in_dir` could not resolve may make the
+#: location short; its docstring says when.
+_FOLDER_UNRESOLVED: Final = ", and the folder of at least one source file could not be resolved"
+
 
 def _module_failure(
     path: Path, exc: BaseException, source_of: Callable[[str], bytes | None]
 ) -> str:
     """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
-    file and line it was raised from, and each identifier :func:`_failure_detail` can vouch for, but
-    never the exception's text (vault BACKLOG #3249).
+    file and line it was raised from, each identifier :func:`_failure_detail` can vouch for, and
+    its fixed note when a folder it could not resolve may make that location short, but never the
+    exception's text (vault BACKLOG #3249).
 
     The text is author code's, or a library's quoting author data, and can carry any value the module
     held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
@@ -12016,7 +12377,8 @@ def _is_a_signal(exc: BaseException, path: Path) -> bool:
 
 def _raised_in_the_config_dir(exc: BaseException, path: Path) -> bool:
     file = raise_statement_file(exc)
-    return file is not None and _in_dir(file, path.parent.resolve())
+    # A raise in a folder that could not be resolved cannot prove a config file raised it.
+    return file is not None and _in_dir(file, path.parent.resolve()) is True
 
 
 def _read_fault(path: Path, fault: BaseException) -> None:
@@ -12068,25 +12430,40 @@ def _failure_detail(
     is not ``own_file``), and each identifier the exception claims that the source line spells.
 
     The file is the deepest frame in the config directory, so a failing helper is named rather than
-    the config module's import of it. A file name and a line number are layout, not data."""
+    the config module's import of it. A file name and a line number are layout, not data.
+
+    A file whose folder could not be resolved (:func:`_in_dir`) is not named. When one is a frame
+    deeper than the last config-directory frame, is any frame when no frame is in the config
+    directory, or is the file a SyntaxError names, the detail ends with :data:`_FOLDER_UNRESOLVED`,
+    because the location may then be short (vault BACKLOG #3765, LF10)."""
     located: tuple[str, int] | None = None
     filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
     lineno = getattr(exc, "lineno", None)
-    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
-        located = (filename, lineno)
-    else:
+    # A SyntaxError's own file is not a frame, so no config-directory frame outweighs it.
+    syntax_file_unresolved = False
+    if isinstance(filename, str):
+        in_dir = _in_dir(filename, config_dir)
+        syntax_file_unresolved = in_dir is None
+        if in_dir is True and isinstance(lineno, int):
+            located = (filename, lineno)
+    deeper_unresolved = False
+    if located is None:
         # One resolve per distinct file: a RecursionError walks about a thousand frames of one file.
-        seen: dict[str, bool] = {}
+        seen: dict[str, bool | None] = {}
         for frame, frame_line in traceback.walk_tb(exc.__traceback__):
             name = frame.f_code.co_filename
             if name not in seen:
                 seen[name] = _in_dir(name, config_dir)
-            if seen[name]:
+            if seen[name] is True:
                 located = (name, frame_line)
+                deeper_unresolved = False
+            elif seen[name] is None:
+                deeper_unresolved = True
+    note = _FOLDER_UNRESOLVED if syntax_file_unresolved or deeper_unresolved else ""
     detail = _type_name(exc)
     # A frame's line can be None (a code object with no line table): no line, and nothing vouched.
     if located is None or not isinstance(located[1], int):
-        return detail
+        return detail + note
     source_file, line = located
     if Path(source_file).name != own_file:
         detail += f" in {Path(source_file).name}"
@@ -12102,7 +12479,7 @@ def _failure_detail(
         ]
         if idents:
             detail += " naming " + ", ".join(repr(ident) for ident in idents)
-    return detail
+    return detail + note
 
 
 def _claimed_identifiers(exc: BaseException) -> tuple[object, ...]:
@@ -12177,9 +12554,14 @@ def _source_name(name: object) -> str | None:
     return name
 
 
-def _in_dir(filename: str, directory: Path) -> bool:
+def _in_dir(filename: str, directory: Path) -> bool | None:
     """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
-    siblings -- compared resolved.
+    siblings -- compared resolved, or ``None`` when its folder could not be resolved.
+
+    ``None`` is not a match, and the names are not compared as text in its place. Nothing is logged
+    here: this runs while an interrupt is judged (:func:`_is_a_signal`), where a log call would run
+    a handler a module added. :func:`_failure_detail` says it in its diagnostic when it may make the
+    location short; the interrupt verdict records nothing of it.
 
     Only an absolute filename counts. The loader's modules record one (the import machinery makes the
     spec's path absolute, even for a config directory given as a relative path), while ``<string>``,
@@ -12193,7 +12575,7 @@ def _in_dir(filename: str, directory: Path) -> bool:
         # (the Kubernetes ConfigMap layout, or one shared helper), and still sits in this one.
         return candidate.parent.resolve() == directory
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _textless_import_error(exc: ImportError) -> ImportError:

@@ -33,6 +33,7 @@ import datetime
 import inspect
 import ssl
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -1094,9 +1095,9 @@ def test_the_smart_revocation_attestation_comes_from_its_own_settings_key(smart_
 
 
 # BACKLOG #1924. Each URL parses to NO hostname (`urlsplit(...).hostname is None`). The guard used to
-# pass `hostname or ""`, and `is_loopback_hop_host("")` is True, so a hop it could not classify took
-# the on-box carve-out and crossed an enforcing posture with no refusal. It is now refused outright,
-# as a plain ValueError. `pytest.raises(ValueError)` alone would also catch a posture refusal, since
+# pass `hostname or ""`, and `is_loopback_hop_host("")` was True until BACKLOG #5512, so a hop it
+# could not classify took the on-box carve-out and crossed an enforcing posture with no refusal. It
+# is now refused outright, as a plain ValueError. `pytest.raises(ValueError)` alone would also catch a posture refusal, since
 # InsecureHopRefused subclasses it, so every arm matches the message.
 _HOSTLESS_HTTPS = ("https:///token", "https://:443/token")
 
@@ -1569,9 +1570,9 @@ async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
 
 
 async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> None:
-    """FAIL-CLOSED on a host the guard cannot read. ``is_loopback_hop_host("")`` is True, so a guard
-    fed an empty host would take the on-box carve-out and ALLOW. The settings validator refuses a
-    missing URL, so only unvalidated settings reach this; ``model_copy`` builds them here."""
+    """FAIL-CLOSED on a host the guard cannot read, whatever the posture, rather than leaving an
+    empty host to the guard's remote reading. The settings validator refuses a missing URL, so only
+    unvalidated settings reach this; ``model_copy`` builds them here."""
     settings = _oidc_settings(
         oidc_issuer=f"https://{REMOTE}",
         oidc_authorization_endpoint=f"https://{REMOTE}/authorize",
@@ -1581,8 +1582,11 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
     ).model_copy(update={"oidc_jwks_uri": None})
     store = await MessageStore.open(":memory:")
     try:
-        with pytest.raises(InsecureHopRefused, match="OIDC jwks_uri endpoint"):
-            AuthService(store, settings, ldap=_FakeLdap(), hop_posture=PROD_PHI)  # type: ignore[arg-type]
+        for posture in (PROD_PHI, STAGING_PHI):
+            with pytest.raises(
+                InsecureHopRefused, match="OIDC jwks_uri endpoint: the URL names no host"
+            ):
+                AuthService(store, settings, ldap=_FakeLdap(), hop_posture=posture)  # type: ignore[arg-type]
     finally:
         await store.close()
 
@@ -1616,10 +1620,10 @@ def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("engine.start")
         raise RuntimeError("PROBE: engine.start reached")
 
-    async def _stop(self: Engine) -> None:
+    async def _stop(self: Engine, **kwargs: Any) -> None:
         # Recorded, then the real stop, which closes the store (the #1257 teardown).
         calls.append("engine.stop")
-        await real_stop(self)
+        await real_stop(self, **kwargs)
 
     monkeypatch.setattr(Engine, "start", _probe)
     monkeypatch.setattr(Engine, "stop", _stop)

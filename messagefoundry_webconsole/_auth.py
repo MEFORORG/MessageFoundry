@@ -34,7 +34,11 @@ from messagefoundry.api.security import (
     record_ws_gate,
 )
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SESSION_TERMINATE,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.auth.webauthn import configured_rp_id
 
@@ -534,7 +538,8 @@ def require_ui(
     must reach (enrollment, the confinement page, the account pages).
 
     ``pending_refusal`` is for a route that passes ``allow_mfa_pending`` for an account with NO factor
-    and must still refuse a pending session on an account that HAS one. It runs where the 6.3.3 gate
+    and must still refuse some pending sessions, at least one on an account that HAS a factor. It
+    runs where the 6.3.3 gate
     runs, so the refusal comes before the permission loop and before either budget is charged
     (BACKLOG #1973). Checked later, the refused request had already spent the user's admin-write
     budget, so a password holder could throttle the real user by being refused in a loop. On a
@@ -2149,6 +2154,12 @@ async def spend_ui_action_step_up(
     return spend
 
 
+#: The reauth-only actions that end sessions, the one place a pending session with no factor is
+#: refused on this gate and so sent to enrol (BACKLOG #1149). The other reauth-only actions bind a
+#: factor, and an account with no factor may take them.
+_SESSION_ENDING_UI_ACTIONS = frozenset({STEP_UP_ACTION_SESSION_TERMINATE})
+
+
 def require_ui_reauth_only_action(
     action: str,
     *permissions: Permission,
@@ -2172,7 +2183,8 @@ def require_ui_reauth_only_action(
     async def refuse_pending(
         request: Request, auth: AuthService, _identity: Identity
     ) -> HTTPException | None:
-        # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS). Run by
+        # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS), or on a
+        # session-ending action any pending session (BACKLOG #1149). Run by
         # the base, so it is refused before the admin-write charge (BACKLOG #1973), and audited there
         # like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks for the
         # code before the password.
@@ -2182,12 +2194,20 @@ def require_ui_reauth_only_action(
         # The JSON twin's rule: a refused request still records the new-IP signal. Only on this
         # branch, because a request let through records it once, later in the base.
         await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
+        # BACKLOG #1149: a session-ending action is refused to a pending session on an account with
+        # NO factor too. It has nothing to give /ui/reauth, which would mint it nothing, so it is
+        # sent to enrol. The mfa_enroll refusal is True exactly when the account holds a factor (and
+        # on an unknown session), the JSON plane's _pending_holds_no_factor reading.
+        if action in _SESSION_ENDING_UI_ACTIONS and not await auth.factor_binding_is_blocked(
+            token, STEP_UP_ACTION_MFA_ENROLL
+        ):
+            return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
         return _reauth_redirect(request, continuation(request))
 
     # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
-    # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
-    # a session it does not recognise. An account that HAS a factor is refused by refuse_pending
-    # (#1951), inside the base so that the refusal spends no budget (#1973).
+    # which can never satisfy a gate standing in front of the route that enrolls it. An account
+    # that HAS a factor is refused by refuse_pending (#1951), and so is any pending session on a
+    # session-ending action (#1149), inside the base so that the refusal spends no budget (#1973).
     base = require_ui(
         *permissions,
         allow_mfa_pending=True,
@@ -2517,6 +2537,16 @@ WEBAUTHN_EXTRA_MISSING_NOTICE = (
 WEBAUTHN_RP_CHANGED_NOTICE = (
     "Your passkeys were enrolled under a different origin and are unusable here — contact your "
     "administrator to reset your MFA so you can re-enroll."
+)
+#: BACKLOG #6886: the account's passkeys under this origin are stored in a form that cannot be read.
+#: A holder with another working factor needs no reset, and one without may not need one either: a
+#: discoverable passkey whose stored id cannot be read still signs in through the combined sign-in,
+#: which names no credential, so the notice sends the holder there before it sends them to a reset.
+WEBAUTHN_UNREADABLE_NOTICE = (
+    "Your passkeys could not be read and are unusable here. Sign in with another factor and "
+    'remove the unreadable passkey. If you have no other factor, try "Sign in with password and '
+    'passkey" on the sign-in page, which may still accept it; only if that fails too, contact '
+    "your administrator to reset your MFA."
 )
 
 

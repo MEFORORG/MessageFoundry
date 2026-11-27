@@ -21,7 +21,9 @@ refused the same way and for the same reason: a misspelt ``[integrty]`` drops ev
 
 The **env** layer has a refusal of its own, narrower than the file's
 (:func:`_reject_unknown_env_keys`, vault BACKLOG #2600): a ``MEFOR_<SECTION>_<KEY>`` variable whose
-section has an env layer and whose key that section does not define. It is narrower because some
+section has an env layer and whose key that section does not define, and a variable that is a
+modelled section's name alone, with or without trailing ``_`` (``MEFOR_STORE``,
+``MEFOR_UPDATE_CHECK``), whatever the section. It is narrower because some
 documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
@@ -51,7 +53,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
@@ -113,7 +115,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
-from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
+from messagefoundry.hostlist import allow_entry_problem, names_no_host, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -174,6 +176,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "SectionNameEnvError",
     "store_path_refusal",
     "settings_file_path",
     "settings_error_detail",
@@ -291,6 +294,11 @@ class StorePrivilegePosture:
     excess: tuple[str, ...] = ()
     #: Why the probe could not observe (``UNOBSERVABLE``), or what it observed against (otherwise).
     detail: str = ""
+    #: Grants the probe named as not read (BACKLOG #6015). Beside an ``OBSERVED`` excess the
+    #: over-grant entry names them, so it does not read as a complete observation. Empty does not
+    #: mean every grant was read: at least a failed SQL Server user-defined role enumeration is
+    #: noted in ``detail`` and not here.
+    unread: tuple[str, ...] = ()
 
 
 class SchemaManagement(str, Enum):  # noqa: UP042
@@ -408,6 +416,25 @@ class _Section(_InputHidingModel, NumbersRefuseBool):
                 if key in data:
                     raise ValueError(refusal)
         return data
+
+    @model_validator(mode="after")
+    def _refuse_non_finite_floats(self) -> Self:
+        """Refuse NaN or an infinity left in any float field once its own validators ran (BACKLOG
+        #5769).
+
+        No setting gives either a meaning as a number, and each slips past the usual range check:
+        NaN compares False against every bound, so a ``value <= 0`` refusal admits it, and +inf
+        admits ``value > 0``. A consumer then waits on a deadline or a cadence that never arrives,
+        such as a WAL checkpoint that never runs. This runs after the field validators, so a field
+        that already refuses a non-finite value keeps its own message, and one that reads ``inf`` as
+        a spelling of off (the ``[delivery]`` age thresholds) has turned it into ``None`` by now. A
+        model-wide ``allow_inf_nan=False`` would do neither. The message names the field, never
+        the value."""
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number; nan and infinity are refused")
+        return self
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
@@ -740,7 +767,8 @@ class StoreSettings(_Section):
     # their connection pool + concurrent submission instead. "Native commit_delay" is PostgreSQL-ONLY
     # (a durability-neutral GUC, a planned gated/off-by-default increment); SQL Server has NO durability-
     # neutral group-commit knob (its DELAYED_DURABILITY relaxes durability and is rejected for the PHI
-    # store), so its scale path is the concurrent pool + sharding (ADR 0037), not a native GUC.
+    # store), so its scale path is the concurrent pool + engine sharding (ADR 0037), not a native
+    # GUC.
     group_commit_window_ms: float = 0.0
     # Flush threshold for the group-commit committer: once this many members are enrolled in the open
     # batch, it commits immediately without waiting out the rest of `group_commit_window_ms` (bounds
@@ -809,11 +837,13 @@ class StoreSettings(_Section):
     # + the response/payload bodies; its error/last_error/detail stay plaintext — see sqlserver.py.)
     # Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
     # Empty = off (values stored as-is).
-    encryption_key: str | None = None
+    # Out of the repr (vault BACKLOG #8163 item 21): a frame on a store refusal's traceback holds
+    # `settings`, so a renderer that prints locals would print the key. Reads are unchanged.
+    encryption_key: str | None = Field(default=None, repr=False)
     # Comma-separated base64 RETIRED keys, kept available for *decrypt only* during a key rotation
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
-    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
-    encryption_keys_retired: str = ""
+    # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none. Out of the repr too.
+    encryption_keys_retired: str = Field(default="", repr=False)
     # When true, `serve` refuses to start without an encryption key even when the audited opt-out
     # below is set. Off by default. See docs/PHI.md §3.
     require_encryption: bool = False
@@ -924,10 +954,11 @@ class StoreSettings(_Section):
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
     # dir, the second refused the same uploader at quota, against a live positive control). The
-    # check-then-write race that used to survive across them — an overshoot of one file per shard
-    # caught between its scan and its write — is closed by an atomic reservation on the unified store
-    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
-    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
+    # check-then-write race that used to survive across them — an overshoot of one file per engine
+    # shard caught between its scan and its write — is closed by an atomic reservation on the unified
+    # store every engine shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated
+    # once in `uploads.UploadQuotaError`. Engine shards given SEPARATE dirs get separate budgets,
+    # by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -963,7 +994,8 @@ class StoreSettings(_Section):
     # Default is SQL Server's port (1433); for the Postgres backend a left-at-default 1433 is treated
     # as "use Postgres's conventional 5432" by the model_validator below, so a Postgres deployment that
     # omits `port` still connects (set MEFOR_STORE_PORT explicitly to override either default).
-    port: int = 1433
+    # A TCP port a database server can listen on (BACKLOG #5769).
+    port: int = Field(default=1433, ge=1, le=65535)
     database: str | None = None
     auth: SqlAuth = SqlAuth.SQL
     username: str | None = None
@@ -1033,9 +1065,14 @@ class StoreSettings(_Section):
     # instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for
     # Postgres/SQLite (they never see the ODBC string). Default off — only multi-subnet AOAG needs it.
     multi_subnet_failover: bool = False
-    pool_size: int = 40
-    connect_timeout: int = 15  # seconds
-    command_timeout: int = 30  # seconds
+    # At least one connection; a pool of 0 could serve no borrow (BACKLOG #5769).
+    pool_size: int = Field(default=40, ge=1)
+    # Seconds (BACKLOG #5769). The login timeout is at least 1, as a connection's is
+    # (check_db_connect_timeout): asyncpg reads 0 as a deadline already past, so every connect would
+    # fail, and pyodbc reads it as the driver's default. The statement timeout keeps its
+    # documented 0 = no limit (STORE-3) and refuses only a negative.
+    connect_timeout: int = Field(default=15, ge=1)
+    command_timeout: int = Field(default=30, ge=0)
     # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
     # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
     # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
@@ -1233,6 +1270,16 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+            # BACKLOG #5512. No hop guard reads a SQL Server store's host, so one that names none
+            # would reach the driver as `SERVER=,1433`. On Postgres only spaces are refused: the
+            # `server` row of docs/CONFIGURATION.md says what an empty value means there.
+            server = self.server or ""  # `missing` above already refused None
+            if self.backend is StoreBackend.SQLSERVER:
+                unnamed = names_no_host(server)
+            else:
+                unnamed = bool(server) and not server.strip()
+            if unnamed:
+                raise ValueError(f"[store].server names no host: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
@@ -1755,7 +1802,9 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
 
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
-    port: int = 8765
+    # 0 to 65535 (BACKLOG #5769): 0 asks the OS for a free port, and supervise counts each engine
+    # shard's port up from this one.
+    port: int = Field(default=8765, ge=0, le=65535)
     # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
     # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
     expose_docs: bool = False
@@ -2230,7 +2279,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2241,6 +2291,12 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
+    # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
+    # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
+    crl_check_chain: bool = False
 
     @field_validator("crl_file")
     @classmethod
@@ -2265,6 +2321,17 @@ class TlsSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_chain_requires_crl_file(self) -> TlsSettings:
+        # With no CRL file the chain check has nothing to check against, so the flag would read as a
+        # control that is on while every hop keeps no revocation check at all.
+        if self.crl_check_chain and not self.crl_file:
+            raise ValueError(
+                "[tls].crl_check_chain = true requires [tls].crl_file: the whole-chain check reads "
+                "the CRLs in that file, and with none set no hop would check revocation"
+            )
+        return self
+
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
         outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
@@ -2277,6 +2344,7 @@ class TlsSettings(_Section):
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
             crl_file=self.crl_file,
+            crl_check_chain=self.crl_check_chain,
         )
 
 
@@ -3270,8 +3338,9 @@ class RetentionSettings(_Section):
     # (skipped, not attempted, when the volume lacks room) and the written archive is INTEGRITY-VALIDATED
     # (decompressed off disk and compared byte-for-byte) *before* the original is removed — a failed
     # validation always leaves the original in place. The archive inherits the source's mtime, so the
-    # `app_log_days` delete window still ages it out (that sweep extends to `*.log.gz`/`*.txt.gz` only
-    # while this window is on). Set this SHORTER than `app_log_days` — a longer window compresses nothing,
+    # `app_log_days` delete window still ages it out (that sweep extends to `*.log.gz`/`*.txt.gz`, and
+    # to a claimed `*.gz.<pid>-<ns>.mfclaim` the compressor left behind, only while this window is on).
+    # Set this SHORTER than `app_log_days` — a longer window compresses nothing,
     # because the delete sweep runs first and has already removed the file.
     # 0 = never compress (the default). A no-op unless ``[logging].log_dir`` is set.
     app_log_compress_days: int = 0
@@ -3552,9 +3621,10 @@ class AuthSettings(_Section):
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
     # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
-    # 0 = unlimited.
+    # 0 = unlimited. A negative cap is refused at load (BACKLOG #5318): it used to read as unlimited
+    # too, a second spelling of off that nobody means.
     # Default 5 (WP-10): generous for a few devices/console instances.
-    max_sessions_per_user: int = 5
+    max_sessions_per_user: int = Field(default=5, ge=0)
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
@@ -3676,7 +3746,9 @@ class AuthSettings(_Section):
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
-    password_min_length: int = 15
+    # 0 sets no floor (a loosening security_loosenings() names); a negative is refused at load
+    # (BACKLOG #5318), as a second spelling of 0.
+    password_min_length: int = Field(default=15, ge=0)
     # Character-class requirements are OFF by default (ASVS forbids mandatory composition) but kept
     # as opt-in knobs for deployments with a legacy standard that still mandates them.
     password_require_uppercase: bool = False
@@ -3761,6 +3833,11 @@ class AuthSettings(_Section):
     # nextUpdate at start and at every bind. With it unset, an off-box LDAPS bind on an enforcing
     # instance is refused when serve builds the auth service.
     ad_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check ad_tls_crl_file against every certificate in the domain
+    # controller's chain, not only the leaf, so a revoked intermediate CA refuses the controller. It
+    # needs ad_tls_crl_file and ad_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    ad_tls_crl_check_chain: bool = False
     # A plain ldap:// bind is refused at every posture (vault BACKLOG #3533 item 1). The opt-in that once
     # released it at [security].enforcement = warn, ad_allow_insecure_ldap, is a REMOVED key
     # (_REMOVED_KEYS), so a config that still sets it is refused by name rather than ignored.
@@ -3885,7 +3962,9 @@ class AuthSettings(_Section):
     # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
     # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
     oidc_issuer: str | None = None
-    oidc_client_id: str | None = None  # also the required `aud`/`azp`
+    # The id_token aud/azp rule this feeds, and its known limit: docs/CONFIGURATION.md, the
+    # oidc_client_id row, and _check_core_claims in auth/oidc/claims.py.
+    oidc_client_id: str | None = None
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
@@ -3919,8 +3998,10 @@ class AuthSettings(_Section):
     oidc_authorization_endpoint: str | None = None  # https, pinned
     oidc_token_endpoint: str | None = None  # https, pinned
     oidc_jwks_uri: str | None = None  # https, pinned
-    # Defence-in-depth allow-list: every OIDC endpoint host must appear here (the model-validator
-    # checks it, and jwks/flow re-check before each outbound call). Refused empty when enabled.
+    # Defence-in-depth allow-list: every OIDC endpoint host must appear here. Only the
+    # model-validator reads it, at load; no OIDC runtime module checks it again before an outbound
+    # call (BACKLOG #5318 item 1). The pinned URLs cannot change without a restart, which re-runs
+    # the validator. Refused empty when enabled.
     oidc_allowed_endpoints: list[str] = Field(default_factory=list)
     # The engine's OWN back-channel TLS trust for the IdP. transports/rest.py uses OpenSSL's default
     # trust, which does NOT consult the Windows machine store — a domain-issued / self-signed IdP cert
@@ -3937,6 +4018,11 @@ class AuthSettings(_Section):
     # leg carrying the client secret, the authorization code and the identity assertion. Same
     # fail-closed refusals as every other CRL (absent / unloadable / past nextUpdate refuses at start).
     oidc_tls_crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check oidc_tls_crl_file against every certificate in the IdP's
+    # chain on both legs, not only the leaf, so a revoked intermediate CA refuses the IdP. It needs
+    # oidc_tls_crl_file and oidc_tls_ca_cert_file, and refuses at load without either: on the OS
+    # trust store the start rule could not be met. Default False keeps the leaf check.
+    oidc_tls_crl_check_chain: bool = False
     oidc_redirect_path: str = "/ui/oidc/callback"  # full URI derived from [api].public_origin
     oidc_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"])
     oidc_signing_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
@@ -3963,8 +4049,12 @@ class AuthSettings(_Section):
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
-    oidc_jwks_ttl_seconds: int = 3600
-    oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
+    # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
+    # the refetch bound below; 0 there removes that bound. The load refuses for both at least a
+    # negative (BACKLOG #5318) and a value too large for a float (_check_oidc_jwks_interval), and
+    # JwksCache refuses both at construction too.
+    oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
+    oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     # The FLOOR beside that ceiling (BACKLOG #2301, ASVS 2.4.2), PROVISIONAL: a callback that returns
     # sooner than this after its flow started is refused as "federated sign-in failed". A step-up
@@ -3985,8 +4075,13 @@ class AuthSettings(_Section):
     # are both on. A value oidc_mfa_amr_values also accepts is refused at load while the claim
     # gate is on: every token the gate admits by it would skip the floor, the floor off in effect.
     oidc_callback_floor_exempt_amr: list[str] = Field(default_factory=list)
-    oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
-    oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
+    # Reject-when-full (never evict — that is a login DoS). At least 1 (BACKLOG #5318): 0 or less
+    # refused every federated sign-in and step-up.
+    oidc_flow_cache_max: int = Field(default=512, ge=1)
+    # G2: cap below id_token.exp if tighter is wanted. None = no cap. At least 1 (BACKLOG #5318):
+    # the service skips a falsy cap, so 0 meant no cap, and a negative one ended every federated
+    # session as it was minted.
+    oidc_session_max_hours: int | None = Field(default=None, ge=1)
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
     # user's authentication AT THE IdP and the end of the engine session it mints. Sent as `max_age` on
     # every authorization request, so a conforming IdP re-authenticates only when its own SSO session
@@ -4001,32 +4096,52 @@ class AuthSettings(_Section):
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
-    # of 0 or less disables both. A count above its default, a window below it, and each off value is
+    # of 0 disables both. A negative count or window is refused at load (BACKLOG #5318): a negative
+    # per-address count refused every attempt after an address's first, a negative global count
+    # refused every attempt, the first included, and a negative window was a second spelling of 0.
+    # A count above its default, a window below it, and each off value is
     # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
-    login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
-    login_rate_limit_global: int = 60  # max attempts across all clients per window
+    login_rate_limit_per_ip: int = Field(default=10, ge=0)  # max attempts per client IP per window
+    login_rate_limit_global: int = Field(default=60, ge=0)  # max attempts, all clients, per window
     # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
     # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
     # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
     # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
-    # refused with them; 0 and a finite negative still load, as the named off value above.
+    # refused with them, and so is a finite negative; 0 still loads, as the named off value above.
     login_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
     # pagination + access auditing. Generous by default (clears console/human use); in-process only,
-    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension.
+    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension; a
+    # negative count or window is refused at load, as for the sign-in limits (BACKLOG #5318).
     phi_read_rate_limit_enabled: bool = True
-    phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
-    phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
+    phi_read_rate_limit_per_actor: int = Field(
+        default=120, ge=0
+    )  # max PHI reads per user per window
+    # Max PHI reads across all users per window (0 = off).
+    phi_read_rate_limit_global: int = Field(default=0, ge=0)
     # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
     # and then refuse every PHI read until a restart. Capped for the same reason.
     phi_read_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
+
+    # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
+    # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
+    # admission by require_monitoring_read. The default's basis and multiplier are written
+    # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
+    # throttle. 0 disables that dimension.
+    monitoring_read_rate_limit_enabled: bool = True
+    monitoring_read_rate_limit_per_actor: int = Field(default=600, ge=0)
+    monitoring_read_rate_limit_global: int = Field(default=0, ge=0)  # 0 = off
+    # No nan/inf and capped, for the reason login_rate_limit_window_seconds gives.
+    monitoring_read_rate_limit_window_seconds: float = Field(
+        default=60.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
@@ -4275,6 +4390,35 @@ class AuthSettings(_Section):
     def _auth_crl_file_exists(cls, v: str | None, info: ValidationInfo) -> str | None:
         return _refuse_a_missing_crl_file(v, f"[auth].{info.field_name}")
 
+    @model_validator(mode="after")
+    def _check_chain_needs_crl_and_ca(self) -> AuthSettings:
+        # Vault BACKLOG #5511. With no CRL file the flag would read as a control that is on while
+        # nothing is checked. With no CA file the hop trusts the OS store, where the whole-chain
+        # start rule would need a CRL from every root it loads, so the builder would refuse it at
+        # start; refusing here says so at load, even with the hop off.
+        # Each value read as an attribute, so a renamed field fails type checking, not a load.
+        hops = (
+            (
+                "oidc",
+                self.oidc_tls_crl_check_chain,
+                self.oidc_tls_crl_file,
+                self.oidc_tls_ca_cert_file,
+            ),
+            ("ad", self.ad_tls_crl_check_chain, self.ad_tls_crl_file, self.ad_tls_ca_cert_file),
+        )
+        for prefix, chain, crl_file, ca_file in hops:
+            if not chain:
+                continue
+            for needed, value in (("crl_file", crl_file), ("ca_cert_file", ca_file)):
+                if not value:
+                    raise ValueError(
+                        f"[auth].{prefix}_tls_crl_check_chain = true requires "
+                        f"[auth].{prefix}_tls_{needed}: the whole-chain check reads the CRLs in "
+                        f"[auth].{prefix}_tls_crl_file against the CAs in "
+                        f"[auth].{prefix}_tls_ca_cert_file alone"
+                    )
+        return self
+
     @field_validator("kerberos_spn")
     @classmethod
     def _check_kerberos_spn(cls, value: str | None) -> str | None:
@@ -4299,6 +4443,20 @@ class AuthSettings(_Section):
             raise ValueError("oidc_clock_skew_seconds must be between 0 and 300")
         return value
 
+    @field_validator("oidc_jwks_ttl_seconds", "oidc_jwks_min_refetch_seconds")
+    @classmethod
+    def _check_oidc_jwks_interval(cls, value: int, info: ValidationInfo) -> int:
+        # JwksCache reads both as floats and refuses an int past the float range at construction
+        # (BACKLOG #6904), so the load refuses it too: `check` and `verify` then refuse what
+        # `serve` would. The value is withheld.
+        try:
+            float(value)
+        except OverflowError:
+            raise ValueError(
+                f"{info.field_name} is too large for a float (value withheld)"
+            ) from None
+        return value
+
     @field_validator("oidc_flow_ttl_seconds")
     @classmethod
     def _check_oidc_flow_ttl(cls, value: int) -> int:
@@ -4310,8 +4468,7 @@ class AuthSettings(_Section):
         # `oidc_flow_cache_max` slot -- see that field for why the cache rejects rather than evicts.
         #
         # The endpoints are a JUDGMENT with no measured anchor, and no neighbouring field supplies
-        # one: every other lifetime and size in this OIDC block is itself unbounded (verified by
-        # execution -- `oidc_jwks_ttl_seconds` accepts 10_000_000). What is NOT a judgment is that
+        # one. What is NOT a judgment is that
         # an unbounded value is wrong in both directions.
         if not 30 <= value <= 1800:
             raise ValueError("oidc_flow_ttl_seconds must be between 30 and 1800")
@@ -4372,7 +4529,7 @@ class AuthSettings(_Section):
     @field_validator("ad_session_recheck_seconds")
     @classmethod
     def _check_ad_recheck_seconds(cls, value: int) -> int:
-        # 0 = off (the default). Anything else is floored at 60 s: a pass costs one LDAP bind per
+        # 0 = off. Anything else must be at least 60 s: a pass costs one LDAP bind per
         # signed-in directory user, so a mistyped `1` would hammer the domain controller.
         if value < 0:
             raise ValueError("ad_session_recheck_seconds must be >= 0 (0 = disabled)")
@@ -4993,10 +5150,14 @@ class AiSettings(_Section):
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
     # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
-    # reaches the app serving POST /ai/chat, and the endpoint is not loopback (BACKLOG #5527;
-    # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
-    # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
-    # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
+    # reaches the app serving POST /ai/chat, and the endpoint host does not read as loopback
+    # (BACKLOG #5527). In code that reading is stated on
+    # transports.ai_broker._refuse_an_unrevoked_ai_hop, and in full in docs/SECURITY-LOOSENING.md,
+    # the [ai].endpoint_revocation_attested entry: config.tls_policy.is_loopback_hop_host on
+    # the host config.tls_policy.hop_url_host takes from the URL, lowercased and without the
+    # brackets of an IPv6 host, so an endpoint URL holding [::1] reads as loopback. So without
+    # that CRL an endpoint whose host reads as remote there is REFUSED under
+    # [security].enforcement = enforce unless this is set.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
     # It is a LOOSENING: security_loosenings()
@@ -5109,12 +5270,20 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
+    can reach the SMTP hop's context, on the conditions its entry names; none can reach the
+    webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
             "the [alerts] SMTP relay, for a login (email_username) over verified STARTTLS",
-            "and no CRL unless [tls].crl_file is set",
+            "and no CRL unless all three hold: [tls].crl_file is set, the [tls] policy reaches "
+            "the caller that builds the sink (messagefoundry serve, provision-admin and admin "
+            "reset-totp hand it, the alerts test send reads the app's [tls] section as POST "
+            "/ai/chat does, and at least an embedder's notifier_from_settings or "
+            "security_notifier_from_settings call, or app, holds none unless it is passed one), "
+            "and the relay host is not loopback as config.tls_policy.is_loopback_hop_host reads "
+            "it. So "
+            "at least a loopback relay checks no CRL whatever [tls].crl_file says",
             alerts.email_tls_revocation_attested,
             alerts.email_tls_revocation_attested_reason,
         ),
@@ -5150,11 +5319,12 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host, and so must
+    a value that trims to nothing, which names no other system (BACKLOG #5512). No DNS.
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5431,7 +5601,8 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     the SAME authority the transports consume — so the forwarder decides identically to every other
     egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
     verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
-    MITM-able and go to the gradient:
+    MITM-able and go to the gradient. A forwarder with no host returns ALLOW before any of this:
+    ``serve`` builds none without a host, so there is no hop to judge (BACKLOG #5512).
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
@@ -5451,15 +5622,16 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     instance carrying patient data there is no instance left for it to fire on, so it is gone. A
     ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
     way this cell could express an acceptance."""
+    if not log.forward_host:
+        # An unconfigured forwarder: `serve` builds none without a host, so there is no hop to
+        # refuse. Said here because the shared predicate no longer reads "" as loopback (#5512).
+        return HopDisposition.ALLOW
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
-        # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
-        # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
-        # can never be refused.
-        is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
+        is_loopback_hop=is_loopback_hop_host(log.forward_host),
         hop_attested=log.forward_hop_attested,
         # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
         # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
@@ -5537,7 +5709,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     number = int(port)
     # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
     # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
-    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    if "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
         address = ipaddress.ip_address(host)
@@ -6306,7 +6478,7 @@ class AlertsSettings(_Section):
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
     webhook_allowed_hosts: list[str] = []
     # BACKLOG #2193 (ADR 0173 section 12 pattern, owner ruling 2026-10-27): attests that revocation of
-    # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
+    # the webhook host's certificate is covered outside the engine. The POST can carry the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
     # reason. It is the only way across: the webhook rides one shared opener, which no CRL
@@ -6419,6 +6591,22 @@ class AlertsSettings(_Section):
         if isinstance(v, str):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _webhook_url_is_buildable(self) -> AlertsSettings:
+        """Vault BACKLOG #3533 item 14: refuse at load a webhook URL the notifier build would refuse.
+
+        It runs the build's own posture-free checks, ``refuse_unbuildable_webhook_url``, so settings
+        load, ``check`` and the serve pre-flight refuse what the build refuses on them; that
+        function's docstring lists them. The value is kept as written. The revocation guard reads
+        the posture and stays at the build. An empty value stays "not configured", as every
+        consumer reads it."""
+        if self.webhook_url:
+            # Lazy, to keep the edit local; the module imports no transports package.
+            from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
+
+            refuse_unbuildable_webhook_url(self.webhook_url, self.webhook_allowed_hosts)
+        return self
 
     @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
@@ -6672,11 +6860,11 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #:
 #: **That holds on Postgres only**, where the renew's borrow and statement share one deadline
 #: (``pipeline.cluster._call_within``), so a renew lands within the clamp of being issued. On SQL
-#: Server the borrow and the statement each get the full clamp (``SqlServerStore._fetchone_clamped``),
-#: plus a COMMIT the clamp does not bound, so the derived default is NOT safe by construction there.
-#: At the shipped 10/20/30 the clamp is 4.5, which runs as a 4.5 s borrow plus a 4 s statement: about
-#: 8.5 s of the 9.0 s margin. At fence 4.0 / TTL 6.0 (margin 1.2 s) the floor makes the clamp 1.0,
-#: which runs as about 2 s, past the margin.
+#: Server the claim's borrow and statement share the clamp's deadline only from a 2 s clamp up
+#: (``SqlServerStore._fetchone_clamped``, BACKLOG #5064), and a COMMIT the clamp does not bound
+#: follows the statement, so the derived default is NOT safe by construction there. At fence 4.0 /
+#: TTL 6.0 (margin 1.2 s) the floor makes the clamp 1.0, which runs as a 1 s borrow plus a 1 s
+#: statement, about 2 s, past the margin.
 #: ``ServiceSettings._sqlserver_renew_bounds`` checks the borrow and statement windows together
 #: (:func:`_sqlserver_renew_reach_seconds`) against the margin: it steps a derived clamp down to a
 #: whole second that fits, and refuses a set clamp, or a pair no clamp fits, such as 4.0 / 6.0
@@ -6718,16 +6906,54 @@ def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> in
     return min(whole, command_timeout) if command_timeout > 0 else whole
 
 
+#: The smallest floored SQL Server clamp under which the lease claim's borrow and statement share
+#: one deadline: the statement timeout counts whole seconds and never drops below 1, so under 2 s no
+#: borrow window fits in front of it (BACKLOG #5064).
+_SQLSERVER_SHARED_DEADLINE_MIN_SECONDS = 2.0
+
+
+def _sqlserver_shared_borrow_limit(clamp_seconds: float) -> float:
+    """The pooled-connection wait of a SQL Server lease claim, whose borrow and statement share the
+    clamp's deadline (``store.sqlserver.SqlServerStore._clamp_bounds``, BACKLOG #5064): the clamp
+    floored at 1 s, less the 1 s a statement needs, and never under 1 s. ``[store].acquire_timeout``
+    caps it further, applied by ``SqlServerStore._acquire_clamped`` so it can tell which limit cut
+    a borrow. The 1 s floor keeps the wait from shrinking as the clamp rises toward 2 s."""
+    return max(1.0, clamp_seconds - 1.0)
+
+
+def _sqlserver_statement_timeout_left(
+    clamp_seconds: float, elapsed_seconds: float, statement_cap: int
+) -> int | None:
+    """The whole-second statement timeout a SQL Server lease claim gets once its borrow took
+    ``elapsed_seconds``, or ``None`` when the borrow left less than the 1 s a statement needs and
+    the statement must not be issued (BACKLOG #5064). ``statement_cap`` is
+    :func:`_clamped_statement_timeout`.
+
+    Rounded DOWN, so the statement timeout ends by the deadline, the clamp floored at 1 s from
+    before the borrow; a whole-number clamp therefore runs its statement at least 1 s short of it.
+    Under :data:`_SQLSERVER_SHARED_DEADLINE_MIN_SECONDS` it is ``statement_cap``, 1 s, whatever the
+    borrow took: refusing whenever the borrow left under 1 s would refuse every claim at a 1 s
+    clamp. So there the claim can overrun the clamp by up to that second less the clamp's
+    fraction."""
+    floored = max(1.0, clamp_seconds)
+    if floored < _SQLSERVER_SHARED_DEADLINE_MIN_SECONDS:
+        return statement_cap
+    left = math.floor(floored - elapsed_seconds)
+    return min(statement_cap, left) if left >= 1 else None
+
+
 def _sqlserver_renew_reach_seconds(
     clamp_seconds: float, acquire_timeout: float, command_timeout: int
 ) -> float:
-    """The two windows of a SQL Server lease claim that config bounds: the pooled-connection wait
-    plus the statement timeout, which there do not share one deadline (BACKLOG #5979).
+    """The two windows of a SQL Server lease claim that config bounds, counted as if they did not
+    share one deadline: the pooled-connection wait plus the statement timeout (BACKLOG #5979).
 
-    The wait is the smaller of the clamp floored at 1 s and ``[store].acquire_timeout``, as
-    ``store.sqlserver.SqlServerStore._clamp_bounds`` borrows; the statement timeout is
-    :func:`_clamped_statement_timeout`, the function the store applies.
-    ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py`` pins this against ``_clamp_bounds``.
+    The wait is the smaller of the clamp floored at 1 s and ``[store].acquire_timeout``; the
+    statement timeout is :func:`_clamped_statement_timeout`. Since BACKLOG #5064 the claim's borrow
+    and statement share the clamp's deadline from 2 s up (:func:`_sqlserver_shared_borrow_limit`),
+    so this OVER-counts them there; it was left as the load check's formula so that no config that
+    check refused loads, because the steps outside both windows are not bounded by it either.
+    ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py`` pins it against what the store applies.
 
     It is a LOWER bound on a late renew, not the whole of one. At least two steps are outside both
     windows: the cursor's creation between them (``SqlServerStore._cursor``, an executor dispatch)
@@ -6783,8 +7009,8 @@ class ClusterSettings(_Section):
     leader election (Step 4 — exactly one node drains the graph; a standby takes over on failover),
     leader-gated poll-source intake (Step 4b), cross-node reference + config-reload + transform-state
     convergence (Steps 6/6b), and the read-only observability API (Step 7 — ``/cluster/status`` +
-    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE singletons (retention, the
-    lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
+    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE work (retention's shared-store
+    phases, the lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
     snapshot; an operator config reload propagates cluster-wide via a version token; and operators can
     see membership + leadership over the API. Operators must keep node clocks synced (NTP — the
     failover-recovery leases are wall-clock), run identical config dirs on every node, and apply config
@@ -6844,8 +7070,9 @@ class ClusterSettings(_Section):
     # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
     # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
     # and the paused tick's owner read at the smaller of this and half its own budget, at least,
-    # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
-    # under 1 s is refused there (ServiceSettings._sqlserver_renew_bounds).
+    # each borrow and statement separately except the claim's, which share it from 2 s up, as
+    # SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused there
+    # (ServiceSettings._sqlserver_renew_bounds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -6857,9 +7084,9 @@ class ClusterSettings(_Section):
     # (fence 4.0 / ttl 6.0, margin 1.2 s) at config load. Deriving it gives a tight pair a
     # proportionally tight clamp instead of a refusal. It is still not safe by construction: the 1.0 s
     # floor can exceed half a small margin, or the margin itself, so the derived value is checked like
-    # an explicit one; and on SQL Server the renew can land up to about twice the clamp after it is
-    # issued (the comment on _RENEW_CLAMP_MARGIN_FRACTION says why). At the shipped 10/20/30 the
-    # margin is 9.0 s and this resolves to 4.5.
+    # an explicit one; and on SQL Server the renew's COMMIT is outside the clamp, and under a 2 s
+    # clamp so is its statement's last second (the comment on _RENEW_CLAMP_MARGIN_FRACTION says
+    # why). At the shipped 10/20/30 the margin is 9.0 s and this resolves to 4.5.
     #
     # Set it EXPLICITLY and it is checked, not clamped: a value that does not fit the margin is
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
@@ -7008,8 +7235,8 @@ class ClusterSettings(_Section):
         **Backend scope.** The comparison is with the clamp alone, which is the renew's whole bound
         on Postgres only, where its borrow and statement share one deadline. **On SQL Server a green
         load does not prove the renew lands inside the margin:** there the borrow and the statement
-        each get the full clamp, so a renew can land up to about twice the clamp after it is issued,
-        plus a COMMIT the clamp does not bound (``SqlServerStore._fetchone_clamped``).
+        share the clamp's deadline only from a 2 s clamp up, and a COMMIT the clamp does not bound
+        follows the statement (``SqlServerStore._fetchone_clamped``).
         :meth:`ServiceSettings._sqlserver_renew_bounds` refuses a config whose borrow and
         statement windows together reach this margin (BACKLOG #5979), and
         :meth:`ServiceSettings.sqlserver_renew_bound_warning` is the start-up warning, not a refusal,
@@ -7113,8 +7340,12 @@ class CertMonitorSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("cert_monitor.check_interval_seconds must be > 0")
+        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``. A NaN timer breaks
+        # asyncio's timer-heap order, delaying the monitor and unrelated timers, and can raise
+        # ValueError from the event loop whether or not other timers are pending;
+        # ``now - last < NaN`` is never true, so the handshake re-alert throttle would never hold.
+        if not (v > 0 and math.isfinite(v)):
+            raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v
 
     @field_validator("crl_max_reloads")
@@ -7270,8 +7501,9 @@ class SecretRotationSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("secret_rotation.check_interval_seconds must be > 0")
+        # Finite as well as positive, for the reason [cert_monitor]'s validator gives.
+        if not (v > 0 and math.isfinite(v)):
+            raise ValueError("secret_rotation.check_interval_seconds must be a finite number > 0")
         return v
 
     @field_validator("store_key_max_age_days", "secret_max_age_days")
@@ -7387,10 +7619,13 @@ class IntegritySettings(_Section):
     # file cannot say the bytes are clean, and stripping the baseline is easier for the stated
     # adversary than editing a module. An install that declares itself editable is still exempt.
     fail_closed_on_drift: bool = False
-    # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
-    # ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes startup (a
-    # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
-    # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
+    # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190).
+    # This is ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink, where one is
+    # configured, but NEVER crashes
+    # startup (a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). The
+    # audit_anchor_file read it arms can fail startup; `Engine._load_audit_anchor` says when.
+    # Default false — opt in; on a very large audit_log the full re-walk adds startup latency, so it
+    # is not on by default.
     audit_verify_on_start: bool = False
     # Path to a file holding one COUNT:HEAD anchor as printed by `messagefoundry audit-anchor` (BACKLOG
     # #328). Empty (the default) = the startup walk stays the bare walk it is today, byte-identical.
@@ -7407,10 +7642,13 @@ class IntegritySettings(_Section):
     # state ever true, and has the chain only GROWN since? It still catches a truncated tail and a
     # mid-chain rewrite. So a stale anchor stays VALID here — it just witnesses less.
     #
-    # ALERT-ONLY, like its partner: a missing, unreadable or malformed anchor logs a WARNING and lets the
-    # bare walk run. It never crashes startup, and it never fires the tamper alert — a config fault must
-    # not manufacture a tamper alarm, or a real one stops meaning anything. `0:`, the anchor of an empty
-    # log, is refused the same way: it can witness nothing, so it is reported rather than compared.
+    # Alert-only for the faults it catches: a missing or unreadable anchor, or one the parser
+    # refuses, logs a WARNING and lets the bare walk run, and never fires the tamper alert — a
+    # config fault must not manufacture a tamper alarm, or a real one stops meaning anything. It can
+    # still fail startup; `Engine._load_audit_anchor` says when. The parser passes a
+    # `vault:v` head through unchecked; `_audit_head_shape` in store/store.py says what that costs.
+    # `0:`, the anchor of an empty log, is refused the same way: it can witness nothing, so it is
+    # reported rather than compared.
     #
     # It does nothing on its own: without audit_verify_on_start the engine warns at startup that the
     # anchor is never read.
@@ -7642,7 +7880,9 @@ class DrSettings(_Section):
 
     ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
     0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
-    the operator endpoint) declares this box should run under the DR profile this boot.
+    the operator endpoint) declares this box should run under the DR profile this boot. Without
+    ``enabled``, ``activate = true`` is refused at load, where it was silently ignored (BACKLOG
+    #5965).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
@@ -7651,7 +7891,7 @@ class DrSettings(_Section):
     # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
     # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
     # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
-    # until an operator activates it. A no-op unless enabled.
+    # until an operator activates it. Refused at load unless enabled (BACKLOG #5965).
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
@@ -7677,12 +7917,17 @@ class DrSettings(_Section):
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
-    # backup destination — no new egress).
+    # backup destination — no new egress). With seed_dir also empty, a passive box (enabled, with
+    # activate = false) is refused at load: no activation could ever name a seed (BACKLOG #5965 item
+    # 1). A box latched with activate = true loads with neither set; what that means after POST
+    # /dr/release is stated once, in the [dr] enabled row of docs/CONFIGURATION.md. Whitespace-only
+    # is refused too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
     # which is operator configuration and is not confined. Must be absolute. A URL is
-    # rejected, like seed_archive.
+    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load;
+    # see seed_archive above (BACKLOG #5965). Whitespace-only is refused too.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
     # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
@@ -7691,7 +7936,8 @@ class DrSettings(_Section):
     # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
     # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
-    # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
+    # byte-unchanged. A URL is rejected (local/UNC only, like seed_archive). Whitespace-only is
+    # refused, and so is any value on a SQLite store, where no check reads it (BACKLOG #5965 item 1).
     restore_token: str = ""
     # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
     # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
@@ -7720,6 +7966,19 @@ class DrSettings(_Section):
             )
         return value
 
+    @field_validator("seed_archive", "seed_dir", "restore_token")
+    @classmethod
+    def _path_not_blank(cls, value: str, info: ValidationInfo) -> str:
+        # "" switches each off. A blank or space-padded value is a path activation would try to open
+        # as written and abort on every time, during the disaster (BACKLOG #5965 item 1).
+        if value and not value.strip():
+            raise ValueError(f"[dr].{info.field_name} must be a non-blank path (or omit it)")
+        if value != value.strip():
+            raise ValueError(
+                f"[dr].{info.field_name} must not begin or end with whitespace; remove the padding"
+            )
+        return value
+
     @field_validator("takeover_timeout_seconds")
     @classmethod
     def _positive_timeout(cls, value: float) -> float:
@@ -7740,11 +7999,11 @@ class DrSettings(_Section):
     @field_validator("seed_dir")
     @classmethod
     def _seed_dir_absolute(cls, value: str) -> str:
-        # "" switches request-named archives off. A blank-but-present or relative value would
-        # instead resolve against the service's working directory and quietly open that. So blank
-        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
-        # that will resolve it: a rooted path with no drive is relative on Windows.
-        value = value.strip()
+        # "" switches request-named archives off. A relative value would instead resolve against
+        # the service's working directory and quietly open that, so it fails at load; a blank or
+        # padded one is refused above, as seed_archive's is (BACKLOG #5965). "Absolute" is judged
+        # for THIS platform, the one that will resolve it: a rooted path with no drive is relative
+        # on Windows.
         if value and not os.path.isabs(value):
             # The value is not quoted: a URL that _looks_like_url missed could carry a
             # credential (vault BACKLOG #2600).
@@ -7773,6 +8032,33 @@ class DrSettings(_Section):
                 "[dr].activation_mode='auto' is not yet supported — automatic HA-pair-loss detection "
                 "and self-promotion are deferred to a future ADR (ADR 0048); use activation_mode='manual' "
                 "(the default) and the RBAC-gated POST /dr/activate operator action"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _activate_needs_enabled(self) -> DrSettings:
+        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
+        # meant to bring up under the DR run-profile came up as an ordinary engine with nothing
+        # said. With enabled it is the startup latch, unchanged.
+        if self.activate and not self.enabled:
+            raise ValueError(
+                "[dr].activate = true needs [dr].enabled = true: it brings a DR box up under the "
+                "DR run-profile, and has no meaning on a box that is not a DR box"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enabled_names_a_seed(self) -> DrSettings:
+        # BACKLOG #5965 item 1: on a passive box with neither set, every activation aborts for
+        # want of a seed, and that is found only during the disaster. seed_archive names one;
+        # seed_dir lets the POST /dr/activate request name one. A box under activate = true is
+        # exempt: it takes the startup latch, which reads no seed, and that path is unchanged
+        # here (its routing through a seeded activation is the open part of BACKLOG #5965).
+        if self.enabled and not self.activate and not self.seed_archive and not self.seed_dir:
+            raise ValueError(
+                "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
+                "POST /dr/activate could never name the cold seed it verifies, so every activation "
+                "would abort"
             )
         return self
 
@@ -8288,8 +8574,9 @@ class ServiceSettings(_InputHidingModel):
            quietly widened. The derived clamp is floored at 1 s and never trips this.
         2. **A claim that can still be running past the margin before its statement returns**
            (BACKLOG #5979). The margin check compares the clamp alone with the margin, which is the
-           renew's bound on Postgres only. On SQL Server the pooled-connection wait and the
-           statement each get their own window (:func:`_sqlserver_renew_reach_seconds`), so a clamp
+           renew's bound on Postgres only. On SQL Server this check counts the pooled-connection
+           wait and the statement as two windows (:func:`_sqlserver_renew_reach_seconds`, which says
+           why it still does from 2 s up, where the claim shares one deadline), so a clamp
            that passed that check could still let a renew issued just before this node self-fences
            land and re-extend the lease it is standing down from. Both windows are known from
            config, so a clamp whose two windows reach the margin is refused, not warned about.
@@ -8347,8 +8634,8 @@ class ServiceSettings(_InputHidingModel):
             remedy = f"Widen {_FENCE_TTL_GAP}{shorter_wait}"
         else:
             cause = (
-                f"lease_renew_timeout_seconds = {clamp:g} runs the lease claim's pool wait and its"
-                f" statement for up to {reach:g} s"
+                f"lease_renew_timeout_seconds = {clamp:g} gives the lease claim's pool wait and its"
+                f" statement {reach:g} s counted as two windows"
             )
             remedy = (
                 "Lower lease_renew_timeout_seconds or unset it to derive one that fits, or widen"
@@ -8359,9 +8646,12 @@ class ServiceSettings(_InputHidingModel):
             )
         raise ValueError(
             f"[cluster] on [store].backend = 'sqlserver': {cause}, which reaches the demotion"
-            f" detection margin ({margin:g} s). On SQL Server the two do not share one deadline, so"
-            " a renew issued just before this node self-fences could still land and re-extend the"
-            f" lease it is standing down from. {remedy}"
+            f" detection margin ({margin:g} s). From a 2 s clamp up the claim's pool wait and"
+            " statement share one deadline, so this count over-states them, but it is kept as the"
+            " headroom for what that deadline does not cover: under 2 s the statement can overrun"
+            " the clamp by up to 1 s, and at least the claim's cursor creation and its COMMIT run"
+            " outside that deadline, with nothing known to bound them. A renew issued just before"
+            f" this node self-fences can still commit late. {remedy}"
         )
 
     def sqlserver_renew_bound_warning(self) -> str | None:
@@ -8369,9 +8659,11 @@ class ServiceSettings(_InputHidingModel):
         or ``None``.
 
         ``ClusterSettings._renew_fits_the_margin`` compares the clamp alone with the margin. On SQL
-        Server the claim's borrow and its statement each get the full clamp, so a renew can land up
-        to about twice the clamp after it is issued, plus a COMMIT the clamp does not bound
-        (``store.sqlserver.SqlServerStore._fetchone_clamped``). :meth:`_sqlserver_renew_bounds`
+        Server a COMMIT the clamp does not bound follows the claim's statement, and under a 2 s
+        clamp the borrow and statement cannot share its deadline
+        (``store.sqlserver.SqlServerStore._fetchone_clamped``). The predicate below predates the
+        shared deadline of BACKLOG #5064 and was kept unchanged; it does not measure the COMMIT's
+        cost, which no config bounds, and whether it still earns its place is open. :meth:`_sqlserver_renew_bounds`
         refuses a config whose two windows reach the margin; this names one that passed that but
         where twice the clamp reaches the same margin. A warning, not a refusal: the bound is
         approximate (Manager decision d20261030T213636115-0af931). Spans two sections, so it lives
@@ -8412,9 +8704,9 @@ class ServiceSettings(_InputHidingModel):
             )
         return (
             f"[cluster] on SQL Server: {cause} reaches the demotion detection margin"
-            f" ({margin:g} s). There the lease claim's pool wait and its statement each get the full"
-            " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
-            f" self-fences can still land and re-extend the lease. {remedy}"
+            f" ({margin:g} s). There the lease claim's COMMIT is not bounded by the clamp, so a renew"
+            " issued just before this node self-fences may still land and re-extend the lease."
+            f" {remedy}"
         )
 
     @model_validator(mode="after")
@@ -8441,9 +8733,9 @@ class ServiceSettings(_InputHidingModel):
         return self
 
     @model_validator(mode="after")
-    def _dr_activate_not_clustered(self) -> ServiceSettings:
-        """A DR box coming up under the DR run-profile must not also be a ``[cluster]`` member (ADR 0096
-        rider). The two govern DIFFERENT things — ``[dr].activate`` gates which *connections* start (the
+    def _dr_not_clustered(self) -> ServiceSettings:
+        """A DR box must not also be a ``[cluster]`` member (ADR 0096 rider). The two govern
+        DIFFERENT things — an activated ``[dr]`` box gates which *connections* start (the
         priority-threshold run-profile, ADR 0048), while ``[cluster].enabled`` makes the node contend for
         *leadership* of a shared store — and combining them is a topology error: a warm DR-site engine
         should be a NON-PROMOTABLE cluster member (``[cluster].promotable = false``) OR a cold/manually
@@ -8452,11 +8744,12 @@ class ServiceSettings(_InputHidingModel):
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
         ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
-        (vault BACKLOG #3263). A provisioned DR box that is not activated is passive: it binds no
-        listener and delivers nothing (ADR 0048). As a cluster member it could win the lease and
-        then serve nothing, and ``POST /dr/activate`` would make it the lease-contending DR box
-        the check above refuses at boot."""
-        if (self.dr.enabled or self.dr.activate) and self.cluster.enabled:
+        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
+        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
+        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
+        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
+        above."""
+        if self.dr.enabled and self.cluster.enabled:
             key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
                 f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
@@ -8466,6 +8759,20 @@ class ServiceSettings(_InputHidingModel):
                 "engine cold (or manually promoted) with [cluster] disabled, or make the warm DR node a "
                 "NON-PROMOTABLE cluster member ([cluster].enabled=true, [cluster].promotable=false) "
                 "instead of a [dr] box."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _dr_restore_token_needs_a_server_db(self) -> ServiceSettings:
+        """``[dr].restore_token`` is read only by the server-DB seed gate (BACKLOG #223), so on a
+        SQLite store it was a silent no-op an operator could take for provenance protection
+        (BACKLOG #5965 item 1). SQLite's own seed check verifies the whole store, so there is
+        nothing for it to add. Refused, as ``[store].db_schema`` is off Postgres; the message names no
+        configured value."""
+        if self.dr.restore_token and self.store.backend is StoreBackend.SQLITE:
+            raise ValueError(
+                "[dr].restore_token applies only to a Postgres or SQL Server store; on SQLite no "
+                "check reads it (the cold-seed archive verifies the whole store instead). Remove it"
             )
         return self
 
@@ -8883,9 +9190,57 @@ def _near_env_name(section: str, key: str, model: type[BaseModel]) -> str | None
     return f"{prefix}{near[0].upper()}?"
 
 
+def _section_named_alone(rest: str, models: Mapping[str, object]) -> str | None:
+    """The modelled section ``rest`` names and nothing else, or ``None``. ``rest`` is a ``MEFOR_*``
+    name after the prefix, in lower case; any trailing ``_`` is ignored, so ``store``, ``store_``
+    and ``store__`` all name ``[store]``. :func:`_reject_unknown_env_keys` refuses such a name and
+    :func:`_unread_env_notes` notes it, both through this, so the two cannot disagree on it."""
+    bare = rest.rstrip("_")
+    return bare if bare in models else None
+
+
+def _how_to_set_in(section: str) -> str:
+    """How a setting in ``section`` is set, so the obvious fix to a section's name alone is not a
+    name the refusal then stops."""
+    if section in _SECTIONS:
+        return f"a setting in it is {_ENV_PREFIX}{section.upper()}_<KEY>"
+    return "that section has no environment layer; set it in the file"
+
+
+class SectionNameEnvError(ValueError):
+    """The refusal :func:`_reject_unknown_env_keys` raises when at least one variable it refuses is
+    a modelled section's name alone (:func:`_section_named_alone`, vault BACKLOG #2600).
+
+    A ``ValueError``, so a caller that reports a load error reports this one too. Its own class so
+    a caller that falls back to a default on a load error can tell this refusal apart and report
+    it instead. Before this refusal the exact ``MEFOR_<SECTION>`` name did not stop the load, so
+    those callers read the settings; falling back on it would drop the file's settings with only
+    the WARNING :func:`load_settings` logs first. Some trailing-``_`` forms
+    (``MEFOR_UPDATE_CHECK_``, ``MEFOR_STORE__``) were refused before as a plain ``ValueError`` and
+    those callers fell back on them; they are this class now, so those callers report them too.
+    At least these report it: ``dryrun``'s and ``check``'s ``[pipeline].snapshot_on_send``
+    resolution, and ``alert add``'s transport and recipient-override checks.
+
+    Each reports it only when it reaches its settings load. At least these stop first: a load
+    error raised before this refusal runs (a missing or malformed file, an unknown file key),
+    which is not this class and on which those callers still fall back, except ``dryrun --env``,
+    which refuses such an error at its earlier load; any error the command
+    reports before the load (a config graph or messages error in ``dryrun``; a dry-run leg that
+    skips for no fixtures or no inbound). The ``check`` leg loads nothing when no settings source
+    resolves, while ``dryrun`` with no file reads the environment alone and so refuses. Under
+    ``--env``, ``dryrun`` loads the settings earlier and prints a fixed line that does not name
+    the variable.
+
+    The class is chosen per refusal, not per variable: a refusal that also names an unknown
+    ``MEFOR_<SECTION>_<KEY>`` is this class when at least one name is a section's name alone, and
+    a plain ``ValueError`` otherwise."""
+
+
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable that names a
-    modelled section and no setting in it (vault BACKLOG #2600).
+    modelled section and no setting in it, or a variable that is a modelled section's name alone
+    (vault BACKLOG #2600). A refusal that names at least one section's name alone is raised as
+    :class:`SectionNameEnvError`, a ``ValueError``, whatever else it names.
 
     The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
     ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
@@ -8895,8 +9250,19 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     and environment layers, before the model is built, so a typo that is also the cause of a
     cross-field validation error is named here first.
 
-    Two cases refuse:
+    Three cases refuse:
 
+    * the name is a modelled section's name and nothing else, ``MEFOR_<SECTION>`` with or without
+      trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
+      modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
+      that name. ``MEFOR_*`` names are the engine's namespace, so a bare section name is refused
+      even though a tool outside the engine could choose one. Two census tests in
+      ``tests/test_settings_env_keys.py`` read the names spelled out as whole string constants in
+      some of this repository's code trees and in its shipped deployment files; they miss a name
+      built at run time and files outside those trees, and no test checks in general the names a
+      tool outside the repository sets. The exact ``MEFOR_<SECTION>`` shape was decided under the
+      owner's delegation of 2026-11-23 (Manager decision d20261123T172418598-d8ffd6, option (c));
+      the trailing ``_`` forms and the every-section scope are this change's reading of it;
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
@@ -8906,14 +9272,17 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
-      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
-      So a typo in the SECTION part of a name is not refused.
+    * one that none of the three cases above matches because it names no modelled section
+      (``MEFOR_ALLOW_INSECURE_TLS``, the escape honoured only at
+      ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name that leaves it naming no modelled section is not
+      refused; a typo that makes its leading parts another section's name (``MEFOR_AI_HOST`` for
+      ``MEFOR_API_HOST``) is read as that section and refused by the cases above.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
-    * one with no key part, which gets the same note when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
-    * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
+    * a ``[security]`` name with a key, which :func:`_desugar_security` refuses with its own
+      message when the key is unknown, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
       the replacement;
     * under ``[secrets].provider = "env"`` only, a variable that one of the
@@ -8928,7 +9297,16 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
+    named_alone = False
     for name, rest in _unspared_env_names(environ, referenced):
+        alone = _section_named_alone(rest, models)
+        if alone is not None:
+            named_alone = True
+            offenders.append(
+                f"{_printable(name)} (names the [{alone}] section and no setting; "
+                f"{_how_to_set_in(alone)})"
+            )
+            continue
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
         if unread is not None:
             offenders.append(
@@ -8937,7 +9315,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             continue
         section, _, key = rest.partition("_")
         model = models.get(section)
-        if section not in _SECTIONS or section == "security" or not key or model is None:
+        # An empty key cannot reach here: the section-name case above took it.
+        if section not in _SECTIONS or section == "security" or model is None:
             continue
         if key in model.model_fields:
             continue
@@ -8946,7 +9325,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
         near = _near_env_name(section, key, model)
         offenders.append(_printable(name) + (f" (did you mean {near})" if near else ""))
     if offenders:
-        raise ValueError(
+        refusal = SectionNameEnvError if named_alone else ValueError
+        raise refusal(
             f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
             "section and no setting the environment can give it. It is REFUSED, not ignored — a "
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "
@@ -9009,18 +9389,22 @@ def _env_can_hold(model: type[BaseModel], key: str) -> bool:
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
-    """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
-    that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
+    """One note per ``MEFOR_*`` variable that LOOKS like a setting nothing will read (vault
+    BACKLOG #2600). Never quotes a value. Every such variable but a section's name alone is one
+    :func:`_reject_unknown_env_keys` lets through; that one it refuses too (the first shape below).
 
-    A WARNING and not a refusal, on purpose. A name the refusal passes names no section the
+    For the rest, a WARNING and not a refusal, on purpose. A name the refusal passes names no section the
     environment can set, and the engine cannot list every such name: harnesses, scripts and an
     operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
     costs a log line; a wrong refusal would stop the start.
 
     At least two shapes are noted:
 
-    * the name is ``MEFOR_<SECTION>`` exactly, a modelled section and no key
-      (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
+    * the name is a modelled section's name alone (:func:`_section_named_alone`), which
+      :func:`_reject_unknown_env_keys` then refuses. It is noted as well, because
+      :func:`load_settings` logs the notes before its key and variable refusals, so a refused file
+      key does not hide it until the next start. A file that cannot be read or parsed is refused
+      before any note is logged;
     * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
       ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
       (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it
@@ -9039,16 +9423,11 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     gone = set(_RELOCATED_TO_SECURITY) | set(_REMOVED_KEYS)
     notes: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
-        if rest in models:
-            # Say how to set one, so the obvious fix is not a name the refusal then stops.
-            how = (
-                f"a setting in it is {_ENV_PREFIX}{rest.upper()}_<KEY>"
-                if rest in _SECTIONS
-                else "that section has no environment layer; set it in the file"
-            )
+        alone = _section_named_alone(rest, models)
+        if alone is not None:
             notes.append(
-                f"{_printable(name)} names the [{rest}] section and no setting in it, so "
-                f"nothing reads it ({how})"
+                f"{_printable(name)} names the [{alone}] section and no setting in it, so "
+                f"nothing reads it ({_how_to_set_in(alone)})"
             )
             continue
         tokens = rest.split("_")
@@ -9524,7 +9903,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     """The ``[auth]`` anti-automation limits, and the other numeric ``[auth]`` knobs that weaken a
     control (vault BACKLOG #2600 step 4), set LOOSER THAN THEIR SHIPPED DEFAULT, as
     ``(switch, risk)`` entries for :func:`security_loosenings`, which always calls this, since sign-in
-    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2, 7.1.2 and 15.2.2 each
+    field cites).
 
     **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
     and a vault re-read then measured near-off values that were just as off in effect and silent: a
@@ -9535,11 +9915,13 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     **The direction is read from each consumer, not from the name.**
 
-    * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
+    * ``SlidingWindowRateLimiter`` (at least the sign-in, ceremony, PHI-read, monitoring-read and
+      admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
-      before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count refuses a negative value at load (BACKLOG #3293), so only the others reach here. A NaN or infinite
+      before it is counted. The load refuses a negative count or window (BACKLOG #3293 for the
+      admin-write count, #5318 for the sign-in and PHI-read ones, vault BACKLOG #1191 for the
+      monitoring-read ones), so none reaches here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
@@ -9549,10 +9931,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       lower ceiling is looser, and one equal to ``lockout_minutes`` turns the doubling off. A ceiling
       at the default or above is not named even when it equals ``lockout_minutes``: every lock then
       lasts at least as long as the default's longest.
-    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0 or less, and a higher cap keeps
-      more sessions live.
+    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0, and a higher cap keeps more
+      sessions live. The load refuses a negative cap (BACKLOG #5318).
     * ``FlowCache`` refuses a new federated flow once it holds ``oidc_flow_cache_max`` pending ones, so
-      a higher cap holds more and 0 or less refuses every flow, which is stricter, not looser.
+      a higher cap holds more. The load refuses a cap below 1 (BACKLOG #5318), which refused every
+      flow.
 
     A part of a limiter is named only while that limiter is built, as ``email_tls_verify`` sits under
     ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
@@ -9625,10 +10008,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       test. ``oidc_jwks_ttl_seconds`` above its default keeps a withdrawn signing key verifying for
       longer. ``JwksCache`` also serves a cached key until it may fetch again, so an
       ``oidc_jwks_min_refetch_seconds`` above the DEFAULT TTL is named for the same reason; below
-      its own default it weakens the bound on fetches an unknown key id can force, and 0 or less
+      its own default it weakens the bound on fetches an unknown key id can force, and 0
       removes it. ``oidc_flow_ttl_seconds`` above its default keeps a staged flow redeemable for
       longer, and ``oidc_max_age_seconds`` above its default accepts an older identity-provider
-      sign-in. The load bounds all but the JWKS pair, each above its default.
+      sign-in.
     * ``oidc_session_max_hours`` is never named: the sign-in takes the minimum of it and the
       token's own expiry, so any value only ends a session sooner.
 
@@ -9718,7 +10101,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             f"the window of the per-address and all-clients sign-in limits, and of {ceremonies},"
         ),
         off=(
-            "the sign-in rate-limit window is zero or negative, which ages every attempt out "
+            "the sign-in rate-limit window is zero, which ages every attempt out "
             "before it is counted -- neither the per-address nor the all-clients sign-in "
             f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
             "still reads as on"
@@ -9825,7 +10208,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         auth.phi_read_rate_limit_window_seconds,
         what="the PHI-read rate-limit window",
         off=(
-            "the PHI-read rate-limit window is zero or negative, which ages every read out before "
+            "the PHI-read rate-limit window is zero, which ages every read out before "
             "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
             "reads as on"
         ),
@@ -9842,6 +10225,41 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             off=(
                 "there is no per-account PHI-read limit, so one signed-in account may read PHI "
                 "as fast as the engine answers (only an all-users limit, if one is set, holds)"
+            ),
+        )
+
+    # --- the monitoring-read limiter (vault BACKLOG #1191, ASVS 15.2.2): per actor, on the six
+    # paced monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
+    # all-users count ships OFF (0), so neither has an off value to name.
+    if not auth.monitoring_read_rate_limit_enabled:
+        out.append(
+            (
+                "monitoring_read_rate_limit_enabled",
+                "the six paced monitoring reads (the wiring graph, status, stats, metrics, "
+                "metrics history and the connections dashboard) have NO pace on the JSON API -- "
+                "one signed-in account may make the engine rebuild the graph and scan the store "
+                "through them as fast as it answers",
+            )
+        )
+    elif _window(
+        "monitoring_read_rate_limit_window_seconds",
+        auth.monitoring_read_rate_limit_window_seconds,
+        what="the monitoring-read rate-limit window",
+        off=None,
+        counts=(auth.monitoring_read_rate_limit_per_actor, auth.monitoring_read_rate_limit_global),
+    ):
+        _count(
+            "monitoring_read_rate_limit_per_actor",
+            auth.monitoring_read_rate_limit_per_actor,
+            what="the per-account monitoring-read limit",
+            so=(
+                "one signed-in account may make that many paced monitoring reads per "
+                "window before it is refused"
+            ),
+            off=(
+                "there is no per-account monitoring-read limit, so one signed-in account may "
+                "drive the graph rebuild and the store scans through the six JSON routes as fast "
+                "as the engine answers (only an all-users limit, if one is set, holds)"
             ),
         )
 
@@ -9958,11 +10376,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 )
             )
 
-    # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
+    # --- concurrent sessions (ASVS 7.1.2). 0 means unlimited; the load refuses a negative cap.
     sessions = auth.max_sessions_per_user
     _count(
         "max_sessions_per_user",
-        max(sessions, 0),
+        sessions,
         what="the per-user cap on live sessions",
         so=(
             "a user may hold that many sessions at once before the oldest is revoked, and more "
@@ -9975,8 +10393,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         ),
     )
 
-    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, so 0 or
-    # less refuses every flow, which is stricter; only a cap above the default is looser.
+    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, and the
+    # load refuses a cap below 1, so only a cap above the default is looser.
     if auth.oidc_enabled:
         _count(
             "oidc_flow_cache_max",
@@ -10505,6 +10923,46 @@ def _reminder_lead(
     return []
 
 
+def _reminder_cadence(
+    section: str, warn_days: int, interval: float, default: float, what: str, extra: str = ""
+) -> list[tuple[str, str]]:
+    """One reminder's ``check_interval_seconds`` entry: named above the shipped default while the
+    reminder is on, nothing otherwise (BACKLOG #2008, #3301; ASVS 6.4.5).
+
+    The runner scans once at start and then once per interval, so a credential that enters its warn
+    window after start waits up to one interval plus up to two scans' duration for its first
+    reminder. Once the interval reaches ``warn_days + 1`` days, that first reminder can come after
+    the credential's deadline, and an
+    interval of a year means none until the next restart. **The bound is the shipped default, and
+    that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
+    looser than its default rather than picking a second number. With ``warn_days = 0`` the runner
+    does not start, and :func:`_reminder_lead` already names that, so the interval is not named on
+    top of it."""
+    if warn_days == 0 or interval <= default:
+        return []
+    # Both runners count the lead in whole days rounded down, so the window opens warn_days + 1 days
+    # before the deadline. The gap between scans is the interval plus the pass, so from this bound
+    # the clause holds for any pass; below it, it holds only for a pass slower than the shortfall,
+    # and the clause is left out there rather than claimed for a duration nothing here knows.
+    past_lead = (
+        f", which is at least the {warn_days + 1} days between the warn window opening and the "
+        f"deadline, since warn_days = {warn_days} counts whole days, so that reminder can come "
+        "after the deadline itself"
+        if interval >= (warn_days + 1) * 86_400
+        else ""
+    )
+    return [
+        (
+            f"{section}.check_interval_seconds",
+            # repr round-trips, so a value one step past the default never prints as it.
+            f"[{section}].check_interval_seconds = {interval!r}, longer than the default of "
+            f"{default:g} -- {what} that enters its warn window after start waits up to "
+            f"{interval!r} s plus up to two scans' duration for its first "
+            f"reminder{past_lead}{extra}",
+        )
+    ]
+
+
 def _reminder_loosenings(
     cert_monitor: CertMonitorSettings,
     secret_rotation: SecretRotationSettings,
@@ -10514,8 +10972,10 @@ def _reminder_loosenings(
 
     BACKLOG #2227: each ``warn_days = 0`` turned its reminder off with only a debug line from the
     runner. A lead shorter than the shipped default is named too, as BACKLOG #1131 names a limit
-    looser than its default: a reminder one day ahead leaves no time to renew. Each section's
-    ``check_interval_seconds`` also delays a reminder and is NOT named here.
+    looser than its default: a reminder one day ahead leaves no time to renew.
+
+    BACKLOG #2008, #3301: each section's ``check_interval_seconds`` above its shipped default is
+    named too, while that reminder is on (:func:`_reminder_cadence`).
 
     BACKLOG #2008 step 4: an ``[[alerts.rules]]`` entry that can send a reminder to no transport
     (:func:`reminder_silencing_rules`)."""
@@ -10548,6 +11008,24 @@ def _reminder_loosenings(
         "[secret_rotation].warn_days = {value}, shorter than the default of {default} -- a "
         "secret is first flagged only {value} day(s) before it is due, which may leave too "
         "little time to rotate it",
+    )
+    out += _reminder_cadence(
+        "cert_monitor",
+        cert_monitor.warn_days,
+        cert_monitor.check_interval_seconds,
+        CertMonitorSettings.model_fields["check_interval_seconds"].default,
+        "a certificate or CRL file the monitor watches",
+        # The same setting is the handshake re-alert throttle for a service caller's client
+        # certificate (api/security.py), so a longer one delays that repeat alert too.
+        ", and a service caller's expiring client certificate is re-alerted no more often than "
+        "once per interval",
+    )
+    out += _reminder_cadence(
+        "secret_rotation",
+        secret_rotation.warn_days,
+        secret_rotation.check_interval_seconds,
+        SecretRotationSettings.model_fields["check_interval_seconds"].default,
+        "a secret",
     )
     silencing = reminder_silencing_rules(alerts)
     if silencing:
@@ -10699,7 +11177,8 @@ def security_loosenings(
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
-    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
+    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days``, their two
+    ``check_interval_seconds`` above the default (#2008), and an
     ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
@@ -10749,7 +11228,8 @@ def security_loosenings(
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
     held list (vault BACKLOG #3123).
-    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227) and its
+    ``check_interval_seconds`` (BACKLOG #2008). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
     ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). ``ai`` joins them for
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)).
@@ -10762,7 +11242,8 @@ def security_loosenings(
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
     warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
-    below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
+    below their defaults, each section's ``check_interval_seconds`` above its default while that
+    reminder is on, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
     transport (:func:`_reminder_loosenings`). Not every way is named.
     ``[auth].initial_password_expiry_hours = 0`` also stops a reminder, and its entry says so
     (vault BACKLOG #2600 step 4).
@@ -10813,7 +11294,10 @@ def security_loosenings(
     start of ``serve`` and ``supervise``, and the build of ``create_app`` and
     ``create_managed_app``, which never reach this registry then; a caller that reads it with no
     refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
-    engine finds its service. ``None`` has the meaning it has for ``remote_debug``.
+    engine finds its service. Another engine secret that reaches the service from outside those
+    lists is named here as ``secret_from_outside_service_lists``; one the machine-wide
+    environment sets refuses them under ``enforce``. ``None`` has the meaning it has for
+    ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
@@ -11143,9 +11627,11 @@ def security_loosenings(
                 "require_action_step_up",
                 "the routes that need a fresh proof bound to one action (docs/CONFIGURATION.md "
                 "lists them) accept the session-wide step-up window instead -- a session taken over "
-                "inside that window ([auth].step_up_max_age_seconds, which a sign-in can open) "
-                "can bind an authenticator, inject a message or export bodies in bulk with no "
-                "fresh proof",
+                "inside that window ([auth].step_up_max_age_seconds, which at least some sign-ins "
+                "open) can, with no fresh proof, at least bind an authenticator, disable MFA "
+                "where [security].require_mfa does not refuse it, end "
+                "the account's other sessions, reset another account's password or factor, "
+                "inject a message, export bodies in bulk, purge a queue or reload config",
             )
         )
     # Vault BACKLOG #2600: the three local-password screens ship ON, and no gate refuses one off.
@@ -11286,7 +11772,7 @@ def security_loosenings(
             switch,
             f"revocation of the certificate of {hop} is attested as covered outside the engine "
             f"(reason: {reason}) -- the engine verifies that certificate but its own handshake "
-            f"checks no OCSP, {crl}; the attestation adds no check. "
+            f"checks no OCSP, {crl}. The attestation adds no check. "
             "Wherever the revocation refusal would apply to that hop it is lifted, so a revoked "
             "certificate is caught only if what the reason names really covers it. It never lifts "
             "a cleartext or verify-off refusal",
@@ -11298,10 +11784,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11310,8 +11796,18 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (messagefoundry serve hands it, an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint host does not read as loopback, as "
+                "config.tls_policy.is_loopback_hop_host reads the host "
+                "config.tls_policy.hop_url_host takes from the URL, lowercased and without the "
+                "brackets of an IPv6 host. Under that reading at least an endpoint URL holding "
+                "127.0.0.1, [::1] or the bare name localhost reads as loopback, and at least the "
+                "name localhost with a "
+                "trailing dot reads as remote, so it gets the CRL where the other two conditions "
+                "hold. So "
+                "at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "
@@ -11575,13 +12071,19 @@ def security_loosenings(
             )
         elif store_privilege.excess:
             named = ", ".join(store_privilege.excess)
+            not_read = (
+                "; these grants were not read, so the list may be incomplete: "
+                f"{', '.join(store_privilege.unread)}"
+                if store_privilege.unread
+                else ""
+            )
             out.append(
                 (
                     "store_principal_over_granted",
                     f"the store principal holds {len(store_privilege.excess)} privilege(s) BEYOND the "
                     f"least-privilege grant docs/DEPLOY-SERVER-DB.md prescribes ({named}) — the "
                     "engine's own database credential can reach data and administrative operations "
-                    "its runbook says it must not",
+                    f"its runbook says it must not{not_read}",
                 )
             )
     # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no

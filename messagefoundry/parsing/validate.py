@@ -37,11 +37,15 @@ is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the co
 which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
 the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
 the version does not define, and a dropped bare defined ID with no field separator, are still
-refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why).
+refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why),
+and a dropped BHS, BTS, FHS or FTS line with a later Z line, or a later defined line that is not
+bare, after it (``_ENVELOPE`` says why; a later bare, unrecognised or undefined line does not
+count).
 The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
-structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
-borrowed under the same code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a
+structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none.
+Under the same code, MSH-9.2 decides whether a borrow keeps it (``MFN^M02^MFN_M01`` does not;
+some do), by the rule :func:`_exempts_defined_segments` states. Where the slot sits inside a
 nested group (at least PRR_PC5 and PPV_PCA), such a segment can still break hl7apy's grouping of
 what follows. Segment order is not checked as such: hl7apy keeps each segment where the message
 has it, so an out-of-order message may pass.
@@ -351,28 +355,79 @@ def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
 
 
 def _exempts_defined_segments(message: Any) -> bool:
-    """True if ``message``'s structure has the "any HL7 segment" slot and is its own.
+    """True if ``message``'s structure has the "any HL7 segment" slot and MSH-9 passes the
+    consistency check below, which some borrowed structures pass too.
 
     hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
     structure's own message code, which fails closed on a structure borrowed under another code.
-    One borrowed under the same code (``MFN^M02^MFN_M01``) still gets it: MSH-9.2 is not
-    compared, since one structure can serve several trigger events (PGL_PC6 serves PC6 to PC8,
-    for one)."""
+    Under the same code, MSH-9.2 is compared too (BACKLOG #5920 step 1). A message with no
+    MSH-9.3 borrows nothing: hl7apy names its structure from MSH-9.1 and MSH-9.2. One with an
+    MSH-9.3 is checked in this order. Where the structure is ``<MSH-9.1>_<MSH-9.2>``, MSH-9.2
+    stripped and upper-cased, it keeps the exemption. Otherwise, where hl7apy's tables have a
+    structure named ``<MSH-9.1>_<MSH-9.2>``, it gets none: ``MFN^M02^MFN_M01``, since MFN_M02 is
+    a structure, and ``QBP^Z73^QBP_Q15`` in 2.5, since QBP_Z73 is one. Otherwise it keeps the
+    exemption where MSH-9.2 starts with Z, taken as a site-defined event (``QBP^Z44^QBP_Q15``)
+    that table 0003 need not list, or is a value in the version's HL7 table 0003 as hl7apy ships
+    it, and gets none for any other value (empty, lower-case, padded or made up, such as
+    ``XY1``). Any Z-led value passes the Z test (``MFN^Zebra^MFN_M01``), and the table holds at
+    least one placeholder that is no event (``Varies`` from 2.4), which passes too. So ``PGL^PC7^PGL_PC6`` in 2.5 keeps it, one structure serving several trigger
+    events (PGL_PC6 serves PC6 to PC8, for one). So does an event in the table that the borrowed
+    structure does not serve in the standard, such as ``MFN^M14^MFN_M01``, or one of another
+    message's family, such as ``MFN^A01^MFN_M01``: hl7apy has no table of which structure serves
+    which event, and only ``<MSH-9.1>_<MSH-9.2>`` is looked up. A Z test is on the raw MSH-9.2, so
+    ``MFN^Z44 ^MFN_M01`` keeps the exemption and ``MFN^z44^MFN_M01`` does not."""
     code = message.msh.msh_9.msh_9_1.to_er7()
-    return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
-        message.name, message.classname, message.version
-    )
+    if code != message.name.split("_", 1)[0]:
+        return False
+    if not _has_any_segment_slot(message.name, message.classname, message.version):
+        return False
+    if len(message.msh.msh_9.to_er7().split(message.encoding_chars["COMPONENT"])) < 3:
+        return True
+    event = message.msh.msh_9.msh_9_2.to_er7()
+    # Normalized so a padded or lower-case own event (``MFN^m01^MFN_M01``) keeps the exemption,
+    # as ``MFN^m01`` with no MSH-9.3 does.
+    own = f"{code}_{event.strip().upper()}"
+    if own == message.name:
+        return True
+    structures, events = _structures_and_events(message.version)
+    if own in structures:
+        return False
+    # A site-defined Z event borrows a structure by design, and table 0003 need not list it.
+    return event.startswith("Z") or event in events
+
+
+# Keyed by version alone, so the cache holds none of a sender's MSH-9.2 text.
+@cache
+def _structures_and_events(hl7_version: str) -> tuple[frozenset[str], frozenset[str]]:
+    """The message structures and the trigger events (HL7 table 0003) hl7apy's tables for
+    ``hl7_version`` define; no events where hl7apy ships no tables for the version."""
+    import hl7apy
+
+    library = hl7apy.load_library(hl7_version)
+    tables = getattr(library, "TABLES", {})
+    events = tables["HL70003"][1] if "HL70003" in tables else ()
+    return frozenset(library.MESSAGES), frozenset(events)
 
 
 # Six IDs a dropped line of which is refused even in a structure with the "any HL7 segment" slot
 # (BACKLOG #5920): MSH opens a message, DSC points at a continuation, and MSA, ERR, QAK and MFA
 # answer another message, so none of the six is the data that slot carries. The list is not every
 # header, continuation or acknowledgment segment the standard defines: at least ADD, SFT, UAC,
-# QPD, QRD, QRF and RCP are not on it and keep the exemption. The batch and file envelope (BHS,
-# BTS, FHS, FTS) is not here either: split_batch cuts only at MSH, so a member can carry its
-# batch's trailers or the next batch's header.
+# QPD, QRD, QRF and RCP are not on it and keep the exemption.
 _NEVER_EXEMPT = frozenset({"MSH", "DSC", "MSA", "ERR", "QAK", "MFA"})
+
+# The batch and file envelope. A dropped one is refused in such a structure too, unless it is in
+# the run of envelope lines that ends the message (BACKLOG #5920 step 2). That run is exempt
+# because some intake paths hand a message over with its batch's trailers or the next batch's
+# header still on it: at least a lone file message that one_message_bytes hands over as raw
+# bytes under an encoding that does not write ASCII as itself (utf-8-sig, UTF-16, cp932), a
+# member whose MSH-1 is not ASCII, and an MLLP, TCP or HTTP body, none of which split_batch's
+# trailer cut (BACKLOG #5806) reaches. An envelope line with a later Z line, or a later defined
+# line that is not bare, frames nothing and is refused. A later bare, unrecognised or undefined
+# line does not count, so an envelope line before only such lines is still exempt, even where
+# hl7apy kept a bare line (_trailer_from).
+_ENVELOPE = frozenset({"BHS", "BTS", "FHS", "FTS"})
 
 # Structures whose tree the dropped-segment check could not read, so each is logged once.
 _compare_failures: set[tuple[str, str | None]] = set()
@@ -388,7 +443,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
     occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
     named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
     followed by a field separator is not refused, as the module docstring says, unless it is one
-    of :data:`_NEVER_EXEMPT`.
+    of :data:`_NEVER_EXEMPT`, or one of :data:`_ENVELOPE` before :func:`_trailer_from`'s position.
     """
     import hl7apy
 
@@ -402,6 +457,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         )
     defined = hl7apy.load_library(message.version).SEGMENTS
     exempts: bool | None = None  # read once, on the first dropped defined segment
+    trailer_from: int | None = None  # read once, on the first dropped envelope segment
     refusals: list[str] = []
     exempted: list[tuple[str, int]] = []
     for name, number in lines.segments:
@@ -412,7 +468,10 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         elif name in defined:
             if exempts is None:
                 exempts = _exempts_defined_segments(message)
-            if exempts and number not in lines.bare and name not in _NEVER_EXEMPT:
+            if name in _ENVELOPE and trailer_from is None:
+                trailer_from = _trailer_from(lines, defined)
+            misplaced = trailer_from is not None and name in _ENVELOPE and number < trailer_from
+            if exempts and number not in lines.bare and name not in _NEVER_EXEMPT and not misplaced:
                 exempted.append((name, number))
             else:
                 refusals.append(
@@ -421,6 +480,23 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         else:
             refusals.append(f"unknown segment at line {number}")
     return refusals, exempted
+
+
+def _trailer_from(lines: _Lines, defined: Any) -> int:
+    """The position where the run of envelope lines that ends the message starts: past every
+    other line, Z lines included. A bare line, an unrecognised one and an ID the version does not
+    define are left out, so such a line after a correct trailer stays the first refusal named. A
+    bare line hl7apy kept is left out too, so an envelope line before only such lines is exempt."""
+    others = [
+        number
+        for name, number in lines.segments
+        if name not in _ENVELOPE
+        and number not in lines.bare
+        and _SEGMENT_ID.fullmatch(name) is not None
+        and name in defined
+    ]
+    others.extend(number for _name, number in lines.z_segments)
+    return 1 + max(others, default=0)
 
 
 @dataclass(frozen=True)

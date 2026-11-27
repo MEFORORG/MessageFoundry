@@ -59,6 +59,7 @@ from messagefoundry.transports.database import (
     generic_odbc_tls_unenforced,
 )
 from messagefoundry.transports.egress import check_egress_allowed, check_source_allowed
+from tests._fake_dbapi_driver import DriverError
 from tests.test_poll_source_tick_ceilings import _CapturingSink
 
 INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
@@ -108,8 +109,10 @@ def test_is_transient_by_sqlstate() -> None:
 
 
 def test_classify_db_error() -> None:
-    assert type(_classify_db_error("08S01", "x")) is DeliveryError  # transient → retry
-    permanent = _classify_db_error("23000", "constraint")
+    assert (
+        type(_classify_db_error("08S01", "x", shown="08S01")) is DeliveryError
+    )  # transient → retry
+    permanent = _classify_db_error("23000", "constraint", shown="23000")
     assert isinstance(permanent, NegativeAckError) and permanent.permanent is True
 
 
@@ -133,7 +136,7 @@ _POSTGRES_DUP = (
 def _driver_exc(sqlstate: str, message: str) -> Exception:
     """A pyodbc-shaped error: ``args == (sqlstate, message)``, so ``str(exc)`` is the tuple repr the
     connector's call sites actually hand to :func:`_classify_db_error`."""
-    return Exception(sqlstate, message)
+    return DriverError(sqlstate, message)
 
 
 @pytest.mark.parametrize(
@@ -148,7 +151,7 @@ def test_classify_db_error_never_carries_the_driver_message(state: str, message:
 
     Red mutation: restore the ``: {message}`` suffix on either branch. Both arms red.
     """
-    err = _classify_db_error(state, str(_driver_exc(state, message)))
+    err = _classify_db_error(state, str(_driver_exc(state, message)), shown=state)
     assert _SYNTHETIC_ID not in str(err)
     assert "duplicate key" not in str(err).lower()
     assert "Key (mrn)" not in str(err)
@@ -160,11 +163,13 @@ def test_classify_db_error_keeps_the_sqlstate_and_the_driver_error_number() -> N
     Red mutation: drop ``_driver_code`` from the detail — the second assertion reds while the
     PHI-freedom tests above stay green, so the two properties are pinned independently.
     """
-    permanent = _classify_db_error("23000", str(_driver_exc("23000", _SQLSERVER_DUP)))
+    permanent = _classify_db_error(
+        "23000", str(_driver_exc("23000", _SQLSERVER_DUP)), shown="23000"
+    )
     assert "[23000]" in str(permanent)
     assert "driver error 2627" in str(permanent)
     link_down = str(_driver_exc("08S01", "[08S01] link failure (10054) (SQLDriverConnect)"))
-    transient = _classify_db_error("08S01", link_down)
+    transient = _classify_db_error("08S01", link_down, shown="08S01")
     assert isinstance(transient, DeliveryError) and "driver error 10054" in str(transient)
 
 
@@ -185,7 +190,7 @@ def test_driver_code_will_not_lift_a_parenthesised_column_value() -> None:
 
 
 def test_sqlstate_extraction() -> None:
-    assert _sqlstate(Exception("08S01", "msg")) == "08S01"
+    assert _sqlstate(DriverError("08S01", "msg")) == "08S01"
     assert (
         _sqlstate(ValueError("some bug")) is None
     )  # not SQLSTATE-shaped → propagates as a code bug
@@ -947,7 +952,7 @@ async def test_send_executes_and_commits() -> None:
 
 
 async def test_send_permanent_db_error_dead_letters() -> None:
-    conn = _FakeConn(_FakeCursor(Exception("23000", "constraint violation")))
+    conn = _FakeConn(_FakeCursor(DriverError("23000", "constraint violation")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(NegativeAckError) as ei:
@@ -957,7 +962,7 @@ async def test_send_permanent_db_error_dead_letters() -> None:
 
 
 async def test_send_transient_db_error_retries() -> None:
-    conn = _FakeConn(_FakeCursor(Exception("08S01", "connection lost")))
+    conn = _FakeConn(_FakeCursor(DriverError("08S01", "connection lost")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(DeliveryError) as ei:
@@ -1045,17 +1050,17 @@ def test_classify_db_error_marks_connection_faults() -> None:
     marked for the lane-stopping arm instead of reading as a per-message reject.
 
     Red on the old code: every permanent state was a plain reject with neither marker."""
-    login = _classify_db_error("28000", str(_login_failed()), connecting=True)
+    login = _classify_db_error("28000", str(_login_failed()), connecting=True, shown="28000")
     assert isinstance(login, NegativeAckError) and login.permanent
     assert login.credential_fault and not login.config_fault
     assert "svc_feed" not in str(login) and "[28000]" in str(login)  # #1661 still holds
-    no_driver = _classify_db_error("IM002", str(_no_driver()), connecting=True)
+    no_driver = _classify_db_error("IM002", str(_no_driver()), connecting=True, shown="IM002")
     assert isinstance(no_driver, NegativeAckError) and no_driver.permanent
     assert no_driver.config_fault and not no_driver.credential_fault
     # Off the connect path a permanent state is the statement's own and keeps no marker, so an
     # IM001 one message's parameter shape raises dead-letters that message, not the lane.
     for state in ("42000", "28000", "IM001", "01000"):
-        plain = _classify_db_error(state, "x")
+        plain = _classify_db_error(state, "x", shown=state)
         assert isinstance(plain, NegativeAckError) and plain.permanent
         assert not plain.credential_fault and not plain.config_fault
 
@@ -1064,13 +1069,15 @@ def test_classify_db_error_connecting_is_never_a_per_message_reject() -> None:
     """Before the statement runs no message can be at fault. unixODBC's missing driver library
     (``01000``) is a config fault there; any other permanent state retries, since a server in
     recovery or failing over may refuse a login under 42000 or HY000."""
-    login = _classify_db_error("28000", "x", connecting=True)
+    login = _classify_db_error("28000", "x", connecting=True, shown="28000")
     assert isinstance(login, NegativeAckError) and login.credential_fault
-    no_lib = _classify_db_error("01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True)
+    no_lib = _classify_db_error(
+        "01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True, shown="01000"
+    )
     assert isinstance(no_lib, NegativeAckError) and no_lib.config_fault
     # Only 01000 of class 01: an invalid connection-string attribute (01S00) is retried.
     for state in ("42000", "HY000", "08001", "01S00"):
-        assert type(_classify_db_error(state, "x", connecting=True)) is DeliveryError
+        assert type(_classify_db_error(state, "x", connecting=True, shown=state)) is DeliveryError
 
 
 async def test_connect_codec_error_is_not_read_as_a_sqlstate() -> None:
@@ -1195,7 +1202,7 @@ async def test_probe_runs_select_1() -> None:
 
 async def test_probe_transient_error_is_delivery_error() -> None:
     dest = _dest()
-    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("08S01", "connection lost"))))
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(DriverError("08S01", "connection lost"))))
     with pytest.raises(DeliveryError) as ei:
         await dest.test_connection()
     assert not isinstance(ei.value, NegativeAckError)  # transient → reachability fail
@@ -1203,7 +1210,7 @@ async def test_probe_transient_error_is_delivery_error() -> None:
 
 async def test_probe_auth_error_is_permanent() -> None:
     dest = _dest()
-    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("28000", "login failed"))))
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(DriverError("28000", "login failed"))))
     with pytest.raises(NegativeAckError):  # bad credentials → permanent (still a test failure)
         await dest.test_connection()
 
@@ -1507,7 +1514,7 @@ async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
     src.on_connection_event = sink
     h = _RecordingHandler()
     cur = await _run_poll(
-        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
+        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=DriverError("08S01", "deadlock")
     )
     assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
     assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
@@ -1708,7 +1715,7 @@ async def test_source_poll_failure_log_carries_no_driver_value(
     assert _SYNTHETIC_ID not in caplog.text
     assert "duplicate key" not in caplog.text.lower()
     assert "Conversion failed" not in caplog.text
-    assert f"RedactedDbError: Exception [{state}] driver error {code}" in caplog.text
+    assert f"RedactedDbError: DriverError [{state}] driver error {code}" in caplog.text
     assert "in _select" in caplog.text  # the frames are kept
 
 
@@ -1731,7 +1738,7 @@ async def test_source_poll_failure_traceback_renders_a_chained_driver_error_safe
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(src, wrapped)
     assert "direct cause of the following exception" in caplog.text
-    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "DriverError [23000] driver error 2627" in caplog.text
     # No SQLSTATE and not the engine's own error, so its text is withheld (BACKLOG #5348).
     assert "RedactedDbError: RuntimeError [message withheld]" in caplog.text
     # The frame's source line still shows the literal; the exception line no longer does.
@@ -1913,7 +1920,7 @@ def test_poll_log_line_names_an_error_with_no_arguments_by_type_alone() -> None:
     assert database_module._poll_log_line(TimeoutError(), under=False) == "TimeoutError"
 
 
-class _UnclassifiableError(Exception):
+class _UnclassifiableError(DriverError):
     """An error whose ``sqlstate`` property raises something ``getattr`` does not swallow."""
 
     @property
@@ -1936,7 +1943,7 @@ async def test_source_poll_failure_keeps_the_chain_when_one_link_cannot_be_class
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), failure)
     assert "_UnclassifiableError [message withheld: RuntimeError while rendering it]" in caplog.text
-    assert "Exception [23000] driver error 2627" in caplog.text
+    assert "DriverError [23000] driver error 2627" in caplog.text
     assert "traceback withheld" not in caplog.text
 
 
@@ -2136,13 +2143,13 @@ async def test_source_poll_failure_reaches_a_sink_as_a_multiline_traceback(
     assert _SYNTHETIC_ID not in out
     if fmt == "json":
         exception = json.loads(out.splitlines()[-1])["exception"]
-        assert "Exception [22018] driver error 245" in exception
+        assert "DriverError [22018] driver error 245" in exception
     else:
         assert len(out.splitlines()) > 3  # the frames kept their line breaks
-        assert "Exception [22018] driver error 245" in out
+        assert "DriverError [22018] driver error 245" in out
 
 
-class _UnprintableDriverError(Exception):
+class _UnprintableDriverError(DriverError):
     """A driver-shaped error whose ``__str__`` raises."""
 
     def __str__(self) -> str:
@@ -2187,7 +2194,7 @@ async def test_source_poll_failure_log_survives_a_failed_copy(
     src = _src(body_column="payload")
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(src, _driver_exc("22018", _SQLSERVER_CONVERT))
-    assert "traceback withheld: RecursionError while rendering Exception" in caplog.text
+    assert "traceback withheld: RecursionError while rendering DriverError" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
 
 
@@ -2195,6 +2202,7 @@ class _AsyncpgShapedError(Exception):
     """asyncpg's shape: the SQLSTATE in a class attribute, the message in ``args[0]``, and a
     ``DETAIL`` line in ``str()`` that quotes the key."""
 
+    __module__ = "asyncpg.exceptions._base"
     sqlstate = "23505"
 
     def __str__(self) -> str:
@@ -2343,7 +2351,7 @@ async def test_a_builtin_cause_under_a_driver_error_is_withheld(
     with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
         await _run_one_failed_poll(_src(body_column="payload"), failure)
     assert "direct cause of the following exception" in caplog.text
-    assert "RedactedDbError: ValueError [driver message withheld]" in caplog.text
+    assert "RedactedDbError: ValueError [message withheld under a driver error]" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
 
 
@@ -2354,7 +2362,10 @@ def test_a_link_under_a_driver_error_names_no_sqlstate_shaped_value() -> None:
 
     Red mutation: drop the ``withhold and not driver`` arm in ``_safe_db_error``. Reds here.
     """
-    assert _safe_db_error(KeyError("A4242"), withhold=True) == "KeyError [driver message withheld]"
+    assert (
+        _safe_db_error(KeyError("A4242"), withhold=True)
+        == "KeyError [message withheld under a driver error]"
+    )
     assert _safe_db_error(_DbApiError("23505"), withhold=True) == "_DbApiError [23505]"
 
 

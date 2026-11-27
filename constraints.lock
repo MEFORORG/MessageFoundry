@@ -61,7 +61,7 @@ elementpath==5.1.3 ; (python_full_version < '3.15' and platform_python_implement
     # via xmlschema
 execnet==2.1.2 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via pytest-xdist
-fastapi==0.163.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+fastapi==0.165.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
 fhir-core==1.1.12 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via
@@ -90,6 +90,8 @@ httptools==0.8.0 ; (python_full_version < '3.15' and platform_python_implementat
 httpx==0.28.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
 hvac==2.4.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+    # via messagefoundry
+hypothesis==6.170.17 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via messagefoundry
 idna==3.20 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via
@@ -247,6 +249,8 @@ signxml==5.3.0 ; (python_full_version < '3.15' and platform_python_implementatio
     # via messagefoundry
 six==1.17.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
     # via python-dateutil
+sortedcontainers==2.4.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')
+    # via hypothesis
 sspilib==0.6.0 ; python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32'
     # via pyspnego
 starlette==1.10.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32')

@@ -12,13 +12,15 @@ acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is
 from __future__ import annotations
 
 import base64
+import sys
+from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import _FILE_SECRET_KEYS, StoreSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused
 from messagefoundry.store.base import resolve_active_key, resolve_decrypt_keys
 from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (
@@ -215,20 +217,35 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "error",
+    "make_error",
     [
-        pytest.param(ImportError("DLL load failed"), id="broken-c-extension"),
-        pytest.param(ImportError("cannot import name 'Client' from 'sdk'"), id="missing-symbol"),
+        pytest.param(
+            lambda: ImportError("DLL load failed: synthetic C:/x/_sdk.pyd"),
+            id="broken-c-extension",
+        ),
+        pytest.param(
+            lambda: ImportError("cannot import name 'Client' from 'synthetic_sdk'"),
+            id="missing-symbol",
+        ),
+        # Vault BACKLOG #6709 item 3: a module's top-level code can fail with an error that is not
+        # an ImportError at all.
+        pytest.param(lambda: OSError("synthetic C:/x/_sdk.pyd"), id="os-error"),
+        pytest.param(lambda: AttributeError("synthetic attribute"), id="attribute-error"),
     ],
 )
 def test_an_external_provider_whose_backend_import_breaks_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, error: ImportError
+    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
 ) -> None:
     # Vault BACKLOG #6709: an SDK that is installed but broken raises a plain ImportError, not
     # ModuleNotFoundError. The seam itself must raise the KeyProviderError its contract names,
-    # chained to the original, never a raw ImportError. The resolve_active_key half is a control:
-    # it already refused any provider error as a KeyProviderError before this fix.
+    # chained to the original, never the raw error. The resolve_active_key half is a control:
+    # it already refused any provider error as a KeyProviderError before this fix. Each import
+    # raises a fresh error (item 2), so no instance carries a traceback from an earlier raise.
+    raised: list[Exception] = []
+
     def _import(_name: str) -> ModuleType:
+        error = make_error()
+        raised.append(error)
         raise error
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
@@ -236,9 +253,28 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
         KeyProviderError, match="could not load its provider module or backend"
     ) as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
-    assert caught.value.__cause__ is error
+    assert caught.value.__cause__ is raised[0]
+    assert "synthetic" not in str(caught.value)
     with pytest.raises(KeyProviderError):
         resolve_active_key(StoreSettings(key_provider="vault"))
+    assert len(raised) == 2 and raised[0] is not raised[1]
+
+
+def test_an_import_time_value_error_is_not_read_as_a_refused_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Vault BACKLOG #6709 item 3: store.base reads a raw ValueError as a refused key and tells the
+    # operator to generate a new one. A provider module whose import raises one is a broken
+    # install, so the seam refuses it as a KeyProviderError like any other failed import.
+    def _import(_name: str) -> ModuleType:
+        raise ValueError("synthetic")
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(KeyProviderError, match="could not load its provider module or backend"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "gen-key" not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -482,3 +518,208 @@ def test_cross_provider_active_key_id_parity_same_mfenc_v1_fixture(
     assert cipher_info(other).active_key_id != fingerprints[0]
     with pytest.raises(CipherError):
         other.decrypt(fixture)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_from_the_provider_module_import_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    # Vault BACKLOG #6709 item 11: out of memory or stack while the provider module imports is
+    # refused like any other broken import, as a chained KeyProviderError.
+    import importlib
+
+    real_import = importlib.import_module
+
+    def _import(name: str, *args: Any) -> ModuleType:
+        if name == "messagefoundry.store.keyprovider_vault":
+            raise error()
+        return real_import(name, *args)
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(KeyProviderError, match=f"import failed: {error.__name__}") as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert isinstance(caught.value.__cause__, error)
+
+
+_strict_requests: ModuleType | None
+try:
+    from messagefoundry.transports import strict_requests as _strict_requests
+except ImportError:  # the optional extra that ships requests is absent
+    _strict_requests = None
+
+#: Each call of ``_mains_build_step``, so the differential can show its main sweep ran.
+_MAIN_STEP_CALLS: list[str] = []
+
+
+def _plant_build_provider(
+    monkeypatch: pytest.MonkeyPatch, raise_error: Callable[[], object]
+) -> list[Exception]:
+    """Plant a provider module whose ``build_provider`` runs ``raise_error()``, which raises; the
+    list it returns holds each error raised, in order. The error is re-raised bare, so its
+    ``__context__`` is the one ``raise_error`` gave it. The module is planted in ``sys.modules``
+    under its own name only, so no other import in the process is redirected."""
+    raised: list[Exception] = []
+    fake = ModuleType("messagefoundry.store.keyprovider_vault")
+
+    def _build(settings: StoreSettings, *, posture: object = None) -> KeyProvider:
+        try:
+            raise_error()
+        except Exception as error:
+            raised.append(error)
+            raise
+        raise AssertionError("raise_error returned")
+
+    fake.build_provider = _build  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "messagefoundry.store.keyprovider_vault", fake)
+    return raised
+
+
+def _mains_build_step(
+    name: str, settings: StoreSettings, posture: HopPosture | None
+) -> KeyProvider:
+    """A copy of origin/main's ``_load_external_provider`` past its import arm (at 181411d1294):
+    ``build_provider`` is called bare, so whatever it raises propagates raw to ``store.base``.
+    The module comes from ``sys.modules``, so it is the planted one."""
+    import importlib
+
+    _MAIN_STEP_CALLS.append(name)
+    module = importlib.import_module(f"messagefoundry.store.keyprovider_{name}")
+    provider: KeyProvider = module.build_provider(settings, posture=posture)
+    return provider
+
+
+def _raises(make: Callable[[], Exception]) -> Callable[[], object]:
+    def _raise() -> object:
+        raise make()
+
+    return _raise
+
+
+def _dpapi_error() -> Exception:
+    from messagefoundry.secrets_dpapi import DpapiError
+
+    return DpapiError("synthetic")
+
+
+def _dpapi_unavailable() -> Exception:
+    from messagefoundry.secrets_dpapi import DpapiUnavailable
+
+    return DpapiUnavailable("synthetic")
+
+
+def _recorded_refusal() -> Exception:
+    from messagefoundry.store.base import StoreCipherConfigError, _recorded
+
+    return _recorded(StoreCipherConfigError("synthetic recorded"), "synthetic recorded")
+
+
+def _codec_error() -> Exception:
+    return UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "synthetic")
+
+
+def _caused_by_codec() -> Exception:
+    error = ValueError("synthetic")
+    error.__cause__ = _codec_error()
+    return error
+
+
+def _caused_by_vault_hop() -> Exception:
+    # Imported at module load, never inside the planted window.
+    if _strict_requests is None:
+        pytest.skip("messagefoundry.transports.strict_requests needs its optional extra")
+    error = RuntimeError("synthetic")
+    error.__cause__ = _strict_requests.VaultHopRefused("Vault test hop: fixed text")
+    return error
+
+
+def _raise_in_codec_context() -> object:
+    # A ValueError raised inside a codec handler carries the codec error as its implicit
+    # __context__. Re-raising the instance after a dispatch's own handler has exited, while the
+    # caller handles another error, would replace it; a bare re-raise would not.
+    try:
+        raise _codec_error()
+    except UnicodeDecodeError:
+        raise ValueError("synthetic")  # noqa: B904 -- the implicit context is the point
+
+
+class _UnreadableChain(ValueError):
+    """A ValueError whose ``__cause__`` raises on each instance's first read, so a chain walk
+    does not finish; ``reads`` counts the reads of that instance."""
+
+    def __init__(self) -> None:
+        super().__init__("synthetic")
+        self.reads = 0
+
+    @property
+    def __cause__(self) -> BaseException | None:  # type: ignore[override]
+        self.reads += 1
+        if self.reads == 1:
+            raise RuntimeError("synthetic")
+        return None
+
+
+def _outcome(call: Callable[[], object]) -> list[tuple[type[BaseException], str]]:
+    """The class and text ``call`` raises, read once bare and once while an unrelated error is
+    being handled. Re-raising the instance after a dispatch's own handler has exited, while the
+    caller handles an error, replaces its ``__context__`` with that error, so the second reading
+    tells an implicit codec context kept, as on main, from one replaced."""
+    seen: list[tuple[type[BaseException], str]] = []
+    with pytest.raises(Exception) as caught:
+        call()
+    seen.append((type(caught.value), str(caught.value)))
+    try:
+        raise LookupError("synthetic unrelated")
+    except LookupError:
+        with pytest.raises(Exception) as caught:
+            call()
+    seen.append((type(caught.value), str(caught.value)))
+    return seen
+
+
+@pytest.mark.parametrize(
+    "raise_error",
+    [
+        pytest.param(_raises(lambda: InsecureHopRefused("synthetic")), id="hop-refused"),
+        pytest.param(_raises(_dpapi_error), id="dpapi-error"),
+        pytest.param(_raises(_dpapi_unavailable), id="dpapi-unavailable"),
+        pytest.param(_raises(_recorded_refusal), id="recorded"),
+        pytest.param(_raises(_codec_error), id="codec-error"),
+        pytest.param(_raises(_caused_by_codec), id="value-error-caused-by-codec"),
+        pytest.param(_raise_in_codec_context, id="value-error-in-codec-context"),
+        pytest.param(_raises(_caused_by_vault_hop), id="caused-by-vault-hop"),
+        pytest.param(_raises(_UnreadableChain), id="unreadable-chain"),
+        pytest.param(_raises(lambda: ValueError("synthetic")), id="plain-value-error"),
+        pytest.param(_raises(lambda: RuntimeError("synthetic")), id="runtime-error"),
+    ],
+)
+def test_an_error_from_build_provider_reaches_the_caller_as_on_main(
+    monkeypatch: pytest.MonkeyPatch, raise_error: Callable[[], object]
+) -> None:
+    # Differential pin: the dispatch adds no build arm, so an error build_provider raises reaches
+    # resolve_key_provider raw and store.base's key seam, decrypt-key seam and cipher build with
+    # the class and text main's dispatch gives them. The build part of vault BACKLOG #6709 was
+    # withdrawn to main, so a plain ValueError here is still read as a refused key (open).
+    from messagefoundry.store import keyprovider
+    from messagefoundry.store.base import build_store_cipher
+
+    settings = StoreSettings(key_provider="vault")
+    _MAIN_STEP_CALLS.clear()
+    raised = _plant_build_provider(monkeypatch, raise_error)
+    with pytest.raises(Exception) as direct:
+        resolve_key_provider(settings)
+    assert direct.value is raised[-1]
+    calls: list[Callable[[], object]] = [
+        lambda: resolve_active_key(settings),
+        lambda: resolve_decrypt_keys(settings),
+        lambda: build_store_cipher(settings),
+    ]
+    head = [_outcome(call) for call in calls]
+    assert not _MAIN_STEP_CALLS
+    monkeypatch.setattr(keyprovider, "_load_external_provider", _mains_build_step)
+    main = [_outcome(call) for call in calls]
+    assert _MAIN_STEP_CALLS, "main's build step never ran, so the comparison pins nothing"
+    _MAIN_STEP_CALLS.clear()
+    assert head == main
+    # raised[0] is the bare resolve_key_provider call above, which reads no chain.
+    unreadable = [e for e in raised[1:] if isinstance(e, _UnreadableChain)]
+    assert all(e.reads for e in unreadable), "store.base never read the chain, so it pins nothing"

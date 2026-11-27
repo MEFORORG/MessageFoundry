@@ -136,6 +136,7 @@ from messagefoundry.config.loaded_crls import (
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import (
+    OUTBOUND_CRL_SETTING,
     context_checks_chain_revocation,
     crl_in_effect,
     crl_label,
@@ -148,6 +149,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import (
+    OWN_CRL_CHAIN_HOPS,
     CrlBlock,
     CrlFacts,
     CrlIssuerKey,
@@ -901,7 +903,8 @@ def _load(
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
     reloaded = timed = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
-    unowned: dict[frozenset[bytes], str | None] = {}  # why the own-CRL rule refuses, if it does
+    # Why the own-CRL rule refuses, if it does, per CA list and per wording (vault BACKLOG #5511).
+    unowned: dict[tuple[frozenset[bytes], str | bool | None], str | None] = {}
     for ctx, held, held_back in ready:
         if held_back is not None:
             # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
@@ -932,9 +935,22 @@ def _load(
                 # Vault BACKLOG #5627: the rule a start applies to a hop checking the whole chain,
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
                 # loads live.
-                if anchors not in unowned:
-                    unowned[anchors] = own_crl_reason(anchors, pem)
-                if (unowned_why := unowned[anchors]) is not None:
+                # Keyed by the wording: a hop in pki.OWN_CRL_CHAIN_HOPS gets its own, and the
+                # rest only outbound or not, so listeners sharing one CA list judge it once.
+                wording = (
+                    held.setting
+                    if held.setting in OWN_CRL_CHAIN_HOPS
+                    else held.setting == OUTBOUND_CRL_SETTING
+                )
+                key = (anchors, wording)
+                if key not in unowned:
+                    unowned[key] = own_crl_reason(
+                        anchors,
+                        pem,
+                        outbound=held.setting == OUTBOUND_CRL_SETTING,
+                        setting=held.setting,
+                    )
+                if (unowned_why := unowned[key]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue
             if unsigned is not None:
@@ -1301,8 +1317,15 @@ class CrlReloadRunner:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self) -> None:
-        """Signal the loop and await its exit, for at most ``stop_timeout_seconds`` (idempotent).
+    @property
+    def stop_timeout_seconds(self) -> float:
+        """The bound :meth:`stop` waits for a pass in flight when it is handed none."""
+        return self._stop_timeout
+
+    async def stop(self, *, timeout: float | None = None) -> None:
+        """Signal the loop and wait up to ``timeout``, or ``stop_timeout_seconds`` when it is None,
+        for its exit, then cancel a pass still running and wait for the cancel to land (idempotent).
+        engine.stop() passes a shorter timeout under its budget (BACKLOG #3191).
 
         A pass in flight gets that long to finish, so it does not go on loading CRLs after the engine
         stopped. A pass that takes longer, such as a read hung on a network share, is abandoned: the
@@ -1313,19 +1336,20 @@ class CrlReloadRunner:
         A stopped runner can no longer see a refusal clear, and the next start builds every
         context from the file as it is then, so an alert left open would say hops hold an old
         copy when none does. A runner started again raises it afresh if a refusal still stands."""
+        wait = self._stop_timeout if timeout is None else timeout
         self._stop.set()
         task = self._task
         self._task = None
         if task is not None:
             try:
-                done, _ = await asyncio.wait({task}, timeout=self._stop_timeout)
+                done, _ = await asyncio.wait({task}, timeout=wait)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
             if not done:
                 log.warning(
                     "crl_reload: a reload pass did not finish within %gs of stop; abandoning it",
-                    self._stop_timeout,
+                    wait,
                 )
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

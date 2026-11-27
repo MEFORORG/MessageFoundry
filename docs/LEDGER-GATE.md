@@ -106,7 +106,8 @@ on the maintainer clone: the backlog floor is **314** counting every ref, but **
 allocator silently resumes issuing numbers that are already in use, with no error. So the highest floor
 ever computed is stored at `<git-common-dir>/mefor-coord/alloc/<kind>/.floor-highwater` and the floor
 never goes below it; a computed floor beneath the mark prints a loud NOTE rather than quietly handing
-out a used number. The mark can only rise.
+out a used number. One run never lowers the mark, but two concurrent runs can leave the lower value,
+because the last writer wins.
 
 **Two maximums, not one — and conflating them bricked the allocator on 2026-08-03.** The public backlog
 sequence is partitioned from the maintainer-internal one at `PUBLIC_BACKLOG_FLOOR` (`#1000`), so the
@@ -279,19 +280,39 @@ same key and the check was a no-op between them. [WORKTREE-GATE.md](WORKTREE-GAT
 session into its own worktree, which is what makes worktree-keyed ownership meaningful. The two gates are
 a pair.
 
-### When the owning worktree is gone — recreate it (BACKLOG #1293)
+### When the owning worktree is gone — check out the branch, or recreate it (BACKLOG #1293, #1282)
 
 `Checker.owns` compares the recorded worktree path to the committing one by **casefolded string
-equality**, with no fallback. So removing a worktree that holds an unlanded allocation strands the
-number: `owns()` returns false for **every** session from then on, and any PR that must re-introduce
-that heading is unlandable **by anyone**. PR #397 was stranded exactly this way.
+equality** first. When the path misses, it falls back to the **recorded branch**: a commit from a
+worktree whose `HEAD` is a branch of the recorded name is entitled to the number (BACKLOG #1282).
+Both keys apply only to a record this machine made (`record_is_here`), so another PC's number is
+never this tree's.
+The branch is a second key that survives the worktree, so removing a worktree no longer strands its
+number on that alone; a branch can be deleted too, so it is not a permanent one. Before the fallback,
+removing a worktree that held an unlanded allocation stranded the number:
+`owns()` returned false for **every** session from then on, and any PR that had to re-introduce that
+heading was unlandable **by anyone**. PR #397 was stranded exactly this way.
 
-**Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while this worktree owns a
-number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
+**The fallback is NOT exclusive.** It is tried whenever the committing tree's path misses, so at
+least two trees can be entitled to one number, for example the recorded worktree by path while it
+stands on another branch (the `drifted-branch-free` state below) and a second worktree on the
+recorded branch. **The match is by name.**
+`owns()` reads the name of the current branch and never checks that it is the branch the allocation
+saw, so a deleted branch recreated under the same name restores entitlement, and an unrelated branch
+that reuses the name inherits it. **A number still strands when the record carries no branch**, as
+one made before the branch field existed does, and its worktree is gone. Then the recovery below is
+the one that works.
+
+`scripts/worktree/remove.ps1` refuses at least the removal of a worktree whose path an allocation
+record names, matched by path only, for a number whose item is not yet on `origin/main`, and a
+cannot-tell reads as at-risk. It does not stop every way a number can strand. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
-uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
+uncommitted changes"*, and one consent must not silently cover a second risk.
 
-**Recovery, for a number already stranded: RECREATE A WORKTREE AT THE RECORDED PATH.** Owner ruling,
+**Recovery, for a number refused after its worktree is gone: follow the table below. A recorded branch
+that exists is the `orphan-branch-held` and `orphan-branch-free` rows; where the record names no
+branch, or its branch is gone (`orphan-branch-absent`), RECREATE A WORKTREE AT THE RECORDED PATH.**
+Owner ruling for the recreate,
 2026-08-21. Its closeness to the rename workaround [`CLAUDE.md`](../CLAUDE.md) §5 forbids was put to the
 owner explicitly and ruled acceptable **for this case only**.
 

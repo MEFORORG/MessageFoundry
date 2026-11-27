@@ -7,6 +7,7 @@ healthy."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 from pathlib import Path
@@ -30,6 +31,7 @@ from messagefoundry.store import MessageStore, Stage
 from messagefoundry.store.store import MessageStatus, OutboxItem
 from messagefoundry.transports.file import FileSource
 from tests._admin_account import create_local_user_chosen
+from tests._ast_sites import parse_source
 
 
 async def _until(predicate: Any, timeout: float = 2.0) -> None:
@@ -188,6 +190,97 @@ async def test_session_reaper_survives_purge_error(monkeypatch: pytest.MonkeyPat
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_session_reaper_runs_after_purge_only_after_a_committed_purge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the step after the purge (the lifespan's re-proof count drop) runs once per
+    purge that committed, not after a failed one, and a failure in it does not stop the reaper."""
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
+    calls = {"purge": 0, "after": 0}
+
+    class _Store:
+        async def purge_expired_sessions(
+            self,
+            *,
+            now: float | None = None,
+            idle_seconds: float | None = None,
+            lineage_seconds: float | None = None,
+        ) -> None:
+            calls["purge"] += 1
+            if calls["purge"] == 1:
+                raise RuntimeError("db blip")
+
+    async def after() -> None:
+        calls["after"] += 1
+        if calls["after"] == 1:
+            raise RuntimeError("drop blip")
+
+    task = asyncio.ensure_future(
+        api_app._session_reaper(_Store(), after_purge=after)  # type: ignore[arg-type]
+    )
+    try:
+        await _until(lambda: calls["after"] >= 3)
+        assert not task.done()
+        # The failed first purge ran no follow-up; every later one did. The fakes never yield
+        # between a purge and its follow-up, so the count is exact.
+        assert calls["after"] == calls["purge"] - 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_a_hung_step_after_the_purge_does_not_stop_the_purges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5336: the step after the purge takes re-proof locks, so the reaper bounds it; a
+    step that never returns is stopped and the next purge still runs."""
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_AFTER_PURGE_TIMEOUT", 0.02)
+    calls = {"purge": 0}
+
+    class _Store:
+        async def purge_expired_sessions(self, **_: object) -> None:
+            calls["purge"] += 1
+
+    async def hung() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.ensure_future(
+        api_app._session_reaper(_Store(), after_purge=hung)  # type: ignore[arg-type]
+    )
+    try:
+        await _until(lambda: calls["purge"] >= 3)
+        assert not task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_the_lifespan_hands_the_reaper_the_reproof_count_drop() -> None:
+    """BACKLOG #5336: the lifespan wires the reaper to AuthService.drop_reaped_reproof_counts."""
+    source = (Path(__file__).resolve().parents[1] / "messagefoundry/api/app.py").read_text(
+        encoding="utf-8"
+    )
+    passing = [
+        c
+        for c in ast.walk(parse_source(source))
+        if isinstance(c, ast.Call)
+        and isinstance(c.func, ast.Name)
+        and c.func.id == "_session_reaper"
+        and any(
+            k.arg == "after_purge"
+            and isinstance(k.value, ast.Attribute)
+            and k.value.attr == "drop_reaped_reproof_counts"
+            and isinstance(k.value.value, ast.Name)
+            and k.value.value.id == "auth"
+            for k in c.keywords
+        )
+    ]
+    assert len(passing) == 1, "the lifespan no longer drops the reaped sessions' re-proof counts"
 
 
 # --- BACKLOG #1611 step 1: surviving the fault is not enough, the claimed row must come back ---

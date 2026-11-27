@@ -8,6 +8,7 @@ exported lock, one ``name==version`` per package, sorted, with markers and hashe
 
 * ``security/runtime-closure-core.txt`` copies ``docker/locks/requirements-core.lock``;
 * ``security/runtime-closure-sqlserver.txt`` copies ``docker/locks/requirements-sqlserver.lock``;
+* ``security/runtime-closure-postgres.txt`` copies ``docker/locks/requirements-postgres.lock``;
 * ``security/runtime-closure-harness.txt`` copies ``security/locks/requirements-harness.lock``.
 
 ``tests/test_risky_component_designation.py`` holds each copy to its lock, and uses this module to
@@ -41,6 +42,8 @@ CLOSURE = ROOT / "security" / "runtime-closure-core.txt"
 CORE_LOCK = ROOT / "docker" / "locks" / "requirements-core.lock"
 SQLSERVER_CLOSURE = ROOT / "security" / "runtime-closure-sqlserver.txt"
 SQLSERVER_LOCK = ROOT / "docker" / "locks" / "requirements-sqlserver.lock"
+POSTGRES_CLOSURE = ROOT / "security" / "runtime-closure-postgres.txt"
+POSTGRES_LOCK = ROOT / "docker" / "locks" / "requirements-postgres.lock"
 HARNESS_CLOSURE = ROOT / "security" / "runtime-closure-harness.txt"
 #: Not under docker/locks: no image installs it. It exists to be the harness closure's source.
 HARNESS_LOCK = ROOT / "security" / "locks" / "requirements-harness.lock"
@@ -50,6 +53,7 @@ HARNESS_LOCK = ROOT / "security" / "locks" / "requirements-harness.lock"
 PAIRS: tuple[tuple[Path, Path], ...] = (
     (CLOSURE, CORE_LOCK),
     (SQLSERVER_CLOSURE, SQLSERVER_LOCK),
+    (POSTGRES_CLOSURE, POSTGRES_LOCK),
     (HARNESS_CLOSURE, HARNESS_LOCK),
 )
 

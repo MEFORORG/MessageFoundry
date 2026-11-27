@@ -18,7 +18,9 @@ checks). Two checks are **required** (they can block a commit):
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
   ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
-  never a silent OFF (#230).
+  never a silent OFF (#230). The section-name refusal
+  (:class:`~messagefoundry.config.settings.SectionNameEnvError`, whose docstring says when) can
+  fail the leg instead.
 
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
@@ -330,7 +332,8 @@ def run_checks(
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
         # Not tagged. Several of its arms read no settings, and its preview falls back to the model
-        # default when a load fails, so a tag here would claim a source the line may not rest on.
+        # default when most loads fail, so a tag here would claim a source the line may not rest
+        # on. Its section-name refusal line does rest on one and is untagged all the same.
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -423,7 +426,16 @@ def run_checks(
         # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory here; a
         # build refuses it on some hops -- see the check and
         # transports.egress.warn_url_query_credentials.
-        _check_url_query_credentials(config_dir),
+        _with_source(
+            _check_url_query_credentials(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+                project_root=project_root,
+                env=env,
+            ),
+            source_note,
+        ),
         _check_generic_db_tls(config_dir),
         # BACKLOG #5041: a generic hop whose odbc_driver is off the driver allowlist, which the
         # build refuses. Advisory, since build-check is the required gate -- see the check.
@@ -1908,8 +1920,10 @@ def _resolve_snapshot_on_send(
     loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
-    to mirror (ADR 0104 §8.1)."""
-    from messagefoundry.config.settings import PipelineSettings
+    to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for
+    :func:`_check_dryrun` to fail its leg with rather than fall back on."""
+    from messagefoundry.config.settings import PipelineSettings, SectionNameEnvError
 
     toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_search, env=env
@@ -1920,6 +1934,8 @@ def _resolve_snapshot_on_send(
         # An instance declared in the environment alone previews its own MEFOR_PIPELINE_* value
         # (vault BACKLOG #2355), exactly as the settings legs read it.
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        raise  # why: SectionNameEnvError's docstring
     except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 
@@ -1932,9 +1948,15 @@ def _check_dryrun(
     suppress_search: bool = False,
     env: str | None = None,
 ) -> CheckResult:
+    from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_message_sets,
+    )
     from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
@@ -2008,15 +2030,32 @@ def _check_dryrun(
         return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
-    snapshot_on_send = _resolve_snapshot_on_send(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
-    )
+    try:
+        snapshot_on_send = _resolve_snapshot_on_send(
+            config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+        )
+    except SectionNameEnvError as exc:
+        return _settings_refused("dryrun", required=True, exc=exc)
     errors: list[str] = []
     total = 0
     pinned = 0
     asserted = (
         0  # runs checked against a declared .expect disposition (executable acceptance criteria)
     )
+    # Built once for the whole run, so each file-backed reference set is read once rather than once
+    # per fixture per inbound (BACKLOG #6820). Every fixture reads the same snapshot, and each read
+    # of a value decodes its own copy, as a read of the live engine's cache does. A loader fault the
+    # builder does not turn into a skipped set fails this leg, naming its type alone, rather than
+    # ending the report: per fixture it was an ERROR, through dry_run's own guard.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the detail
+        return CheckResult(
+            "dryrun",
+            ok=False,
+            required=True,
+            detail=f"reference sets did not load for the preview ({type(exc).__name__})",
+        )
     for label, path, raw, target in message_sets:
         try:
             expected = _expected_disposition(path, cap=cap)
@@ -2028,7 +2067,13 @@ def _check_dryrun(
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=ic_name,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             # A Router/Handler's own `raise` can quote field values, so its text goes through
             # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
             # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in
@@ -2495,6 +2540,73 @@ def _check_posture(
     )
 
 
+def _instance_env_values(settings: ServiceSettings) -> dict[str, Any]:
+    """The values ``serve`` resolves ``env()`` against under ``settings``: the active environment's
+    value file, with its environment-variable and secrets-directory overlays, or ``{}`` when the
+    settings name no environment. Raises what
+    :func:`~messagefoundry.config.environments.load_environment_values` raises, at least
+    ``ValueError`` for a malformed file and ``OSError`` for one that cannot be read.
+
+    Inside :func:`run_checks` the load runs once per distinct key, a refusal included, as
+    :func:`_load_check_settings` memoizes its load. The key is the environment, ``[environments]``
+    ``base_dir`` and ``dir``, and the working directory. The environment-variable and
+    secrets-directory overlays are read in that one load. So ``build-check`` and
+    ``url-query-credential`` read one set of values (PR 3150 finding 7, vault BACKLOG #3766). Each
+    caller gets its own deep copy."""
+    import copy
+    import os
+
+    from messagefoundry.config.environments import (
+        load_environment_values,
+        resolve_values_base_dir,
+    )
+
+    env_name = settings.ai.environment
+    if env_name is None:
+        return {}
+    base_dir, dir_name, cwd = settings.environments.base_dir, settings.environments.dir, Path.cwd()
+
+    def load() -> dict[str, Any]:
+        return load_environment_values(
+            base_dir=resolve_values_base_dir(base_dir, cwd=cwd),
+            dir_name=dir_name,
+            environment=env_name,
+            environ=os.environ,
+        )
+
+    memo = _RUN_MEMO.get()
+    if memo is None:
+        return load()
+    key = ("env-values", env_name, base_dir, dir_name, str(cwd))
+    if key not in memo:
+        try:
+            memo[key] = load()
+        except _SETTINGS_LOAD_ERRORS as exc:
+            memo[key] = exc
+            raise
+    cached = memo[key]
+    if isinstance(cached, BaseException):
+        raise cached.with_traceback(None)
+    return copy.deepcopy(cast("dict[str, Any]", cached))
+
+
+def _value_file_exists(settings: ServiceSettings, environment: str) -> bool:
+    """Whether the value file :func:`_instance_env_values` would read for ``environment`` is a
+    regular file. A path that cannot be built or stat'ed reads as absent here."""
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
+    from messagefoundry.config.snapshot import is_regular_file
+
+    try:
+        path = values_file_path(
+            resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+            settings.environments.dir,
+            environment,
+        )
+        return is_regular_file(path)
+    except (ValueError, OSError):
+        return False
+
+
 def _check_build(
     config_dir: str | Path,
     *,
@@ -2520,12 +2632,6 @@ def _check_build(
     this check); a graph that won't load → SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
     config blocks. With no file but an environment declaration the settings come from the environment
     alone (:func:`_settings_source`, vault BACKLOG #2355)."""
-    import os
-
-    from messagefoundry.config.environments import (
-        load_environment_values,
-        resolve_values_base_dir,
-    )
     from messagefoundry.config.settings import hop_posture_from_ai, insecure_bind_escape
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
@@ -2574,16 +2680,7 @@ def _check_build(
     # Resolve env() against the active environment the same way serve does, so a hop's host/scheme (an
     # env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference.
     try:
-        env_values = (
-            load_environment_values(
-                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-                dir_name=settings.environments.dir,
-                environment=env_name,
-                environ=os.environ,
-            )
-            if env_name is not None
-            else {}
-        )
+        env_values = _instance_env_values(settings)
         trust_anchor_policy = settings.tls.policy()
     except (ValueError, OSError) as exc:
         # A malformed environments/<env>.toml (TOMLDecodeError is a ValueError) or an unreadable
@@ -2969,7 +3066,14 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
     )
 
 
-def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
+def _check_url_query_credentials(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+    project_root: str | Path | None = None,
+    env: str | None = None,
+) -> CheckResult:
     """Name every outbound whose endpoint ``url`` carries a credential-like query parameter (ASVS
     14.2.1), with the parameter NAMES and never a value.
 
@@ -2978,11 +3082,15 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
     a heuristic over names. This line stays advisory on every hop. The ``build-check`` leg refuses
     one on a hop the no-escape credential rule covers, but that leg can SKIP (its own detail says
     why), so a passing ``check`` does not prove the hop was judged.
-    Unlike ``build-check``, it does not load the instance's environment values, so an ``env()`` URL
-    is read as its literal ``default=`` and one with no default is not read, which the clean
-    detail says; the construction WARNING and the posture entry read the resolved URL. SKIPs when
-    the graph
-    will not load, like its siblings."""
+
+    An ``env()`` URL is read against the environment values ``build-check`` loads, resolved as
+    ``serve`` resolves them (:func:`_instance_env_values`, vault BACKLOG #3766 item 24), when a
+    settings file or an environment declaration resolves and its values load. Otherwise it is read
+    by its literal ``default=``, including where the settings file cannot be read, the settings
+    are refused or the values do not load, which the detail names. Either way one that neither the values nor a default gives, or
+    whose value does not resolve (a failed cast, say), is not read, and the detail says which
+    reading ran, on a hit as on a clean graph (item 23). SKIPs when the graph will not load, like
+    its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
     name = "url-query-credential"
@@ -2992,15 +3100,62 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
         return CheckResult(
             name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
         )
-    found = query_credential_hops(registry)
+    defaults_only = "an env() url is read by its default= only, so one with no default is not read"
+    reading = f"{defaults_only}: no settings were read"
+    values: dict[str, Any] | None = None
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+    )
+    if toml is not None or env_only:
+        cli: dict[str, dict[str, object]] | None = (
+            {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
+        )
+        # The graph half needs no settings, so a refusal (which build-check reports) or values
+        # that do not load fall back to the defaults rather than drop the hops. Only the error's
+        # type is kept: a settings or decoder message can quote a configured value.
+        # Not "settings did not load": that is the refused settings legs' own line, which a
+        # census of those legs matches (tests/test_checks_settings_memo.py).
+        loaded = False
+        try:
+            settings = _load_check_settings(toml, cli=cli, env=env)
+            loaded = True
+            values = _instance_env_values(settings)
+        except _SETTINGS_LOAD_ERRORS as exc:
+            if loaded:
+                what = "the environment values did not load"
+            elif isinstance(exc, OSError) and toml is not None:
+                # A missing or unreadable --service-config is not a refusal of its content (PR
+                # 3150 finding 10, vault BACKLOG #3766).
+                what = "the settings file could not be read"
+            else:
+                what = "the settings were refused"
+            reading = f"{defaults_only}: {what} ({type(exc).__name__})"
+        else:
+            environment = settings.ai.environment
+            if environment is None:
+                reading = f"{defaults_only}: the settings name no environment"
+            else:
+                # A missing value file loads as no file, so the values are the overlays alone
+                # (MEFOR_VALUE_* and the secrets directory); say so rather than name the file.
+                source = (
+                    f"the {environment!r} environment's values"
+                    if _value_file_exists(settings, environment)
+                    else f"the overlays only, with no {environment!r} value file"
+                )
+                reading = (
+                    f"an env() url is read against {source}, else its default= where they hold "
+                    "no such key, so one that neither gives, or whose value does not resolve, is "
+                    "not read"
+                )
+    found = query_credential_hops(registry, env_values=values)
     if not found:
         return CheckResult(
             name,
             ok=True,
             required=False,
             detail=(
-                "no outbound or FhirLookup url carries a credential-like query parameter; an "
-                "env() url is read by its default= only, so one with no default is not read here"
+                "no outbound or FhirLookup url carries a credential-like query parameter; "
+                f"{reading}"
             ),
         )
     listed = "; ".join(f"{conn} ({params})" for conn, params in found)
@@ -3011,7 +3166,7 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(found)} connection(s) carry a credential in the endpoint url's query "
             f"string — {listed}. It rides the request line, so the partner's and any proxy's access "
-            "log holds it (ASVS 14.2.1)"
+            f"log holds it (ASVS 14.2.1); {reading}"
         ),
     )
 

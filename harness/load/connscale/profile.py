@@ -455,13 +455,28 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
         "empty_claims_base_reading": profile.slo.empty_claims_base_reading,
         "empty_claims_herd_floor_legs": bool(profile.slo.empty_claims_herd_floor_legs),
     }
-    # The floor grades the FIRST record at the base count in each lane (`herd_floor_readings`), so a
-    # repeat trial would be recorded and never graded: refuse the pairing rather than grade one of N.
-    if profile.slo.empty_claims_herd_floor_legs and profile.trials > 1:
-        raise ConnScaleProfileError(
-            f"{where}: slo.empty_claims_herd_floor_legs grades one base reading per lane, so it "
-            f"cannot be armed with trials = {profile.trials}"
-        )
+    # The floor once graded only the FIRST record at the base count of each (sweep_mode, claim_mode),
+    # so a repeat trial or a second arm was recorded and never graded. Since BACKLOG #5090
+    # `herd_floor_readings` groups on `monotonic_lane`, so each trial and each fusion or batching arm
+    # is graded in its own lane, labelled `.../trial=<n>`, `.../fuse=<on|off>` or
+    # `.../batch=<on|off>`; the harvest behind the arming never read a lane so named, so the pairing
+    # is refused. A sandbox A/B is refused with it in `_validate_sandbox`.
+    if profile.slo.empty_claims_herd_floor_legs:
+        splits = [
+            f"{name} = {value}"
+            for name, value, split in (
+                ("trials", profile.trials, profile.trials > 1),
+                ("fuse_modes", list(profile.fuse_modes), len(profile.fuse_modes) > 1),
+                ("batch_modes", list(profile.batch_modes), len(profile.batch_modes) > 1),
+            )
+            if split
+        ]
+        if splits:
+            raise ConnScaleProfileError(
+                f"{where}: slo.empty_claims_herd_floor_legs cannot be armed with "
+                f"{' and '.join(splits)}: each trial or arm grades in a lane of its own, named "
+                f"'.../<axis>=<value>', which the harvest behind the arming never read"
+            )
     for key, armed in per_lane_only.items():
         if armed and PER_LANE not in profile.claim_modes:
             raise ConnScaleProfileError(
@@ -506,14 +521,16 @@ def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: fuse_modes includes true with sandbox_modes naming {SANDBOX_SUBPROCESS!r}; "
             f"the engine disables fusion under the subprocess sandbox, so that arm would not be fused"
         )
-    # The two empty-claims checks group records by (sweep_mode, claim_mode), so with two sandbox arms
-    # they would grade one arm's base reading and never the other's. `fd_monotonic` keeps each arm in
-    # its own lane since BACKLOG #5570, but it skips an unmeasured reading, and the only bound that it
-    # compared anything at all is the CI smoke's, over any lane: an arm whose FD probe never measured
-    # would pass unseen beside one that did.
+    # Each of the three keeps each sandbox arm in its own lane: `fd_monotonic` since BACKLOG
+    # #5570, the two empty-claims checks since #5090. None has a per-arm bound that it graded
+    # anything: `fd_monotonic` skips an unmeasured reading, and the empty-claims checks pass a lane
+    # with no gradeable base reading (zero graded lanes is a pass), so the only bound is the CI
+    # smoke's, over any lane. An arm that produced nothing gradeable would pass unseen beside one
+    # that did.
     if len(profile.sandbox_modes) > 1:
-        mixes = (
-            "groups records by sweep mode and claim mode only, so it would mix the two sandbox arms"
+        ungraded = (
+            "has no per-arm bound that it graded each sandbox arm's base reading, so an arm with "
+            "none would pass unseen"
         )
         for key, armed, why in (
             (
@@ -522,11 +539,11 @@ def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
                 "has no per-arm bound that it compared each sandbox arm at least once, so an arm "
                 "whose FD probe never measured would pass unseen",
             ),
-            ("empty_claims_base_reading", profile.slo.empty_claims_base_reading, mixes),
+            ("empty_claims_base_reading", profile.slo.empty_claims_base_reading, ungraded),
             (
                 "empty_claims_herd_floor_legs",
                 bool(profile.slo.empty_claims_herd_floor_legs),
-                mixes,
+                ungraded,
             ),
         ):
             if armed:

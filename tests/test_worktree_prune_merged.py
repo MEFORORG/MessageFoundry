@@ -642,12 +642,20 @@ def git_shim_that_lies_about_removal(tmp_path: Path) -> Path:
     PATH itself and passes argv through untouched (measured: the caret survives and the exit code
     propagates).
     """
+    return _git_shim(tmp_path, "exit 0")
+
+
+def _git_shim(tmp_path: Path, on_remove: str) -> Path:
+    """A ``git.ps1`` that runs ``on_remove`` for ``worktree remove`` and passes all else through.
+    ``{git}`` in ``on_remove`` is the real git. See the docstring above for why it is ``.ps1``."""
     d = _shim_dir(tmp_path)
     real = shutil.which("git")
     assert real, "git must be on PATH"
     (d / "git.ps1").write_text(
         "# No param block: `-C <path>` must land in $args, not bind to a parameter.\n"
-        "if (($args -contains 'worktree') -and ($args -contains 'remove')) { exit 0 }\n"
+        "if (($args -contains 'worktree') -and ($args -contains 'remove')) {\n"
+        f"{on_remove.replace('{git}', real)}\n"
+        "}\n"
         f"& '{real}' @args\n"
         "exit $LASTEXITCODE\n",
         encoding="utf-8",
@@ -913,6 +921,82 @@ def test_dead_record_is_not_a_veto_and_not_a_permission(fx: Fixture, sleeper: in
     assert d["Occupants"] == []  # not a veto
     assert d["Decision"] == "SKIP"  # and not a green light either
     assert d["Reason"].startswith("recently active")
+
+
+def _gone_session_fields(state: str) -> tuple[int, int]:
+    """The pid and ``startedAt`` that make the fence read a record as ``state``. STALE is this
+    running process under a ``startedAt`` long before it began."""
+    now_ms = int(time.time() * 1000)
+    if state == "DEAD":
+        return never_live_pid(), now_ms
+    return os.getpid(), now_ms - 48 * 3600 * 1000
+
+
+@pytest.mark.parametrize(
+    ("state", "where"), [("DEAD", "root"), ("STALE", "root"), ("DEAD", "subdirectory")]
+)
+def test_a_dead_or_stale_record_holds_its_tree_and_the_next_run_still_works(
+    fx: Fixture, sleeper: int, state: str, where: str
+) -> None:
+    """Removing a tree with such a record in it left a record naming a checkout that is gone. The
+    fence cannot place that, so the next run refused every candidate, exit 2. The record stays
+    untouched, so the tree stays too: it is not a veto, it is not a permission, and -Name does not
+    lift it. Red before the fix on the second run's fence. ``repo-gone`` is the positive control."""
+    live_record(fx, sleeper, fx.primary)
+    clean = fx.sibling("clean")
+    cwd = clean if where == "root" else clean / "sub" / "dir"
+    pid, started_at = _gone_session_fields(state)
+    fx.write_session(pid=pid, cwd=cwd, session_id="eeeeeeee-5555", started_at=started_at)
+    record = fx.cfg / "sessions" / f"{pid}.json"
+    _backdate(fx.primary, clean, hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    first = run(fx, "-Apply", "-Name", "clean")
+    d = by_leaf(first, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert d["Occupants"] == [], "it is not reported as an occupant"
+    assert f"[{state}]" in d["Reason"], d["Reason"]
+    assert first["counts"]["removed"] == 0
+    assert clean.exists()
+
+    second = run(fx, "-Apply", "-Name", "gone")
+    assert second["fence"]["available"] is True, second["fence"]["detail"]
+    assert second["fence"]["recordsUnplaceable"] == 0
+    assert by_leaf(second, "gone")["Outcome"] == "removed"
+    assert second["_exit"] == 0
+    assert clean.exists()
+    assert record.exists(), "a record this script did not write is not its to delete"
+
+
+@pytest.mark.parametrize("state", ["DEAD", "STALE"])
+def test_a_dead_or_stale_record_arriving_mid_run_holds_the_tree(
+    fx: Fixture, sleeper: int, tmp_path: Path, state: str
+) -> None:
+    """The -Apply re-check reads the same hold: the record lands after the decision pass."""
+    merged = _stage_recheck(fx, sleeper)
+    pid, started_at = _gone_session_fields(state)
+    shim = gh_shim(
+        tmp_path,
+        payload=merged,
+        side_effect=(
+            "import json\n"
+            f"rec = {{'pid': {pid}, 'sessionId': 'beef0002-2222',"
+            f" 'cwd': r'{fx.sibling('clean')}', 'entrypoint': 'claude-desktop',"
+            f" 'startedAt': {started_at}}}\n"
+            f"pathlib.Path(r'{fx.cfg / 'sessions' / 'beef2.json'}')"
+            ".write_text(json.dumps(rec), encoding='utf-8')\n"
+        ),
+    )
+    res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
+
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", "the decision pass could not have known"
+    assert d["Outcome"] == "skipped"
+    assert d["OutcomeDetail"].startswith("re-check: "), d["OutcomeDetail"]
+    assert f"[{state}]" in d["OutcomeDetail"], d["OutcomeDetail"]
+    assert d["Occupants"] == []
+    assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"  # positive control
 
 
 def test_unreadable_record_vetoes_while_the_fence_stays_available(
@@ -1869,14 +1953,23 @@ def test_refuses_outside_a_repository(tmp_path: Path) -> None:
 
 
 def test_gh_json_field_list_is_one_argv_entry() -> None:
-    """`--json number, headRefOid` is three argv entries; gh rejects the third and the block dies.
+    """`--json number, headRefOid` is two argv entries; gh rejects the second and the block dies.
 
     That is the whole exact-tip merge probe silently never running while the receipt still claimed a
     PR probe was scoped -- a green gate that cannot see the thing it guards.
     """
     src = SCRIPT.read_text(encoding="utf-8")
-    assert "--json number,headRefOid" in src
+    assert "--json number,headRefOid,baseRefName,isCrossRepository " in src
     assert "--json number, " not in src
+
+
+def test_the_fetch_passes_no_auto_maintenance() -> None:
+    """BACKLOG #7614, pinned in the source too: the behavioural test skips on a git whose fetch does
+    not prune worktrees, and there it could not see the flag go missing."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    fetches = [ln for ln in src.splitlines() if re.search(r"&\s*git\b.*\bfetch\b", ln)]
+    assert fetches, "no fetch call found, so this check sees nothing"
+    assert all("--no-auto-maintenance" in ln for ln in fetches), fetches
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1889,11 +1982,15 @@ def test_gh_json_field_list_is_one_argv_entry() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def _stage_recheck(fx: Fixture, sleeper: int) -> None:
+def _stage_recheck(fx: Fixture, sleeper: int) -> str:
+    """Returns the gh payload to answer with: ``gone``'s PR merged at its tip, so it stays the
+    positive control once the probe answers (BACKLOG #7615 made a gone upstream with an answered
+    ``[]`` a SKIP)."""
     live_record(fx, sleeper, fx.primary)
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("clean"), hours=100)
     _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    return json.dumps([_pr(11, _git(fx.primary, "rev-parse", "gone").strip())])
 
 
 def test_a_session_arriving_mid_run_is_vetoed_and_counted(
@@ -1904,9 +2001,10 @@ def test_a_session_arriving_mid_run_is_vetoed_and_counted(
     The fence receipt must also OWN the save: a re-check veto used to leave `Occupants: []` on the one
     candidate the fence stopped, so `vetoedCandidates` reported 0 for a run signal 1 had rescued.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=(
             "import json, time\n"
             f"rec = {{'pid': {sleeper}, 'sessionId': 'beef0001-1111',"
@@ -1938,9 +2036,9 @@ def test_activity_is_rechecked_before_the_removal(
     Signal 1 has been measured vetoing 0 of 4 live siblings, so during the apply window the fence was
     effectively down: a git command by the occupant between the decision and the delete changed nothing.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     gitdir = fx.primary / ".git" / "worktrees" / "repo-clean" / "HEAD"
-    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{gitdir}', None)\n")
+    shim = gh_shim(tmp_path, payload=merged, side_effect=f"os.utime(r'{gitdir}', None)\n")
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -1957,9 +2055,9 @@ def test_a_mypy_run_during_the_apply_window_is_caught_by_the_recheck(
     """BACKLOG #5603. The re-check reads the working tree too: a mypy run between the decision and
     the delete touches no git metadata, only mypy's cache."""
     wt = _populate_mypy_cache(fx)
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     cache = wt / ".mypy_cache" / "3.14" / "cache.0.db"
-    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{cache}', None)\n")
+    shim = gh_shim(tmp_path, payload=merged, side_effect=f"os.utime(r'{cache}', None)\n")
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -1994,7 +2092,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_
     the side effect, is ``gone``'s, after ``clean``'s decision, as in the default-mode re-check tests.
     """
     _exclude(fx, ".ruff_cache/")
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     for other in fx.primary.parent.glob("repo-*"):
         if other.name not in ("repo-clean", "repo-gone"):
             subprocess.run(
@@ -2002,7 +2100,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_
                 capture_output=True,
                 check=False,
             )
-    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"))
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"), merged)
 
     res = run(fx, "-Apply", "-IdleHours", "0", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -2023,7 +2121,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("ahead"), hours=100)
     tip = _git(fx.primary, "rev-parse", "ahead").strip()
-    payload = json.dumps([{"number": 7, "headRefOid": tip}])
+    payload = json.dumps([_pr(7, tip)])
     shim = _grow_past_the_cap(tmp_path, fx.sibling("ahead"), payload)
 
     res = run(fx, "-Apply", "-Name", "ahead", skip_gh=False, path_prepend=shim)
@@ -2037,10 +2135,11 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
 def test_a_nested_worktree_appearing_mid_run_is_vetoed(
     fx: Fixture, sleeper: int, tmp_path: Path
 ) -> None:
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     late = fx.sibling("clean") / ".claude" / "worktrees" / "late"
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=(
             f"subprocess.run(['git', '-C', r'{fx.primary}', 'worktree', 'add', '-q', '-b',"
             f" 'late-branch', r'{late}'], check=True)\n"
@@ -2062,10 +2161,12 @@ def test_the_clean_recheck_keeps_the_specific_reason(
     A vanished directory, an exit-128 status, a new untracked file and a real edit are not the same
     event, and the operator is reading this precisely because something moved under a destructive run.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     victim = fx.sibling("clean") / "brand_new.py"
     shim = gh_shim(
-        tmp_path, side_effect=f"pathlib.Path(r'{victim}').write_text('x', encoding='utf-8')\n"
+        tmp_path,
+        payload=merged,
+        side_effect=f"pathlib.Path(r'{victim}').write_text('x', encoding='utf-8')\n",
     )
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
@@ -2084,10 +2185,11 @@ def test_a_fence_that_dies_mid_run_refuses_and_says_so(
     A caller gating on the receipt concluded the fence was fine; a caller gating on the exit code
     concluded a refusal. Both were reading the same run.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     sessions = fx.cfg / "sessions"
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=f"[p.unlink() for p in pathlib.Path(r'{sessions}').glob('*.json')]\n",
     )
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
@@ -2132,7 +2234,7 @@ def test_a_merged_pr_at_this_exact_tip_is_a_merge_signal(
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("ahead"), hours=100)
     tip = _git(fx.primary, "rev-parse", "ahead").strip()
-    shim = gh_shim(tmp_path, payload=json.dumps([{"number": 7, "headRefOid": tip}]))
+    shim = gh_shim(tmp_path, payload=json.dumps([_pr(7, tip)]))
 
     res = run(fx, skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "ahead")
@@ -2154,7 +2256,7 @@ def test_a_pr_merged_at_an_OLDER_tip_is_not_a_merge_signal(
     res = run(fx, skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "ahead")
     assert d["Decision"] == "SKIP"
-    assert any("the branch moved on after that merge" in n for n in d["Notes"])
+    assert any("the branch moved on after that merge" in n for n in d["Notes"]), d["Notes"]
 
 
 def test_a_failing_gh_probe_is_reported_not_claimed(
@@ -2178,6 +2280,107 @@ def test_a_failing_gh_probe_is_reported_not_claimed(
     assert "FAILED on 1 of 1" in res["gh"]
     assert any("merged-PR probe FAILED" in r for r in res["fence"]["reducedAssurance"])
     assert any("probe FAILED for this branch" in n for n in by_leaf(res, "ahead")["Notes"])
+
+
+@pytest.mark.parametrize(
+    "payload", ["not json at all", "", "null", '{"number": 1}', '[{"": 1}]', '[{"a": 1, "A": 2}]']
+)
+def test_a_gh_answer_that_is_not_a_json_array_is_a_failed_probe(
+    fx: Fixture, sleeper: int, tmp_path: Path, payload: str
+) -> None:
+    """BACKLOG #7615 review. On origin/main, exit 0 with malformed text read as an empty answer
+    counted as a successful probe, and a JSON value that is not an array crashed the run. Now it is
+    a failed probe in the receipt, but gh did exit 0, so the gone upstream is not re-enabled: the
+    crash removed nothing, and this must not remove more."""
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    shim = gh_shim(tmp_path, payload=payload)
+
+    res = run(fx, skip_gh=False, path_prepend=shim)
+    assert res["ghProbes"]["failed"] == res["ghProbes"]["attempted"] > 0, res["ghProbes"]
+    d = by_leaf(res, "gone")
+    assert any("without a JSON array" in n for n in d["Notes"]), d["Notes"]
+    assert d["Decision"] == "SKIP", d
+
+
+def _pr(number: int, oid: str, *, base: str = "main", fork: bool = False) -> dict[str, Any]:
+    """One row of ``gh pr list --json number,headRefOid,baseRefName,isCrossRepository``."""
+    return {"number": number, "headRefOid": oid, "baseRefName": base, "isCrossRepository": fork}
+
+
+@pytest.mark.parametrize(
+    ("row", "needle"),
+    [
+        pytest.param({"base": "release/1"}, "into 'release/1', not 'main'", id="other-base"),
+        pytest.param({"fork": True}, "from a fork", id="fork"),
+        pytest.param(None, "did not say which base", id="fields-missing"),
+    ],
+)
+def test_a_pr_merged_at_this_tip_but_not_into_main_from_this_repo_is_not_a_merge_signal(
+    fx: Fixture, sleeper: int, tmp_path: Path, row: dict[str, Any] | None, needle: str
+) -> None:
+    """BACKLOG #7615. ``--head <branch>`` matches a PR into ANY base, and a fork's PR from a branch of
+    the same name. A stacked PR merged into another feature branch leaves this branch's commits off
+    main, so it must not read as merged. A row without the two fields fails closed too."""
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("ahead"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "ahead").strip()
+    pr = {"number": 7, "headRefOid": tip} if row is None else _pr(7, tip, **row)
+    shim = gh_shim(tmp_path, payload=json.dumps([pr]))
+
+    res = run(fx, skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "ahead")
+    assert d["Decision"] == "SKIP", d
+    assert d["Reason"] != "PR #7 merged at this exact tip"
+    assert any(needle in n for n in d["Notes"]), d["Notes"]
+    assert res["ghProbes"] == {"attempted": 1, "failed": 0, "firstError": ""}
+
+
+@pytest.mark.parametrize(
+    ("payload", "decision"),
+    [
+        pytest.param("[]", "SKIP", id="no-merged-pr"),
+        pytest.param("older", "SKIP", id="merged-at-an-older-tip"),
+        pytest.param("other-base", "SKIP", id="merged-at-this-tip-into-another-base"),
+        pytest.param("fork", "SKIP", id="merged-at-this-tip-from-a-fork"),
+        pytest.param("tip", "PRUNE", id="control-merged-at-this-tip"),
+    ],
+)
+def test_a_gone_upstream_is_not_a_merge_signal_when_the_pr_probe_answered_no(
+    fx: Fixture, sleeper: int, tmp_path: Path, payload: str, decision: str
+) -> None:
+    """BACKLOG #7615. ``[gone]`` means the remote ref is absent, which a CLOSED PR or a ``push
+    --delete`` leaves as well as a merge. When the probe ANSWERED and found no PR merged into main at
+    this tip, the gone upstream is not proof. ``-SkipGh`` keeps the old reading (the control below)."""
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "gone").strip()
+    body = {
+        "[]": "[]",
+        "older": json.dumps([_pr(5, "deadbeef" * 5)]),
+        "tip": json.dumps([_pr(6, tip)]),
+        "other-base": json.dumps([_pr(6, tip, base="release/1")]),
+        "fork": json.dumps([_pr(6, tip, fork=True)]),
+    }[payload]
+    shim = gh_shim(tmp_path, payload=body)
+
+    d = by_leaf(run(fx, skip_gh=False, path_prepend=shim), "gone")
+    assert d["Decision"] == decision, d
+    if decision == "SKIP":
+        assert any("probe found no PR merged into 'main'" in n for n in d["Notes"]), d["Notes"]
+        assert not any("ANOTHER branch" in n for n in d["Notes"]), d["Notes"]
+    else:
+        assert d["Reason"] == "PR #6 merged at this exact tip"
+
+    if payload != "[]":
+        return
+    # Control, once: with no probe at all the gone upstream still reads as merged, as before.
+    skipped = by_leaf(run(fx), "gone")
+    assert skipped["Decision"] == "PRUNE", skipped
+    assert "is gone" in skipped["Reason"]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2235,6 +2438,38 @@ def test_apply_fetches_for_real(fx: Fixture, sleeper: int) -> None:
     assert res["fetched"] is True
     assert "origin fetched" in res["refs"]
     assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
+def test_the_fetch_never_runs_background_maintenance(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #7614. A plain ``git fetch`` ends with ``maintenance run --auto``, which runs ``git
+    worktree prune`` and expires registrations in the middle of a pass that is reasoning about them.
+    Measured on git 2.55 with default gc settings: one expired prunable registration is enough. The
+    control after the run proves a plain fetch really would have pruned it here; a git whose auto
+    maintenance does not prune worktrees cannot show the hazard, so the test skips there."""
+    live_record(fx, sleeper, fx.primary)
+    _git(fx.primary, "push", "-q", "origin", "main")
+    far = fx.root / "far-away"
+    _add_worktree(fx.primary, far, "far-away")
+    shutil.rmtree(far)
+    # Expire at once, and run in the foreground so the control reads the end state.
+    for key, value in (
+        ("gc.autoDetach", "false"),
+        ("maintenance.autoDetach", "false"),
+        ("gc.worktreePruneExpire", "now"),
+    ):
+        _git(fx.primary, "config", key, value)
+
+    def registered() -> bool:
+        return "far-away" in _git(fx.primary, "worktree", "list", "--porcelain")
+
+    assert registered()
+    res = run(fx, "-Fetch", skip_fetch=False)
+    assert res["fetched"] is True, res["refs"]
+    assert registered(), "the script's fetch ran git's auto maintenance and pruned a registration"
+
+    _git(fx.primary, "fetch", "origin", "--prune", "--quiet")
+    if registered():
+        pytest.skip("this git's fetch does not prune worktrees, so the hazard cannot be shown here")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2344,6 +2579,44 @@ def test_a_repaired_orphan_stops_being_reported(fx: Fixture, sleeper: int) -> No
     later = run(fx)
     assert later["counts"]["orphansFromEarlierRuns"] == 0
     assert later["_exit"] == 0
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative-gitdir", "absolute-gitdir"])
+def test_an_unregistered_sibling_pointing_into_this_repo_is_an_orphan(
+    fx: Fixture, sleeper: int, relative: bool
+) -> None:
+    """BACKLOG #7616. The ledger-free detector compared the raw ``gitdir:`` line against the common
+    dir, so a pointer git wrote with ``worktree.useRelativePaths`` never matched and the orphan went
+    unreported. The absolute case is the control."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("lost")
+    flag = "true" if relative else "false"
+    _git(
+        fx.primary,
+        "-c",
+        f"worktree.useRelativePaths={flag}",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lost",
+        str(tree),
+    )
+    pointer = (tree / ".git").read_text(encoding="utf-8")
+    if relative and Path(pointer.split("gitdir:", 1)[1].strip()).is_absolute():
+        pytest.skip("this git ignores worktree.useRelativePaths (needs 2.48+)")
+    assert Path(pointer.split("gitdir:", 1)[1].strip()).is_absolute() is not relative, pointer
+    # Deregister it the way a failed removal leaves it: the admin entry gone, the directory and its
+    # .git pointer still on disk.
+    shutil.rmtree(_gitdir(tree))
+    assert "repo-lost" not in _git(fx.primary, "worktree", "list", "--porcelain")
+
+    res = run(fx)
+    assert [o["leaf"] for o in res["orphansFromEarlierRuns"]] == ["repo-lost"], res[
+        "orphansFromEarlierRuns"
+    ]
+    assert "git no longer lists it" in res["orphansFromEarlierRuns"][0]["why"]
+    assert res["_exit"] == 3
 
 
 def _write_orphan_ledger(fx: Fixture, *paths: Path) -> None:
@@ -2469,6 +2742,64 @@ def test_an_orphan_under_a_linked_ancestor(fx: Fixture, sleeper: int, where: str
     assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
     assert "is a link" in later["orphansFromEarlierRuns"][0]["why"], later
     assert later["_exit"] == 3
+
+
+@pytest.mark.parametrize("shape", ["not-found-under-unlistable-parent", "unreadable-leftover"])
+def test_an_end_state_it_cannot_confirm_is_not_counted_as_removed(
+    fx: Fixture, sleeper: int, tmp_path: Path, shape: str
+) -> None:
+    """The -Apply end state read the directory with Test-Path. Two shapes, both red before the fix:
+
+    * not found, under a parent this user may not list: Test-Path said false, so the tree counted as
+      removed, on a reading the shared "gone" rule does not accept;
+    * a leftover this user may not read, under that parent: Test-Path raised access denied, which
+      this script's Stop preference made fatal, so the run ended with exit 1 and no JSON receipt
+      after git had already run its removal.
+    """
+    live_record(fx, sleeper, fx.primary)
+    leftover = fx.sibling("clean")
+    _backdate(fx.primary, leftover, hours=100)
+    who = ""
+    shim: Path | None = None
+    if shape == "unreadable-leftover":
+        who = subprocess.run(
+            ["whoami"], capture_output=True, text=True, check=False, timeout=30
+        ).stdout.strip()
+        assert who
+        shim = _git_shim(
+            tmp_path,
+            "    & '{git}' @args\n"
+            "    $code = $LASTEXITCODE\n"
+            "    $left = [string]$args[-1]\n"
+            "    [void][System.IO.Directory]::CreateDirectory($left)\n"
+            f"    & icacls $left /deny '{who}:(RA,REA,RD)' | Out-Null\n"
+            "    exit $code",
+        )
+    try:
+        with _unlistable(fx.primary.parent):
+            res = run(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+    finally:
+        if shim is not None:
+            subprocess.run(
+                ["icacls", str(leftover), "/remove:d", who],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] == "orphaned", d
+    assert "not confirmed gone" in d["OutcomeDetail"], d["OutcomeDetail"]
+    assert d["BranchOutcome"] == "kept"
+    assert "could not be confirmed" in d["BranchDetail"], "git exited 0: it is not a failed removal"
+    assert res["counts"]["removed"] == 0
+    assert res["_exit"] == 3
+    assert "clean" in _git(fx.primary, "branch", "--list", "clean")
+
+    # With the deny lifted the ledger settles it: a leftover stays reported, a gone tree clears.
+    later = run(fx)
+    expected = [str(leftover)] if shape == "unreadable-leftover" else []
+    assert [o["path"].replace("/", "\\") for o in later["orphansFromEarlierRuns"]] == expected
 
 
 def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: int) -> None:
@@ -2710,6 +3041,266 @@ def test_a_claim_held_by_a_pruned_worktree_is_released(fx: Fixture, sleeper: int
     assert res["counts"]["claimsReleased"] == 1
     assert res["counts"]["claimsUnreleased"] == 0
     assert res["_exit"] == 0
+
+
+def _ledger_paths(fx: Fixture) -> list[str]:
+    """The paths in the orphan ledger, forward-slashed; ``[]`` when there is no ledger file."""
+    ledger = fx.primary / ".git" / "prune-merged-orphans.json"
+    if not ledger.exists():
+        return []
+    entries = json.loads(ledger.read_text(encoding="utf-8-sig"))
+    return [str(e["path"]).replace("\\", "/") for e in entries]
+
+
+def _fwd(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def _held_claims(res: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """``(path, key, file name)`` for every claim named by ``ledger.heldForClaims``."""
+    return [
+        (_fwd(Path(h["path"])), c["key"], Path(c["file"]).name)
+        for h in res["ledger"]["heldForClaims"]
+        for c in h["claims"]
+    ]
+
+
+def test_an_unknown_end_state_keeps_the_claim_and_its_ledger_entry(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Red before this branch's ledger pass: once the tree read as gone the ledger dropped the
+    entry, and the claim stayed with nothing reporting it. The pass releases no claim, ever; it keeps
+    the entry and names the claim, on a dry run and under -Apply, for claim.ps1 to release."""
+    live_record(fx, sleeper, fx.primary)
+    clean = fx.sibling("clean")
+    _backdate(fx.primary, clean, hours=100)
+    claim = write_claim(fx, "clean-work", clean)
+    living = write_claim(fx, "living-work", fx.sibling("dirty"))
+
+    with _unlistable(fx.primary.parent):
+        first = run(fx, "-Apply", "-Name", "clean")
+        assert by_leaf(first, "clean")["Outcome"] == "orphaned"
+        assert by_leaf(first, "clean")["ClaimsReleased"] == []
+        assert claim.exists(), "an unknown end state released the claim"
+        unconfirmed = run(fx, "-Apply")
+        assert unconfirmed["counts"]["claimsReleased"] == 0
+        assert claim.exists(), "a run that could not confirm the tree gone released the claim"
+        assert _ledger_paths(fx) == [_fwd(clean)]
+
+    named = [(_fwd(clean), "clean-work", claim.name)]
+    preview = run(fx)
+    assert preview["counts"]["claimsReleased"] == 0
+    assert claim.exists(), "a dry run released a claim"
+    assert _held_claims(preview) == named, "the dry run did not name the claim"
+    assert _ledger_paths(fx) == [_fwd(clean)], "a dry run rewrote the ledger"
+
+    confirmed = run(fx, "-Apply")
+    assert claim.exists(), "the ledger pass released a claim"
+    assert living.exists()
+    assert confirmed["counts"]["claimsReleased"] == 0
+    assert _held_claims(confirmed) == named
+    assert _ledger_paths(fx) == [_fwd(clean)], "the entry went while a claim still names the tree"
+    assert confirmed["_exit"] == 0
+
+    claim.unlink()  # what claim.ps1 -Release -Force does once a seat has checked the holder is gone
+    settled = run(fx, "-Apply")
+    assert settled["ledger"]["heldForClaims"] == []
+    assert _ledger_paths(fx) == []
+    assert settled["_exit"] == 0
+
+
+@pytest.mark.parametrize("claimed_by", ["this-machine", "another-pc", "unreadable-claim"])
+def test_a_gone_entry_stays_in_the_ledger_while_a_claim_may_name_it(
+    fx: Fixture, sleeper: int, claimed_by: str
+) -> None:
+    """The claim is named and never released, and the run's code is the one the claims alone earn:
+    0, so another PC's claim cannot red every run, or 1 for an unreadable claim as before. Red before
+    this branch: the ledger dropped the entry on the first -Apply."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("deleted")
+    _write_orphan_ledger(fx, tree)
+    claim = write_claim(fx, "deleted-work", tree)
+    if claimed_by == "another-pc":
+        rec = json.loads(claim.read_bytes())
+        rec["host"] = "OTHER-PC"
+        claim.write_bytes(json.dumps(rec).encode("utf-8"))
+    corrupt = _claims_dir(fx) / "corrupt.json"
+    if claimed_by == "unreadable-claim":
+        claim.unlink()
+        corrupt.write_bytes(b"{not json at all")
+
+    held = run(fx, "-Apply")
+    assert held["counts"]["claimsReleased"] == 0
+    assert _ledger_paths(fx) == [_fwd(tree)], "the entry went while a claim may still name it"
+    assert [_fwd(Path(h["path"])) for h in held["ledger"]["heldForClaims"]] == [_fwd(tree)]
+    if claimed_by == "unreadable-claim":
+        assert "could not be read" in held["ledger"]["heldForClaims"][0]["why"]
+        assert held["_exit"] == 1
+        corrupt.unlink()
+    else:
+        assert claim.exists()
+        assert _held_claims(held) == [(_fwd(tree), "deleted-work", claim.name)]
+        assert held["_exit"] == 0
+        claim.unlink()
+
+    settled = run(fx, "-Apply")
+    assert settled["ledger"]["heldForClaims"] == []
+    assert _ledger_paths(fx) == []
+    assert settled["_exit"] == 0
+
+
+@pytest.mark.parametrize(
+    ("host", "shown"),
+    [("OTHER-PC", "OTHER-PC"), (None, "<no host>"), (42, "<unreadable host>")],
+)
+def test_the_held_entry_notice_names_the_host_and_prints_no_release_command(
+    fx: Fixture, sleeper: int, host: object, shown: str
+) -> None:
+    """Red on 2d4ef04485: the notice printed one `claim.ps1 -Release '<key>' -Force` recipe for every
+    held entry and no host, so it told the operator to force-release another PC's claim from here.
+    Whether a claim can be released is claim.ps1's call, so the notice now prints no release command
+    for any claim; it names the key, the file and the host, and points at claim.ps1 -List. The text
+    and the receipt write the host the same way, a missing or non-string one included."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("deleted")
+    _write_orphan_ledger(fx, tree)
+    claim = write_claim(fx, "deleted-work", tree)
+    if host is not None:
+        rec = json.loads(claim.read_bytes())
+        rec["host"] = host
+        claim.write_bytes(json.dumps(rec).encode("utf-8"))
+
+    proc = run_text(fx)
+    receipt = run(fx)
+
+    assert claim.exists(), "the notice released a claim"
+    text = proc.stdout
+    start = text.find("ledger entr(ies) kept for a tree read as gone")
+    assert start >= 0, text
+    notice = text[start:]
+    assert "-Release" not in notice, notice
+    assert "-Force" not in notice, notice
+    claim_lines = [ln for ln in notice.splitlines() if "claim 'deleted-work'" in ln]
+    assert len(claim_lines) == 1, notice
+    line = claim_lines[0]
+    assert claim.name in line, line
+    assert f"host {shown}:" in line, line
+    assert "claim.ps1 -List" in line, line
+    assert "leaves the ledger on the next -Apply once no claim names its tree" in notice, notice
+    assert "could not be read in full stays" not in notice, notice
+    held = receipt["ledger"]["heldForClaims"]
+    assert [c["host"] for h in held for c in h["claims"]] == [shown], held
+
+
+def test_the_held_entry_footer_for_an_unreadable_registry_does_not_promise_it_clears(
+    fx: Fixture, sleeper: int
+) -> None:
+    """An entry held because a claim file could not be read was never named by a claim, so the
+    footer must not say it clears once no claim names its tree; it says what holds it instead."""
+    live_record(fx, sleeper, fx.primary)
+    _write_orphan_ledger(fx, fx.sibling("deleted"))
+    (_claims_dir(fx) / "corrupt.json").write_bytes(b"{not json at all")
+    notice = run_text(fx).stdout
+    start = notice.find("ledger entr(ies) kept for a tree read as gone")
+    assert start >= 0, notice
+    notice = notice[start:]
+    assert "could not be read in full stays" in notice, notice
+    assert "An entry a claim names" not in notice, notice
+    assert "-Release" not in notice, notice
+
+
+def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: int) -> None:
+    """The control for the hold above: an entry with nothing to release is not kept."""
+    live_record(fx, sleeper, fx.primary)
+    _write_orphan_ledger(fx, fx.sibling("deleted"))
+    other = write_claim(fx, "other-work", fx.sibling("dirty"))
+    res = run(fx, "-Apply")
+    assert _ledger_paths(fx) == []
+    assert res["ledger"]["heldForClaims"] == []
+    assert res["counts"]["claimsReleased"] == 0
+    assert other.exists()
+    assert res["_exit"] == 0
+
+
+@pytest.mark.parametrize(("git_exit", "surface"), [(1, "json"), (0, "text"), (1, "text")])
+def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
+    fx: Fixture, sleeper: int, tmp_path: Path, git_exit: int, surface: str
+) -> None:
+    """Red before the fix: it read ORPHANED and printed a recipe for moving a registered checkout
+    aside. The run established only git's exit code, that git still lists the tree, and that the
+    directory could not be read. A non-zero git exit keeps exit 3, because git may have deleted part
+    of the tree before it failed; exit 0 reports 1. The text case with git exit 1 was red a second
+    time on 2d4ef04485: exit 3 reached the closing line that says a directory is broken RIGHT NOW and
+    points at a recipe the run never printed."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("clean")
+    _backdate(fx.primary, tree, hours=100)
+    who = subprocess.run(
+        ["whoami"], capture_output=True, text=True, check=False, timeout=30
+    ).stdout.strip()
+    assert who
+    shim = _git_shim(
+        tmp_path,
+        "    $left = [string]$args[-1]\n"
+        f"    & icacls $left /deny '{who}:(RA,REA,RD)' | Out-Null\n"
+        f"    exit {git_exit}",
+    )
+    try:
+        with _unlistable(fx.primary.parent):
+            if surface == "json":
+                res = run(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+            else:
+                proc = run_text(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+    finally:
+        subprocess.run(
+            ["icacls", str(tree), "/remove:d", who],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+    assert _ledger_paths(fx) == [], "a tree git still lists is not an orphan to remember"
+    assert "clean" in _git(fx.primary, "branch", "--list", "clean")
+    if surface == "json":
+        d = by_leaf(res, "clean")
+        assert d["Outcome"] == "unknown", d["OutcomeDetail"]
+        assert d["OutcomeDetail"].startswith("END STATE UNKNOWN"), d["OutcomeDetail"]
+        assert "still lists" in d["OutcomeDetail"], d["OutcomeDetail"]
+        assert d["BranchOutcome"] == "kept"
+        assert res["counts"]["orphaned"] == 0
+        assert res["counts"]["failed"] == 1
+        assert res["_exit"] == (3 if git_exit else 1)
+    else:
+        assert "END STATE UNKNOWN" in proc.stdout, proc.stdout
+        for wrong in (
+            "ORPHANED",
+            "Move-Item",
+            "FAILED (exit",
+            "not a git repository",
+            "RIGHT NOW",
+            "recipe above",
+        ):
+            assert wrong not in proc.stdout, f"{wrong!r} in:\n{proc.stdout}"
+        # The run's own closing line for this exit, saying what it established and to re-check.
+        closing = [ln for ln in proc.stdout.splitlines() if "worktree(s) git still lists" in ln]
+        assert len(closing) == 1, proc.stdout
+        assert "1 worktree(s)" in closing[0], closing[0]
+        assert "Re-check" in closing[0], closing[0]
+        assert proc.returncode == (3 if git_exit else 1)
+
+
+def test_the_orphan_closing_line_still_prints_for_a_real_orphan(fx: Fixture, sleeper: int) -> None:
+    """The control for the case above: an orphan the ledger recorded, still on disk, takes the
+    closing line and its recipe, and no unknown-end-state line."""
+    live_record(fx, sleeper, fx.primary)
+    kept = fx.root / "kept" / "repo-kept"
+    kept.mkdir(parents=True)
+    _write_orphan_ledger(fx, kept)
+    proc = run_text(fx)
+    assert "RIGHT NOW" in proc.stdout, proc.stdout
+    assert "Move-Item" in proc.stdout, proc.stdout
+    assert "worktree(s) git still lists" not in proc.stdout, proc.stdout
+    assert proc.returncode == 3
 
 
 def test_a_claim_from_ANOTHER_machine_is_never_reaped_with_the_tree(

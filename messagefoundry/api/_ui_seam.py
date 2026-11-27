@@ -937,8 +937,9 @@ from typing import Any
 #: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
 #:
 #: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
-#: field too, to the style ``missing_eol_style`` names (CR for a body that starts with MSH). That
-#: helper is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
+#: field too, to the style ``missing_eol_style`` names (at the time, CR for a body that starts with
+#: MSH; the batch-header note below widens it). That helper
+#: is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
 #: hashed closure changed. No engine surface changed. Re-derived with ``--write`` on the branch,
 #: from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``, and over the merge with BACKLOG #5505 above,
 #: from ``10638208017f77d0`` to ``92b8db415d6730cc``.
@@ -961,12 +962,47 @@ from typing import Any
 #: again when those factories took every continuation from ``_step_up_continuation``, working it
 #: out only on a refusal, to ``7c3240bbbaf0605a``.
 #:
+#: BACKLOG #5559: the console adds ``GET /ui/users/{user_id}/delete-confirm``, the confirmation
+#: the users list links to for an account whose record fails its seal, and the snapshot records
+#: each ``/ui`` route. No engine surface changed. Re-derived with ``--write``, from
+#: ``0cb66e183386b7c8`` to ``10cd6745cb708c1a``, and over the merge with BACKLOG #5646 above, from
+#: ``7c3240bbbaf0605a`` to ``a888b8fed812bbe6``.
+#:
+#: Vault BACKLOG #3748 item 7: the console passes the keyword ``operation`` to the
+#: ``audit_channel_denied`` callback on its refusals that name no channel. As for BACKLOG #3378
+#: above, the digest does not cover that callback's signature, so it did not move and the handshake
+#: does not catch the skew. A newer console on an older engine raises TypeError on such a refusal:
+#: the bulk routes catch and log it and write no denial row, and the purge confirm page answers 500
+#: with no row. The console release that carries this raises its ``messagefoundry`` floor instead.
+#: ADR 0215's slice 5 drops the callback from the bundle, and each JSON route then writes its own
+#: row.
+#:
+#: BACKLOG #1149: the console's reauth-only action gate sends a pending session with no factor to
+#: enrolment when a session-ending action refuses it. The snapshot hashes that gate's body, so the
+#: digest moved. No engine surface changed. Re-derived with ``--write``, from
+#: ``a888b8fed812bbe6`` to ``c5417861cbb1bd67``.
+#:
+#: BACKLOG #6886: the console imports ``StoredPasskeysUnreadable``, which
+#: ``AuthService.begin_webauthn_assertion`` now raises for an account whose passkeys under the
+#: relying party all have stored ids that do not decode, and shows its own notice for it. Before,
+#: that leg let the decode error escape, a 500. A console built against the old seam
+#: would meet that exception unhandled, so the seam moves. Re-derived with ``--write``, from
+#: ``c5417861cbb1bd67`` to ``7802871bd39526f1``.
+#:
+#: BACKLOG #5930: ``missing_eol_style``, which ``_resubmit_form`` calls for a form with no ``eol``
+#: field, now names CR for a body led by a ``BHS`` or ``FHS`` batch header in its separator shape,
+#: as well as for one that starts with MSH. The snapshot hashes that function's body, so the digest
+#: moved. What it leaves unhashed includes at least the ``_LEADS_WITH_BATCH_HEADER`` pattern, which
+#: is module data. No engine surface changed. Re-derived with ``--write``, on the branch from
+#: ``c5417861cbb1bd67`` to ``46614ee1fc6617d6``, and over the merge with BACKLOG #6886 above, from
+#: ``7802871bd39526f1`` to ``2fdef0ec34ace13d``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "7c3240bbbaf0605a"
+ENGINE_UI_SEAM: str = "2fdef0ec34ace13d"
 
 
 @dataclass(frozen=True, slots=True)

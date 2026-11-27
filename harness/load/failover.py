@@ -73,6 +73,8 @@ REMOTE_DEBUG_OFF = ("-X", "disable-remote-debug")
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.5  # let the final ACKs/arrivals settle before the truly-final engine sample
+_OPENING_STATS_ATTEMPTS = 5
+_OPENING_STATS_RETRY_S = 0.5
 
 #: The most bytes the rig reads of one ``/health``, ``/cluster/status`` or ``/stats`` answer, the
 #: only API routes it polls over ``httpx`` (ASVS 5.1.1, BACKLOG #1127). Each is a role or a few
@@ -181,6 +183,11 @@ class EngineNode:
         self._env.pop(rigadmin.ADMIN_FACTOR_ENV, None)
         for name, value in rigadmin.SERVE_ENV.items():
             self._env.setdefault(name, value)
+        # The rig's own pollers (connscale's EnginePoller, the batch fleet) read /stats, /status and
+        # /connections every tick as the one rig Administrator, which outruns the per-actor
+        # monitoring-read pace (vault BACKLOG #1191) and would turn samples into 429s. A bench
+        # measures its own engine, so the pace is off here; setdefault, so a scenario can keep it.
+        self._env.setdefault("MEFOR_AUTH_MONITORING_READ_RATE_LIMIT_ENABLED", "false")
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
@@ -387,8 +394,11 @@ class EngineNode:
         data = await self._signed_in_json(client, "/stats")
         if data is None:
             return None
-        by = data.get("outbox_by_status", {})
-        by = by if isinstance(by, dict) else {}
+        by = data.get("outbox_by_status")
+        # The API always sends this map, and a status absent from it is a true zero. With no map at
+        # all this is no reading, and zeros here would pass as a run's opening baseline.
+        if not isinstance(by, dict):
+            return None
         return NodeStats(
             done=int(by.get("done", 0)),
             dead=int(by.get("dead", 0)),
@@ -679,8 +689,7 @@ async def run_failover_load(
             leader = await _await_single_leader(nodes, client, timeout=election_timeout)
             notes.append(f"elected {leader.node_id} as the initial primary")
             await _await_port("127.0.0.1", ports.inbound_adt, timeout=15.0)
-            done_baseline = await _live_stats(nodes, client)
-            done_at_start = done_baseline.done if done_baseline else 0
+            opening = await _opening_stats(nodes, client)
 
             dispatcher.start()
             stop = asyncio.Event()
@@ -732,7 +741,7 @@ async def run_failover_load(
                 tracker,
                 outcome,
                 final,
-                done_at_start,
+                opening.done,
                 fo,
                 notes,
             )
@@ -1058,6 +1067,21 @@ async def _live_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> Nod
         if s is not None:
             return s
     return None
+
+
+async def _opening_stats(nodes: list[EngineNode], client: httpx.AsyncClient) -> NodeStats:
+    """The run's baseline, read before any load. With none, the report would count a reused store's
+    prior ``done`` rows as this run's deliveries and hide duplicates, so the run refuses instead."""
+    for attempt in range(_OPENING_STATS_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_OPENING_STATS_RETRY_S)
+        stats = await _live_stats(nodes, client)
+        if stats is not None:
+            return stats
+    raise FailoverError(
+        f"could not read the opening /stats baseline in {_OPENING_STATS_ATTEMPTS} attempts; "
+        "no load was offered"
+    )
 
 
 async def _await_drain(node: EngineNode, client: httpx.AsyncClient, *, timeout: float) -> None:

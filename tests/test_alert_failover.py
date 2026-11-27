@@ -170,7 +170,11 @@ class _RecordingStore:
         return 1
 
     async def list_active_alert_instances(
-        self, *, limit: int = 1000, allowed_channels: object
+        self,
+        *,
+        limit: int = 1000,
+        allowed_channels: object,
+        suspended_until_after: float | None = None,
     ) -> list[Any]:
         return []
 
@@ -315,7 +319,12 @@ class _FakeSqlStore:
         self.executed.append(sql)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> None:
         self.executed.append(sql)  # the release's entry point (BACKLOG #5064)
 

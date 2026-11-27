@@ -32,6 +32,7 @@ __all__ = [
     "INTAKE_DISK_REASON",
     "REMINDER_SECONDS",
     "STORE_RESTORED_SUBJECT",
+    "UNREACHED_ROLLUP_SOURCE",
     "AlertSink",
     "HELD_COPY_NOTE",
     "LoggingAlertSink",
@@ -53,6 +54,12 @@ log = logging.getLogger(__name__)
 #: ``DEPTH_REASON`` and ``DISK_REASON``.
 INTAKE_DEPTH_REASON = "staged_depth"
 INTAKE_DISK_REASON = "disk_floor"
+
+#: The source label prefix of a rollup of unreachable directory accounts' ``ad_reconcile_aborted``
+#: instance, ``<this>:<key>`` (vault BACKLOG #3100 item 14). The API raises it; why each rollup is
+#: keyed by its accounts is said there, at ``_UNREACHED_ROLLUP_SOURCE``. Defined here so the
+#: notifier, which bounds its in-memory state for these instances, shares the one spelling.
+UNREACHED_ROLLUP_SOURCE = "directory-reconciler-unreached-rollup"
 
 #: How often an emitter raises a condition that persists again: ``queue_buildup``, ``message_stall``
 #: and ``saturation`` in ``wiring_runner``, and ``intake_paused`` in ``intake_bound``. One value, so
@@ -792,9 +799,10 @@ class AlertSink(Protocol):
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
-        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
-        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
-        (``AuthService._record_unreached_accounts`` decides when), so each
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or
+        ``"directory-reconciler-unreached-rollup:<key>"`` for a rollup of those entering on one
+        pass, keyed by those accounts (``AuthService._record_unreached_accounts`` decides when,
+        and the API's ``_UNREACHED_ROLLUP_SOURCE`` says why), so each
         is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
         ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
@@ -1115,9 +1123,12 @@ class AlertSink(Protocol):
         #2596 a worker runs the snapshot the engine sends it, so an edit on disk is not a cause.
 
         Raised once per refusal, on the event loop, by the runner: not again for each later
-        message the session refuses from its cached refusal, and not for a refusal computed
-        against a graph a reload has since replaced. A reload makes fresh sessions, so a refusal
-        that outlives the reload raises again. A sink that raises here is logged, not retried. ``name`` is the inbound connection's name.
+        message the session refuses from its cached refusal, and not for a refusal the runner
+        finds overtaken (``RegistryRunner._sandboxed_dispatch`` says when, BACKLOG #6830): that
+        message runs again instead, and its rerun's refusal, if the cause stands, raises it. A
+        reload makes fresh sessions, so a refusal that outlives the reload raises again, from the
+        fresh session. A sink that raises here is logged, not retried. ``name`` is the inbound
+        connection's name.
         Fixed words only, built by :func:`sandbox_worker_refused_detail`: no message content, no
         PHI. Not in the control-action set: a restart reloads nothing, so it cannot clear this.
         Nothing resolves it automatically; an operator resolves the instance after the reload."""

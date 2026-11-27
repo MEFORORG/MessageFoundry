@@ -9,10 +9,10 @@ import { isRecord } from "./engineTrustModel";
 
 /**
  * The fields of messagefoundry/api/models.py:ReloadResult (the /config/reload response) that the
- * promote reads. The engine also sends `degraded` and `failures`; reporting those is BACKLOG #2259.
- * `restart_required` holds setting names on an applied reload, and is null on a dry run, which did
- * not check. It is `unknown` here because `isReloadResult` does not check it, so a reader has to go
- * through `reloadShortfall`.
+ * promote reads. `degraded` is true when the graph swapped and a follow-on step did not complete,
+ * and `failures` then names each step (BACKLOG #2259, #5836). `restart_required` holds setting names
+ * on an applied reload, and is null on a dry run, which did not check. The three are `unknown` here
+ * because `isReloadResult` does not check them, so a reader has to go through `reloadShortfall`.
  */
 export interface ReloadResult {
   inbound: number;
@@ -21,6 +21,8 @@ export interface ReloadResult {
   handlers: number;
   running: boolean;
   dry_run: boolean;
+  degraded?: unknown;
+  failures?: unknown;
   restart_required?: unknown;
 }
 
@@ -97,21 +99,67 @@ export function preflightOutcome(
 const SETTING_NAME_RE = /^\[[a-z0-9_]{1,64}\]\.[a-z0-9_]{1,64}$/;
 
 /**
+ * One `failures` entry: a follow-on step label, such as `reference_sync` (ReloadResult's docstring
+ * in messagefoundry/api/models.py lists them). Server text headed for a notification, so a list
+ * holding anything else is reported as unreadable and never printed, as with `SETTING_NAME_RE`.
+ */
+const STEP_LABEL_RE = /^[a-z0-9_]{1,64}$/;
+
+/** `value` as a list of server strings each matching `re`, or undefined for any other shape. The
+ *  one gate on server text bound for a notification, so each list is checked the same way. */
+function printableList(value: unknown, re: RegExp): string[] | undefined {
+  return Array.isArray(value) && value.every((v) => typeof v === "string" && re.test(v))
+    ? (value as string[])
+    : undefined;
+}
+
+/** The degraded sentence, or none for a reload whose follow-on steps all completed. The engine
+ *  sends `degraded` and `failures` on every reply, and the two agree, so any other pairing (a
+ *  missing or non-boolean `degraded`, a clean reply naming a step, a degraded one naming none) is
+ *  unreadable, not clean. */
+function degradedShortfall(r: ReloadResult): string[] {
+  const steps = printableList(r.failures, STEP_LABEL_RE);
+  if (r.degraded === false && steps?.length === 0) {
+    return [];
+  }
+  if (r.degraded !== true || steps === undefined || steps.length === 0) {
+    return [
+      "Check the engine's log for whether a follow-on step failed after the swap: the engine's " +
+        "report of them could not be read.",
+    ];
+  }
+  // `audit` is among the labels, and nobody can redo that one by hand, so the sentence names the
+  // steps and the log rather than promising a step to finish.
+  const which = steps.length === 1 ? "this follow-on step" : "these follow-on steps";
+  return [
+    `Check the engine's log: ${which} failed after the swap: ${steps.join(", ")}. ` +
+      "The new graph is live.",
+  ];
+}
+
+/**
  * The sentences for what a live swap left to do, as far as this reply says. A list, as in the web
- * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, not reported here yet) can sit
- * beside the restart sentence. The first entry leads the notification, so it reads on from the
- * message's prefix. This reads applied replies only, so null or no value is unreadable, as any other
- * shape is. An unreadable list keeps the counts and says so: the swap did happen, and it must not
- * read as a clean promote.
+ * console's `_reload_shortfall`, so a degraded apply (BACKLOG #2259, #5836) sits beside the restart
+ * sentence. A known restart goes first, unlike the web console, which shows each sentence as its own
+ * banner: here only the lead survives a collapsed notification, and a stale CA is the one left
+ * trusted. An unreadable restart list knows of no stale CA, so a degraded report leads then. This
+ * reads applied replies only, so null or no value is unreadable, as any other shape
+ * is. An unreadable list keeps the counts and says so: the swap did happen, and it must not read as
+ * a clean promote.
  */
 function reloadShortfall(r: ReloadResult): string[] {
-  const names = r.restart_required;
-  if (
-    !Array.isArray(names) ||
-    !names.every((name) => typeof name === "string" && SETTING_NAME_RE.test(name))
-  ) {
+  const restart = restartShortfall(r);
+  const degraded = degradedShortfall(r);
+  return printableList(r.restart_required, SETTING_NAME_RE) === undefined
+    ? [...degraded, ...restart]
+    : [...restart, ...degraded];
+}
+
+function restartShortfall(r: ReloadResult): string[] {
+  const names = printableList(r.restart_required, SETTING_NAME_RE);
+  if (names === undefined) {
     return [
-      "check the engine's log for trust anchors that take a restart: the engine's list of them " +
+      "Check the engine's log for trust anchors that take a restart: the engine's list of them " +
         "could not be read.",
     ];
   }
@@ -119,7 +167,7 @@ function reloadShortfall(r: ReloadResult): string[] {
     return [];
   }
   return [
-    `restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
+    `Restart the engine for ${names.join(", ")}: this reload checked each changed CA file but ` +
       "does not load it, so the engine still trusts the old CA.",
     'The settings list above is not complete: see the section "Outbound TLS trust anchor" of ' +
       "docs/SECURITY.md in the MessageFoundry repository, at the paragraph " +
@@ -169,6 +217,11 @@ export function promoteOutcomeMessage(
   }
   return {
     level: "warning",
-    text: [`MessageFoundry: ${lead}`, `Promoted ${graph}`, ...rest].join(" "),
+    // The lead reads on from the prefix, so only it starts lower-case.
+    text: [
+      `MessageFoundry: ${lead.charAt(0).toLowerCase()}${lead.slice(1)}`,
+      `Promoted ${graph}`,
+      ...rest,
+    ].join(" "),
   };
 }

@@ -40,6 +40,7 @@ from messagefoundry.transports.database import (
     _make_pool,
     _thread_settled,
 )
+from tests._fake_dbapi_driver import ConnectionDriverError
 
 _SQLSERVER: dict[str, Any] = {"server": "db.example", "database": "d"}
 
@@ -202,7 +203,7 @@ class _RaisingRaw(_RawConnection):
 
     @autocommit.setter
     def autocommit(self, value: bool) -> None:
-        raise ConnectionError("HY000")
+        raise ConnectionDriverError("HY000")
 
 
 async def test_a_setter_that_raises_returns_the_connection_unconfirmed(driver: _Driver) -> None:

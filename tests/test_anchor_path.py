@@ -793,7 +793,361 @@ def test_posix_root_engine_trusts_only_root() -> None:
 def test_posix_clean_chain_on_a_network_mount_is_indeterminate() -> None:
     table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
     for fs in ("nfs", "nfs4", "cifs", "fuse.sshfs", "9p"):
-        assert _posix("/srv/a.pem", table, fstype={"/srv": fs}).ok is None, fs
+        v = _posix("/srv/a.pem", table, fstype={"/srv": fs})
+        assert v.ok is None, fs
+        assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)], fs
+        assert f"{fs} mount" in v.findings[0].reason, fs
+
+
+def test_posix_clean_chain_on_an_overlay_mount_is_indeterminate() -> None:
+    """vault BACKLOG #8390 item 31: an overlay answers as a network mount does (the
+    ``POSIX_TRUSTED_FS`` comment says why). Red under ``overlay`` back in ``POSIX_TRUSTED_FS``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    assert v.ok is None
+    assert [(f.path, f.mount) for f in v.findings] == [("/srv", True)]
+    assert "overlay mount" in v.findings[0].reason
+
+
+def test_posix_an_overlay_root_leaves_a_bind_mounted_anchor_indeterminate() -> None:
+    """An overlay root, as in a container: the walk reads the type under ``/`` too, so an anchor
+    on a bind-mounted ext4 volume still answers indeterminate, and the finding names ``/``."""
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay", "/srv": "ext4"})
+    assert v.ok is None
+    assert [f.path for f in v.findings] == ["/"]
+
+
+def test_an_overlay_anchor_refuses_at_enforce_unless_a_pin_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 31's outcome at ``enforce``: an overlay verdict is refused as any indeterminate path
+    is, and a matching pin loads it. Red under ``overlay`` back in ``POSIX_TRUSTED_FS``, where the
+    unpinned anchor was accepted."""
+    p = _pem(tmp_path)
+    table = {"/srv": (0, D755), "/srv/a.pem": (0, F644)}
+    overlay = _posix("/srv/a.pem", table, fstype={"/srv": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: overlay)
+    spec = AnchorSpec("t", "[x]", str(p), None, "[x].pin")
+    with pytest.raises(TrustAnchorError, match="enforce refuses it") as err:
+        ta.enforce_anchor(spec, enforcing=True)
+    assert "could not settle" in str(err.value) and "overlay mount" in str(err.value)
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), digest, "[x].pin"), enforcing=True)
+    # An anchor read again by path, as the store CAs and the outbound CAs are: a pin is no escape.
+    by_path = AnchorSpec("t", "[x]", str(p), digest, "[x].pin", loads_verified_bytes=False)
+    with pytest.raises(TrustAnchorError, match="at enforce it is refused") as err:
+        ta.enforce_anchor(by_path, enforcing=True)
+    assert "set [x].pin to" not in str(err.value).lower()
+
+
+_FOLDER = "/etc/messagefoundry/"
+# The fix under a mount the check cannot vouch for: S1 to S6, in this order, and nothing else.
+_S2 = "The path is also replaceable; fix that first"
+_S2_FILE = "this finding needs the file replaced by a regular file only root can change"
+_S3 = "set [x].pin to"
+_S4 = "At warn the anchor is used with a warning; at enforce it is refused."
+_S6 = "docker/README.md"
+# Sentences earlier passes wrote, each false in some case.
+_GONE = (
+    "no location below it passes",
+    "clears the finding above",
+    "Fixed in place",
+    "Or use a pin",
+    "moving the anchor",
+    "move the anchor",
+    "bind mount",
+    _FOLDER,
+)
+
+
+def _s1(mount: str, kind: str) -> str:
+    return (
+        f"The check cannot vouch for the mount at {mount!r} ({kind}), so it cannot settle any "
+        "anchor below that mount."
+    )
+
+
+def _s5(mount: str) -> str:
+    return f"An anchor on a mount the check trusts, outside {mount!r}, can pass."
+
+
+def _assert_template(text: str, present: list[str], absent: list[str]) -> None:
+    """``present`` appear in this order; ``absent`` and every retired sentence do not. Case is
+    ignored, so a sentence matches whether or not it opens the line."""
+    low = text.lower()
+    for s in [*absent, *_GONE]:
+        assert s.lower() not in low, (s, text)
+    at = [low.find(s.lower()) for s in present]
+    assert -1 not in at and at == sorted(at), (present, text)
+
+
+_MOUNT_TABLE = {
+    "/srv": (0, D755),
+    "/srv/a.pem": (0, F644),
+    "/etc/x": (0, D755),
+    "/etc/x/a.pem": (0, F644),
+    "/etc/messagefoundry": (0, D755),
+    "/etc/messagefoundry/ca.pem": (0, F644),
+}
+
+
+_FINGERPRINT = "ab" * 32
+
+
+def _path_text(
+    verdict: ap.PathVerdict,
+    anchor: str,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+) -> str:
+    """The insecure-path message for a POSIX anchor path, so the fix can tell the anchor's own file
+    and folder from a folder above them. ``_refusal`` reads a real file, whose path is this host's."""
+    spec = AnchorSpec(
+        "t", "[x]", anchor, None, pin_setting, loads_verified_bytes=loads_verified_bytes
+    )
+    found = ta.AnchorVerdict(_FINGERPRINT, True, None, verdict.ok, verdict)
+    return ta._path_message(spec, found)
+
+
+def _no_mountinfo(anchor: str) -> ap.PathVerdict:
+    """The host reader with no mount table: it answers no type for any path."""
+    return posix_path_verdict(
+        anchor,
+        cwd="/",
+        euid=10001,
+        lstat_fn=lambda q: PosixStat(*{**_ETC, **_MOUNT_TABLE}[q]),
+        readlink_fn=lambda q: "",
+        fstype_fn=lambda q: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mount", "kind", "anchor", "fstype"),
+    [
+        ("/", "overlay", "/srv/a.pem", {"/": "overlay"}),
+        ("/etc", "nfs", "/etc/x/a.pem", {"/etc": "nfs"}),
+        ("/", "unread mount table", "/srv/a.pem", None),
+        ("/", "unread mount table", _FOLDER + "ca.pem", None),
+        ("/srv", "nfs", "/srv/a.pem", {"/srv": "nfs"}),
+        ("/srv", "overlay", "/srv/a.pem", {"/srv": "overlay"}),
+    ],
+    ids=[
+        "overlay-root",
+        "nfs-etc",
+        "no-mountinfo",
+        "no-mountinfo-folder",
+        "nfs-srv",
+        "overlay-srv",
+    ],
+)
+def test_the_fix_under_an_untrusted_mount_is_the_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mount: str,
+    kind: str,
+    anchor: str,
+    fstype: dict[str, str] | None,
+) -> None:
+    """An anchor that could not be settled because of a mount: S1, the pin only for an anchor whose
+    consumer loads the verified bytes, S4, S5 only for a read mount other than '/', and the README
+    pointer only for an overlay. Nothing about moving. An unread mount table (``fstype`` None)
+    makes every path answer indeterminate, and its finding names '/'. Red under the earlier text,
+    which said moving did or did not help."""
+    v = _no_mountinfo(anchor) if fstype is None else _posix(anchor, _MOUNT_TABLE, fstype=fstype)
+    assert v.ok is None and [(f.path, f.mount) for f in v.findings] == [(mount, True)]
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    s6 = [_S6] if kind == "overlay" else []
+    tail = [_S4, *s5, *s6]
+    gone = [_s5(mount)] if not s5 else []
+    gone += [_S6] if not s6 else []
+    pinned = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin")
+    _assert_template(pinned, [_s1(mount, kind), _S3, *tail], [_S2, *gone])
+    by_path = _refusal(tmp_path, monkeypatch, v, loads_verified_bytes=False)
+    no_pin = [_S2, _S3, "pin it to", "A pin does not help here", *gone]
+    _assert_template(by_path, [_s1(mount, kind), *tail], no_pin)
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["verified-bytes", "by-path"])
+def test_an_insecure_path_under_an_untrusted_mount_is_the_template(by_path: bool) -> None:
+    """An insecure path under an overlay '/': S1, S2 with the anchor's own folder's chmod, S4 and
+    the README pointer. No pin, since a pin never clears a replaceable path, and no digest of
+    bytes that may be substituted. Red under the text that offered a pin and talked of moving."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _path_text(v, "/srv/a.pem", pin_setting="[x].pin", loads_verified_bytes=not by_path)
+    # /srv is the anchor's own folder, so dropping its write bits is the anchor's own fix.
+    s2 = [_S2 + ":", "  chmod go-w /srv"]
+    present = [_s1("/", "overlay"), *s2, _S4, _S6]
+    _assert_template(text, present, [_S3, _FINGERPRINT, _S2_FILE, "pin it to", "outside '/'"])
+
+
+def test_a_path_that_is_not_a_regular_file_gets_no_command() -> None:
+    """A path that is not a regular file is named without a command, as a folder above it is."""
+    odd = ap.ChainFinding("/srv/a.pem", FILE, True, "it is not a regular file")
+    overlay = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    (root,) = overlay.findings
+    text = _path_text(ap.PathVerdict(False, (odd, root), "posix", "uid 7"), "/srv/a.pem")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4, _S6], [_S2_FILE, "chmod"])
+
+
+def test_a_directory_named_as_the_anchor_gets_no_command() -> None:
+    """The setting names a directory another account owns, under an overlay '/': no chown of that
+    folder, which may be a user's home folder, and no word of replacing it with a file. Red under
+    the own-file commands the configured path drew whatever it named."""
+    table = {**_MOUNT_TABLE, **_USERS}
+    v = _posix("/data/team", table, fstype={"/": "overlay"})
+    assert v.ok is False
+    text = _path_text(v, "/data/team", pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], [_S2_FILE, "chown", "chmod"])
+
+
+def test_a_link_then_dotdot_draws_no_chmod_above_the_anchor() -> None:
+    """``/data/team/link/../ca.pem`` with ``link`` pointing at ``/etc`` opens ``/ca.pem``, as the
+    kernel resolves it, so the anchor's own folder is ``/``, not ``/data/team``. Red under the
+    lexical folder, which drew ``chmod go-w /data/team``."""
+    table = {
+        **_MOUNT_TABLE,
+        **_USERS,
+        "/data/team": (0, D777),
+        "/data/team/link": (0, LNK),
+        "/ca.pem": (0, F644),
+    }
+    anchor = "/data/team/link/../ca.pem"
+    v = _posix(anchor, table, links={"/data/team/link": "/etc"}, fstype={"/": "overlay"})
+    assert v.ok is False and [f.path for f in v.findings if f.insecure] == ["/data/team"]
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    _assert_template(text, [_s1("/", "overlay"), _S2 + ".", _S4], ["chmod", "chown"])
+
+
+@pytest.mark.parametrize(
+    ("mount", "kind"), [("/", "overlay"), ("/srv", "nfs")], ids=["overlay-root", "nfs-srv"]
+)
+def test_the_acl_warning_under_an_untrusted_mount_is_the_template(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mount: str,
+    kind: str,
+) -> None:
+    """At warn, an ACL that could not be read beside a replaceable path under an untrusted mount:
+    the ACL's warning follows the same template as the path's, with no pin for a replaceable path,
+    no digest, and no folder to move to. Red under the text that fell through to the folder and
+    the pin."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={mount: kind})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    acl = [r.message for r in caplog.records if "could not settle" in r.message]
+    assert len(acl) == 1, acl
+    tail = [_S4, _S6] if kind == "overlay" else [_S4, _s5(mount)]
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    _assert_template(acl[0], [_s1(mount, kind), _S2, *tail], [_S3, "pin it to", digest])
+
+
+def test_no_digest_of_a_file_a_non_owner_can_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At warn, a file whose permissions let a non-owner write it, under an overlay '/': the fix
+    quotes no digest of bytes that may be substituted. Red under the digest quoted whenever the
+    path was not found replaceable."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: v)
+    p = _pem(tmp_path)
+    ta.enforce_anchor(AnchorSpec("t", "[x]", str(p), None, "[x].pin"), enforcing=False)
+    assert "could not settle" in caplog.text and _S3 in caplog.text.lower(), caplog.text
+    assert hashlib.sha256(p.read_bytes()).hexdigest() not in caplog.text, caplog.text
+
+
+# A folder another account owns, standing in for a user's home folder.
+_USERS = {
+    "/data": (0, D755),
+    "/data/team": (1000, D755),
+    "/data/team/ca.pem": (0, F644),
+    "/data/team/pki": (0, D755),
+    "/data/team/pki/ca.pem": (0, F644),
+    "/srv/x": (0, D755),
+    "/srv/x/a.pem": (1000, F644),
+}
+
+
+@pytest.mark.parametrize(
+    ("anchor", "fstype", "table"),
+    [
+        ("/data/team/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", {"/": "overlay"}, {}),
+        ("/data/team/pki/ca.pem", None, {}),
+        ("/data/team/pki/ca.pem", {"/data": "nfs"}, {}),
+        ("/srv/x/a.pem", {"/srv": "nfs"}, {"/srv": (1000, D755)}),
+    ],
+    ids=["overlay-own-folder", "overlay-ancestor", "no-mountinfo", "nfs-data", "nfs-srv"],
+)
+def test_no_fix_under_an_untrusted_mount_chowns_a_folder(
+    anchor: str,
+    fstype: dict[str, str] | None,
+    table: dict[str, tuple[int, int]],
+) -> None:
+    """Under a mount the check cannot vouch for, fixing the path in place does not make it pass,
+    so the fix never hands a folder such as a user's home to root, and it follows the template.
+    A command for the anchor's own file stays. Red under the chown of /data/team (or /srv) the
+    fix offered."""
+    full = {**_MOUNT_TABLE, **_USERS, **table}
+    if fstype is None:
+        v = posix_path_verdict(
+            anchor,
+            cwd="/",
+            euid=10001,
+            lstat_fn=lambda q: PosixStat(*{**_ETC, **full}[q]),
+            readlink_fn=lambda q: "",
+            fstype_fn=lambda q: None,
+        )
+    else:
+        v = _posix(anchor, full, fstype=fstype)
+    assert v.ok is False
+    text = _path_text(v, anchor, pin_setting="[x].pin")
+    lines = text.splitlines()
+    assert lines, text  # the message the filter reads; v.ok False above proves a finding was made
+    folders = [line for line in lines if "chown" in line and "a.pem" not in line]
+    assert not folders, text
+    mount = next(f.path for f in v.findings if f.mount)
+    kind = (fstype or {}).get(mount, "unread mount table")
+    s5 = [_s5(mount)] if mount != "/" and fstype else []
+    _assert_template(text, [_s1(mount, kind), _S2, _S4, *s5], [_S3])
+    if anchor == "/srv/x/a.pem":
+        assert "  chown -h root /srv/x/a.pem" in text, text  # the anchor's own file
+
+
+def test_a_by_path_anchor_with_a_pin_says_why_the_pin_does_not_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A by-path anchor under an overlay '/' whose pin matches: the refusal says why that pin does
+    not help. Red under the template that dropped the sentence."""
+    v = _posix("/srv/a.pem", _MOUNT_TABLE, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(
+        tmp_path, monkeypatch, v, pin_setting="[x].pin", loads_verified_bytes=False, pin=digest
+    )
+    no_pin = "A pin does not help here: this anchor is read again by path"
+    _assert_template(text, [_s1("/", "overlay"), no_pin, _S4, _S6], [_S3, _S2])
+
+
+def test_a_pin_is_not_offered_for_a_replaceable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An insecure path under an overlay root whose pin already matches: a pin never clears a
+    replaceable path, so the fix offers none, and does not tell the operator to set the pin they
+    have."""
+    table = {**_MOUNT_TABLE, "/srv": (0, D777)}
+    v = _posix("/srv/a.pem", table, fstype={"/": "overlay"})
+    digest = hashlib.sha256(_pem(tmp_path).read_bytes()).hexdigest()
+    text = _refusal(tmp_path, monkeypatch, v, pin_setting="[x].pin", pin=digest)
+    assert "set [x].pin to" not in text and "already matches" not in text, text
 
 
 def test_posix_unknown_mount_table_is_indeterminate() -> None:
@@ -1073,11 +1427,27 @@ def test_path_arm_runs_beside_the_file_arm(tmp_path: Path, monkeypatch: pytest.M
         ta.enforce_anchor(spec, enforcing=True)
 
 
-def _refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: ap.PathVerdict) -> str:
+def _refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: ap.PathVerdict,
+    *,
+    pin_setting: str | None = None,
+    loads_verified_bytes: bool = True,
+    pin: str | None = None,
+) -> str:
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: verdict)
+    spec = AnchorSpec(
+        "t",
+        "[x]",
+        str(_pem(tmp_path)),
+        pin,
+        pin_setting,
+        loads_verified_bytes=loads_verified_bytes,
+    )
     with pytest.raises(TrustAnchorError) as err:
-        ta.enforce_anchor(AnchorSpec("t", "[x]", str(_pem(tmp_path)), None), enforcing=True)
+        ta.enforce_anchor(spec, enforcing=True)
     return str(err.value)
 
 
@@ -1415,3 +1785,575 @@ def test_a_subst_drive_splices_its_target_with_a_separator() -> None:
     chain, cause = windows_chain("certs\\ca.pem", "S:\\w", _plain_probe, drive_target=_subst_s)
     assert cause is None
     assert chain[-1] == ("C:\\real\\w\\certs\\ca.pem", FILE)
+
+
+# --- BACKLOG #6281 member S12-15: the real reader reads a mask only where an entry holds one -----
+
+#: ``S-1-1-0`` (Everyone) as a binary SID: revision 1, one sub-authority, authority 1, value 0.
+_EVERYONE_SID_BYTES = bytes([1, 1, 0, 0, 0, 0, 0, 1]) + (0).to_bytes(4, "little")
+
+
+def _ace(ace_type: int, body: bytes) -> bytes:
+    """One access entry: type, flags, the entry's size counting its own 4-byte header, then body."""
+    return bytes([ace_type, 0]) + (4 + len(body)).to_bytes(2, "little") + body
+
+
+def _allow_everyone() -> bytes:
+    return _ace(0x00, (0x001F01FF).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+
+
+def _set_protected_dacl(path: Path, aces: list[bytes]) -> int:
+    """Write ``aces`` as the protected DACL of ``path``, byte for byte, and return the Win32 status.
+    The kernel validates the list, so a status other than 0 means it refused that shape."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("writes a real NTFS DACL")
+    import ctypes
+    from ctypes import wintypes
+
+    body = b"".join(aces)
+    # ACL header: revision 2, sbz1, AclSize, AceCount, sbz2.
+    acl = (
+        bytes([2, 0])
+        + (8 + len(body)).to_bytes(2, "little")
+        + len(aces).to_bytes(2, "little")
+        + bytes(2)
+        + body
+    )
+    buffer = ctypes.create_string_buffer(acl, len(acl))
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    # SE_FILE_OBJECT; DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION.
+    return int(advapi32.SetNamedSecurityInfoW(str(path), 1, 0x80000004, None, None, buffer, None))
+
+
+@_windows_only
+def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
+    tmp_path: Path,
+) -> None:
+    """An entry of a type Windows does not define may be its 4-byte header alone, and the kernel
+    accepts it in a DACL. The reader records no rights for it, and reads nothing after its header
+    as part of it, such as the next entry's header, ``0x00140000``. Why that changes no verdict is
+    in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
+    target = tmp_path / "short-entry.txt"
+    target.write_bytes(b"synthetic")
+    assert _set_protected_dacl(target, [_ace(0x20, b""), _allow_everyone()]) == 0
+    sec = ap.windows_host_readers().read_security(str(target), FILE)
+    assert sec.error is None
+    assert sec.aces == ((0x20, 0, 0, ""), (0x00, 0, 0x001F01FF, "S-1-1-0"))
+
+
+@_windows_only
+def test_s12_52_the_shared_token_read_answers_the_sid_whoami_reports() -> None:
+    """The shared run-as SID read answers the SID ``whoami`` reports for this process's account, an
+    instrument outside every reader (BACKLOG #6281, member S12-52)."""
+    from messagefoundry import win32_sid
+
+    row = subprocess.run(
+        [_system_exe("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        check=True,
+    ).stdout.decode("ascii", errors="replace")
+    expected = row.strip().rsplit(",", 1)[1].strip('"')
+    assert expected.startswith("S-1-")
+    advapi32, kernel32 = win32_sid.sid_libraries()
+    assert win32_sid.process_user_sid(advapi32, kernel32) == expected
+    assert win32_sid.sid_text(advapi32, kernel32, None) is None
+
+
+@_windows_only
+def test_s12_52_both_windows_readers_take_the_run_as_sid_from_the_shared_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anchor reader and the config-source reader each answer whatever the shared token read
+    answers, so neither keeps a private copy of it."""
+    from messagefoundry import win32_sid
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    monkeypatch.setattr(win32_sid, "process_user_sid", lambda _a, _k: "S-1-5-21-1-2-3-4242")
+    assert ap.windows_host_readers().engine_sid == "S-1-5-21-1-2-3-4242"
+    assert _win32_config_source_probes().self_sid == "S-1-5-21-1-2-3-4242"
+
+
+@_windows_only
+def test_s12_52_the_config_source_readers_import_no_auth_module() -> None:
+    """The shared helper is a leaf outside ``auth/``, so building the config-source readers loads
+    nothing from the auth package."""
+    # ``messagefoundry.author_output`` shares the prefix, so the package is matched by its dot.
+    code = (
+        "import sys\n"
+        "from messagefoundry.config import wiring\n"
+        "def auth():\n"
+        "    return {m for m in sys.modules if (m + '.').startswith('messagefoundry.auth.')}\n"
+        "before = auth()\n"
+        "wiring._win32_config_source_probes()\n"
+        "print(wiring.__file__)\n"
+        "print(sorted(auth() - before))\n"
+    )
+    # Run from this tree, with it first on the path, so the child imports the code under test.
+    repo = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, [str(repo), os.environ.get("PYTHONPATH")])),
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=repo, env=env
+    ).stdout.splitlines()
+    assert Path(out[0]).resolve().is_relative_to(repo), out[0]
+    assert out[1] == "[]"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the refusal is the non-Windows branch")
+def test_s12_52_the_shared_sid_helpers_refuse_off_windows() -> None:
+    from messagefoundry import win32_sid
+
+    with pytest.raises(OSError, match="only on Windows"):
+        win32_sid.sid_libraries()
+    with pytest.raises(OSError, match="only on Windows"):
+        win32_sid.sid_text(None, None, None)
+    with pytest.raises(OSError, match="only on Windows"):
+        win32_sid.process_user_sid(None, None)
+
+
+@_windows_only
+def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path) -> None:
+    """The control: a well-formed allow entry reads with its mask and SID as before. The deny entry
+    beside it now records no rights; it recorded ``0x2`` before. Which callers that leaves unchanged
+    is in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
+    target = tmp_path / "well-formed.txt"
+    target.write_bytes(b"synthetic")
+    deny_write = _ace(0x01, (0x00000002).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+    assert _set_protected_dacl(target, [deny_write, _allow_everyone()]) == 0
+    sec = ap.windows_host_readers().read_security(str(target), FILE)
+    assert sec.error is None
+    assert sec.aces == ((0x01, 0, 0, ""), (0x00, 0, 0x001F01FF, "S-1-1-0"))
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        # Less than a header.
+        (bytes([0x00, 0]), "too short to hold its header"),
+        # An undefined type, header only: no rights recorded, and nothing past the header read.
+        (bytes([0x20, 0, 4, 0]), (0x20, 0, 0)),
+        # A deny entry grants nothing, so its mask is not recorded.
+        (_ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES), (0x01, 0, 0)),
+        # A well-formed allow entry, with its inheritance flags.
+        (
+            bytes([0x00, 0x03])
+            + (20).to_bytes(2, "little")
+            + (0x1F01FF).to_bytes(4, "little")
+            + _EVERYONE_SID_BYTES,
+            (0x00, 0x03, 0x1F01FF),
+        ),
+        # A callback allow entry carries its mask after the header; its SID is not parsed here.
+        (_ace(0x09, (0x40).to_bytes(4, "little")), (0x09, 0, 0x40)),
+        # A granting entry with no room for a mask.
+        (_ace(0x09, b""), "too short to hold its rights"),
+        (_ace(0x00, b""), "too short to hold its rights"),
+        # An allow entry with a mask but no room for a SID's fixed 8 bytes.
+        (_ace(0x00, (0x1F01FF).to_bytes(4, "little")), "too short to hold its SID"),
+        # An allow entry whose SID counts five sub-authorities but holds one.
+        (
+            _ace(
+                0x00, (0x1F01FF).to_bytes(4, "little") + bytes([1, 5, 0, 0, 0, 0, 0, 1]) + bytes(4)
+            ),
+            "too short to hold its SID",
+        ),
+    ],
+)
+def test_s12_15_a_dacl_entry_is_read_only_as_far_as_it_reaches(
+    entry: bytes, expected: tuple[int, int, int] | str
+) -> None:
+    """Every platform runs the entry parse the Windows reader uses (BACKLOG #6281, member S12-15).
+    The kernel refuses a too-short granting entry in a file's DACL (error 1340, measured on Windows
+    11, 2026-11-24), so these shapes reach no real-host test."""
+    assert ap.dacl_entry_fields(entry) == expected
+
+
+def _acl(entries: list[bytes], *, count: int | None = None, size: int | None = None) -> bytes:
+    """A DACL's bytes: the 8-byte header, then ``entries``. ``count`` and ``size`` override the
+    header's AceCount and AclSize; the bytes returned are always exactly ``size`` long, as the
+    reader copies them."""
+    body = b"".join(entries)
+    acl_size = 8 + len(body) if size is None else size
+    header = (
+        bytes([2, 0])
+        + acl_size.to_bytes(2, "little")
+        + (len(entries) if count is None else count).to_bytes(2, "little")
+        + bytes(2)
+    )
+    return (header + body + bytes(max(0, acl_size - 8 - len(body))))[:acl_size]
+
+
+_EVERYONE_ALLOW = (0, 0x00, 0, 0x1F01FF, 16)  # entry 0, so its SID starts at 8 + 8
+
+
+def _walk(
+    acl: bytes,
+) -> tuple[tuple[tuple[int, int, int, int, int | None], ...], str | None, tuple[int, ...]]:
+    walk = ap.dacl_entries(acl)
+    return walk.entries, walk.reason, walk.malformed
+
+
+def test_s12_15_the_dacl_walk_reads_each_entry_where_it_starts() -> None:
+    """The control: a well-formed DACL walks to each entry, and only the allow entry gets a SID
+    offset. A header-only entry of an undefined type last reads nothing past it."""
+    deny = _ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
+    assert _walk(_acl([deny, _allow_everyone(), _ace(0x20, b"")])) == (
+        ((0, 0x01, 0, 0, None), (1, 0x00, 0, 0x1F01FF, 8 + 20 + 8), (2, 0x20, 0, 0, None)),
+        None,
+        (),
+    )
+    assert _walk(_acl([])) == ((), None, ())
+
+
+def test_s12_15_a_dacl_with_slack_after_its_last_entry_reads_in_full() -> None:
+    """The control for the bound: Windows often leaves an AclSize larger than its entries, and the
+    unused bytes after the last entry are not read as one."""
+    assert _walk(_acl([_allow_everyone()], size=64)) == ((_EVERYONE_ALLOW,), None, ())
+
+
+def test_s12_15_the_walk_is_bounded_by_the_dacls_own_aclsize() -> None:
+    """Bytes past the header's AclSize are not read as an entry, whatever the caller passed."""
+    entries, reason, _ = _walk(_acl([], count=1, size=8) + _allow_everyone())
+    assert entries == ()
+    assert reason is not None and "starts past the end of the DACL" in reason
+
+
+_UNDEFINED_HEADER = (0, 0x20, 0, 0, None)
+_SHORT_CALLBACK = _ace(0x09, b"")  # AceSize 4: a granting type with no room for its rights
+_OVERRUNNING_EVERYONE = (
+    _allow_everyone()[:2] + (0xFFFF).to_bytes(2, "little") + _allow_everyone()[4:]
+)
+#: An allow entry with room for its rights and none for its SID, then a grant to Everyone.
+_SID_LESS_THEN_GRANT = _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little")), _allow_everyone()])
+#: An allow entry whose SID has revision 0, which ConvertSidToStringSidW refuses, then a grant to
+#: Everyone.
+_BAD_SID_THEN_GRANT = _acl(
+    [_ace(0x00, (0x1F01FF).to_bytes(4, "little") + bytes(8)), _allow_everyone()]
+)
+
+
+@pytest.mark.parametrize(
+    ("acl", "read", "reason", "malformed"),
+    [
+        # An AceSize of 0 or 2 stops the walk: GetAce steps by it (measured on Windows 11,
+        # 2026-11-24 US Central: with 0 it returned entry 0 again for index 1, with 2 an entry
+        # starting inside entry 0), so no later entry can be found. The entry is read from its
+        # header alone.
+        pytest.param(
+            _acl([bytes([0x20, 0, 0, 0]), _allow_everyone()]),
+            (_UNDEFINED_HEADER,),
+            "entry 0 of its DACL is shorter than an entry header",
+            (),
+            id="acesize-0-first",
+        ),
+        pytest.param(
+            _acl([bytes([0x20, 0, 2, 0]), _allow_everyone()]),
+            (_UNDEFINED_HEADER,),
+            "entry 0 of its DACL is shorter than an entry header",
+            (),
+            id="acesize-2-first",
+        ),
+        pytest.param(
+            _acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]),
+            (_EVERYONE_ALLOW, (1, 0x20, 0, 0, None)),
+            "entry 1 of its DACL is shorter than an entry header",
+            (),
+            id="acesize-0-after-a-grant",
+        ),
+        # A granting entry with an AceSize of 0: its header alone cannot hold its rights.
+        pytest.param(
+            _acl([bytes([0x00, 0, 0, 0]), _allow_everyone()]),
+            (),
+            "entry 0 of its DACL is shorter than an entry header",
+            (0,),
+            id="granting-acesize-0",
+        ),
+        # An AceSize past AclSize: the entry is read from its own bytes up to the bound.
+        pytest.param(
+            _acl([_OVERRUNNING_EVERYONE]),
+            (_EVERYONE_ALLOW,),
+            "entry 0 of its DACL runs past the end of the DACL",
+            (),
+            id="acesize-past-aclsize",
+        ),
+        pytest.param(
+            _acl(
+                [
+                    _ace(0x00, (0x1F01FF).to_bytes(4, "little"))[:2]
+                    + (0xFFFF).to_bytes(2, "little")
+                    + (0x1F01FF).to_bytes(4, "little")
+                ]
+            ),
+            (),
+            "entry 0 of its DACL runs past the end of the DACL",
+            (0,),
+            id="granting-past-aclsize-without-sid",
+        ),
+        # A granting entry too short for its body, inside the bound: left out as malformed, never
+        # read from the next entry's bytes, and the walk goes on by its AceSize.
+        pytest.param(
+            _acl([_SHORT_CALLBACK, _allow_everyone()]),
+            ((1, 0x00, 0, 0x1F01FF, 8 + 4 + 8),),
+            "entry 0 of its DACL is too short to hold its rights",
+            (0,),
+            id="short-callback-then-grant",
+        ),
+        pytest.param(
+            _acl(
+                [
+                    bytes([0x00, 0, 16, 0])
+                    + (0x1F01FF).to_bytes(4, "little")
+                    + _EVERYONE_SID_BYTES[:8],
+                    _allow_everyone(),
+                ]
+            ),
+            ((1, 0x00, 0, 0x1F01FF, 8 + 16 + 8),),
+            "entry 0 of its DACL is too short to hold its SID",
+            (0,),
+            id="allow-sid-past-acesize",
+        ),
+        pytest.param(
+            _SID_LESS_THEN_GRANT,
+            ((1, 0x00, 0, 0x1F01FF, 8 + 8 + 8),),
+            "entry 0 of its DACL is too short to hold its SID",
+            (0,),
+            id="allow-without-sid-then-grant",
+        ),
+        pytest.param(
+            _acl([_allow_everyone()], count=2),
+            (_EVERYONE_ALLOW,),
+            "entry 1 of its DACL starts past the end of the DACL",
+            (),
+            id="count-past-aclsize",
+        ),
+        # An entry that starts within 3 bytes of AclSize, so its AceSize is not inside the DACL.
+        pytest.param(
+            _acl([_allow_everyone(), bytes(2)], count=2),
+            (_EVERYONE_ALLOW,),
+            "entry 1 of its DACL starts past the end of the DACL",
+            (),
+            id="header-split-by-aclsize",
+        ),
+        pytest.param(
+            _acl([], size=4), (), "its DACL is too short to hold its header", (), id="under-8-bytes"
+        ),
+        # Eight bytes passed, but the header's own AclSize is 4.
+        pytest.param(
+            bytes([2, 0, 4, 0, 0, 0, 0, 0]),
+            (),
+            "its DACL is too short to hold its header",
+            (),
+            id="aclsize-below-8",
+        ),
+        # A revision Windows does not define reads no entry.
+        pytest.param(
+            bytes([9]) + _acl([_allow_everyone()])[1:], (), "revision 9", (), id="revision-9"
+        ),
+        pytest.param(
+            bytes([0]) + _acl([_allow_everyone()])[1:], (), "revision 0", (), id="revision-0"
+        ),
+    ],
+)
+def test_s12_15_a_dacl_with_an_entry_out_of_its_bounds_is_read_as_incomplete(
+    acl: bytes,
+    read: tuple[tuple[int, int, int, int, int | None], ...],
+    reason: str,
+    malformed: tuple[int, ...],
+) -> None:
+    """The walk reads each entry from its own bytes only, and never past the DACL's bound. It
+    returns every entry it could read, the first reason the read is incomplete, and the granting
+    entries too short for their body (BACKLOG #6281, member S12-15)."""
+    entries, stopped, bad = _walk(acl)
+    assert entries == read
+    assert stopped is not None and reason in stopped, stopped
+    assert bad == malformed
+
+
+def test_s12_15_the_dacl_revisions_windows_defines_are_read() -> None:
+    """The control for the revision check: revisions 2, 3 and 4 read in full."""
+    for revision in (2, 3, 4):
+        acl = bytes([revision]) + _acl([_allow_everyone()])[1:]
+        assert _walk(acl) == ((_EVERYONE_ALLOW,), None, ())
+
+
+def _sid_at(acl: bytes, offset: int) -> str | None:
+    """The text of the SID at ``offset``, or ``None`` where ``ConvertSidToStringSidW`` would refuse
+    it: a revision other than 1, more than 15 sub-authorities, or bytes the DACL does not hold."""
+    if offset + 8 > len(acl) or acl[offset] != 1 or acl[offset + 1] > 15:
+        return None
+    count = acl[offset + 1]
+    if offset + 8 + 4 * count > len(acl):
+        return None
+    authority = int.from_bytes(acl[offset + 2 : offset + 8], "big")
+    subs = (
+        int.from_bytes(acl[offset + 8 + 4 * i : offset + 12 + 4 * i], "little")
+        for i in range(count)
+    )
+    return "-".join(["S-1", str(authority), *map(str, subs)])
+
+
+def _security(acl: bytes, owner: str = "S-1-5-18") -> WinSecurity:
+    """What the reader records for ``acl``, with the pure SID renderer in place of ctypes."""
+    walk = ap.dacl_entries(acl)
+    aces, reason = ap.dacl_aces(walk, lambda offset: _sid_at(acl, offset))
+    return WinSecurity(owner, aces, reason, walk.malformed, reason is not None)
+
+
+@pytest.mark.parametrize(
+    "acl",
+    [
+        pytest.param(_acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]), id="acesize-0-after-grant"),
+        pytest.param(_acl([_SHORT_CALLBACK, _allow_everyone()]), id="short-callback-then-grant"),
+        pytest.param(_acl([_OVERRUNNING_EVERYONE]), id="grant-past-aclsize"),
+        pytest.param(_SID_LESS_THEN_GRANT, id="allow-without-sid-then-grant"),
+        pytest.param(_BAD_SID_THEN_GRANT, id="unrenderable-sid-then-grant"),
+    ],
+)
+def test_s12_15_a_grant_the_reader_can_read_is_judged_insecure(acl: bytes) -> None:
+    """Each DACL grants Everyone full control in an entry the reader can read, so the object is
+    definitely insecure: the verdict is False, which no pin lets through, beside the failed read.
+    A failed read is reported first. A SID that will not render leaves out its own entry only."""
+    sec = _security(acl)
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    assert findings[0].insecure is False and "could not be read" in findings[0].reason
+    assert any(f.insecure and f.sids == ("S-1-1-0",) for f in findings)
+    assert _verdict(sec, DIRECTORY, trust) is False
+
+
+@pytest.mark.parametrize(
+    "acl",
+    [
+        pytest.param(_acl([_SHORT_CALLBACK]), id="short-callback"),
+        pytest.param(_acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]), id="allow-without-sid"),
+        pytest.param(_SID_LESS_THEN_GRANT, id="allow-without-sid-then-grant"),
+        pytest.param(
+            _acl(
+                [
+                    bytes([0x00, 0, 16, 0])
+                    + (0x1F01FF).to_bytes(4, "little")
+                    + _EVERYONE_SID_BYTES[:8],
+                    _allow_everyone(),
+                ]
+            ),
+            id="allow-sid-past-acesize",
+        ),
+    ],
+)
+def test_s12_15_a_malformed_granting_entry_is_a_definite_finding_naming_no_principal(
+    acl: bytes,
+) -> None:
+    """A granting entry too short for its body is reported as malformed, a definite finding that
+    names no account, so no fix offers to remove an account the DACL does not hold. Every account
+    a finding names is one an entry really holds: an entry is never read from the next entry's
+    bytes, which would name an account no entry holds."""
+    sec = _security(acl)
+    trust = WinTrust("S-1-5-18", lambda _s: True)  # every account but a broad group is trusted
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    [bad] = [f for f in findings if f.insecure and not f.sids]
+    assert "entry 0 of its access list is malformed" in bad.reason
+    assert {sid for f in findings for sid in f.sids} <= {"S-1-1-0"}
+    assert _verdict(sec, DIRECTORY, trust) is False
+
+
+def test_s12_15_an_unrenderable_sid_is_left_out_and_the_walk_goes_on() -> None:
+    """An allow entry whose SID will not render is left out with a reason naming its entry, and the
+    entries after it are kept. Where the walk already gave a reason, that first reason is kept."""
+    walk = ap.DaclWalk(
+        ((0, 0x00, 0, 0x1F01FF, 100), (1, 0x00, 0, 0x1F01FF, 200), (2, 0x01, 0, 0, None))
+    )
+    texts = {200: "S-1-1-0"}
+    aces, reason = ap.dacl_aces(walk, texts.get)
+    assert aces == ((0x00, 0, 0x1F01FF, "S-1-1-0"), (0x01, 0, 0, ""))
+    assert reason == "the SID in entry 0 of its DACL could not be read"
+    earlier = ap.DaclWalk(walk.entries, "entry 3 of its DACL is shorter than an entry header")
+    assert ap.dacl_aces(earlier, texts.get)[1] == earlier.reason
+    assert ap.dacl_aces(ap.DaclWalk(walk.entries[1:]), texts.get) == (aces, None)
+
+
+@_windows_only
+def test_s12_15_the_real_sid_renderer_leaves_out_an_unrenderable_sid_and_keeps_the_grant() -> None:
+    """The same with ``ConvertSidToStringSidW`` itself as the renderer, on a copy of the DACL, as
+    the reader renders it."""
+    import ctypes
+
+    from messagefoundry import win32_sid
+
+    advapi32, kernel32 = win32_sid.sid_libraries()
+    buffer = ctypes.create_string_buffer(_BAD_SID_THEN_GRANT, len(_BAD_SID_THEN_GRANT))
+    aces, reason = ap.dacl_aces(
+        ap.dacl_entries(buffer.raw),
+        lambda offset: win32_sid.sid_text(advapi32, kernel32, ctypes.addressof(buffer) + offset),
+    )
+    assert aces == ((0x00, 0, 0x1F01FF, "S-1-1-0"),)
+    assert reason == "the SID in entry 0 of its DACL could not be read"
+
+
+def test_s12_15_an_owner_read_before_a_failed_dacl_read_is_still_judged() -> None:
+    """An untrusted owner is definitely insecure whether or not the DACL read failed."""
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    failed = "entry 0 of its DACL is shorter than an entry header"
+    users = WinSecurity("S-1-5-32-545", (), failed)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, users, trust)
+    assert findings[0].reason == f"its permissions could not be read: {failed}"
+    assert findings[1].insecure is True and findings[1].owner is True
+    assert _verdict(users, DIRECTORY, trust) is False
+
+
+def test_s12_15_an_owner_that_could_not_be_read_is_reported_beside_a_failed_read() -> None:
+    """An owner that could not be read is reported beside a failed DACL read, the failed read
+    first."""
+    failed = "entry 0 of its DACL is shorter than an entry header"
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, WinSecurity(None, (), failed), trust)
+    assert [f.reason for f in findings] == [
+        f"its permissions could not be read: {failed}",
+        "its owner could not be read",
+    ]
+    assert not any(f.insecure for f in findings)
+
+
+def test_s12_15_a_failed_read_is_reported_first() -> None:
+    """The failed read leads, so a caller that quotes the first finding names it."""
+    sec = _security(_acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]))
+    findings = evaluate_windows_object(
+        "C:\\x", DIRECTORY, sec, WinTrust("S-1-5-18", lambda _s: False)
+    )
+    assert "could not be read" in findings[0].reason and findings[0].insecure is False
+    assert findings[1].insecure is True
+
+
+def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
+    """What the reader returns for a refused DACL, an error, makes the object indeterminate."""
+    sec = WinSecurity("S-1-5-18", (), "entry 0 of its DACL is shorter than an entry header")
+    trust = WinTrust("S-1-5-18", lambda _sid: True)
+    [finding] = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    assert finding.insecure is False and "could not be read" in finding.reason
+
+
+def test_s12_15_a_malformed_holder_list_is_told_to_replace_it_not_to_grant_read_access() -> None:
+    """A holder whose list was read but is malformed is told to replace that list. Granting the
+    right to read it, the fix for a refused read, would change nothing."""
+    from messagefoundry import restricted_file
+
+    damaged = WinSecurity("S-1-5-18", (), "entry 0 of its DACL is malformed", damaged=True)
+    problem = str(restricted_file._holder_read_problem(damaged))
+    assert "is malformed" in problem and "replace that folder's access list" in problem
+    assert "right to read" not in problem
+    # The control: a read that was refused keeps the read-access fix.
+    refused = WinSecurity(None, (), "Win32 error 5 (Access is denied.)")
+    assert "right to read that folder's permissions" in str(
+        restricted_file._holder_read_problem(refused)
+    )
+    assert restricted_file._holder_read_problem(WinSecurity("S-1-5-18", ())) is None

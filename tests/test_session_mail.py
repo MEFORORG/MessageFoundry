@@ -35,19 +35,23 @@ fixed and cannot be quietly closed.
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests._session_mail_harness import assert_drain_stderr
 from tests._session_pin import seed_pin
 from tests._spawn_lock import spawn_burst
 
@@ -172,14 +176,14 @@ foreach ($s in $specs) {
             id         = if ($null -ne $s.jsonId) { [string]$s.jsonId } else { $stem }
             kind       = if ($s.kind) { [string]$s.kind } else { 'note' }
             createdUtc = $now.ToString('o')
-            expiresUtc = if ($s.expiresUtc) { [string]$s.expiresUtc } else { $now.AddMinutes(720).ToString('o') }
+            expiresUtc = if ($s.expiresUtc -is [datetime]) { $s.expiresUtc.ToString('o') } elseif ($s.expiresUtc) { [string]$s.expiresUtc } else { $now.AddMinutes(720).ToString('o') }
             from       = [ordered]@{
                 sessionId = '00000000-0000-0000-0000-000000000000'
                 cwd       = if ($null -ne $s.fromCwd) { [string]$s.fromCwd } else { 'D:\t\peer-wt' }
                 branch    = if ($null -ne $s.fromBranch) { [string]$s.fromBranch } else { 'claude/other-work' }
-                host      = 'TESTBOX'
+                host      = if ($null -ne $s.fromHost) { [string]$s.fromHost } else { 'TESTBOX' }
             }
-            to         = [ordered]@{ cwd = $Cwd; sessionId = [string]$s.toSessionId }
+            to         = [ordered]@{ cwd = if ($null -ne $s.toCwd) { [string]$s.toCwd } else { $Cwd }; sessionId = [string]$s.toSessionId }
             body       = [string]$s.body
         }
         $text = $o | ConvertTo-Json -Depth 8
@@ -240,6 +244,16 @@ def seed(
     return dict(json.loads(proc.stdout))
 
 
+# Sets the culture, then runs the hook in the same process so it inherits stdin and the culture.
+# The path and culture arrive by environment, because pwsh joins -Command arguments into its text.
+# The explicit exit carries the hook's code out, or run_drain's exit-0 check would prove nothing.
+_CULTURE_WRAPPER = (
+    "[Globalization.CultureInfo]::CurrentCulture = "
+    "[Globalization.CultureInfo]::GetCultureInfo($env:MAIL_TEST_CULTURE); "
+    "& $env:MAIL_TEST_DRAIN; exit $LASTEXITCODE"
+)
+
+
 def run_drain(
     repo: Path,
     *,
@@ -248,8 +262,19 @@ def run_drain(
     cwd: Path | None = None,
     anchor_repo: Path | None = None,
     run_from: Path | None = None,
+    expect_stderr: str | None = None,
+    culture: str | None = None,
+    tz: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the hook exactly as Claude Code does.
+
+    ``expect_stderr`` names the one line a test expects on stderr. Stderr stays asserted empty for
+    every call that does not name one, so allowing it for the OFF notice loosens nothing else.
+
+    ``culture`` runs the hook under that CurrentCulture, through a wrapper, because a process's
+    culture comes from the machine and a test cannot otherwise choose it.
+
+    ``tz`` sets the TZ variable, which moves the hook's local zone only where .NET honours it.
 
     The payload MUST carry ``cwd``: mail-drain.ps1:272 falls back to ``(Get-Location).Path``, so a
     payload without it would point the drain at the LIVE checkout's mail root, which is both a false
@@ -264,9 +289,18 @@ def run_drain(
     payload: dict[str, Any] = {"hook_event_name": event, "cwd": str(cwd or repo)}
     if session_id is not None:
         payload["session_id"] = session_id
-    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)]
-    if anchor_repo is not None:
-        argv += ["-AnchorRepo", str(anchor_repo)]
+    argv = ["pwsh", "-NoProfile", "-NonInteractive"]
+    env: dict[str, str] | None = None
+    if culture is None:
+        argv += ["-File", str(DRAIN)]
+        if anchor_repo is not None:
+            argv += ["-AnchorRepo", str(anchor_repo)]
+    else:
+        assert anchor_repo is None, "the culture wrapper does not forward -AnchorRepo"
+        argv += ["-Command", _CULTURE_WRAPPER]
+        env = {**os.environ, "MAIL_TEST_DRAIN": str(DRAIN), "MAIL_TEST_CULTURE": culture}
+    if tz is not None:
+        env = {**(env if env is not None else os.environ), "TZ": tz}
     # run_from exists because the PAYLOAD cwd and the PROCESS cwd are separable in production and
     # must be separable here: a payload can name a directory that no longer exists, which Windows
     # refuses as a process working directory. Defaulting it to the payload keeps every other test
@@ -279,12 +313,13 @@ def run_drain(
         text=True,
         timeout=TIMEOUT,
         check=False,
+        env=env,
     )
     # FAIL OPEN, asserted in the helper and not per-test. A Stop hook that fails can end a turn badly
     # and a SessionStart hook that fails replaces the whole starting context; asserting it per-test
     # would leave every path nobody wrote a test for unchecked.
     assert proc.returncode == 0, f"drain exited {proc.returncode}: {proc.stderr}"
-    assert not proc.stderr.strip(), f"drain wrote to stderr: {proc.stderr}"
+    assert_drain_stderr(proc, expect_stderr)
     return proc
 
 
@@ -432,12 +467,12 @@ def test_a_plain_message_is_delivered_end_to_end(repo: Path, tmp_path: Path) -> 
     assert len(box_files(repo, key, "seen")) == 1
 
 
-def _send(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
+def _send(repo: Path, body: str, *extra: str) -> subprocess.CompletedProcess[str]:
     """Drive the REAL sender. The seeder deliberately bypasses these arms, so they need this route."""
     return subprocess.run(
         [
             "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
-            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body,
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", body, *extra,
         ],
         cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
     )  # fmt: skip
@@ -1587,7 +1622,14 @@ def test_the_off_switch_suppresses_delivery_without_losing_mail(repo: Path, tmp_
     info = seed(repo, tmp_path, [{"body": "must not be shown while OFF is present"}])
     key = str(info["key"])
     (mail_root(repo) / "OFF").write_text("", encoding="ascii")
-    text = injection(run_drain(repo))
+
+    # STOP: stdout would re-wake a stopping session, so the notice goes to stderr (BACKLOG #5863).
+    stopped = run_drain(repo, expect_stderr="SUPPRESSED")
+    assert "is NOT lost" in stopped.stderr
+    assert "must not be shown while OFF is present" not in stopped.stderr
+
+    # SESSIONSTART is the control: it wakes nothing, so it keeps the injection.
+    text = injection(run_drain(repo, event="SessionStart"))
     assert "SUPPRESSED" in text
     assert "must not be shown while OFF is present" not in text
     assert "is NOT lost" in text
@@ -2065,9 +2107,16 @@ def test_a_swept_message_is_still_nameable_LONG_AFTER_the_turn_that_swept_it(rep
     assert row["Expired"] == 1, "two later drains must not erase the record of an expiry"
 
 
-def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
+def test_the_Status_TEXT_render_explains_expiry_without_the_stale_nobody_was_told(
+    repo: Path,
+) -> None:
     """The human path, not just the JSON one. A count with no explanation invites the reader to treat
-    expiry as a routine sweep, when it is the one disposition that reaches neither end."""
+    expiry as a routine sweep, when it is the one disposition that destroys a hand-off.
+
+    CORRECTED (BACKLOG #1386): this test used to pin the text "NOBODY WAS TOLD", which stopped being
+    true when the drain began naming each expired id to the receiver and writing an
+    'expired-unshown' receipt for the sender (BACKLOG #1228). Both arrive only after the loss, which
+    is what the render now says, and it names the receipt a sender reads."""
     seed(repo, repo, [{"body": "live"}])
     proc = subprocess.run(
         [
@@ -2087,7 +2136,8 @@ def test_the_Status_TEXT_render_says_nobody_was_told(repo: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "Expired:" in proc.stdout
-    assert "NOBODY WAS TOLD" in proc.stdout
+    assert "expired-unshown" in proc.stdout
+    assert "NOBODY WAS TOLD" not in proc.stdout
 
 
 # --------------------------------------------------------- BACKLOG #1386, limbs 1 and 2
@@ -2178,6 +2228,173 @@ def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_p
     assert "oldest" in text, (
         "the depth alone does not say whether the queue is aging toward its TTL"
     )
+
+
+# --------------------------------------------------------- BACKLOG #1386, limb 3: warn BEFORE expiry
+#
+# The drain names an expired id to the receiver and writes an 'expired-unshown' receipt for the
+# sender, but both arrive only AFTER the message is gone. The warning has to be sender-side: the case
+# that loses mail is an idle recipient, and an idle seat runs no drain, so nothing receiver-side can
+# speak for it. `mail.ps1 -Expiring` lists the caller's own sent mail that no session has been shown
+# and whose TTL falls inside a stated window.
+
+
+def _send_ttl(repo: Path, body: str, ttl_minutes: int) -> str:
+    """Send through the REAL sender with a chosen TTL and return the message id it queued."""
+    proc = _send(repo, body, "-TtlMinutes", str(ttl_minutes), "-Json")
+    assert proc.returncode == 0, f"send failed: {proc.stdout}\n{proc.stderr}"
+    rows = json.loads(proc.stdout)
+    assert len(rows) == 1 and rows[0]["Status"] == "queued", rows
+    return str(rows[0]["Id"])
+
+
+def _near_ids(view: Any) -> list[str]:
+    return [str(r["Id"]) for r in view["Near"]]
+
+
+def test_Expiring_lists_the_senders_unshown_mail_inside_the_window(repo: Path) -> None:
+    """MUST FIRE, with a control on the far side of the window.
+
+    A one-hour TTL is inside a 24-hour window and a three-day TTL is outside it, so a view that
+    listed everything, or nothing, fails one of the two assertions.
+    """
+    soon = _send_ttl(repo, "expires within the hour", 60)
+    later = _send_ttl(repo, "expires in three days", 4320)
+    view = _mail_json(repo, "-Expiring", "-WithinHours", "24")
+    assert _near_ids(view) == [soon], view
+    assert later not in _near_ids(view)
+    assert view["BeyondWindow"] == 1, view
+    assert view["WithinHours"] == 24, view
+    row = view["Near"][0]
+    assert row["PastTtl"] is False, row
+    assert 0 < row["MinutesLeft"] <= 60, row
+    # The recipient is named, so the sender knows whom to re-send to.
+    assert str(row["ToCwd"]).lower() == str(repo).lower(), row
+
+
+def test_Expiring_flags_held_mail_and_drops_it_once_consumed(repo: Path) -> None:
+    """SessionStart shows a message and HOLDS it in the inbox. The drain still sweeps held mail at
+    its TTL and receipts it 'expired-unshown', so the view keeps listing it, flagged HELD, or it
+    would contradict that receipt. Only consumption, at the session's next turn boundary, ends it."""
+    ident = _send_ttl(repo, "shown at session start", 60)
+    before = _mail_json(repo, "-Expiring")
+    assert _near_ids(before) == [ident], "positive control before the drain"
+    assert before["Near"][0]["Held"] is False, before
+    text = injection(run_drain(repo, event="SessionStart"))
+    assert "shown at session start" in text, "the drain did not show it, so this proves nothing"
+    held = _mail_json(repo, "-Expiring")
+    assert _near_ids(held) == [ident], held
+    assert held["Near"][0]["Held"] is True, held
+    run_drain(repo, event="Stop")
+    assert _near_ids(_mail_json(repo, "-Expiring")) == []
+
+
+def test_WithinHours_without_Expiring_refuses_instead_of_prompting(repo: Path) -> None:
+    """``-WithinHours`` exists only in the Expiring set. With ``-Expiring`` Mandatory, a call that
+    forgot it bound that set and PROMPTED on stdin, hanging a caller whose stdin stays open and
+    silent, as ``-Send`` once did. It must refuse by name, quickly, and never read stdin."""
+    rc, err = run_holding_stdin_open(
+        [
+            "pwsh", "-NoProfile", "-File", str(MAIL),
+            "-MailRoot", str(mail_root(repo)), "-WithinHours", "24",
+        ],
+        cwd=repo,
+    )  # fmt: skip
+    assert rc != 0, "-WithinHours without -Expiring must be refused"
+    assert "-Expiring" in err, err
+
+
+def test_Expiring_names_mail_already_past_its_TTL_that_no_drain_has_swept(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The message an idle recipient is about to lose: past its TTL, still in the inbox, and swept
+    unshown by the next drain of that box. It is the case this limb exists for."""
+    host = os.environ.get("COMPUTERNAME", "")
+    info = seed(
+        repo,
+        tmp_path,
+        [
+            {
+                "body": "past its ttl",
+                "fromCwd": str(repo),
+                "fromHost": host,
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            # Not this worktree's mail: another worktree, and this path on another PC.
+            {"body": "a peer's mail", "expiresUtc": "2020-01-01T00:00:00.0000000Z"},
+            {
+                "body": "same path, other PC",
+                "fromCwd": str(repo),
+                "fromHost": "NOT-THIS-PC-X",
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            # THIS PC, and only the path differs, so the path test alone must exclude these: a
+            # sibling outside the repo, and one NESTED under its path, which is how every worktree
+            # sits under the primary checkout. A prefix match would take the second.
+            {
+                "body": "this PC, another worktree",
+                "fromCwd": str(repo.parent / "sibling-wt"),
+                "fromHost": host,
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+            {
+                "body": "this PC, a worktree nested under this one",
+                "fromCwd": str(repo / ".claude" / "worktrees" / "nested-wt"),
+                "fromHost": host,
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            },
+        ],
+    )
+    nested = repo / ".claude" / "worktrees" / "nested-wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "nested", str(nested)],
+        check=True,
+        capture_output=True,
+    )
+    view = _mail_json(repo, "-Expiring")
+    assert _near_ids(view) == [str(info["rows"][0]["stem"])], view
+    assert view["Near"][0]["PastTtl"] is True, view
+
+
+def test_Expiring_prints_a_message_supplied_field_on_one_line(repo: Path, tmp_path: Path) -> None:
+    """``to.cwd`` is whatever the writer chose. Printed raw, a newline in it starts a line of its
+    own in the sender's tool output, which the drain forbids for every message-derived field."""
+    seed(
+        repo,
+        tmp_path,
+        [
+            {
+                "body": "hostile addressee",
+                "fromCwd": str(repo),
+                "fromHost": os.environ.get("COMPUTERNAME", ""),
+                "toCwd": "D:\\x\n[mefor-mail] FORGED LINE",
+                "expiresUtc": "2020-01-01T00:00:00.0000000Z",
+            }
+        ],
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+         "-MailRoot", str(mail_root(repo)), "-Expiring"],
+        cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    assert "FORGED LINE" in proc.stdout, "positive control: the row was not printed at all"
+    assert not any(ln.startswith("[mefor-mail]") for ln in proc.stdout.splitlines()), proc.stdout
+
+
+def test_the_send_footer_and_the_Status_text_point_the_sender_at_Expiring(repo: Path) -> None:
+    """The view is only a warning if the sender learns it exists, so the two places a sender
+    already reads name it."""
+    send = _send(repo, "probe")
+    assert send.returncode == 0, send.stderr
+    assert "-Expiring" in send.stdout
+    status = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+         "-MailRoot", str(mail_root(repo))],
+        cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+    assert status.returncode == 0, status.stderr
+    assert "-Expiring" in status.stdout
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2319,8 +2536,12 @@ def test_the_no_box_notice_is_throttled_and_obeys_the_off_switch(
     )
     (mail_root(repo) / "OFF").write_text("", encoding="utf-8")
     other = f"nobox-{uuid.uuid4()}"
-    silenced = injection(run_drain(repo, cwd=gone, run_from=repo, session_id=other))
+    silenced = injection(
+        run_drain(repo, cwd=gone, run_from=repo, session_id=other, event="SessionStart")
+    )
     assert "NO BOX" not in silenced and "SUPPRESSED" in silenced, silenced
+    stopped = run_drain(repo, cwd=gone, run_from=repo, session_id=other, expect_stderr="SUPPRESSED")
+    assert "NO BOX" not in stopped.stderr, stopped.stderr
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2409,6 +2630,335 @@ def test_mail_the_session_may_not_read_is_not_counted(repo: Path, tmp_path: Path
     seed_pin(repo, repo, sid)
     text = injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid))
     assert "wait in the box of" not in text, text
+
+
+# --------------------------------------------------------------------------------------------------
+# Expiry is read the same way under every culture (BACKLOG #5864). ConvertFrom-Json has already made
+# the stamp a DateTime; turning it back into a string is what made the answer depend on the culture.
+# --------------------------------------------------------------------------------------------------
+
+_EXPIRY_CULTURES = ["en-GB", "en-US"]
+_EXPIRY_STEM = "20260101T000000001-aaaaaa"
+
+
+# .NET honours TZ on Linux and macOS and ignores it on Windows.
+_PINNED_ZONE = "Asia/Tokyo"
+
+
+def _offset_stamp(hours: int) -> str:
+    return (datetime.now(UTC) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _require_a_zone_away_from_utc() -> None:
+    """Skip, visibly, where a one-hour stamp cannot tell a local reading from a UTC one."""
+    offset = _effective_utc_offset_hours(_PINNED_ZONE)
+    if abs(offset) < 2:
+        pytest.skip(
+            f"host reads as UTC{offset:+g} and ignores TZ, so this cannot detect a local-time misread"
+        )
+
+
+@functools.cache
+def _effective_utc_offset_hours(tz: str) -> float:
+    """The offset pwsh itself sees with TZ set, which is the only reading that settles the pin."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[TimeZoneInfo]::Local.GetUtcOffset([DateTime]::UtcNow).TotalHours.ToString("
+            "[Globalization.CultureInfo]::InvariantCulture)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+        env={**os.environ, "TZ": tz},
+    )
+    return float(proc.stdout.strip())
+
+
+def test_the_culture_wrapper_carries_the_exit_code(tmp_path: Path) -> None:
+    """The control for run_drain's exit-0 check on every culture= call."""
+    script = tmp_path / "exit seven.ps1"
+    script.write_text("exit 7\n", encoding="ascii")
+    env = {**os.environ, "MAIL_TEST_DRAIN": str(script), "MAIL_TEST_CULTURE": "en-GB"}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", _CULTURE_WRAPPER],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 7, proc.stderr
+
+
+def _raw_message(stem: str, body: str, expires: str | None) -> dict[str, Any]:
+    """A seed spec carrying ``expires`` byte for byte. The seeder's own field would re-format it."""
+    message: dict[str, Any] = {
+        "v": 1,
+        "id": stem,
+        "kind": "note",
+        "createdUtc": "2026-01-01T00:00:00.0000000Z",
+        "from": {"sessionId": "", "cwd": "D:\\t\\peer-wt", "branch": "b", "host": "TESTBOX"},
+        "to": {"cwd": "", "sessionId": ""},
+        "body": body,
+    }
+    if expires is not None:
+        message["expiresUtc"] = expires
+    return {"stem": stem, "raw": json.dumps(message)}
+
+
+def _age_inbox(repo: Path, days: int) -> None:
+    """Backdate every queued file, so the receiver's floor would fire if it were consulted."""
+    stamp = time.time() - days * 86400
+    for p in (mail_root(repo) / "box").glob("*/inbox/*.json"):
+        os.utime(p, (stamp, stamp))
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+def test_a_past_stamp_expires_under_every_culture(repo: Path, tmp_path: Path, culture: str) -> None:
+    """Day 13 has no month-first reading on a day-first culture, so the stamp used to read as absent."""
+    info = seed(
+        repo, tmp_path, [_raw_message(_EXPIRY_STEM, "long expired", "2020-01-13T00:00:00.000Z")]
+    )
+    text = injection(run_drain(repo, culture=culture))
+    assert "long expired" not in text, text
+    assert box_files(repo, str(info["key"]), "seen") == []
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize("stamp", ["2099-01-13T00:00:00.000Z", "2099-01-13"])
+def test_a_future_stamp_outlives_the_floor_under_every_culture(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    """The sender's longer TTL must win over the receiver's 7-day floor.
+
+    The date-only form stays a string through ConvertFrom-Json, so it takes the reader's other path.
+    """
+    seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "still live", stamp)])
+    _age_inbox(repo, 8)
+    assert "still live" in injection(run_drain(repo, culture=culture))
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+def test_an_offset_stamp_is_read_as_the_instant_it_names(
+    repo: Path, tmp_path: Path, culture: str
+) -> None:
+    """Coerced to a Local DateTime, and read as a wall clock it would be off by the host's offset.
+
+    The two stamps cover both directions: the live one catches a host west of UTC, the dead one a
+    host east of it. Within two hours of UTC neither can tell the old reader from this one, so the
+    zone is pinned where the platform honours TZ, and the test SKIPS where it still lands there.
+    """
+    _require_a_zone_away_from_utc()
+    specs = [
+        _raw_message(_EXPIRY_STEM, "live for an hour", _offset_stamp(1)),
+        _raw_message("20260101T000000002-aaaaaa", "dead for an hour", _offset_stamp(-1)),
+    ]
+    info = seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo, culture=culture, tz=_PINNED_ZONE))
+    assert "live for an hour" in text, text
+    assert "dead for an hour" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
+
+
+@pytest.mark.parametrize("expires", [None, "03/04/2026", "not a date"])
+def test_the_floor_still_covers_a_missing_or_unreadable_stamp(
+    repo: Path, tmp_path: Path, expires: str | None
+) -> None:
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "inside the floor", expires)])
+    key = str(info["key"])
+    assert "inside the floor" in injection(run_drain(repo, event="SessionStart", culture="en-GB"))
+    _age_inbox(repo, 8)
+    assert "inside the floor" not in injection(
+        run_drain(repo, session_id=f"{uuid.uuid4()}", culture="en-GB")
+    )
+    # Absence from the text alone would also pass for a message left in the inbox.
+    assert box_files(repo, key, "inbox") == []
+    assert len(box_files(repo, key, "expired")) == 1
+
+
+def test_the_moved_box_count_reads_expiry_the_same_way(repo: Path, tmp_path: Path) -> None:
+    _require_a_zone_away_from_utc()
+    specs = [
+        _raw_message(_EXPIRY_STEM, "live", _offset_stamp(1)),
+        _raw_message("20260101T000000002-aaaaaa", "dead", "2020-01-13T00:00:00.000Z"),
+        _raw_message("20260101T000000003-aaaaaa", "just dead", _offset_stamp(-1)),
+    ]
+    text = _moved_box_notice(repo, tmp_path, specs, culture="en-GB", tz=_PINNED_ZONE)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def test_the_moved_box_count_counts_a_duplicated_stem_once(repo: Path, tmp_path: Path) -> None:
+    """The delivery loop shows one of two files sharing a stem, so the notice must count one."""
+    specs = [_raw_message(_EXPIRY_STEM, "twice on disk", _offset_stamp(1))]
+    text = _moved_box_notice(repo, tmp_path, specs, duplicate=True)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def _moved_box_notice(
+    repo: Path,
+    tmp_path: Path,
+    specs: list[dict[str, Any]],
+    age: int = 0,
+    culture: str | None = None,
+    tz: str | None = None,
+    duplicate: bool = False,
+) -> str:
+    """What a session pinned to ``repo`` is told about a box it moved into, seeded with ``specs``."""
+    wt = Path(os.path.realpath(tmp_path)) / "moved-wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", wt.name, str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    seed(repo, tmp_path, specs, box_cwd=wt)
+    if duplicate:
+        # The same stem under a second valid token: only the token's last hex digit differs.
+        for p in list((mail_root(repo) / "box").glob("*/inbox/*.json")):
+            last = "1" if p.stem[-1] == "0" else "0"
+            shutil.copy(p, p.with_name(f"{p.stem[:-1]}{last}.json"))
+    if age:
+        _age_inbox(repo, age)
+    sid = str(uuid.uuid4())
+    seed_pin(repo, repo, sid)
+    return injection(run_drain(repo, cwd=wt, run_from=repo, session_id=sid, culture=culture, tz=tz))
+
+
+def test_the_moved_box_count_applies_the_receivers_floor(repo: Path, tmp_path: Path) -> None:
+    """Past the floor, the box's own drain expires these, so the notice must not call them waiting.
+
+    The dated message is the control: a stated future expiry outranks the floor in both readers.
+    """
+    specs = [
+        _raw_message(_EXPIRY_STEM, "no stamp", None),
+        _raw_message("20260101T000000002-aaaaaa", "ambiguous stamp", "03/04/2026"),
+        _raw_message("20260101T000000003-aaaaaa", "dated far ahead", "2099-01-13T00:00:00Z"),
+    ]
+    text = _moved_box_notice(repo, tmp_path, specs, age=8)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+def test_the_moved_box_count_skips_a_payload_that_is_not_an_object(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The delivery loop calls these unreadable, so they are not waiting mail. One real message
+    beside them is the control that the notice still fires."""
+    payloads = ["[1,2,3]", '"just a string"', "7", "true"]
+    specs: list[dict[str, Any]] = [
+        {"stem": f"20260101T00000000{i}-aaaaaa", "raw": raw} for i, raw in enumerate(payloads, 1)
+    ]
+    specs.append(_raw_message("20260101T000000005-aaaaaa", "a real one", _offset_stamp(1)))
+    text = _moved_box_notice(repo, tmp_path, specs)
+    assert "1 message(s) wait in the box of" in text, text
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "01/13/2020",
+        "13/01/2020",
+        "13.01.2020",
+        "03/03/2020",
+        "2020/01/13",
+        "Jan 13 2020",
+        "January 13, 2020",
+        "13 Jan 2020",
+        "Mon, 13 Jan 2020 10:00:00 GMT",
+        "01/13/2020 10:00:00 PM",
+        "01/13/2020 10:00:00 +05:00",
+        "2020-01-13 10:00:00 UTC",
+        "01/13/2020 10:00 PM Z",
+        "13 Jan 2020 10:00 PM UTC",
+        "Sept 13 2020",
+    ],
+)
+def test_an_unambiguous_past_stamp_expires_a_fresh_message(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    """Fresh, so the floor cannot be what expires it: only reading the stamp can."""
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "stale body", stamp)])
+    text = injection(run_drain(repo, culture=culture))
+    assert "stale body" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "01/13/2099",
+        "13/01/2099",
+        "Jan 13 2099",
+        "13 January 2099",
+        "Sept 13 2099",
+        "2099-01-13 10:00:00 UTC",
+        "01/13/2099 10:00:00 PM UTC",
+    ],
+)
+def test_an_unambiguous_future_stamp_outlives_the_floor(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "still live", stamp)])
+    _age_inbox(repo, 8)
+    assert "still live" in injection(run_drain(repo, culture=culture))
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "03/04/2020",
+        "03-04-2020",
+        "03.04.2020",
+        "02/30/2020",
+        "01/13/20",
+        "Jan 2020",
+        "2020-01-13 PM",
+        "Tue, 13 Jan 2020 10:00:00 GMT",
+    ],
+)
+def test_an_ambiguous_or_impossible_stamp_takes_the_floor(
+    repo: Path, tmp_path: Path, culture: str, stamp: str
+) -> None:
+    """Read as a date, each of these past stamps would expire a fresh message at once."""
+    info = seed(repo, tmp_path, [_raw_message(_EXPIRY_STEM, "floor decides", stamp)])
+    key = str(info["key"])
+    assert "floor decides" in injection(run_drain(repo, event="SessionStart", culture=culture))
+    assert box_files(repo, key, "expired") == []
+    _age_inbox(repo, 8)
+    run_drain(repo, session_id=f"{uuid.uuid4()}", culture=culture)
+    assert len(box_files(repo, key, "expired")) == 1
+
+
+@pytest.mark.parametrize("culture", _EXPIRY_CULTURES)
+def test_a_zoneless_iso_stamp_near_now_is_read_as_utc(
+    repo: Path, tmp_path: Path, culture: str
+) -> None:
+    """ConvertFrom-Json gives these Kind Unspecified. One hour either side of now, so a reader that
+    took them as local time would flip one of them on any host at least two hours from UTC."""
+    _require_a_zone_away_from_utc()
+    now = datetime.now(UTC)
+    specs = [
+        _raw_message(
+            _EXPIRY_STEM, "zoneless live", (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        ),
+        _raw_message(
+            "20260101T000000002-aaaaaa",
+            "zoneless dead",
+            (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        ),
+    ]
+    info = seed(repo, tmp_path, specs)
+    text = injection(run_drain(repo, culture=culture, tz=_PINNED_ZONE))
+    assert "zoneless live" in text, text
+    assert "zoneless dead" not in text, text
+    assert len(box_files(repo, str(info["key"]), "expired")) == 1
 
 
 def _hand_drain(wt: Path, sid: str) -> str:

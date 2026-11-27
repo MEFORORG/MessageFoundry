@@ -1,0 +1,806 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""Only a database driver's own error NAMES a SQLSTATE in text (engine PR 3150 open findings 1,
+5 and 6); an error shaped like one is still classified by it. The connector's reading
+(``_log_sqlstate``, ``_shown_state``) and the traceback line's (``redaction.driver_sqlstate_of``)
+are separate. The connector still classifies an asyncpg error by the shape of its ``args[0]``,
+its message, as before; neither reading names a state read from it in text.
+Also two log-path changes in the same module (vault BACKLOG #1661, added items 5 and 6).
+
+Each test was red on the code before its fix, except at least those whose docstring calls it a
+control or a regression check that is not red on main. All values are synthetic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+import sys
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import pytest
+
+from messagefoundry.redaction import UNDER_A_DRIVER_ERROR, safe_exc, safe_traceback
+from messagefoundry.transports import database
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from tests._fake_dbapi_driver import DriverError
+from tests._odbc_cancel_fakes import RawConn, never
+from tests.test_backlog2394_database_gate import _aioodbc_serving, _destination, _Rig
+from tests.test_backlog5010_database_gate_discard import _WakingPool
+from tests.test_database_transport import _dest, _FakeConn, _FakeCursor, _FakePool
+
+_VALUE = "MRN42"  # five characters of the SQLSTATE alphabet, as an identifier can be
+
+
+def _raised[E: BaseException](exc: E) -> E:
+    try:
+        raise exc
+    except BaseException:  # noqa: BLE001 - only to give it a traceback
+        return exc
+
+
+# --- PR 3150 finding 1: a non-driver error is classified by shape, and its text is withheld ------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(KeyError(_VALUE), id="KeyError"),
+        pytest.param(RuntimeError("HYT00", "synthetic"), id="RuntimeError"),
+        pytest.param(Exception("23000", "synthetic"), id="Exception"),
+    ],
+)
+def test_a_non_driver_error_is_classified_by_shape_but_never_named(exc: BaseException) -> None:
+    """The state still classifies the failure, as before this branch; text never names it."""
+    assert database._sqlstate(exc) == exc.args[0]
+    assert database._log_sqlstate(exc) == exc.args[0]
+    assert database._shown_state(exc.args[0], exc) is None
+
+
+async def test_a_non_driver_error_in_a_send_is_never_dead_lettered_with_its_text() -> None:
+    """Red on main: ``KeyError('MRN42')`` was dead-lettered as ``database rejected the statement
+    [MRN42]``, a value in ``last_error`` and the alert. It is still dead-lettered, by its shape,
+    but its text and code name no state."""
+    conn = _FakeConn(_FakeCursor(KeyError(_VALUE)))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError) as refused:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value) == "database rejected the statement [SQLSTATE withheld]"
+    assert refused.value.permanent and refused.value.code == "db"
+    assert _VALUE not in safe_exc(refused.value)  # what the runner stores as last_error
+    assert conn.rolledback
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(RuntimeError("08S01", f"link lost ({_VALUE})"), id="08S01"),
+        pytest.param(RuntimeError("HYT00", f"timed out ({_VALUE})"), id="HYT00"),
+    ],
+)
+async def test_a_shaped_transient_send_error_is_retried_naming_no_text(
+    exc: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on the previous head, which made it an internal error: a non-driver error shaped like
+    a transient SQLSTATE is retried as before this branch, and no message text reaches the log or
+    the error the runner stores."""
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert str(raised.value) == "database transient error [SQLSTATE withheld]"
+    assert _VALUE not in safe_exc(raised.value)
+    assert _VALUE not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(KeyError(_VALUE), id="KeyError"),
+        pytest.param(RuntimeError("23000", f"duplicate key ({_VALUE}2)"), id="driver tuple"),
+    ],
+)
+def test_a_non_driver_error_shaped_like_a_drivers_prints_no_value_on_a_log_line(
+    exc: BaseException,
+) -> None:
+    """Red on main for the KeyError: ``_safe_db_error`` printed ``KeyError [MRN42]``, the value as
+    a SQLSTATE. Neither reads as a SQLSTATE now, and neither falls to ``safe_exc``'s text."""
+    line = database._safe_db_error(exc)
+    assert _VALUE not in line
+    assert line == f"{type(exc).__name__} [message withheld]"
+
+
+class _UnreadableState(DriverError):
+    """A driver error whose ``sqlstate`` raises when read."""
+
+    @property
+    def sqlstate(self) -> str:
+        raise RuntimeError("unreadable")
+
+
+async def test_a_driver_error_whose_sqlstate_cannot_be_read_still_rolls_back() -> None:
+    """The send reads ``args`` alone before its rollback, so an attribute that raises when read
+    never skips the rollback and leaves the failed statement's transaction open (BACKLOG #5010).
+    The release's connection-lost read of the attribute then raises. A regression check of this
+    branch's first head, not red on main."""
+    conn = _FakeConn(_FakeCursor(_UnreadableState("23000", "synthetic")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert conn.rolledback
+
+
+@pytest.mark.parametrize("attribute", ["", None, 7])
+def test_an_unusable_sqlstate_attribute_falls_back_to_args(attribute: object) -> None:
+    """An attribute that is not a SQLSTATE leaves ``args[0]`` read for classification, so a
+    class-08 link is still seen as a lost connection. A regression check, not red on main."""
+    exc = DriverError("08S01", "synthetic")
+    exc.sqlstate = attribute  # type: ignore[attr-defined]
+    assert database._log_sqlstate(exc) == "08S01"
+    assert database._connection_lost(exc)
+
+
+class _UnclassableMeta(type):
+    """A class whose ``__mro__`` raises when read, so no driver test can class it."""
+
+    @property
+    def __mro__(cls) -> tuple[type, ...]:
+        raise RuntimeError("unclassable")
+
+
+class _Unclassable(Exception, metaclass=_UnclassableMeta):
+    pass
+
+
+def test_an_error_whose_driver_test_raises_is_classified_by_shape() -> None:
+    """Red on the previous head, which read no state from such a class: it is classified by the
+    shape of ``args[0]``, as on main, so a class-08 link is seen as lost; the state is never named."""
+    exc = _Unclassable("08S01", f"link lost ({_VALUE})")
+    assert database._sqlstate(exc) == "08S01"
+    assert database._log_sqlstate(exc) == "08S01"
+    assert database._connection_lost(exc)
+    assert database._shown_state("08S01", exc) is None
+    named = _Unclassable(_VALUE, "dup (900123) (SQLExecDirectW)")
+    assert database._safe_db_error(named) == "_Unclassable [message withheld]"
+    assert _VALUE not in database._poll_log_line(named, under=False)
+    assert _VALUE not in database._credential_free_detail(named)
+
+
+async def test_an_unclassable_send_error_is_retried_and_its_text_withheld(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red on the previous head, where the send raised it as an internal error: an ``('08S01',
+    ...)`` error from a class whose driver test raises is retried, as on main, and neither the
+    error the runner stores nor the log carries its text or state."""
+    conn = _FakeConn(_FakeCursor(_Unclassable("08S01", f"link lost ({_VALUE})")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert str(raised.value) == "database transient error [SQLSTATE withheld]"
+    assert _VALUE not in safe_exc(raised.value)
+    assert _VALUE not in caplog.text
+
+
+async def test_a_driver_error_in_a_send_is_still_rejected_by_its_sqlstate() -> None:
+    """Control: a driver's error keeps its SQLSTATE, and its message stays out of the text."""
+    conn = _FakeConn(_FakeCursor(DriverError("23000", f"duplicate key ({_VALUE})")))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError) as refused:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value) == "database rejected the statement [23000]"
+
+
+# --- PR 3150 finding 5: the connector and the log chain agree on these errors ------------------
+
+
+def test_a_sqlite_message_is_not_read_as_a_sqlstate_by_the_connector() -> None:
+    """Red on main: the connector's copy read SQLite's ``args[0]``, its message, as a SQLSTATE,
+    where the log chain's copy did not, so the two disagreed on one error."""
+    exc = sqlite3.IntegrityError(_VALUE)
+    assert database._sqlstate(exc) is None
+    assert database._log_sqlstate(exc) is None
+    assert _VALUE not in database._safe_db_error(exc)
+
+
+def test_the_connector_and_the_log_chain_read_one_sqlstate() -> None:
+    """Control: the same driver error names the same SQLSTATE on both paths."""
+    exc = _raised(DriverError("42S02", f"no object {_VALUE}"))
+    assert database._log_sqlstate(exc) == "42S02"
+    assert database._safe_db_error(exc) == "DriverError [42S02]"
+    assert "[42S02] [driver message withheld]" in safe_traceback((type(exc), exc, None))
+
+
+# --- PR 3150 finding 6: only SQLite's own error carries its result-code name -------------------
+
+
+class _NamedDriverError(DriverError):
+    """A driver error that is not SQLite's, carrying an attribute of SQLite's name."""
+
+    sqlite_errorname = "SQLITE_CONSTRAINT"
+
+
+def test_a_result_code_name_reads_only_from_sqlite() -> None:
+    """Red on main: the trailing ``sqlite_errorname`` read in ``redaction._driver_code`` printed
+    the name for any driver's error with no SQLSTATE, and ``database._withheld`` did too."""
+    exc = _NamedDriverError(f"no state {_VALUE}")
+    assert "SQLITE_CONSTRAINT" not in safe_traceback((type(exc), exc, None))
+    assert database._safe_db_error(exc) == "_NamedDriverError [driver message withheld]"
+
+
+def test_sqlite_still_names_its_result_code() -> None:
+    """SQLite's own error keeps its result-code name on both paths. Red on main at the connector,
+    which read the message as a SQLSTATE and printed ``IntegrityError [MRN42]``."""
+    exc = sqlite3.IntegrityError(_VALUE)
+    exc.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"
+    assert "[driver message withheld SQLITE_CONSTRAINT_UNIQUE]" in safe_traceback(
+        (type(exc), exc, None)
+    )
+    assert database._safe_db_error(exc) == (
+        "IntegrityError [driver message withheld SQLITE_CONSTRAINT_UNIQUE]"
+    )
+
+
+# --- #1661 added item 5: the DEBUG cursor-close lines render only when kept --------------------
+
+
+def _counting_render(monkeypatch: pytest.MonkeyPatch) -> list[BaseException]:
+    rendered: list[BaseException] = []
+
+    def render(exc: BaseException, **_kwargs: Any) -> str:
+        rendered.append(exc)
+        return "rendered"
+
+    monkeypatch.setattr(database, "_safe_db_error", render)
+    return rendered
+
+
+class _CloseFails:
+    def close(self) -> None:
+        raise DriverError("HY010", f"close {_VALUE}")
+
+
+class _AsyncCloseFails:
+    async def close(self) -> None:
+        raise DriverError("HY010", f"close {_VALUE}")
+
+
+async def test_a_cursor_close_failure_is_not_rendered_when_debug_is_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on main: both close sites rendered the error eagerly, before ``logger.debug`` dropped
+    the line."""
+    rendered = _counting_render(monkeypatch)
+    caplog.set_level(logging.INFO, logger=database.logger.name)
+    database._close_raw_cursor(_CloseFails())
+    await database._close_cursor(_AsyncCloseFails())
+    assert rendered == []
+
+
+async def test_a_cursor_close_failure_is_rendered_when_debug_is_on(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control: at DEBUG both lines still render and log."""
+    rendered = _counting_render(monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    database._close_raw_cursor(_CloseFails())
+    await database._close_cursor(_AsyncCloseFails())
+    assert len(rendered) == 2
+    assert caplog.text.count("cursor close failed, ignored: rendered") == 2
+
+
+# --- #1661 added item 6: an exception group keeps its members in the redacted copy -------------
+
+
+def test_the_redacted_copy_keeps_an_exception_groups_members() -> None:
+    """Red on main: the copy was one ``RedactedDbError``, so the members and their frames were
+    dropped from the poll-failure traceback."""
+    group = _raised(
+        ExceptionGroup(
+            "synthetic group",
+            [_raised(DriverError("23000", f"duplicate ({_VALUE})")), _raised(ValueError("y"))],
+        )
+    )
+    copy = database._safe_db_exc_info(group)
+    assert isinstance(copy, BaseExceptionGroup)
+    assert isinstance(copy, database.RedactedDbError)
+    lines = [str(member) for member in copy.exceptions]
+    assert lines == ["DriverError [23000]", "ValueError [message withheld]"]
+    assert all(member.__traceback__ is not None for member in copy.exceptions)
+    text = safe_traceback((type(copy), copy, copy.__traceback__))
+    assert "DriverError [23000]" in text
+    assert _VALUE not in text
+
+
+def test_a_member_whose_chain_leads_back_to_its_group_does_not_loop() -> None:
+    """A member whose context is its own group closes the cycle rather than recursing.
+
+    The group is reached twice: from the top, and again as the driver member's context, where it
+    is under a driver error. Each gets its own copy (vault BACKLOG #8153, item 8), and the copy
+    under the member closes on its own stand-in."""
+    member = DriverError("23000", f"duplicate ({_VALUE})")
+    group = ExceptionGroup("synthetic group", [member])
+    member.__context__ = group
+    copy = database._safe_db_exc_info(group)
+    assert isinstance(copy, BaseExceptionGroup)
+    assert copy.message == "ExceptionGroup [message withheld]"
+    (copied,) = copy.exceptions
+    under = copied.__context__
+    assert isinstance(under, BaseExceptionGroup)
+    assert under.message == f"ExceptionGroup {UNDER_A_DRIVER_ERROR}"
+    (again,) = under.exceptions
+    assert again.__context__ is not None  # the cycle closes on the group's stand-in under it
+    assert again.__context__.args == (under.message,)
+
+
+def test_a_link_reached_first_outside_a_driver_error_is_withheld_under_one() -> None:
+    """Vault BACKLOG #8153, item 8. Red on the previous head: the copy cache was keyed by the link
+    alone, so a link first copied outside a driver error kept that rendering when a driver error
+    held it too, and printed its text under the driver error.
+
+    The shared link is an ``ImportError``, whose text the poll traceback keeps outside a driver
+    error (BACKLOG #5348) and must withhold under one."""
+    shared = ImportError("cannot import name synthetic_MRN900123456")
+    driver = DriverError("23000", f"duplicate ({_VALUE})")
+    driver.__cause__ = shared
+    outer = RuntimeError("synthetic outer")
+    outer.__context__ = shared
+    group = ExceptionGroup("synthetic group", [outer, driver])
+    copy = database._safe_db_exc_info(group)
+    assert isinstance(copy, BaseExceptionGroup)
+    outside, inside = copy.exceptions
+    assert outside.__context__ is not None and inside.__cause__ is not None
+    assert "synthetic_MRN900123456" in str(outside.__context__)  # the control: kept outside
+    assert str(inside.__cause__) == f"ImportError {UNDER_A_DRIVER_ERROR}"
+
+
+# --- Regressions of this branch's earlier heads ------------------------------------------------
+
+
+async def test_a_wrapped_lost_link_still_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red on the previous head, whose withheld error carried no chain: a driver's 08S01 under a
+    non-driver error shaped like one is seen by the release's lost-link read, and discarded."""
+    try:
+        try:
+            raise DriverError("08S01", "link lost")
+        except DriverError as link:
+            raise RuntimeError("HY000", "wrapped") from link
+    except RuntimeError as caught:
+        failure = caught
+    released: list[bool] = []
+    real_release = database._close_and_release
+
+    async def recording(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
+        # The release's own lost-link read, as it decides with the exception in flight.
+        released.append(discard or database._connection_lost(sys.exc_info()[1]))
+        await real_release(pool, conn, cur, discard=discard)
+
+    monkeypatch.setattr(database, "_close_and_release", recording)
+    conn = _FakeConn(_FakeCursor(failure))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError, match=r"\[SQLSTATE withheld\]"):
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert released == [True]
+
+
+@pytest.mark.parametrize("step", ["fetch", "nextset"])
+async def test_a_shaped_capture_error_rolls_back_by_its_state(step: str) -> None:
+    """A non-driver error shaped like a transient SQLSTATE during the capture is the statement's
+    failure, as before this branch: it propagates, the send rolls back and retries, and its text
+    is withheld."""
+    from tests.test_database_out_params_capture import _FaultCursor, _send_dest
+
+    def error() -> Exception:
+        return RuntimeError("40001", f"deadlock victim ({_VALUE})")
+
+    sets: list[Any] = [([(1,)], [("id",)]), ([(0,)], [("status",)])]
+    if step == "fetch":
+        cur = _FaultCursor(sets, fetch_raises_on=0, fetch_error=error)
+    else:
+        cur = _FaultCursor(sets, nextset_raises_on=0, nextset_error=error)
+    d, conn = _send_dest(cur)
+    with pytest.raises(DeliveryError) as raised:
+        await d.send('{"mrn": "42"}')
+    assert not isinstance(raised.value, NegativeAckError)
+    assert _VALUE not in safe_exc(raised.value)
+    assert conn.rolledback and not conn.committed
+
+
+async def test_a_shaped_client_fetch_state_commits_naming_no_text() -> None:
+    """Red on the previous head, which rolled it back: a non-driver error shaped like the client
+    conversion state 07006 is a capture problem, as before this branch, so the write commits; the
+    capture's detail names no state."""
+    from tests.test_database_out_params_capture import _FaultCursor, _send_dest
+
+    cur = _FaultCursor(
+        [([(1,)], [("id",)])],
+        fetch_raises_on=0,
+        fetch_error=lambda: RuntimeError("07006", f"restricted ({_VALUE})"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable"
+    assert resp.detail == "result-set not readable (RuntimeError)"
+    assert conn.committed and not conn.rolledback
+
+
+class _AsyncpgMessage(Exception):
+    """asyncpg's shape: the message in ``args[0]``, and a ``sqlstate`` that is set but unusable."""
+
+    __module__ = "asyncpg.exceptions._base"
+    sqlstate = ""
+
+
+class _AsyncpgClientMessage(Exception):
+    """asyncpg's client-side shape: the message in ``args[0]``, and no ``sqlstate`` at all."""
+
+    __module__ = "asyncpg.exceptions._base"
+
+
+class _AsyncpgNoneState(Exception):
+    """asyncpg's server shape with no state read: the message in ``args[0]``, ``sqlstate`` None."""
+
+    __module__ = "asyncpg.exceptions._base"
+    sqlstate = None
+
+
+_ASYNCPG_SHAPES = [_AsyncpgMessage, _AsyncpgClientMessage, _AsyncpgNoneState]
+
+
+@pytest.mark.parametrize("make", _ASYNCPG_SHAPES)
+def test_the_traceback_line_never_reads_a_message_as_a_sqlstate(make: type[Exception]) -> None:
+    """Red on the branch head before this fix (2c4ced1906e): ``_safe_db_error`` named ``[MRN42]``,
+    asyncpg's message read from ``args[0]``, and the traceback line did too for an absent or None
+    ``sqlstate``. Classification by that shape is kept, as on 2c4ced1906e; only the text changes."""
+    exc = _raised(make(_VALUE))
+    assert _VALUE not in safe_traceback((type(exc), exc, None))
+    assert database._log_sqlstate(exc) == _VALUE  # classified by shape, as on 2c4ced1906e
+    assert database._sqlstate(exc) == _VALUE
+    assert database._shown_state(_VALUE, exc) is None
+    assert database._safe_db_error(exc) == f"{make.__name__} [message withheld]"
+
+
+def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
+    """Control: an asyncpg error's own ``sqlstate`` attribute still names its state."""
+    exc = _AsyncpgMessage(f"duplicate key ({_VALUE})")
+    exc.sqlstate = "23505"
+    assert database._log_sqlstate(exc) == "23505"
+    assert database._safe_db_error(exc) == "_AsyncpgMessage [23505]"
+    assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
+
+
+class _AgreeingText(str):
+    """Text whose ``==`` says yes to anything."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+def test_a_sqlstate_text_subclass_cannot_name_an_asyncpg_message() -> None:
+    """Red on a03971a7569, whose ``attribute == state`` let a ``str`` subclass's ``__eq__`` name
+    ``MRN42``, asyncpg's message, as the state."""
+    exc = _AsyncpgMessage(_VALUE)
+    exc.sqlstate = _AgreeingText("")
+    assert database._shown_state(_VALUE, exc) is None
+    assert _VALUE not in database._safe_db_error(exc)
+
+
+class _Loud(str):
+    """SQLSTATE-shaped data whose ``__str__`` prints a value instead."""
+
+    def __str__(self) -> str:
+        return _VALUE
+
+
+def _asyncpg_error(message: object, sqlstate: object) -> _AsyncpgMessage:
+    exc = _AsyncpgMessage(message)
+    exc.sqlstate = sqlstate  # type: ignore[assignment]  # the fake's attribute is typed str
+    return exc
+
+
+def test_the_shown_state_is_an_exact_copy_never_the_callers_object() -> None:
+    """Hold item 1 on engine PR 3163: red on 05ee5958ff9, whose ``_shown_state`` returned the
+    caller's ``state``, a ``str`` subclass from ``args[0]`` that prints ``MRN42``, once it equalled
+    the vetted attribute. What it returns now is an exact ``str`` copy, for any driver."""
+    for exc in (_asyncpg_error(_Loud("23505"), "23505"), DriverError(_Loud("23505"), "x")):
+        shown = database._shown_state(_Loud("23505"), exc)
+        assert type(shown) is str and shown == "23505"
+        assert _VALUE not in f"[{shown}]"
+
+
+def test_the_shown_state_compares_by_strs_own_method() -> None:
+    """Hold item 6: the mutant ``attribute is not None and attribute == state`` names a state for
+    a ``str`` subclass from ``args[0]`` whose reflected ``__eq__`` says yes to anything, since
+    ``==`` runs the right operand's ``__eq__`` first when its class is a subclass of the left's."""
+    exc = _asyncpg_error(_AgreeingText(_VALUE), "23505")
+    assert database._shown_state(_AgreeingText(_VALUE), exc) is None
+
+
+def test_a_classified_error_prints_the_shown_state_never_its_sqlstate() -> None:
+    """Hold item 2: red on 05ee5958ff9, where ``shown`` was a bool and the text and ``code``
+    printed the ``sqlstate`` argument, here a ``str`` subclass that prints ``MRN42``."""
+    for connecting in (False, True):
+        err = database._classify_db_error(_Loud("23505"), "x", shown="23505", connecting=connecting)
+        assert _VALUE not in str(err)
+        assert _VALUE not in str(getattr(err, "code", ""))
+    refused = database._send_refusal(_Loud("23505"), _asyncpg_error(_Loud("23505"), "23505"))
+    assert isinstance(refused, NegativeAckError)
+    assert str(refused) == "database rejected the statement [23505]"
+    assert type(refused.code) is str and refused.code == "23505"
+
+
+def test_a_sqlstate_subclass_is_read_as_an_exact_copy() -> None:
+    """Hold item 3: red on 05ee5958ff9, whose readers returned a ``str`` subclass in the
+    ``sqlstate`` attribute or ``args[0]`` as it was, so the traceback line printed ``[MRN42]``
+    through its ``__str__``. The readers now return an exact copy of its data, so the error is
+    classified as on origin/main and no reader hands the subclass on."""
+    from messagefoundry import redaction
+    from messagefoundry.redaction import driver_sqlstate_of
+
+    exc = _raised(_asyncpg_error(_VALUE, _Loud("23505")))
+    assert _VALUE not in safe_traceback((type(exc), exc, None))
+    assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
+    for state in (driver_sqlstate_of(exc), database._log_sqlstate(exc)):
+        assert type(state) is str and state == "23505"
+    assert database._safe_db_error(exc) == "_AsyncpgMessage [23505]"
+    shaped = DriverError(_Loud("23505"), "x")
+    for state in (
+        database._sqlstate(shaped),
+        database._log_sqlstate(shaped),
+        driver_sqlstate_of(shaped),
+    ):
+        assert type(state) is str and state == "23505"
+    assert database._safe_db_error(shaped) == "DriverError [23505]"
+    assert not redaction.reads_as_a_sqlstate(_Loud("23505"))
+    assert type(redaction.sqlstate_text(_Loud("23505"))) is str
+
+
+async def test_a_probe_prints_no_sqlstate_subclass() -> None:
+    """Hold item 2, the probe's caller: red on 05ee5958ff9, whose ``test_connection`` error read
+    ``database rejected the statement [MRN42]`` for this asyncpg error. Still a permanent
+    rejection, as there."""
+    dest = _dest()
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(_asyncpg_error(_Loud("23505"), "23505"))))
+    with pytest.raises(NegativeAckError) as failed:
+        await dest.test_connection()
+    assert str(failed.value) == "database rejected the statement [23505]"
+    assert type(failed.value.code) is str and failed.value.code == "23505"
+    assert _VALUE not in safe_exc(failed.value)
+
+
+_SUBCLASS_DUP = "Cannot insert duplicate key. The duplicate key value is (900123456). (2627) (X)"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _asyncpg_error(_Loud("23505"), "23505"),
+        DriverError(_Loud("23505"), _SUBCLASS_DUP),
+    ],
+    ids=["asyncpg", "pyodbc"],
+)
+async def test_a_send_classifies_a_sqlstate_subclass_and_prints_a_copy(exc: Exception) -> None:
+    """Review of the hold's fix: a ``str`` subclass state is still classified by its data, a
+    dead-lettered rejection after a rollback, as on origin/main, never re-raised to the internal-
+    error arm, whose stored text would print the driver's message or the subclass's value."""
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError) as refused:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value).startswith("database rejected the statement [23505]")
+    assert refused.value.permanent and refused.value.code == "23505"
+    assert _VALUE not in safe_exc(refused.value)
+    assert "900123456" not in safe_exc(refused.value)
+    assert conn.rolledback
+
+
+class _FakesStr:
+    """Not text, though ``isinstance(x, str)`` says it is: its ``__class__`` reads as ``str``."""
+
+    __class__ = property(lambda self: str)
+
+
+def test_an_object_faking_str_reads_as_no_sqlstate() -> None:
+    """Review of the hold's fix: an ``isinstance`` gate would let this through to ``str.__len__``,
+    the first ``str`` method ``sqlstate_text`` calls on it, which raises, and ``_sqlstate`` runs in
+    the send's error arm before its rollback. The readers answer None instead."""
+    from messagefoundry.redaction import driver_sqlstate_of, sqlstate_text
+
+    exc = DriverError(_FakesStr(), "x")
+    assert isinstance(_FakesStr(), str)
+    assert sqlstate_text(_FakesStr()) is None
+    assert database._sqlstate(exc) is None and database._log_sqlstate(exc) is None
+    assert driver_sqlstate_of(exc) is None
+
+
+async def test_a_fetch_deadlock_with_a_sqlstate_subclass_still_propagates() -> None:
+    """Review of the hold's fix: a deadlock from a fetch, its state a ``str`` subclass, is the
+    statement's own failure and propagates so the write rolls back, as on origin/main; a reader
+    that rejected the subclass would make it an unreadable result and the write would commit."""
+
+    class _Cursor:
+        description = (("id",),)
+
+        async def fetchall(self) -> list[Any]:
+            raise DriverError(_Loud("40001"), "deadlock")
+
+    with pytest.raises(DriverError):
+        await database._fetch_result_set(_Cursor())
+
+
+class _ClassRaises(DriverError):
+    """A driver error whose ``__class__`` attribute raises when read, as ``isinstance`` reads it
+    for a class that does not match."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        raise RuntimeError("__class__ read")
+
+
+async def test_a_send_rolls_back_when_the_errors_class_attribute_raises() -> None:
+    """Review of the hold's fix, finding 1 of round-15921764ae: red on 094202761556, where
+    ``_sqlstate``'s ``isinstance`` tests read ``exc.__class__`` and raised before the send's
+    rollback, so the INSERT could be left open on a pooled connection (BACKLOG #5010). It reads
+    the class with ``type()`` now, and the send is still a classified rejection."""
+    from messagefoundry.redaction import is_a_sqlite_error
+
+    exc = _ClassRaises("23505", f"duplicate key ({_VALUE})")
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    # The outcome is read outside the except arms: pytest's own report reads ``__class__`` on a
+    # failure chained to this error, and would crash rather than report it.
+    outcome = "returned"
+    try:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    except NegativeAckError as refused:
+        outcome = str(refused)
+    except Exception as failed:  # noqa: BLE001 - recorded and asserted below
+        outcome = f"raised {type(failed).__name__}"
+    assert outcome == "database rejected the statement [23505]"
+    assert conn.rolledback
+    readers = []
+    for read in (database._sqlstate, database._log_sqlstate, is_a_sqlite_error):
+        try:
+            readers.append(read(exc))
+        except Exception as failed:  # noqa: BLE001 - recorded and asserted below
+            readers.append(f"raised {type(failed).__name__}")
+    assert readers == ["23505", "23505", False]
+
+
+async def test_a_connect_refusal_with_a_sqlstate_subclass_keeps_its_disposition() -> None:
+    """Review of the hold's fix: a refused login whose state is a ``str`` subclass is still a
+    credential fault that stops the lane, as on origin/main, and prints a copy of its state."""
+
+    async def refuse() -> Any:
+        raise DriverError(_Loud("28000"), "login failed")
+
+    with pytest.raises(NegativeAckError) as raised:
+        await database._connect(refuse, 1.0)
+    assert raised.value.credential_fault
+    assert str(raised.value) == "database refused the login [28000]"
+    assert _VALUE not in safe_exc(raised.value)
+
+
+async def test_an_asyncpg_message_in_a_send_is_dead_lettered_naming_no_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red on the branch head before this fix (2c4ced1906e): the send's arm dead-lettered the
+    message as ``database rejected the statement [MRN42]``, code ``MRN42``, the text the runner
+    stores as ``last_error`` and the alert carries. It is still dead-lettered by the same arm, a
+    permanent rejection after a rollback, as on 2c4ced1906e; its text and code name no state."""
+    conn = _FakeConn(_FakeCursor(_AsyncpgClientMessage(_VALUE)))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(NegativeAckError) as refused:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value) == "database rejected the statement [SQLSTATE withheld]"
+    assert refused.value.permanent and refused.value.code == "db"
+    assert _VALUE not in safe_exc(refused.value)  # what the runner stores as last_error
+    assert _VALUE not in caplog.text
+    assert conn.rolledback
+
+
+@pytest.mark.parametrize("make", _ASYNCPG_SHAPES)
+async def test_an_asyncpg_message_is_never_printed_as_a_sqlstate(
+    make: type[Exception], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on the branch head before this fix (2c4ced1906e): an asyncpg error whose ``sqlstate`` is
+    unusable or absent was read by
+    its ``args[0]``, its message, so the connect error, the ``last_error`` the runner stores from
+    it and the log line all printed ``[MRN42]``."""
+    exc = make(_VALUE)
+
+    async def refuse() -> Any:
+        raise exc
+
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(DeliveryError) as raised:
+        await database._connect(refuse, 1.0)
+    assert _VALUE not in str(raised.value)
+    assert _VALUE not in str(getattr(raised.value, "code", ""))
+    assert _VALUE not in safe_exc(raised.value)  # what the runner stores as last_error
+    closing: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    closing.set_exception(exc)
+    database._log_late_pool_close("DATABASE", closing)
+    assert "pool close failed" in caplog.text
+    assert _VALUE not in caplog.text
+
+
+class _NoArgs(DriverError):
+    """A driver error whose ``args`` is missing when read."""
+
+    @property
+    def args(self) -> Any:  # type: ignore[override]
+        raise AttributeError("args")
+
+
+def test_a_missing_args_reads_as_no_sqlstate() -> None:
+    """Red on the previous head: ``exc.args`` was read with no default, so an error arm raised
+    before its rollback. Read with ``getattr`` and a default, as main read it."""
+    assert database._sqlstate(_NoArgs()) is None
+
+
+@pytest.fixture
+async def rig() -> AsyncIterator[_Rig]:
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="test-w7-db")
+    r = _Rig(executor)
+    try:
+        yield r
+    finally:
+        r.release.set()  # never leave a worker parked if an arm failed early
+        executor.shutdown(wait=True)
+        for pool in r.pools:
+            pool_executor = database._tracked(database._POOL_EXECUTORS, pool)
+            if pool_executor is not None:
+                pool_executor.shutdown(wait=True)
+
+
+class _ShapedTimeoutSetter(RawConn):
+    """A connection whose ``timeout`` write fails with a non-driver error shaped like HYT00."""
+
+    @property
+    def timeout(self) -> int:
+        return 0
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        if value:  # the fake's own __init__ writes 0
+            raise RuntimeError("HYT00", f"timed out ({_VALUE})")
+
+
+async def test_a_shaped_hyt00_setter_failure_discards_and_retries(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Red on the previous head, which returned the handle and stopped the lane on a config fault:
+    a non-driver error shaped like HYT00 from the statement-timeout write discards the connection
+    and retries, as before this branch, and no message text reaches the log or the error."""
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_ShapedTimeoutSetter, blocks=never
+    )
+    with pytest.raises(DeliveryError) as caught:
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError), caught.value
+    pool = rig.pools[0]
+    assert pool.returned and pool.free == [] and rig.conn.closed
+    assert _VALUE not in safe_exc(caught.value)
+    assert _VALUE not in caplog.text

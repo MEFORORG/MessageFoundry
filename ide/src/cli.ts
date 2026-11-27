@@ -146,16 +146,46 @@ function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
     return undefined;
   }
+  const escape = pathSettingLinkEscape(key, s);
+  if (escape !== undefined) {
+    void vscode.window.showErrorMessage(escape);
+    return undefined;
+  }
+  return s;
+}
+
+/**
+ * The refusal text when the file or folder `s` names leaves the workspace through a link
+ * ({@link escapesByLink}), else undefined. Run only in a trusted window, for the reason
+ * {@link writerSetting} gives. A blank serviceConfig is judged as the fallback file, which is what
+ * Start, the connection edits and the offline AI policy open for it; the alert writers send the blank
+ * value as written, so for them the refusal's naming of the fallback file is an open limit. A reader
+ * that sends the value as written uses {@link readerPathEscapesByLink}. Exported for the offline AI
+ * policy (aiPolicy.ts), which names that fallback file explicitly (BACKLOG #5411).
+ */
+export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetting): string | undefined {
   // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
   // own fallback, `./messagefoundry.toml` in the workspace folder, at least serve does. That file is
   // checked in its place, since the blank value names the folder itself.
   const blank = key === "serviceConfig" && s.value.trim() === "";
   const checked = blank ? PATH_FALLBACK.serviceConfig : s.value;
   if (!isExecGated() && escapesByLink(workspaceDir(), checked)) {
-    void vscode.window.showErrorMessage(linkEscapeRefusal(key, blank ? checked : undefined));
-    return undefined;
+    return linkEscapeRefusal(key, blank ? checked : undefined);
   }
-  return s;
+  return undefined;
+}
+
+/**
+ * Whether the path `s` names, handed to the CLI as written, leaves the workspace through a link
+ * ({@link escapesByLink}), for a reader that passes the value as written, at least the alert list
+ * and engine trust's `cert inventory` (BACKLOG #5411, #8237 item 24). A blank value names no file,
+ * so nothing is checked; the CLI is handed the blank value. Run only in a trusted window, as
+ * {@link writerSetting}'s check is. `ws` is the folder the CLI runs in, by default the workspace's.
+ * Open limit: the check reads real paths synchronously, so a link onto an unreachable share holds
+ * the extension host for that read.
+ */
+export function readerPathEscapesByLink(s: ContainedPathSetting, ws: string | undefined = workspaceDir()): boolean {
+  return s.value.trim() !== "" && !isExecGated() && escapesByLink(ws, s.value);
 }
 
 /**

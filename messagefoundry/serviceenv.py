@@ -30,6 +30,19 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
+* **Another engine secret that reaches a known service from outside the lists it read is named
+  as ``secret_from_outside_service_lists``, and one the machine-wide environment sets refuses the
+  start under ``[security].enforcement = "enforce"``** (vault BACKLOG #2595, slice B's other
+  half). The owner's 2026-10-01 ruling refuses key-class names and a Windows service's NSSM
+  environment always, and other secrets in the environment under ``enforce``; this refusal is
+  that second half for the machine-wide environment, so :func:`service_env_enforced_refusal`
+  carries it and the caller applies the setting. The engine refuses only a name it finds set in
+  that environment's registry key: a secret a ``python.exe`` wrapper between NSSM and the
+  engine exports into the engine's own environment is named and not refused, unless the
+  machine-wide key also sets that name. Under a wrapper the walk does not pass through, such as
+  ``cmd.exe``, with ``nssm.exe`` above it, the engine cannot tell whether it runs as that
+  service: it names ``service_environment_unobservable`` and refuses nothing here. A store key
+  from outside the lists stays named and not refused, as the bullet above says.
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
 grandchild when a virtual environment's ``python.exe`` starts the base interpreter, or further
@@ -42,15 +55,15 @@ by something else, such as a shell, even when that shell itself runs under some 
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or
 the ``messagefoundry`` launcher, and a variable an operator names as a ``[secrets].provider =
 "env"`` reference, whose name the engine does not read here, unless that name starts with
-``MEFOR_VALUE_``, which is refused as every such name is; and any secret or ``MEFOR_VALUE_*``
-variable, other than a store key, that reaches the engine from the machine-wide environment. An
-``env()`` value's ``MEFOR_VALUE_*`` name in the service's own lists is covered.
+``MEFOR_VALUE_``, which is refused as every such name is; and any ``MEFOR_VALUE_*`` variable
+that reaches the engine from the machine-wide environment. An ``env()`` value's
+``MEFOR_VALUE_*`` name in the service's own lists is covered.
 
 **Not a refusal when the read fails, with one exception.** An engine that cannot walk its
 ancestors, or cannot read its service's lists, reports ``service_environment_unobservable`` and
 starts, and a secret in those lists goes unrefused. The exception: a known service whose lists
-could not be read refuses a store key in this process's environment, since it most likely came
-from them.
+could not be read refuses a store key or another engine secret in this process's environment,
+whatever the enforcement setting, since it most likely came from them.
 """
 
 from __future__ import annotations
@@ -61,7 +74,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -104,8 +117,12 @@ _INLINE_PEM_NAMES = frozenset({"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY"})
 #: The values that carry a service's environment: NSSM's two under the service's ``Parameters``
 #: key (``AppEnvironment`` replaces the environment, ``AppEnvironmentExtra`` adds to it), and the
 #: Service Control Manager's ``Environment`` on the service's own key.
-NSSM_ENVIRONMENT_VALUES: tuple[str, ...] = ("AppEnvironment", "AppEnvironmentExtra")
+NSSM_EXTRA_VALUE = "AppEnvironmentExtra"
+NSSM_ENVIRONMENT_VALUES: tuple[str, ...] = ("AppEnvironment", NSSM_EXTRA_VALUE)
 SCM_ENVIRONMENT_VALUE = "Environment"
+
+#: What the Windows probe puts before each NSSM value's name in the label of an entry it reads.
+_NSSM_LABEL_PREFIX = "Parameters\\"
 
 _NSSM_IMAGE = "nssm.exe"
 
@@ -152,6 +169,15 @@ class ServiceEnvPosture:
     #: The key-class names set, and not empty, in THIS process's environment, wherever they came
     #: from. Empty when ``status`` is ``NOT_A_SERVICE``.
     keys_in_environment: tuple[str, ...] = ()
+    #: The :data:`DIRECTORY_CLASS_NAMES` set, and not empty, in THIS process's environment,
+    #: wherever they came from. Each comes from that constant, never from the registry. Empty
+    #: when ``status`` is ``NOT_A_SERVICE`` (vault BACKLOG #2595, slice B's other half).
+    others_in_environment: tuple[str, ...] = ()
+    #: The names in ``others_in_environment`` that the machine-wide environment sets, read from
+    #: its registry key (:data:`MACHINE_ENVIRONMENT_KEY`). Each comes from that constant list,
+    #: never from the registry. Empty unless ``status`` is ``OBSERVED``, or when that key could
+    #: not be read.
+    others_machine_wide: tuple[str, ...] = ()
     #: Why the reading failed (``UNOBSERVABLE``).
     detail: str = ""
     #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry sets empty or blank, so the
@@ -162,14 +188,58 @@ class ServiceEnvPosture:
     #: holding a line break that is counted under a later line's name is not.
     unplain_value_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether a refused name's value, empty in its own string, runs on into the next strings of
-    #: its registry value, so the refusal can say to remove those strings too.
+    #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
-    #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
-    #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
-    #: or not :func:`_names` keeps the variable it was joined to.
-    #: NSSM may read that string as its own variable, so the refusal must not say to remove every
-    #: such string, nor that the lists set no secrets directory.
+    #: The refused names with nothing to move (:func:`_nothing_to_move`): each entry that sets one
+    #: is empty, or its only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are blank or
+    #: plainly a path (:func:`_directory_entry_value`). The remedy alone reads this, never the
+    #: refusal itself.
+    nothing_to_move_names: tuple[str, ...] = field(default=(), repr=False)
+    #: Whether any registry string in the lists is a directory entry in doubt
+    #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
+    #: ``MEFOR_SECRETS_DIRECTORY``, and the string alone is not plainly a path. Where this is
+    #: True the remedy prints no keep-one step and no clause sparing directory lines from its
+    #: removal steps. Its first step says to take every line that may name the directory
+    #: (:func:`_may_name_directory`) out of every list, with the lines the engine reads as its
+    #: value, and those lines alone, keeping every refused variable for the steps below. The
+    #: protect-key step follows where a store key moves, then, where a setting moves to the
+    #: secrets directory, the create step, even where a directory entry is listed, then the step
+    #: that moves it, the removal steps, and the add-back step, which says to add one entry
+    #: naming the path wherever the directory exists. Where it is False, every directory entry is
+    #: plainly a path on its own, so the keep-one step prints where a refused value runs on into
+    #: one (``directory_run_on``), and no step removes one otherwise. The remedy alone reads this,
+    #: never the refusal itself (the Lander's ruling B on PR 3142's repair handback, comment
+    #: 7106776128, and its ruling (a) on comment 7112155891).
+    directory_in_doubt: bool = False
+    #: Whether a refused value runs on into a string whose first non-blank line sets
+    #: ``MEFOR_SECRETS_DIRECTORY``. Where no directory entry is in doubt, the remedy then prints
+    #: the keep-one step and spares directory lines from the run-on step; otherwise the run-on
+    #: step removes the string. The remedy alone reads this.
+    directory_run_on: bool = False
+    #: Whether a directory entry is in doubt and taking out each line that may name
+    #: ``MEFOR_SECRETS_DIRECTORY``, as the doubt step's rule says, changes how the reader reads a
+    #: refused variable (:func:`_take_out_changes_refused`), so the reader may hold such a line
+    #: as part of that variable. Where it does, the doubt step prints its leave sentence; that
+    #: function says what the sentence asks and what the check does not see. The remedy alone
+    #: reads this.
+    directory_in_refused: bool = False
+    #: Whether any AppEnvironmentExtra string is one install-service.ps1 reads as setting
+    #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`), so the doubt step may leave such a
+    #: string as it is. Where it may (``directory_in_refused``), the create step then says how to
+    #: treat such a string before the installer runs, a clause that states its own condition.
+    #: The remedy alone reads this.
+    installer_reads_extra: bool = False
+    #: Whether a value that runs on takes, as the first string after its own that is not blank
+    #: (:func:`_still_blank`), one whose first non-blank line sets ``MEFOR_SECRETS_DIRECTORY``
+    #: (:func:`_sets_directory`), whether or not :func:`_names` keeps the variable it was joined
+    #: to. The remedy alone reads this: its add-back step then says to pass back none of the
+    #: strings the steps above it say to remove.
     directory_joined: bool = False
+    #: Whether any line of any string in the lists sets ``MEFOR_SECRETS_DIRECTORY``, each line
+    #: read as :func:`_sets_directory` reads one, as its own item or joined to a value. The
+    #: remedy alone reads this, and then never says the lists set no secrets directory (the
+    #: Lander's holds on PR 3142, comments 7088663896 and 7089064404, B).
+    directory_in_lists: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -189,6 +259,15 @@ class ServiceEnvPosture:
         one: an operator may have typed a value where the name goes. The bare prefix is one too:
         it names no ``env()`` key, but a value set under it is as readable as any other."""
         return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
+
+    @property
+    def others_from_elsewhere(self) -> tuple[str, ...]:
+        """The other engine secrets in this process's environment that the service's lists, once
+        read, do not set: they reached the service from somewhere else, such as the machine-wide
+        environment. Empty unless ``status`` is ``OBSERVED``."""
+        if self.status is not ServiceEnvStatus.OBSERVED:
+            return ()
+        return tuple(name for name in self.others_in_environment if name not in self.listed)
 
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it, and the line of its string when
@@ -321,7 +400,7 @@ class _WindowsProbe:
         key = _service_key(service_name)
         return [
             *read(key, (SCM_ENVIRONMENT_VALUE,), ""),
-            *read(f"{key}\\Parameters", NSSM_ENVIRONMENT_VALUES, "Parameters\\"),
+            *read(f"{key}\\Parameters", NSSM_ENVIRONMENT_VALUES, _NSSM_LABEL_PREFIX),
         ]
 
 
@@ -350,6 +429,28 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 #: 43 such characters in a row, such as a hex digest, is read as key material too, an error toward
 #: refusing.
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
+
+#: For the remedy only (the Lander's sixth hold on PR 3142, H1): a whole value that is plainly
+#: an absolute path, from a drive letter or a UNC server and share, in ASCII letters,
+#: digits, spaces, ``.``, ``_``, ``-``, parentheses and separators only; and a key run in either
+#: base64 alphabet. A joined directory value is kept only when it is such a path and holds no
+#: such run; anything else may be key material, so the remedy treats it as one.
+_PLAIN_PATH = re.compile(
+    r"[A-Za-z]:[\\/][A-Za-z0-9 ._()\\/-]*"
+    r"|\\\\(?=[A-Za-z0-9._-]*[A-Za-z0-9])[A-Za-z0-9._-]+[\\/]"
+    r"(?=[A-Za-z0-9 ._()-]*[A-Za-z0-9])[A-Za-z0-9 ._()-]+(?:[\\/][A-Za-z0-9 ._()\\/-]*)?"
+)
+_EITHER_KEY_RUN = re.compile(r"[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43}")
+
+#: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
+#: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
+#: alphabet with or without that ``=``. Length alone does not tell a secret from a name, a path or a
+#: service name, so :func:`_is_one_key_text` also asks for what a random secret of that length all
+#: but always holds: letters of both cases and, in base64url, whose alphabet a mixed-case name
+#: shares, a digit. A name or value of that exact shape that is not a secret is read as one too,
+#: an error toward refusing.
+_STANDARD_KEY_TEXT = re.compile(r"[A-Za-z0-9+/]{43}=")
+_URLSAFE_KEY_TEXT = re.compile(r"[A-Za-z0-9_-]{43}=?")
 
 
 #: Text of the standard base64 alphabet alone, as the body of a padded secret is.
@@ -413,7 +514,12 @@ def _ends_blank_class(line: str) -> bool:
       Windows spells it (:data:`_WINDOWS_NAMES`), such as ``Path=C:\\x``;
     * an ordinary line under ``MEFOR_SECRETS_DIRECTORY`` in upper case, so an item that sets the
       directory is still read as setting it (a later line of one string never is, under the
-      line rule :func:`_variables` states).
+      line rule :func:`_variables` states);
+
+    and its value is not one secret or a list of them (:func:`_is_key_value`). So ``Path=<key>``
+    or ``MEFOR_SECRETS_DIRECTORY=<key>`` there is read as the secret's value (vault BACKLOG #5394
+    added items 6 and 12), an error toward refusing: such a variable whose whole value has a
+    secret's shape makes an empty secret above it read as set.
 
     No other name ends the value, however conventional: ``HTTP_PROXY=x``, ``TZ=UTC``,
     ``MEFOR_AI_ENVIRONMENT=prod``, ``Public=Summer!``, ``PATH=,C:\\x`` and ``=orphan`` all refuse,
@@ -424,18 +530,53 @@ def _ends_blank_class(line: str) -> bool:
     (``tests/test_b532w3_serviceenv_split_shapes.py`` pins it). What
     this misses, at least: a secret whose own text is exactly such a line, such as
     ``OS=Summer!``."""
-    name = line.partition("=")[0]
-    return (name in _WINDOWS_NAMES or name == _DIRECTORY_VARIABLE) and _is_ordinary_line(line)
+    name, _equals, value = line.partition("=")
+    return (
+        (name in _WINDOWS_NAMES or name == _DIRECTORY_VARIABLE)
+        and _is_ordinary_line(line)
+        and not _is_key_value(value)
+    )
+
+
+def _mixed_case(text: str) -> bool:
+    """Whether ``text`` holds both an ASCII upper-case and an ASCII lower-case letter."""
+    return any("a" <= c <= "z" for c in text) and any("A" <= c <= "Z" for c in text)
+
+
+def _is_one_key_text(text: str) -> bool:
+    """Whether ``text`` is exactly one 32-byte secret (:data:`_STANDARD_KEY_TEXT`,
+    :data:`_URLSAFE_KEY_TEXT`)."""
+    if not _mixed_case(text):
+        return False
+    if _STANDARD_KEY_TEXT.fullmatch(text) is not None:
+        return True
+    return _URLSAFE_KEY_TEXT.fullmatch(text) is not None and any(c.isdigit() for c in text)
 
 
 def _holds_key_run(text: str) -> bool:
-    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`)."""
-    return _KEY_SHAPED_RUN.search(text) is not None
+    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`), or, stripped, is
+    one base64url secret less its padding (:func:`_is_one_key_text`), as the name a secret with one
+    ``=`` of padding reads as."""
+    return _KEY_SHAPED_RUN.search(text) is not None or _is_one_key_text(text.strip())
+
+
+def _is_key_value(text: str) -> bool:
+    """Whether ``text``, stripped and with one pair of surrounding quotes taken off, is one secret
+    or a comma-separated list of them (:func:`_is_one_key_text`; vault BACKLOG #5394 added items
+    6 and 12). A blank entry, from a trailing or doubled comma, is skipped once another entry is
+    not blank, as the engine's retired-keys reader skips one, so such a list is still read as key
+    material (code review on PR 3142)."""
+    value = text.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    parts = [part.strip() for part in value.split(",")]
+    entries = [part for part in parts if part]
+    return bool(entries) and all(_is_one_key_text(part) for part in entries)
 
 
 def _is_ordinary_line(line: str) -> bool:
     """Whether ``line`` sets an ordinary variable (:data:`_ORDINARY_LINE`) and its name holds no
-    store key (:data:`_KEY_SHAPED_RUN`)."""
+    key material (:func:`_holds_key_run`)."""
     return bool(_ORDINARY_LINE.match(line)) and not _holds_key_run(line.partition("=")[0])
 
 
@@ -564,8 +705,15 @@ class _Variable:
     #: Whether its value, blank in its own string, takes the strings after it, which
     #: :func:`_variables` joins to that string.
     runs_on: bool = False
+    #: Whether it runs on, and every non-blank string it takes is a directory entry that is blank
+    #: or plainly a path (:func:`_directory_entry_value`). Read by the remedy only.
+    directory_only: bool = False
+    #: Whether it runs on, and a string after its own in the joined group sets
+    #: ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank line (:func:`_sets_directory`).
+    #: Remedy only.
+    takes_directory: bool = False
     #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
-    #: on its first line (:func:`_sets_directory_first`).
+    #: on its first line (:func:`_sets_directory`).
     holds_directory: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
@@ -698,14 +846,18 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     equals sign continues the value only in the cases below. Its name is the text before its
     first equals sign, stripped, and its value the text after it:
 
-    * the name holds a store-key-sized run (:data:`_KEY_SHAPED_RUN`), whatever the value;
+    * the name holds key material (:func:`_holds_key_run`), whatever the value, or the value is
+      one secret (:func:`_is_key_value`), so a base64url secret with one ``=`` and ``=<key>``
+      continue it (vault BACKLOG #5394 added items 6 and 12), but ``x=<key>``, an ordinary line
+      (:func:`_is_ordinary_line`), ends it, so the empty ``MEFOR_VALUE_*`` item is named;
     * the name is standard base64 text, and the value holds only whitespace and equals signs;
     * the name is not blank, and the value holds an equals sign and nothing but equals signs
       and whitespace.
 
-    So there ``abc==`` continues it in any alphabet, ``abc=`` continues it under the second
-    case, and ``PATH=`` continues it too. ``HTTP_PROXY=`` and ``PATH=C:\\x`` end it, as they fit
-    no case, but ``MEFOR_SECRETS_DIRECTORY==`` fits the third and continues it. In each case
+    So there ``abc==`` continues it in any alphabet, ``abc=`` continues it only under the first
+    two cases, so ``ab-c_dE=``, too short to be key material, ends it, and ``PATH=`` continues it
+    too. ``HTTP_PROXY=`` and ``PATH=C:\\x`` end it, as they fit no case, but
+    ``MEFOR_SECRETS_DIRECTORY==`` fits the third and continues it. In each case
     :func:`_line_start` reads the first line as starting no variable. So when the strings are
     joined, the line and the item's later lines are read as later lines of one string."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
@@ -720,20 +872,14 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     if not equals:
         return True
     name = written.strip()
-    could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
+    could_be_key = (
+        _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name) or _is_key_value(rest)
+    )
     # A secret outside the standard alphabet padded with ``==``, such as base64url, reads as a
     # name set to ``=``. The rule of 3085e1d5c55 continued on that, so this case keeps it.
     # ``_line_start`` holds the value to equals signs and whitespace, as on a later line.
     padded = bool(name) and "=" in rest
     return (could_be_key or padded) and _line_start(first) is None
-
-
-def _sets_directory_first(entry: str) -> bool:
-    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names."""
-    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
-    written, equals, _rest = first.partition("=")
-    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -818,6 +964,20 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
+        # For the remedy only, from the last string back: whether the non-blank strings from
+        # each index on are all directory entries that are blank or plainly a path
+        # (:func:`_directory_entry_value`), whether there is one, and whether one sets the
+        # directory. Nothing here feeds ``_names``, so it changes no refusal (the Lander's fifth
+        # hold on PR 3142, H2).
+        only_after = [True] * (len(strings) + 1)
+        any_after = [False] * (len(strings) + 1)
+        set_after = [False] * (len(strings) + 1)
+        for i in range(len(strings) - 1, -1, -1):
+            only_after[i], any_after[i] = only_after[i + 1], any_after[i + 1]
+            set_after[i] = set_after[i + 1] or _sets_directory(strings[i])
+            if not _still_blank(strings[i]):
+                only_after[i] = only_after[i] and _directory_entry_value(strings[i]) is not None
+                any_after[i] = True
         for variable in joined:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
             local = (variable.line or 1) - starts[index] + 1
@@ -837,17 +997,172 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     ),
                     "",
                 )
-                holds = _sets_directory_first(taken)
+                holds = _sets_directory(taken)
             read.append(
                 replace(
                     variable,
                     line=line_on_string,
                     broken=variable.broken and not joined_break,
                     runs_on=ran_on,
+                    directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
+                    takes_directory=ran_on and set_after[index + 1],
                     holds_directory=holds,
                 )
             )
     return read
+
+
+#: The run the doubt step's printed rule names: 43 letters, digits, plus signs, slashes, hyphens
+#: or underscores, both base64 alphabets together.
+_STEP_KEY_RUN = re.compile(r"[A-Za-z0-9+/_-]{43}")
+
+
+def _ends_directory_value(line: str) -> bool:
+    """Whether ``line``, below a line the doubt step takes out, ends that line's value under the
+    step's own printed rule: it names a refused variable, alone or set (:func:`_refused_line`),
+    or it sets another variable, a name before its first equals sign with no
+    :data:`_STEP_KEY_RUN` in it, and after that sign something besides equals signs and blanks.
+    The remedy alone reads this."""
+    if _refused_line(line):
+        return True
+    name, equals, value = line.partition("=")
+    return bool(
+        equals and name.strip() and not _STEP_KEY_RUN.search(name) and not _still_blank(value)
+    )
+
+
+def _taken_out(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """``entries`` as the doubt step leaves them when it leaves no string as it is: each line
+    that may name the directory (:func:`_may_name_directory`) out, with each line below it that
+    :func:`_ends_directory_value` does not end, and a string left with nothing else out too.
+    The remedy alone reads this."""
+    kept: list[tuple[str, str]] = []
+    for where, entry in entries:
+        lines: list[str] = []
+        dropping = False
+        for line in _LINE_BREAK.split(entry):
+            if _may_name_directory(line):
+                dropping = True
+                continue
+            if dropping and not _ends_directory_value(line):
+                continue
+            dropping = False
+            lines.append(line)
+        if any(line.strip() for line in lines):
+            kept.append((where, "\n".join(lines)))
+    return kept
+
+
+def _refused_readings(variables: Sequence[_Variable]) -> frozenset[int]:
+    """The ``hash`` of each variable in ``variables`` whose name the refusal is about
+    (:func:`_refused_name`), as ``(registry value, upper-cased name, value)``, line breaks
+    written as one ``\\n``, compared within this one process only. Every such variable, counted
+    or not and empty or not, since the engine may load an uncounted twin's value under a name
+    that starts with it, and erring toward a difference only leaves more strings as they are.
+    Hashes, so no repr of them holds a value, which may be key material. Remedy only."""
+    return frozenset(
+        hash((v.where, v.written.upper(), _LINE_BREAK.sub("\n", v.value)))
+        for v in variables
+        if _refused_name(v.written.upper())
+    )
+
+
+def _take_out_changes_refused(
+    entries: Sequence[tuple[str, str]], variables: Sequence[_Variable]
+) -> bool:
+    """Whether the doubt step's take-out (:func:`_taken_out`), applied to every string of
+    ``entries``, which the reader read as ``variables``, changes how the reader reads any
+    refused variable (:func:`_refused_readings`): its value, its name, or whether it is read at
+    all. Then a line it takes out may be part of a refused value, a store key among them, and
+    the step prints a sentence asking the operator to leave as it is each string that holds a
+    refused variable or that one's value runs on into (the Lander's hold on PR 3142, comment
+    7116005396, F3), and each string whose take-out, alone or beside the others, would change
+    such a reading (the Lander's hold on PR 3142, comment 7119680463, item 3). Which strings
+    those are, the operator works out; this check reads only the take-out of every string at
+    once, so it says whether the sentence prints, not which strings it covers. It compares the
+    readings as sets, so it does not see a take-out that only changes how many identical
+    readings there are, such as one that stops a reading which a twin with the same registry
+    value, name and value still makes; the sentence then does not print (the Lander's hold on
+    PR 3142, comment 7122889682, item 2, and its recommended finding on this comparison). The
+    remedy alone reads this."""
+    return _refused_readings(variables) != _refused_readings(_variables(_taken_out(entries)))
+
+
+def _refused_line(line: str) -> bool:
+    """Whether ``line`` sets a name the refusal is about, or names one alone
+    (:func:`_refused_name`)."""
+    return _refused_name(line.partition("=")[0].strip().upper())
+
+
+def _installer_reads(entry: str) -> bool:
+    """Whether install-service.ps1 takes the AppEnvironmentExtra string ``entry`` as one that
+    sets ``MEFOR_SECRETS_DIRECTORY``: its ``Test-EnvironmentEntryNames`` matches a string that
+    starts with the name and an equals sign, ignoring case, reads the value after it as the
+    directory the service names, and drops the whole string when it adds its own. The case fold
+    here is Python's ``str.upper``, not measured against .NET's ordinal one for a letter outside
+    ASCII."""
+    return entry[: len(_DIRECTORY_VARIABLE) + 1].upper() == f"{_DIRECTORY_VARIABLE}="
+
+
+def _sets_directory(entry: str) -> bool:
+    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
+    regard to case, as Windows compares names. What is written before the ``=``, blanks
+    around the name included, must be ASCII, as :func:`_directory_entry_value` requires, since
+    ``str.upper`` maps a name such as one with U+017F or U+0131 onto it and ``str.strip``
+    removes a blank such as U+00A0 (the Lander's hold on PR 3142, comment 7090314503)."""
+    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
+    written, equals, _rest = first.partition("=")
+    return bool(equals) and written.isascii() and _may_name_directory(written)
+
+
+def _directory_entry_value(entry: str) -> str | None:
+    """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
+    only blanks or line breaks after it and no blank around the name, the name is ASCII, and the
+    value is blank or plainly a path (:data:`_PLAIN_PATH`) with no key run in it
+    (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips the value it
+    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
+    directory path from key material."""
+    line = entry.rstrip()
+    if _LINE_BREAK.search(line):
+        return None
+    written, equals, value = line.partition("=")
+    if not equals or not written.isascii() or written.upper() != _DIRECTORY_VARIABLE:
+        return None
+    if _still_blank(value):
+        return value  # nothing in it, so no key and no path to keep
+    path = value.strip()
+    if not _PLAIN_PATH.fullmatch(path) or _EITHER_KEY_RUN.search(path):
+        return None
+    return value
+
+
+def _may_name_directory(text: str) -> bool:
+    """Whether the text before the first equals sign of ``text``, or all of it where it has none,
+    is ``MEFOR_SECRETS_DIRECTORY`` once blanks around it are stripped and it is upper-cased.
+    :func:`_sets_directory` adds an equals sign and ASCII to this. Without them it is broader on
+    purpose, to fail closed. It takes a non-ASCII letter ``str.upper`` maps onto an ASCII one,
+    such as U+017F or U+0131, since Python's ``os.environ`` on Windows upper-cases each name it
+    reads, so the engine may read such a name as the directory (the Lander's hold on PR 3142,
+    comment 7104660861). It takes a padded name, U+00A0 included, which ``os.environ`` does not
+    strip, because the reader's whole-string reading strips one. And it takes a name written
+    alone, which a value on a later line may still complete."""
+    return text.partition("=")[0].strip().upper() == _DIRECTORY_VARIABLE
+
+
+def _directory_entry_in_doubt(entry: str) -> bool:
+    """Whether the registry string ``entry`` is a directory entry the remedy may not keep: a line
+    of it, or its whole-string name, may name the directory (:func:`_may_name_directory`), and
+    the string alone is not plainly a path, that is, :func:`_directory_entry_value` reads no
+    value from it or a blank one. So a directory line beside other lines of its string, one in a
+    broken whole-string name, one whose value is key text, blank or ``=``, and one whose name is
+    padded or not ASCII are each in doubt. A string with one such line plainly a path is not,
+    whether or not a refused value runs on into it. The remedy alone reads it, through
+    ``ServiceEnvPosture.directory_in_doubt`` (the Lander's ruling B on PR 3142's repair
+    handback, comment 7106776128)."""
+    if not any(_may_name_directory(text) for text in (entry, *_LINE_BREAK.split(entry))):
+        return False
+    value = _directory_entry_value(entry)
+    return value is None or _still_blank(value)
 
 
 def _kept_empty(variable: _Variable) -> bool:
@@ -857,6 +1172,16 @@ def _kept_empty(variable: _Variable) -> bool:
     return variable.written.upper().startswith(_VALUE_PREFIX) and not (
         variable.alone and not variable.value.strip()
     )
+
+
+def _sensitive_value(name: str, value: str) -> bool:
+    """Whether ``value``, read for ``name`` from this process's environment, holds a secret: it
+    is not blank, and for a name that takes either a key or its path, it is not a path, as
+    :func:`_names` judges the same name in the lists (:func:`_path_form`). One line, since an
+    environment value is one string."""
+    if not value.strip():
+        return False
+    return not (name in _INLINE_PEM_NAMES and _path_form(value))
 
 
 def _path_form(value: str) -> bool:
@@ -889,7 +1214,7 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
         if not ((value and not value.isspace()) or _kept_empty(variable)):
             continue
-        if name in _INLINE_PEM_NAMES and _path_form(value):
+        if name in _INLINE_PEM_NAMES and not _sensitive_value(name, value):
             continue
         names.setdefault(name, (variable.where, variable.line))
     return tuple((name, where, line) for name, (where, line) in names.items())
@@ -920,19 +1245,68 @@ def _value_entry_shapes(
     return tuple(empty), tuple(unplain)
 
 
+#: The registry key, under ``HKEY_LOCAL_MACHINE``, that holds the machine-wide environment. Windows
+#: passes it to every local user's processes.
+MACHINE_ENVIRONMENT_KEY = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+
+
+def _machine_wide_names(names: Sequence[str]) -> list[str]:
+    """Which of ``names`` the host's machine-wide environment sets, read by name from
+    :data:`MACHINE_ENVIRONMENT_KEY`. Raises ``OSError`` where the key cannot be read. Names only:
+    a value is read by ``QueryValueEx`` and dropped at once."""
+    if sys.platform != "win32":
+        raise OSError("the Windows registry is not available on this platform")
+    import winreg
+
+    found: list[str] = []
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, MACHINE_ENVIRONMENT_KEY) as key:
+        for name in names:
+            try:
+                winreg.QueryValueEx(key, name)
+            except FileNotFoundError:
+                continue
+            found.append(name)
+    return found
+
+
+def _located_machine_wide(
+    machine_wide: Callable[[Sequence[str]], Iterable[str]] | None, names: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The ``names`` ``machine_wide`` says the machine-wide environment sets, in their own order.
+    None located where there is no reader, no name to ask about, or the read fails: the refusal
+    acts only on a name it found there, and the loosening still names the rest."""
+    if machine_wide is None or not names:
+        return ()
+    try:
+        located = {name.upper() for name in machine_wide(names)}
+    except OSError as exc:
+        _log.warning("the machine-wide environment could not be read: %s", exc)
+        return ()
+    return tuple(name for name in names if name in located)
+
+
 def read_service_env_posture(
-    *, probe: ServiceProbe | None = None, environ: Mapping[str, str] | None = None
+    *,
+    probe: ServiceProbe | None = None,
+    environ: Mapping[str, str] | None = None,
+    machine_wide: Callable[[Sequence[str]], Iterable[str]] | None = None,
 ) -> ServiceEnvPosture:
     """Read the engine's own service environment now. Never raises for a host it cannot read.
 
     ``probe`` and ``environ`` default to the host and to this process's environment. Off Windows,
-    with no probe given, the engine is not a service."""
+    with no probe given, the engine is not a service. ``machine_wide`` answers which of the names
+    it is given the machine-wide environment sets, raising ``OSError`` where it cannot tell; it
+    defaults to the host's registry where no probe is given, and to none set where one is."""
     if probe is None:
         if sys.platform != "win32":
             return ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE)
         probe = _WindowsProbe()
+        machine_wide = _machine_wide_names if machine_wide is None else machine_wide
     environ = os.environ if environ is None else environ
     keys = tuple(name for name in KEY_CLASS_NAMES if environ.get(name, "").strip())
+    others = tuple(
+        name for name in DIRECTORY_CLASS_NAMES if _sensitive_value(name, environ.get(name, ""))
+    )
     service: str | None = None
     try:
         ancestors = iter(probe.ancestor_images())
@@ -940,7 +1314,7 @@ def read_service_env_posture(
         if starter is None:
             return ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE)
         if starter[1].lower() != _NSSM_IMAGE:
-            return _started_by_something_else(starter[1], ancestors, keys)
+            return _started_by_something_else(starter[1], ancestors, keys, others)
         service = probe.service_at(starter[0])
         if service is None:
             raise LookupError(f"no service runs at nssm.exe process {starter[0]}")
@@ -950,6 +1324,7 @@ def read_service_env_posture(
             ServiceEnvStatus.UNOBSERVABLE,
             service_name=service,
             keys_in_environment=keys,
+            others_in_environment=others,
             detail=(
                 f"the registry key of service {service!r} could not be read: {exc}"
                 if service is not None
@@ -958,7 +1333,12 @@ def read_service_env_posture(
         )
     variables = _variables(entries)
     found = _names(variables)
+    listed_names = {name for name, _where, _line in found}
+    machine = _located_machine_wide(machine_wide, tuple(n for n in others if n not in listed_names))
     empty, unplain = _value_entry_shapes(variables)
+    # Every registry string as written, never the variables read from them, so a line absorbed
+    # into a broken name or an uncounted twin is still judged.
+    doubt = any(_directory_entry_in_doubt(entry) for _where, entry in entries)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
@@ -966,17 +1346,62 @@ def read_service_env_posture(
         sources=tuple((name, where) for name, where, _line in found),
         source_lines=tuple((name, line) for name, _where, line in found if line is not None),
         keys_in_environment=keys,
+        others_in_environment=others,
+        others_machine_wide=machine,
         empty_value_names=empty,
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
+        nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
+        directory_in_doubt=doubt,
+        directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
+        directory_in_refused=doubt and _take_out_changes_refused(entries, variables),
+        # Any such string, erring toward printing the clause, which states its own condition:
+        # whether the doubt step leaves one as it is follows from the reader's readings
+        # (``directory_in_refused``), which no narrower rule here could restate (code review
+        # round 2 on the repair of the Lander's hold on PR 3142, comment 7116005396).
+        installer_reads_extra=any(
+            where.endswith(NSSM_EXTRA_VALUE) and _installer_reads(entry) for where, entry in entries
+        ),
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
+        # Every line, since NSSM may read a later line of a string as its own variable.
+        directory_in_lists=any(
+            _sets_directory(line) for _where, entry in entries for line in _LINE_BREAK.split(entry)
+        ),
     )
 
 
+def _nothing_to_move(variable: _Variable) -> bool:
+    """Whether ``variable`` holds nothing the remedy moves elsewhere: its only value is joined
+    directory entries that are blank or plainly a path, or it is a ``MEFOR_VALUE_*`` name whose
+    value is empty or blank, which the remedy says to delete, not to put in the secrets
+    directory, since that directory refuses an empty file (code review on PR 3142). Remedy only."""
+    if variable.directory_only:
+        return True
+    return variable.written.upper().startswith(_VALUE_PREFIX) and not variable.value.strip()
+
+
+def _every_kept(
+    variables: Sequence[_Variable],
+    found: Sequence[tuple[str, str, int | None]],
+    test: Callable[[_Variable], bool],
+) -> tuple[str, ...]:
+    """The names in ``found`` each of whose variables :func:`_names` keeps passes ``test``.
+    Remedy only."""
+    only: list[str] = []
+    for name, _where, _line in found:
+        kept = [v for v in variables if v.written.upper() == name and _names([v])]
+        if kept and all(test(v) for v in kept):
+            only.append(name)
+    return tuple(only)
+
+
 def _started_by_something_else(
-    image: str, rest: Iterator[tuple[int, str]], keys: tuple[str, ...]
+    image: str,
+    rest: Iterator[tuple[int, str]],
+    keys: tuple[str, ...],
+    others: tuple[str, ...],
 ) -> ServiceEnvPosture:
     """The engine was started by ``image``, which is neither NSSM, a Python interpreter, nor
     ``messagefoundry.exe``.
@@ -995,6 +1420,7 @@ def _started_by_something_else(
     return ServiceEnvPosture(
         ServiceEnvStatus.UNOBSERVABLE,
         keys_in_environment=keys,
+        others_in_environment=others,
         detail=(
             f"nssm.exe (process {nssm}) is above {image}, which is neither a Python interpreter "
             "nor messagefoundry.exe, so the engine cannot tell whether it runs as that service "
@@ -1032,7 +1458,7 @@ def _where(posture: ServiceEnvPosture) -> str:
 
 
 class ServiceEnvironmentRefused(Exception):  # noqa: N818 - a refusal, not an error condition
-    """An API app factory refused to build on :func:`service_env_refusal`'s finding.
+    """An API app factory refused to build on :func:`service_env_start_refusal`'s finding.
 
     Not a ``RuntimeError``, so a handler written for another build failure, such as the absent
     web console ``create_app(serve_ui=True)`` reports, does not catch this refusal with it."""
@@ -1046,12 +1472,89 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
     name the secrets directory supplies, and so does every ``MEFOR_VALUE_*`` name (the owner's
     2026-11-14 ruling). The owner's 2026-10-01 ruling refuses them always, so
     ``[security].enforcement = "warn"`` does not reopen it. A known
-    service whose lists could not be read refuses only on a store key in this process's
-    environment, since only the store key's names are read from it."""
+    service whose lists could not be read refuses on a store key or another engine secret in
+    this process's environment, since those are the secret-class names read from it; a
+    ``MEFOR_VALUE_*`` name there is not read."""
     found = _refusal_findings(posture)
     if found is None:
         return None
     return f'{found}. [security].enforcement = "warn" does not change this refusal'
+
+
+def service_env_enforced_refusal(posture: ServiceEnvPosture) -> str | None:
+    """Why ``serve``, ``supervise`` or an API app factory must not start under
+    ``[security].enforcement = "enforce"``, or None; the caller applies the setting. The module
+    docstring says what it refuses and the ruling it rests on."""
+    found = _machine_wide_finding(posture)
+    if found is None:
+        return None
+    return (
+        f'{found}. Under [security].enforcement = "warn" the engine starts and names this as '
+        "secret_from_outside_service_lists, but that setting relaxes other refusals as well, so "
+        "move the secret instead"
+    )
+
+
+def service_env_start_refusal(posture: ServiceEnvPosture, *, enforcing: bool) -> str | None:
+    """The one refusal ``serve``, ``supervise`` and the API app factories apply, or None:
+    :func:`service_env_refusal`, and where ``enforcing`` (``[security].enforcement =
+    "enforce"``) :func:`service_env_enforced_refusal` too, both in one message where both
+    apply, so one start names every finding."""
+    found = [service_env_refusal(posture)]
+    if enforcing:
+        found.append(service_env_enforced_refusal(posture))
+    return ". ".join(f for f in found if f is not None) or None
+
+
+#: Where the remedies say a secrets directory is created and named for the service.
+_CREATE_POINTER = (
+    'the bullet "The other secrets: a secrets directory" under docs/SERVICE.md, "Protect the '
+    'store encryption key at rest", says how'
+)
+_MOVE = (
+    f"Put each in the secrets directory {_DIRECTORY_VARIABLE} names, as one restricted file per "
+    "setting named as its variable, and remove it from where it is set. Where no secrets "
+    f"directory exists yet, or the service's lists name none, {_CREATE_POINTER} it is created and "
+    'named for the service. See docs/CONFIGURATION.md, "The secrets directory"'
+)
+
+
+def _machine_wide_finding(posture: ServiceEnvPosture) -> str | None:
+    """What :func:`service_env_enforced_refusal` refuses on and the remedy, without its
+    enforcement note. Names only, each from :data:`DIRECTORY_CLASS_NAMES`."""
+    located = [n for n in posture.others_from_elsewhere if n in posture.others_machine_wide]
+    if not located:
+        return None
+    return (
+        f"{', '.join(located)} is set in the machine-wide environment, which Windows keeps in the "
+        f"registry key HKLM\\{MACHINE_ENVIRONMENT_KEY} and passes to every local user's "
+        f"processes, and so reaches the Windows service {posture.service_name or '<unknown>'!r}. "
+        + _MOVE
+    )
+
+
+def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
+    """What the ``secret_from_outside_service_lists`` entry names: every engine secret in this
+    process's environment that the engine did not read in the service's lists, wherever it
+    came from. Names only."""
+    elsewhere = posture.others_from_elsewhere
+    if not elsewhere:
+        return None
+    machine = [n for n in elsewhere if n in posture.others_machine_wide]
+    where = (
+        f"; {', '.join(machine)} is set in the machine-wide environment, which "
+        "`serve`, `supervise` and the API app factories refuse under "
+        '[security].enforcement = "enforce"'
+        if machine
+        else ""
+    )
+    return (
+        f"{', '.join(elsewhere)} reaches the Windows service "
+        f"{posture.service_name or '<unknown>'!r} through its environment, and the engine did not "
+        "read it in the service's own lists, so it came from somewhere else, such as the "
+        f"machine-wide environment or a python.exe wrapper{where}. Any process that can read "
+        f"the place it came from can read it. {_MOVE}"
+    )
 
 
 def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
@@ -1066,59 +1569,97 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             named.append(posture.counted_with_source(values))
         found = f"{', '.join(named)} is set in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
-        if not posture.keys_in_environment:
+        if not (posture.keys_in_environment or posture.others_in_environment):
             return None
-        # The service is known and its lists could not be read, so a store key in this process's
-        # environment most likely came from them. Refused, as a listed key would be, and with the
-        # same remedy, so ``keys`` now names them.
+        # The service is known and its lists could not be read, so a store key or another engine
+        # secret in this process's environment most likely came from them. Refused, as a listed
+        # one would be, and with the same remedy, so ``keys`` and ``others`` now name them (vault
+        # BACKLOG #2595, slice B's other half, for the other secrets).
         keys = posture.keys_in_environment
+        others = posture.others_in_environment
         found = (
-            f"{', '.join(keys)} reaches this engine through its "
+            f"{', '.join((*keys, *others))} reaches this engine through its "
             f"environment, and {_where(posture)} could not be read ({posture.detail})"
         )
     else:
         return None
+    # A secret whose only value is a joined directory entry that is blank or plainly a path has
+    # nothing to move (the Lander's fifth hold on PR 3142, H2; the sixth hold, H1), and nor
+    # has such a MEFOR_VALUE_* name (the Lander's hold in comment 7085002242), or an empty one,
+    # which the steps below say to delete. A store key that still reaches this process, from
+    # anywhere, keeps the protect-key step (code review on PR 3142).
+    only = posture.nothing_to_move_names
+    moving_keys = [k for k in keys if k not in only or k in posture.keys_in_environment]
+    moving_others = [o for o in others if o not in only]
+    moving_values = [v for v in values if v not in only]
     steps: list[str] = []
-    if posture.value_runs_on:
-        # With a directory string joined, "remove those strings" alone would take the directory
-        # entry too, so the exception goes in the same sentence, ahead of the step that keeps it.
-        # ``directory_joined`` may come from another variable than the one that runs on, so the
-        # exception says "any", never that one of these strings holds it.
-        run_on = (
-            "At least one refused variable is empty in its own string and its value runs on into "
-            "the strings after it in the same registry value, as `nssm set` writes each argument "
-            "as its own string"
-        )
-        if posture.directory_joined:
-            steps.append(
-                f"{run_on}. The value stays in the registry key until those strings are removed, "
-                f"so remove each of them, but for any that sets {_DIRECTORY_VARIABLE}, which the "
-                "next step covers"
-            )
-        else:
-            steps.append(
-                f"{run_on}, so remove those strings with it, or the value stays in the registry key"
-            )
-    # Only where the remedy touches the lists' strings or needs the secrets directory: a refusal
-    # about a store key alone sends the operator to a key file, not to the directory's entry.
-    if posture.directory_joined and (posture.value_runs_on or others or values):
+    doubt = posture.directory_in_doubt
+    if doubt:
+        # First, so the remedy can be followed top to bottom (the Lander's ruling (a) on round-3
+        # open findings 1 and 2 of PR 3142's repair handback, comment 7112155891): once these
+        # lines are out, the create step below runs the installer with no line left that may set
+        # the directory but in a string this step leaves as it is, and the protect-key and Put
+        # steps still find every refused value where it was, since this step takes out those
+        # lines alone and keeps each refused variable for the steps below. It names
+        # every list it acts in, with how each is edited (code review round 2 on the earlier
+        # repair): since every refused value is still in them, through the registry cmdlets in
+        # one session, never `nssm set`, whose arguments are a command line (the Lander's hold
+        # on PR 3142, comment 7116005396, F2). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
+        # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
+        # directory and nothing else, or beside other lines, is now either plainly a path, and
+        # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
+        # comment 7106776128). A line below a directory line is read as part of the directory's
+        # value, which may be key text, until one names a refused variable or sets an ordinary
+        # variable (_line_start, _is_ordinary_line), so it goes with it; the step spells that
+        # rule out (code review round 2 on this repair). Where the reader holds such a line as
+        # part of a refused variable, in its name, its value or a string its value runs on into,
+        # taking it out may
+        # take that value too, a store key among them, so the strings holding a refused variable
+        # or its run-on are left as they are until the step that removes that variable (code
+        # review round 1 on this repair), and so is a string whose take-out would join its
+        # neighbours into another reading of one (the Lander's hold on PR 3142, comment
+        # 7119680463, item 3).
         steps.append(
-            f"At least one string in the service's lists sets {_DIRECTORY_VARIABLE} on its first "
-            "non-blank line and is read here as part of the empty value of the variable in the "
-            "string above it. NSSM may instead read it as a variable of its own, so this reading "
-            "does not take it as naming the secrets directory. Keep one "
-            f"{_DIRECTORY_VARIABLE} entry in the service's lists, written as "
-            f"{_DIRECTORY_VARIABLE}=<path> naming the secrets directory by its path, and remove "
-            f"any other entry that sets {_DIRECTORY_VARIABLE}, before any re-run of the "
-            "installer, which refuses an existing directory the service does not name. `nssm "
-            "set` replaces a whole list, so read it first with `nssm get`, running the service's "
-            "own nssm.exe by its full path, and pass back every entry but those refused above "
-            "and the strings this step and any step above say to remove: see docs/SERVICE.md, "
-            '"Start / stop / status". Where no secrets directory exists yet, the bullet "The '
-            'other secrets: a secrets directory" under docs/SERVICE.md, "Protect the store '
-            'encryption key at rest", says how the directory is created'
+            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
+            "plainly to a path under that name, in ASCII with no blank around it, so first, "
+            "reading the lists as this step says below, note the path each such line names where "
+            "it is plainly a path, then take "
+            "each line that may set it out of every list, whatever its letter case, a blank "
+            "around its name, or a letter outside ASCII that upper-cases to one of its letters, "
+            "with each line below it in its string that the engine reads as part of its value, "
+            "up to the next that names a refused variable, alone or set, or sets another "
+            "variable: a name before its first equals sign with no run of 43 letters, digits, "
+            "plus signs, slashes, hyphens or underscores in it, and after that sign something "
+            "besides equals signs and blanks. Take out those lines alone, and keep every refused "
+            "variable and every other line where it is, for the steps below to move each value "
+            "before its entry goes: where such a line shares a registry string with other lines, "
+            "write that string back with its other lines as they were, in their order, and "
+            "leave out only a string that holds nothing else"
+            # Its own sentence, after the take-out it qualifies (the Lander's hold on PR 3142,
+            # comment 7116005396, F5).
+            + (
+                ". Leave as it is each string that holds a refused variable or that a refused "
+                "variable's value runs on into, since a line there that may set "
+                f"{_DIRECTORY_VARIABLE} may be part of that value, and each string whose take-out, "
+                "alone or beside the others this step takes out, would change how the engine "
+                "reads a refused variable, such as one between a refused name written alone or "
+                "set to nothing and the string below it, which the take-out may join, until a "
+                "step below removes that variable, then take such lines out with it"
+                if posture.directory_in_refused
+                else ""
+            )
+            + ". No refused value may be typed on a command line, where it reaches at least the "
+            "shell's history, a transcript and process-creation audit events, so while a list "
+            "holds one, do not pass it back with `nssm set`. Read AppEnvironment and "
+            "AppEnvironmentExtra, under Parameters in the registry key named above, which "
+            "PowerShell names under HKLM:, with `Get-ItemProperty` into a "
+            "variable, printing nothing, edit those strings in that same session, and write each "
+            "back with `Set-ItemProperty -Type MultiString`, every entry kept but those lines. "
+            "The service's own Environment value is no NSSM list, and is read and written the "
+            'same way on the registry key named above: see docs/SERVICE.md, "Start / stop / '
+            'status"'
         )
-    if keys:
+    if moving_keys:
         steps.append(
             "Keep the store key in a DPAPI-protected key file instead: `messagefoundry protect-key "
             '--out <new path> --grant-account "NT SERVICE\\<service>"`, then set '
@@ -1127,41 +1668,108 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             'store encryption key at rest"'
         )
     if others or values:
-        put = [", ".join(others)] if others else []
-        if values:
+        # The installer refuses an existing directory the service does not name, so this points
+        # only at how one is created, and before the step that moves a setting there (the third
+        # hold's H2, the fourth hold's H1). Where a directory entry is in doubt, the doubt step
+        # above has taken out every line that may name the directory, so a listed name settles
+        # nothing and the step prints all the same (round-3 open finding 1 on PR 3142's repair
+        # handback, comment 7110577570). The doubt step leaves the installer no line to read or
+        # drop that may set the directory but in a string it leaves as it is for a refused
+        # variable; only where such a string may be one the installer reads does the step carry
+        # a clause about it, which states its own condition (the Lander's ruling (a), comment
+        # 7112155891; code review round 1 on this repair). The clause has the operator read every
+        # line out before removing the string, since the registry may hold its only copy: a
+        # retired store key, which protect-key never stores, an env-provider secret or a
+        # MEFOR_VALUE_* value bound for its value file among them (the Lander's hold on PR 3142,
+        # comment 7116005396, F1). It takes the strings a refused value in that string runs on
+        # into with it, so no value is left behind unnamed, and it has the list written back as
+        # the first step says, since the other refused values are still in it (code review on
+        # that repair). It also takes, until none is left, the strings whose refused variables
+        # removing the others would read differently (the Lander's hold on PR 3142, comment
+        # 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair). It removes each
+        # of those strings whole and adds no line of them back, so the installer finds no line
+        # in them to read as the directory, and no line of a refused value they hold is left as
+        # an entry of its own. The ordinary lines they hold are lost with them: the clause has
+        # the operator read them out but gives them nowhere to go, and says nothing of their
+        # loss. The per-line restoration this clause carried before, not the directory
+        # add-back step, put back at least a store key below a directory line and a line of a
+        # joined group's value, so it was removed (the Lander's hold on PR 3142, comment
+        # 7125522135). Restoring those ordinary lines safely is open work, unfiled.
+        if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
+            moving_others or moving_values
+        ):
+            create = f"Where no secrets directory exists yet, {_CREATE_POINTER} it is created"
+            if doubt and posture.directory_in_refused and posture.installer_reads_extra:
+                create += (
+                    ". Where a string the first step leaves as it is lies in AppEnvironmentExtra "
+                    f"and starts with {_DIRECTORY_VARIABLE}= in any letter case, "
+                    "install-service.ps1, which `messagefoundry service install` also runs, may "
+                    "read that string as the directory the service names and print it, and drops "
+                    "it whole, so before you run the installer read out of that string, of each "
+                    "string that holds a refused variable, alone or set, whose reading removing "
+                    "the strings this sentence names would change, and of each string a refused "
+                    "value in them runs on into, every line they hold, remove those strings with "
+                    "each refused variable whose value they hold, put each refused value you read "
+                    "where the other steps say, and keep a retired key for the shell that runs "
+                    "`messagefoundry rotate-key`, writing the list back as the first step says"
+                )
+            steps.append(create)
+        put = [", ".join(moving_others)] if moving_others else []
+        if moving_values:
             put.append("each MEFOR_VALUE_* variable")
-        step = (
-            f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
-            "one restricted file per setting named as its variable"
+        # Where a directory entry is in doubt, the doubt step has taken every directory line
+        # out, so at this step the service may name none: the directory is the one the installer
+        # made or the one already there, which the add-back step names again (code review round
+        # 1 on this repair).
+        put_where = (
+            "the secrets directory, the one the installer made or the one already there,"
+            if doubt
+            else f"the secrets directory {_DIRECTORY_VARIABLE} names,"
+        )
+        parts = (
+            [
+                f"Put {' and '.join(put)} in {put_where} as one restricted file per setting "
+                "named as its variable"
+            ]
+            if put
+            else []
         )
         cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
-        if values:
-            step += (
-                ". A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
+        if moving_values:
+            parts.append(
+                "A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
                 "of the environment may go in its value file instead, environments/<env>.toml by "
-                "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
-                "name is counted once, without regard to case, under the first registry value "
-                "that sets it, so remove it from every value that sets it"
+                "default, keyed by the name after MEFOR_VALUE_ in lower case"
             )
-            if _VALUE_PREFIX in values:
-                step += (
-                    ". The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather "
-                    "than move it"
-                )
-            if posture.empty_value_names:
-                step += (
-                    ". An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where "
-                    "an empty override is really wanted, write it in the value file instead, "
-                    "since the secrets directory refuses an empty file"
-                )
-            if posture.unplain_value_names:
-                step += (
-                    ". At least one of them is spelled with a character other than an ASCII "
+        if values:
+            # For a name only told to go as well: a copy left in a second value refuses the
+            # next start (the Lander's hold on PR 3142, comment 7104660861, item 3).
+            parts.append(
+                "Each MEFOR_VALUE_* name is counted once, without regard to case, under the "
+                "first registry value that sets it, so remove it from every value that sets it"
+            )
+        if _VALUE_PREFIX in values:
+            parts.append(
+                "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather than "
+                "move it"
+            )
+        # A value whose only content is a joined directory entry is empty in its own entry.
+        if posture.empty_value_names or any(v in only and v != _VALUE_PREFIX for v in values):
+            parts.append(
+                "An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where an "
+                "empty override is really wanted, write it in the value file instead, since the "
+                "secrets directory refuses an empty file"
+            )
+        if moving_values:
+            # Not for a name that is only told to go (code review on PR 3142).
+            if any(name not in only for name in posture.unplain_value_names):
+                parts.append(
+                    "At least one of them is spelled with a character other than an ASCII "
                     "letter, a digit or an underscore, a file name the secrets directory refuses, "
                     "so rename that env() key before moving it there"
                 )
-            step += (
-                '. A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
+            parts.append(
+                'A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
                 "read from the environment only, never from the secrets directory. Drop that "
                 "reference instead and put the credential in the secrets directory under the "
                 "setting it stands for, such as MEFOR_AUTH_AD_BIND_PASSWORD; or, second, use "
@@ -1169,29 +1777,124 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
                 "the secret in the registry key"
             )
+        if values:
             cite += ' and "[environments]"'
-        steps.append(f"{step}. {cite}")
-        if _DIRECTORY_VARIABLE not in posture.listed and not posture.directory_joined:
-            # A joined directory string is covered by its own step above: the lists may still set
-            # it, so "add it back" would be false there.
-            # Two routes, because install-service.ps1 refuses an existing directory the service
-            # does not name: an operator whose later `nssm set` dropped the variable must not be
-            # sent to the installer, which would say to remove the directory holding the files.
-            steps.append(
-                f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
-                f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
-                "existing path back to the service's AppEnvironmentExtra, beside its other "
-                "entries, before any re-run of the installer, which refuses an existing directory "
-                "the service does not name. `nssm set` replaces that whole list, so read it first "
-                "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-                "back every entry but those refused above: see docs/SERVICE.md, "
-                '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
-                'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
-                'rest", says how the directory is created'
+        if parts:
+            steps.append(". ".join([*parts, cite]))
+    # The per-entry rule, as ``directory_in_doubt``'s doc states it (the Lander's ruling B on PR
+    # 3142's repair handback, comment 7106776128). Where no directory entry is in doubt and a
+    # refused value runs on into one, one entry is kept, written as the path, and every other
+    # directory line goes, as origin/main's joined-directory step said; the removal steps then
+    # spare each directory line, so no step removes an entry a later one keeps (code review on
+    # PR 3142). directory_run_on needs a refused value that runs on, so the run-on step prints
+    # too. Where any entry is in doubt, nothing is spared or kept: the doubt step, first and with
+    # no condition, says to take every line that may name the directory out of every list, and
+    # the add-back step then names the path again wherever the directory exists, so no step
+    # changes the directory the engine reads without naming it (code review rounds 1 and 2 on
+    # the earlier repair).
+    keep_one = posture.directory_run_on and not doubt
+    # Only where the lists were read: where they could not be, the engine cannot say whether they
+    # name the directory, so it neither says they set none nor says to add one back.
+    add_back_due = doubt or (
+        posture.status is ServiceEnvStatus.OBSERVED
+        and not posture.directory_run_on
+        and bool(others or values)
+        and _DIRECTORY_VARIABLE not in posture.listed
+    )
+    spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
+    # Last, so protect-key and the secrets directory take each value before its entry goes. It
+    # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
+    steps.append(
+        "Remove each refused variable, with its value, from the service's environment"
+        + (spare if keep_one else "")
+        + '. See docs/SERVICE.md, "Start / stop / status"'
+    )
+    if posture.status is ServiceEnvStatus.UNOBSERVABLE:
+        # The lists were not read, so the value may have come from elsewhere instead, and a
+        # removal from the lists alone would leave it refused at every start.
+        steps.append(
+            "The engine could not read the service's lists, so a refused variable may come from "
+            "the machine-wide environment instead, which Windows keeps in the registry key "
+            f"HKLM\\{MACHINE_ENVIRONMENT_KEY}: where it is set there, remove it there too"
+        )
+    if posture.value_runs_on:
+        # Removing the name alone would leave the value, which then refuses nothing.
+        steps.append(
+            "At least one refused variable's value runs on past its own entry, so remove the "
+            "entries it runs on into with it"
+            + (spare if keep_one else "")
+            + ", or the value stays in the registry key"
+        )
+    if add_back_due:
+        # After the removal and the run-on sentence, as on origin/main, so the list it says
+        # to pass back is the one those steps left. A joined directory string is removed with
+        # the value it is joined to unless no directory entry is in doubt, when the keep-one
+        # step below keeps one instead (the Lander's ruling on handback 7085947392, F1). With
+        # no entry in doubt, a listed directory also leaves this step out. A refused
+        # name outside the key class may need the directory, and the run-on step may remove
+        # a directory string even for a store key alone (the Lander's ruling on comment
+        # 7087145957, F1 on H3's terms).
+        # Two routes, because install-service.ps1 refuses an existing directory the service
+        # does not name: an operator whose later `nssm set` dropped the variable must not be
+        # sent to the installer, which would say to remove the directory holding the files.
+        # Where an entry is in doubt, the doubt step may have taken out a working entry, so the
+        # step says to add one back wherever the directory exists, however it was made (code
+        # review round 2 on the earlier repair).
+        # The step says the lists set no directory only where no line of any string in them
+        # sets one (directory_in_lists) and no directory entry is in doubt. Where one is in
+        # doubt, the entries it says to pass back leave out the strings and lines the steps
+        # above say to remove or take out, so none in doubt is written back to override the one
+        # added or to keep key text. Where a value runs on, they leave out the strings the steps
+        # above say to remove, which may hold the refused value or set the directory (the
+        # Lander's holds on PR 3142, comments 7088102723 and 7088663896).
+        none_set = (others or values) and not posture.directory_in_lists and not doubt
+        made = (
+            "the secrets directory already exists, however it was made"
+            if doubt
+            else "install-service.ps1 already made the secrets directory"
+        )
+        add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
+            f"Where {made}, add {_DIRECTORY_VARIABLE} naming that existing path back to the service's "
+            "AppEnvironmentExtra, beside its other entries, before any re-run of the installer, "
+            "which refuses an existing directory the service does not name. `nssm set` replaces "
+            "that whole list, so read it first with `nssm get`, running the service's own "
+            "nssm.exe by its full path, and pass back every entry but those refused above"
+        )
+        if doubt:
+            add_back += " and the strings and lines the steps above say to remove or take out"
+        elif posture.value_runs_on or posture.directory_joined:
+            add_back += " and the strings this step and any step above say to remove"
+        add_back += ': see docs/SERVICE.md, "Start / stop / status"'
+        # Only where a setting moves, as the create step reads: a store key alone goes to a
+        # key file and needs no secrets directory (the third hold's H2; the Lander's ruling on
+        # handback 7087574833, R1).
+        if moving_others or moving_values:
+            add_back += (
+                '. Where none exists yet, the bullet "The other secrets: a secrets directory" '
+                'under docs/SERVICE.md, "Protect the store encryption key at rest", says how the '
+                "directory is created"
             )
+        steps.append(add_back)
+    if keep_one:
+        # One entry, rewritten to the path, so no joined entry's text stays, key material
+        # included (sixth hold, H1), and none other is left to override it: a kept decoy, "==" or
+        # lower-case entry in AppEnvironmentExtra wins over the path the service should read
+        # (code review on PR 3142). AppEnvironmentExtra, because NSSM applies it last.
+        steps.append(
+            f"Leave exactly one entry that sets {_DIRECTORY_VARIABLE} in the service's lists: "
+            f"one in AppEnvironmentExtra, which NSSM applies last, added there where that list "
+            f"has none, written as {_DIRECTORY_VARIABLE}=<path> naming the secrets directory by "
+            f"its path, so it is the one the engine reads. Take each other line that sets {_DIRECTORY_VARIABLE} out "
+            "of every list, keeping each other line no step above says to remove, before any "
+            "re-run of the installer, which refuses an existing directory the service does not "
+            "name. `nssm set` replaces a whole list, so read it first with `nssm get`, running "
+            "the service's own nssm.exe by its full path, and pass back every entry but those "
+            "refused above and the strings and lines this step and any step above say to "
+            'remove: see docs/SERVICE.md, "Start / stop / status"'
+        )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "
-        f"here. Remove each refused variable from the service's lists. {'. '.join(steps)}"
+        f"here. {'. '.join(steps)}"
     )
 
 
@@ -1228,9 +1931,11 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     """The ``(name, plain-language risk)`` entries for ``posture``. One place for the wording, so
     ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things.
 
-    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve``,
+    A caller that refuses on :func:`service_env_start_refusal` checks it first, as ``serve``,
     ``supervise``, ``create_app`` and ``create_managed_app`` do, so
-    ``secret_in_service_environment`` reaches only a caller that does not."""
+    ``secret_in_service_environment`` reaches only a caller that does not. Under ``warn`` they
+    read ``secret_from_outside_service_lists`` here, including a machine-wide secret they refuse
+    under ``enforce``."""
     out: list[tuple[str, str]] = []
     if posture.status is ServiceEnvStatus.UNOBSERVABLE:
         out.append(
@@ -1253,6 +1958,16 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "able to read: the service's registry key, or the machine-wide environment. Keep "
                 "the store key in a DPAPI-protected key file ([store].encryption_key_file, made "
                 "with `messagefoundry protect-key`)",
+            )
+        )
+    # Refused under enforce only, so a start under warn reads it here. Named whatever the
+    # setting, since this list does not know it, and an enforcing start refuses before it reads.
+    elsewhere = _elsewhere_finding(posture)
+    if elsewhere is not None:
+        out.append(
+            (
+                "secret_from_outside_service_lists",
+                elsewhere,
             )
         )
     # What `serve`, `supervise` and the API app factories refuse, named for a caller that reads

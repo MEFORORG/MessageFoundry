@@ -745,7 +745,7 @@ async def test_an_unbound_inbounds_directories_are_protected(
     """B is stopped, so it is not in the archive list; the guard source still names its watch
     directory, which A's archive directory holds.
 
-    Mutation: ignore `guard_source` in `_prune_processed_archives`. Red."""
+    Mutation: ignore `guard_source` in `_plan_processed_archives`. Red."""
     stopped_inbox = tmp_path / "shared" / "b-inbox"
     a = _source(tmp_path / "a", processed_subdir=str(tmp_path / "shared"))
     b_drop = _aged(stopped_inbox / "waiting.hl7", 90)

@@ -99,15 +99,17 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.credential import constant_time_equal
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.redaction import json_loads_or_refusal, safe_text
+from messagefoundry.redaction import engine_text_only, json_loads_or_refusal, safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.cell_tag import (
     CellTagError,
+    UnreadableParentMetadataError,
     audits_cell_tag,
     dead_letters_on_cell_tag,
     is_row_tagged,
@@ -137,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -146,13 +149,13 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    StoreKeylessError,
     allows_unmarked,
     audit_key_id,
     cell_aad,
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
-    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -211,6 +214,7 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    NonFiniteSealValueError,
     ResealOutcome,
     RevokedRowSealError,
     RowSealer,
@@ -218,15 +222,18 @@ from messagefoundry.store.row_seal import (
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    cipher_call,
     classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    seal_chunks,
     seal_row_ref,
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -625,23 +632,34 @@ class _GroupCommitter:
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
+        # The task _on_stopped last handled, so it runs once per task whichever of its two callers
+        # (the done-callback, or aclose) reaches it first.
+        self._reaped: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
             self._closed = False
+            self._reaped = None  # the old task is done; a callback still queued for it reads stale
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
             self._task.add_done_callback(self._on_stopped)
 
     def _on_stopped(self, task: asyncio.Task[None]) -> None:
         """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
         first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
-        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
-        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
-        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
-        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
-        if task is not self._task:
-            return  # a stale task; a newer one owns the committer now
+        no :meth:`submit` after this runs may enrol, and every member still pending is rejected, or
+        its caller (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather
+        than a ``finally`` in :meth:`_run`, because a task cancelled before its first step never
+        enters its body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
+
+        :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
+        the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
+        finds the task done and gets past its ``await`` without yielding. Without the direct call
+        this callback would run only after ``aclose`` cleared ``_task``, read the task as stale, and
+        leave that member pending (BACKLOG #5664)."""
+        if task is not self._task or task is self._reaped:
+            return  # a stale task (a newer one owns the committer now), or one already handled
+        self._reaped = task
         self._closed = True
         stranded, self._pending = self._pending, []
         if task.cancelled() or task.exception() is not None:
@@ -654,7 +672,8 @@ class _GroupCommitter:
                 member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
-        """Stop the committer, flushing any enrolled members first so nothing is stranded."""
+        """Stop the committer, flushing the members it can still reach first. A member still pending
+        once the committer task has ended is rejected through :meth:`_on_stopped`, not left to park."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -664,15 +683,23 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier has already rejected its members (_on_stopped); that
-                # stale cancel must not abort the store's close. A cancel of OUR task during the
-                # await still propagates; the baseline keeps a caller that already caught an
+                # A committer cancelled earlier rejects its members in _on_stopped, which its
+                # done-callback or the call below runs once; that stale cancel must not abort the
+                # store's close. A cancel of OUR task during the await still propagates; asyncio
+                # passes it on to the committer, whose done-callback has already run _on_stopped by
+                # the time this re-raises. The baseline keeps a caller that already caught an
                 # earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
                     raise
-            self._task = None
+            # Before clearing _task, so the member a same-turn submit() enrolled is rejected rather
+            # than left to a done-callback that would read the task as stale (see _on_stopped).
+            self._on_stopped(task)
+            # An overlapping close and start() may have installed a newer task; leave that one.
+            if self._task is task:
+                self._task = None
+                self._reaped = None
 
     async def submit(
         self,
@@ -1009,6 +1036,58 @@ class ReingressOriginMissing(ResendError):
     ADR 0090 §9 / BACKLOG #153) no longer exists — the store cannot resolve the channel to re-enter
     on nor correlate the child. The API validates the origin (404) before calling, so this is a
     belt-and-suspenders race guard; the txn rolls back and nothing is written."""
+
+
+class ResendOriginMetadataUnreadable(ResendError):
+    """The origin's ``metadata`` cell opened, but building an edited child's correlation metadata
+    from it raised (BACKLOG #5758). At least: the cell nests too deep to decode, its
+    ``correlation_depth`` cannot be read as an integer, or the child's metadata cannot be
+    serialized from it. Most cells the pass-through transform handoff now dead-letters are such
+    cells, so without this refusal the operator's edit of that message raised out of the API as a
+    500; it is now a 409. The txn rolls back and nothing is written: the origin and its queue rows
+    stay as they were, and the idempotency key stays free."""
+
+
+def edit_child_metadata(raw_meta: str | None, *, origin_message_id: str) -> str:
+    """The ``metadata`` of an edit-and-resend or edit-and-resubmit child of ``origin_message_id``,
+    correlated to the origin from its opened ``raw_meta`` (ADR 0090 §9, BACKLOG #153).
+
+    Every cell the inline copies this replaced turned into a child still does, with the same
+    metadata: a cell that decodes to something other than a JSON object, or fails to decode with a
+    ``ValueError``, carries no lineage. A cell on which they raised one of the errors the outer
+    ``except`` names is now refused with :class:`ResendOriginMetadataUnreadable` (BACKLOG #5758),
+    and that includes one that nests too deep to decode. The refusal is raised outside the
+    ``except``, because json's error holds the whole cell, and neither it nor the log names more
+    than the message id."""
+    try:
+        try:
+            parent_meta = json.loads(raw_meta) if raw_meta else {}
+        except (ValueError, TypeError):
+            parent_meta = {}
+        if not isinstance(parent_meta, dict):
+            parent_meta = {}
+        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+        root = parent_meta.get("correlation_root_id") or origin_message_id
+        return json.dumps(
+            {
+                "correlation_id": origin_message_id,
+                "correlation_root_id": root,
+                "correlation_depth": child_depth,
+                "edited_from": origin_message_id,
+            }
+        )
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        # json.loads overflows on deep nesting with a RecursionError, not a ValueError, so it lands
+        # here rather than in the inner "no lineage" reading.
+        pass
+    log.warning(
+        "message %s metadata does not hold readable correlation metadata; the edit was refused",
+        origin_message_id,
+    )
+    raise ResendOriginMetadataUnreadable(
+        f"message {origin_message_id} metadata does not hold readable correlation metadata"
+        " -- cannot edit-and-resend or edit-and-resubmit it"
+    )
 
 
 #: The ``resend_log.to_destination`` sentinel prefix an edit-and-resubmit RE-INGRESS records instead of
@@ -1519,6 +1598,19 @@ class ConnectionEventWrite(TypedDict):
     now: NotRequired[float | None]
 
 
+def stamped_connection_event(ev: ConnectionEventWrite) -> ConnectionEventWrite:
+    """``ev``, with ``now`` set to the current time when it is absent or ``None``.
+
+    The writers call this on the event loop before they hand the event's params to the cipher
+    (BACKLOG #3929), so an event is stamped when it is written, not when a busy Transit pool
+    reaches it; the stamp is also in the reason cell's AAD."""
+    if ev.get("now") is not None:
+        return ev
+    stamped = ev.copy()
+    stamped["now"] = time.time()
+    return stamped
+
+
 #: The session columns a session seal leaves out, each with the reason (BACKLOG #2592). Everything
 #: else in :class:`SessionRecord` is sealed, so a column added later is covered by default.
 #: ``tests/test_session_seal.py`` pins this list.
@@ -1571,17 +1663,29 @@ GLOBAL_SESSION_EPOCH_MISSING: Final = (
 )
 
 
-# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
-# SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
-# transaction, the SELECT only inside supersede_session's, and the DELETE only from the session
-# purge. No other statement names the table: a retired hash must authenticate nothing.
+# Vault BACKLOG #4276: ((julianday('now') - 2440587.5) * 86400.0) is the database's own clock as
+# epoch seconds, the unit `session_lineage.retired_at` holds. SQLite reads the host clock through its
+# VFS, not through Python's `time.time`, and holds 'now' fixed for the whole of one statement.
+# postgres.py and sqlserver.py spell their own clock (`_PG_EPOCH_NOW`, `_MSSQL_EPOCH_NOW`). Here the
+# expression is spelled literally in each statement below rather than interpolated, so
+# test_writer_txn_is_the_only_begin.py can read each as text; keep the three copies identical.
+# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements; postgres.py and sqlserver.py
+# respell them. The INSERT runs only inside rotate_session's own transaction, the SELECT only inside
+# supersede_session's, and the DELETE only from the session purge. No other statement names the
+# table: a retired hash must authenticate nothing. Each stamps or measures `retired_at` on the
+# database's clock, never a parameter from an engine process (vault BACKLOG #4276,
+# store/session_lineage.py), so the window is one clock's reading on every engine shard.
 _SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES (?,?,?)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    " VALUES (?,?,((julianday('now') - 2440587.5) * 86400.0))"
 )
 _SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=? AND retired_at >= ?"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=?"
+    " AND retired_at >= ((julianday('now') - 2440587.5) * 86400.0) - ?"
 )
-_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < ?"
+_SESSION_LINEAGE_PURGE: Final = (
+    "DELETE FROM session_lineage WHERE retired_at < ((julianday('now') - 2440587.5) * 86400.0) - ?"
+)
 
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
@@ -1602,7 +1706,9 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.global_epoch,
         new.seal,
         old.token_hash,
-        old.seal,
+        # The seal cell as read, so a non-empty BLOB cell still matches and an empty one does not,
+        # each as on main (SessionRecord.from_mapping).
+        getattr(old, "_seal_cell", old.seal),
     )
 
 
@@ -1623,6 +1729,35 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.global_epoch,
         record.seal,
     )
+
+
+def _non_finite_kind(value: object) -> str | None:
+    """``"nan"``, ``"inf"`` or ``"-inf"`` for a float that is not finite, else ``None``."""
+    if not isinstance(value, float) or math.isfinite(value):
+        return None
+    return "nan" if math.isnan(value) else repr(value)
+
+
+def _refuse_new_non_finite(
+    sealer: AnyRowSealer | None,
+    fields: Iterable[tuple[str, object]],
+    prior: Iterable[tuple[str, object]] = (),
+) -> None:
+    """On a store with no sealer, raise :class:`NonFiniteSealValueError`, the type
+    :meth:`RowSealer.seal` raises, for a NaN or an infinity in ``fields`` that ``prior``, the row
+    as it was read, does not already hold under that name (BACKLOG #6717). No seal is made here:
+    SQLite stores a NaN as ``NULL``, so a nullable column would change silently and a ``NOT NULL``
+    one would refuse the write, and no sealed field means anything by an infinity, as that class
+    says. A value carried forward from the stored row is
+    written as before, so only a new value is refused. A name may repeat (a user's role grants),
+    so a value counts as held when any field of that name in ``prior`` holds the same kind."""
+    if sealer is not None:
+        return
+    held = {(n, k) for n, v in prior if (k := _non_finite_kind(v)) is not None}
+    for name, value in fields:
+        kind = _non_finite_kind(value)
+        if kind is not None and (name, kind) not in held:
+            raise NonFiniteSealValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
@@ -1696,6 +1831,12 @@ def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
     return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
 
 
+#: The note :meth:`RevokeSealOutcome.committing` adds to a failure of the report it runs after the
+#: revoke committed, so a caller can tell a revoke that landed from one that rolled back (BACKLOG
+#: #5093): ``admin-revoke-sessions`` reads it.
+REVOKE_COMMITTED_NOTE = "raised by the report after the revoke committed"
+
+
 @dataclass
 class RevokeSealOutcome:
     """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
@@ -1725,7 +1866,8 @@ class RevokeSealOutcome:
         known, on every exit (decision d20261110T063908944-857965, item 6).
 
         **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
-        between the commit and a separate call can skip it.
+        between the commit and a separate call can skip it. A failure of that report carries
+        :data:`REVOKE_COMMITTED_NOTE`, since the revoke it reports on has landed (BACKLOG #5093).
 
         **If the transaction raises**, the report says the revoke failed before its commit was
         confirmed, rather than that it went ahead, and the exception propagates (decision
@@ -1761,7 +1903,11 @@ class RevokeSealOutcome:
         carry = _REVOKE_CARRY.get()
         if carry is not None and not carry.closed:
             carry.covered_by(self)
-        await self.report(record_audit)
+        try:
+            await self.report(record_audit)
+        except Exception as exc:
+            exc.add_note(REVOKE_COMMITTED_NOTE)
+            raise
 
     def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
         """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
@@ -2083,19 +2229,42 @@ def cancels_at_entry() -> int:
 
 def _force_failed_open_release(
     force_release: Callable[[], object] | None, *, after: str = "a failed store open"
-) -> None:
+) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
-    None is a caller with nothing it can release without waiting."""
+    None is a caller with nothing it can release without waiting. True only when a release ran
+    and returned something other than ``False``, which a release made of several steps returns
+    when one of them failed, so a caller's log line says the release happened only then (BACKLOG
+    #5720)."""
     if force_release is None:
-        return
+        return False
     try:
-        force_release()
+        return force_release() is not False
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
             "forcing the release after %s also failed (%s)",
             after,
             type(failure).__name__,
         )
+        return False
+
+
+def _forced_outcome(
+    force_release: Callable[[], object] | None,
+    released: bool,
+    *,
+    built: str = "what it had not closed",
+    left: str = "may still be open",
+) -> str:
+    """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
+    names what was to be released, and ``left`` what follows when nothing released it. A release
+    that ran is not said to have released everything: on SQL Server it marks the pool closing and
+    shuts its executor down, which leaves the pool's free connections open, and on SQLite a
+    statement that ignores the interrupt keeps its worker running."""
+    if released:
+        return f"a forced release of {built} ran without waiting for it"
+    if force_release is None:
+        return f"{built} {left}"
+    return f"forcing its release failed, so {built} {left}"
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
@@ -2115,6 +2284,20 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _force_stop_connections(conns: Sequence[aiosqlite.Connection]) -> bool:
+    """Interrupt and stop each of ``conns`` without waiting, each step's failure logged by class.
+    False when any step failed, so the caller does not report them released (BACKLOG #5720).
+    interrupt() aborts a statement the worker is running, so the close stop() queues behind it is
+    reached; stop() does not await it."""
+    released = True
+    for conn in conns:
+        raw = getattr(conn, "_connection", None)
+        if raw is not None:
+            released &= _force_failed_open_release(raw.interrupt)
+        released &= _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+    return released
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -2183,8 +2366,8 @@ async def cleanup_failed_open(
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
     The bound starts at once when the open's own end was a cancel, or a cancel this open received
     under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
-    the bound, ``force_release`` drops what the open built without waiting, and this stops
-    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    the bound, ``force_release`` runs without waiting, which need not release everything the open
+    built (see :func:`_forced_outcome`), and this stops waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
@@ -2233,15 +2416,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release, after=after)
+            released = _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
-                "what the open built was released without waiting for it"
-                if force_release is not None
-                else "it was left to finish on its own",
+                _forced_outcome(
+                    force_release,
+                    released,
+                    built="what the open built",
+                    left="is left to the cleanup, until it finishes, if it does",
+                ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task, what)
@@ -2276,14 +2462,10 @@ async def cleanup_failed_open(
                 break
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
-        # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release, after=after)
+        # the read pool included: force its release without waiting (BACKLOG #5720).
+        released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
-        left = (
-            "what it had not closed was released without waiting for it"
-            if force_release is not None
-            else "what it had not closed may still be open"
-        )
+        left = _forced_outcome(force_release, released)
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:
@@ -2436,6 +2618,24 @@ async def _held_seal_ok(
     return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
 
 
+def sign_in_state_refused(
+    disabled: object,
+    locked_until: float | None,
+    second_step_locked_until: float | None,
+    now: float,
+) -> bool:
+    """Whether an account's row, read inside ``create_session``'s transaction, may not take a new
+    session under ``require_sign_in_eligible`` (BACKLOG #5653): disabled, or either lock live at
+    ``now``. The values are the raw columns, so each backend's integer, boolean or bit reads alike.
+    The service's own check before the mint reads the same three states
+    (``_directory_login_refusal``); this repeats it where a concurrent disable or lockout can no
+    longer land between that check and the INSERT. A lock is live on the boundary
+    :meth:`UserRecord.sign_in_locked` and :meth:`UserRecord.second_step_locked` use."""
+    return bool(disabled) or any(
+        until is not None and now < until for until in (locked_until, second_step_locked_until)
+    )
+
+
 def new_session_record(
     *,
     token_hash: str,
@@ -2477,6 +2677,13 @@ def new_session_record(
     )
 
 
+def _reanchored(stored: str | None, client: str | None) -> str | None:
+    """A session's address after a proof from ``client``: ``client``, or the stored one when it is
+    ``None`` (WP-L3-13). The one rule both :func:`reauth_stamp` and :func:`mfa_stamp` move the
+    anchor by (vault BACKLOG #2964 item 30)."""
+    return stored if client is None else client
+
+
 def reauth_stamp(
     now: float, client: str | None, idp_auth_time: float | None
 ) -> Callable[[SessionRecord], SessionRecord]:
@@ -2495,7 +2702,7 @@ def reauth_stamp(
         return replace(
             s,
             reauth_at=when,
-            client=s.client if client is None else client,
+            client=_reanchored(s.client, client),
             idp_auth_time=forward,
         )
 
@@ -2531,7 +2738,7 @@ class _MfaStamp:
         return replace(
             s,
             mfa_verified_at=self._when,
-            client=s.client if anchor.client is None else anchor.client,
+            client=_reanchored(s.client, anchor.client),
             reauth_at=self._when if anchor.open_window else None,
         )
 
@@ -2906,6 +3113,56 @@ class AdminGrant(StrEnum):
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
+#: How many times ``create_session`` runs on every backend before it gives up: once per seal over
+#: the session epochs it read, made again when a revoke raised one before the insert's locked read,
+#: and on SQLite also once per busy ``BEGIN IMMEDIATE`` (BACKLOG #5653), which backs off as the
+#: first-administrator grant does. Both are rare, so a bound that is reached raises
+#: :class:`SessionMintContended` rather than spin; it is not a refusal, so it is never ``False``.
+SESSION_MINT_ATTEMPTS: Final = _ADMIN_GRANT_BUSY_ATTEMPTS
+
+#: The ``cause`` of a :class:`SessionMintContended` when SQLite answered busy to every
+#: ``BEGIN IMMEDIATE`` the insert ran (BACKLOG #5653).
+SESSION_MINT_BUSY: Final = "busy"
+#: The ``cause`` of a :class:`SessionMintContended` when a revoke raised a session epoch the seal
+#: covers before every locked read the insert ran (BACKLOG #5653).
+SESSION_MINT_EPOCH_RAISED: Final = "session_epoch_raised"
+#: The ``cause`` of a :class:`SessionMintContended` when the SQLite insert's attempts met both: at
+#: least one answered busy and at least one found the session epochs raised (BACKLOG #5653).
+SESSION_MINT_BUSY_AND_EPOCH_RAISED: Final = "busy_and_session_epoch_raised"
+#: Every ``cause`` a :class:`SessionMintContended` carries.
+SESSION_MINT_CAUSES: Final[frozenset[str]] = frozenset(
+    {SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED, SESSION_MINT_BUSY_AND_EPOCH_RAISED}
+)
+
+
+def session_mint_cause(*, busy: int, epoch_raised: int) -> str:
+    """The ``cause`` a contended insert names from how many of its attempts met each kind of
+    contention, so a run that met both says so rather than naming the last one alone."""
+    if busy and epoch_raised:
+        return SESSION_MINT_BUSY_AND_EPOCH_RAISED
+    return SESSION_MINT_BUSY if busy else SESSION_MINT_EPOCH_RAISED
+
+
+class SessionMintContended(RuntimeError):
+    """:meth:`~messagefoundry.store.base.AuthStore.create_session` ran its bounded attempts and
+    wrote nothing, because each one met contention rather than a refusal (BACKLOG #5653).
+    ``cause`` is one of :data:`SESSION_MINT_CAUSES`, as :func:`session_mint_cause` names it from
+    every attempt; ``attempts`` is how many ran. Exported from :mod:`messagefoundry.store`.
+
+    **Raised, never returned as ``False``.** ``False`` means the account itself refused the
+    session (gone, disabled, locked, or its binding changed), and a caller renders it as that
+    refusal. Contention says nothing about the account, so a sign-in that meets it fails as a
+    temporary server-side failure and is audited under its own reason. The message is numeric and
+    PHI-free."""
+
+    def __init__(self, cause: str, attempts: int) -> None:
+        super().__init__(cause, attempts)
+        self.cause = cause
+        self.attempts = attempts
+
+    def __str__(self) -> str:
+        return f"session insert contended ({self.cause}) after {self.attempts} attempts"
+
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
@@ -3149,7 +3406,7 @@ class UserRecord:
     password_claimed_at: float | None = None
     # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
     # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
-    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on an AD/OIDC login --
     # touches ``display_name`` and ``email`` only.
     #
     # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
@@ -3450,7 +3707,14 @@ class SessionRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        record = decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        if isinstance(d["seal"], bytes) and d["seal"]:
+            # ``seal`` reads a non-empty BLOB as text, which fails a seal check as malformed; the
+            # compare-and-set binds the cell itself (:func:`session_reseal_params`), so a keyless
+            # write still matches the row it read, as on main. An empty BLOB reads as ``""`` and
+            # binds as text, which does not match it, as on main (BACKLOG #6718).
+            object.__setattr__(record, "_seal_cell", d["seal"])
+        return record
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -3469,7 +3733,7 @@ class SessionRecord:
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
             global_epoch=int(d["global_epoch"]),
-            seal=d["seal"] or "",
+            seal=str(d["seal"] or ""),
         )
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
@@ -3850,6 +4114,13 @@ def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
                 continue
             parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
     return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def passkey_set_matches(creds: Iterable[WebAuthnCredential], cred_digest: str) -> bool:
+    """Whether ``creds`` digest to ``cred_digest``, the digest the account's seal covers, compared
+    with :func:`~messagefoundry.credential.constant_time_equal` rather than ``==`` (ASVS 11.2.4,
+    BACKLOG #1167). Shared by the three store backends."""
+    return constant_time_equal(passkey_digest(creds), cred_digest)
 
 
 def global_epoch_or_refuse(value: Any) -> int:
@@ -4347,18 +4618,26 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     """Whether one passkey can be a way past the sign-in lock: recorded as discoverable, AND stored
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
-    tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
-    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
-    only its hash-scheme half for a directory account's second factor, which needs no discoverable
-    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
+    tag, a malformed value), can never sign in, so it is no way past however it is recorded. Nor is
+    one whose stored ``public_key`` does not decode, which the verify refuses (BACKLOG #6886). A
+    hash that reads back as bytes counts as the text it holds, as the sign-in's compare does. A
+    stored ``credential_id`` is not asked: the combined sign-in names no credential up front and
+    finds the passkey by the hash of the id the browser sends. Those stored-cell checks are
+    :func:`~messagefoundry.auth.tokens.stored_passkey_is_readable`.
+
+    The one statement of the per-passkey way-past rule: at least the store's conditional writes,
+    the census, the service's gates, the sign-in path and the lock notice ask it. The census's reset
+    list asks only its stored-cell half for a directory account's second factor, which needs no
+    discoverable record, and adds that the stored id decodes, which that leg's allow list needs."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import credential_id_hash_is_current
+    from messagefoundry.auth.tokens import stored_passkey_is_readable
 
-    return credential_id_hash_is_current(cred.credential_id_hash)
+    return stored_passkey_is_readable(
+        credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
+    )
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -4388,17 +4667,18 @@ def discoverable_way_past(
     :func:`holds_way_past` (ADR 0197 Amendment A, wave 2). On a ``sealed`` store a set that does not
     match ``cred_digest``, the digest the account's seal covers, counts for nothing: a passkey row
     written or flipped outside the store must not count. The census asks it too."""
-    if sealed and passkey_digest(passkeys) != cred_digest:
+    if sealed and not passkey_set_matches(passkeys, cred_digest):
         return False
     counts = passkey_counts or passkey_is_way_past
     return any(counts(c) for c in passkeys)
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
-#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
-#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
-#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
-#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses or whose key is too
+#: short to compute with (BACKLOG #5340), or no secret at all. ``"unknown"``: it could not be judged
+#: (the cell did not open, a cipher service did not answer, or the value is not base32). Only a
+#: KNOWN refusal moves any decision away from the plain ``totp_enabled`` rule; an unknown answer is
+#: treated exactly as that rule treats it.
 TotpState = Literal["usable", "refused", "unknown"]
 
 #: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
@@ -4716,8 +4996,12 @@ def removal_keeps_way_past(
     row = record.row
     if not drop_totp and _totp_is_way_past(record, totp_counts):
         return True
-    remaining = [c for c in passkeys if c.credential_id_hash != drop_passkey]
-    trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
+    remaining = [
+        c
+        for c in passkeys
+        if drop_passkey is None or not constant_time_equal(c.credential_id_hash, drop_passkey)
+    ]
+    trusted = not sealed or passkey_set_matches(passkeys, row.cred_digest)
     counts = passkey_counts or passkey_is_way_past
     return trusted and any(counts(c) for c in remaining)
 
@@ -4736,10 +5020,10 @@ async def way_past_passkeys(
     Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
     the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
     must not refuse a write the TOTP already allows. A write that reads the set for its own sake
-    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
-    under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
-    (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
-    (:func:`totp_removal`), so only then are they read. A set that cannot be read
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that
+    no longer counts under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write
+    removes the TOTP (``drop_totp``) it is the other way round: the passkeys matter only while that
+    TOTP counts (:func:`totp_removal`), so only then are they read. A set that cannot be read
     (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
     if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
         return []
@@ -5282,6 +5566,31 @@ def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
     return apply
 
 
+def ad_scope_replacement(
+    scope_json: str,
+    expected_scope: str | None,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_ad_channel_scope_if_unchanged``'s compare-and-set (BACKLOG #6887): write the
+    directory's scope, marked ``ad``, only while the row still holds ``expected_scope`` AND
+    ``expected_source`` exactly (``None`` matching NULL). Both, because the AD sign-in decides from
+    both: the value decides whether the write changes the scope, which is what triggers its revoke,
+    and the source decides whether an unchanged value still needs taking over. The compare is
+    Python's, so it is byte-exact on every backend, as :func:`scope_withdrawal`'s is."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
 def federated_bind(issuer: str, subject: str, *, expect_unbound: bool, now: float) -> UserChange:
     """``set_user_federated_subject``'s write, with the session epoch raised in the same write
     because the caller ends the account's sessions with it. With ``expect_unbound`` (BACKLOG
@@ -5340,6 +5649,22 @@ def rotation_reseal(
         return r.changed(totp_secret=reencrypt(str(secret), aad))
 
     return apply
+
+
+def marker_test_sql(column: str, *, present: bool) -> str:
+    """SQLite's test of ``column`` against the marker pattern bound as ``?1`` (``<prefix>%``).
+
+    Text compares byte-exact, because ``LIKE`` folds ASCII case and ``MFENC:`` is not a marker to
+    the cipher (BACKLOG #5506, #5611). A BLOB keeps ``LIKE`` and so reads as it did before: ``substr``
+    of a BLOB is a BLOB, which never equals text, so an exact test would call every BLOB unmarked.
+    What ``LIKE`` does with a BLOB depends on the SQLite build (``cipher_cells._sealed_test`` says
+    how), and on a build where it matches none, every BLOB is unmarked here too. ``column`` is a
+    code constant. NULL matches neither form."""
+    compare, like = ("=", "LIKE") if present else ("<>", "NOT LIKE")
+    return (
+        f"CASE WHEN typeof({column}) = 'blob' THEN {column} {like} ?1"
+        f" ELSE substr({column}, 1, length(?1) - 1) {compare} substr(?1, 1, length(?1) - 1) END"
+    )
 
 
 def report_refused_role_holder() -> None:
@@ -6473,9 +6798,12 @@ AUDIT_ANCHOR_DIGEST_HEX_LEN = AUDIT_MAC_HEX_LEN
 AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 
 
-#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- the longest
-#: producible form is a count plus a `vault:v1:<base64>` MAC, comfortably under 200 bytes -- so anything
-#: past this is not an anchor file and the excess must never be read, let alone quoted back.
+#: How much of an anchor file is read before it is refused. An anchor is ONE short line -- a count
+#: plus a 64-character hex head, or a shorter `vault:v<N>:<base64>` Transit MAC, comfortably under 200
+#: bytes -- so anything past this is not an anchor file and the excess must never be read, let alone
+#: quoted back. This is the READER's bound, not a parser check: the parser passes a `vault:v` head
+#: through unchecked (:func:`_audit_head_shape` says what that costs), so only this byte bound limits
+#: one read from a file, and nothing limits one given as ``--expected-anchor`` on the command line.
 #:
 #: THE BOUND IS A LOG-DISCLOSURE CONTROL, NOT A PERFORMANCE ONE. ``str(AuditAnchorError)``
 #: interpolates the offending text with ``{text!r}``. Neither file caller prints it now (vault
@@ -6484,6 +6812,23 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: file, or a captured HL7 message would put that line into the service log at WARNING -- which is
 #: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
+
+
+def _ascii_digits(text: str) -> bool:
+    """``text`` is ASCII decimal digits only: the digit rule of :func:`_audit_decimal`, which the
+    anchor's sign check shares."""
+    return text.isascii() and text.isdigit()
+
+
+def _audit_decimal(text: str) -> int | None:
+    """``text`` as an int when it is ASCII digits only, at most 19 of them (the width of the signed
+    64-bit ``seq`` column every backend uses), else ``None``. The one count grammar of
+    :func:`parse_audit_anchor` and :func:`parse_audit_row_pair`: ``int()`` alone would read
+    ``1_0`` as 10, accept a sign or non-ASCII digits, and parse any length up to Python's limit.
+    The caller checks the value against :data:`_AUDIT_SEQ_MAX`."""
+    if not _ascii_digits(text) or len(text) > 19:
+        return None
+    return int(text)
 
 
 class AuditAnchorError(ValueError):
@@ -6514,8 +6859,9 @@ class AuditAnchorError(ValueError):
 
 
 def read_audit_anchor_file(path: str | Path) -> str:
-    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises ``OSError`` or
-    ``UnicodeDecodeError``; each caller words its own operator-facing refusal around those.
+    """Read an anchor file into the text :func:`parse_audit_anchor` takes. Raises at least
+    ``OSError``, ``UnicodeDecodeError``, and ``ValueError`` for a path carrying a NUL character;
+    ``Engine._load_audit_anchor`` says what the third does at startup.
 
     ``utf-8-sig`` absorbs a leading BOM: PowerShell 5.1's ``Set-Content -Encoding utf8`` writes UTF-8
     WITH one, and this product deploys as a Windows service, so that is a first-class way an operator
@@ -6569,9 +6915,11 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     verify: a silently-ignored anchor turns the whole control into a gate that reports green while
     checking nothing, which is precisely the failure the anchor exists to close.
 
-    It must ALSO refuse rather than hand a comparator a head the store can never emit. Both comparators
-    compare the head byte-exactly and report *any* difference as ``truncated or rewritten``, so an
-    accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
+    It ALSO refuses a hex head of the wrong length and a head of neither shape, rather than hand a
+    comparator a head the store can never emit; a ``vault:v`` head is the exception, passed through
+    unchecked (see the second bullet), and :func:`_audit_head_shape` states what that costs.
+    Both comparators compare the head byte-exactly and report *any* difference as
+    ``truncated or rewritten``, so an accepted-but-impossible head becomes a FALSE tamper alarm — a red light on an intact chain,
     indistinguishable from a real detection. A control whose whole value is that a FAIL means something
     cannot be allowed to manufacture FAILs out of its own input handling — the inverse of the
     green-while-checking-nothing hole above, and it costs just as much.
@@ -6605,16 +6953,26 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     count_text, sep, head = raw.partition(":")
     if not sep:
         raise AuditAnchorError("no ':' separator", text)
-    try:
-        count = int(count_text)
-    except ValueError:
-        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
-        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
-        raise AuditAnchorError("the row count is not an integer", text) from None
-    if count < 0:
-        # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
-        # the count is that file's content (vault BACKLOG #2612).
+    count_text = count_text.strip()
+    # The row pair's grammar, not `int()`'s, which also takes `+5`, `1_000`, non-ASCII digits and
+    # any length up to Python's digit limit (vault BACKLOG #4790). The count is quoted in `str(exc)`
+    # via `text`; no reason names a value, not even the count: `--expected-anchor-file` prints the
+    # reason, and the count is that file's content (vault BACKLOG #2612).
+    # A minus sign before ASCII digits is judged on the sign before the width, so each reason is
+    # true of its input: "-0" is a signed zero, not a negative count, and a minus before 20 or more
+    # digits is negative whatever its width.
+    unsigned = count_text.removeprefix("-")
+    if unsigned != count_text and _ascii_digits(unsigned):
+        if not unsigned.strip("0"):
+            raise AuditAnchorError("the row count is a signed zero, which no store prints", text)
         raise AuditAnchorError("the row count is negative", text)
+    count = _audit_decimal(count_text)
+    if count is None:
+        raise AuditAnchorError(
+            "the row count is not a plain decimal integer of up to 19 digits", text
+        )
+    if count > _AUDIT_SEQ_MAX:
+        raise AuditAnchorError("the row count is larger than any store can hold", text)
     head = head.strip()
     if not head:
         if count != 0:
@@ -6640,9 +6998,19 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
 
 def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, str]:
     """``(why a non-empty head is refused, or None; the head normalised)``. The one statement of
-    which heads the store can emit, shared by :func:`parse_audit_anchor` and
+    which heads are taken, shared by :func:`parse_audit_anchor` and
     :func:`parse_audit_row_pair`, so a hardening of it reaches both. The reason quotes no part of the
-    head. ``noun`` names the value in the reason."""
+    head. ``noun`` names the value in the reason.
+
+    THE KNOWN COST OF THE ``vault:v`` PASS-THROUGH. A ``vault:v`` anchor or row pair whose count or
+    seq passes, and whose head is malformed (for example truncated, or carrying a space), is not
+    refused: it reaches the comparator, and on an intact chain the walk reports ``truncated or
+    rewritten``. ``audit-verify`` then exits 1, the tamper code, not 2. The engine's
+    ``[integrity].audit_anchor_file`` startup check logs that verdict at WARNING, quoting the
+    anchor's count and the first 12 characters of its head and of the chain's head at that row,
+    and, where an alert sink is configured, fires ``integrity_drift`` with subject
+    ``audit-chain-truncated`` carrying the same text. Vault BACKLOG #5987 item 1 and #4790 items 2
+    and 4 hold it open."""
     if set(head) <= _AUDIT_ANCHOR_HEX:
         if len(head) != AUDIT_ANCHOR_DIGEST_HEX_LEN:
             return (
@@ -6651,7 +7019,13 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return None, head  # opaque by construction; never normalise what we do not define
+        # Opaque by construction; never normalise what we do not define. Not held to the Transit
+        # MAC's shape either: `audit-anchor` prints a tampered `vault:v` head as the store holds it,
+        # and `audit-verify` exits 2 on an anchor this parser refuses, before it walks, so a shape
+        # check here would leave such a tamper unwalked. A malformed `vault:v` head is therefore
+        # compared against the walked chain, not refused. A tampered head of another shape is still
+        # refused before the walk. The cost is in the docstring.
+        return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
@@ -6681,20 +7055,20 @@ def parse_audit_row_pair(text: str) -> tuple[int, str]:
     """Parse a ``SEQ:ROW_HASH`` pair, one row the off-box tee witnessed, into the tuple
     ``verify_audit_chain(expected_rows=...)`` takes (vault BACKLOG #2612).
 
-    It refuses, as :func:`parse_audit_anchor` does and for the same reason, any head the store can
-    never emit, since a comparator would report it as tampering. Unlike an anchor, a pair names a
-    ROW, so its sequence number is at least 1 and its head is never empty."""
+    It applies :func:`parse_audit_anchor`'s head rule, so it refuses a hex head that is not exactly
+    64 characters and a head of neither shape, and passes a ``vault:v`` head through unchecked, at
+    the cost :func:`_audit_head_shape` states.
+    Unlike an anchor, a pair names a ROW, so its sequence number is at least 1 and its head is never
+    empty."""
     seq_text, sep, head = text.strip().partition(":")
     if not sep:
         raise AuditRowPairError("no ':' separator", text)
     seq_text = seq_text.strip()  # space either side of the ':' reads alike
-    # ASCII digits only, and no wider than a store's sequence column: `int()` alone would read
-    # '1_0' as 10, accept non-ASCII digits, and admit a seq no store can hold.
-    if not (seq_text.isascii() and seq_text.isdigit()) or len(seq_text) > 19:
+    seq = _audit_decimal(seq_text)
+    if seq is None:
         raise AuditRowPairError(
             "the sequence number is not a plain decimal of up to 19 digits", text
         )
-    seq = int(seq_text)
     if not 1 <= seq <= _AUDIT_SEQ_MAX:
         raise AuditRowPairError(
             "the sequence number is outside 1 to 2**63-1, so it names no row", text
@@ -7079,6 +7453,21 @@ def audit_seal_next(
     return seq, row_hash
 
 
+def held_append_mac(
+    head: Sequence[Any] | None,
+    expect_prev: str | None,
+    append_mac: Callable[[], tuple[bytes | None, AuditMacFn | None]],
+) -> Callable[[], tuple[bytes | None, AuditMacFn | None]]:
+    """``append_mac``'s answer, taken now, as :func:`audit_seal_next` takes it: after the head check.
+
+    A backend that runs :func:`audit_seal_next` off the event loop (BACKLOG #3929) calls this on the
+    loop first, so the range key is read in the same step as the head, as it was before the hop,
+    and a refusal raises in the same order. The off-loop seal then uses the key read here."""
+    audit_next_link(head, expect_prev)
+    held = append_mac()
+    return lambda: held
+
+
 #: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
 _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
@@ -7423,7 +7812,7 @@ async def _store_pin_refusal(
     expected: str | None = None
     if secret is not None:
         with suppress(AuditKeyVersionRefusedError):
-            expected = _audit_row_mac(first, "", secret[0], secret[1])
+            expected = await cipher_call(secret[1], _audit_row_mac, first, "", secret[0], secret[1])
     if expected is None or not hmac.compare_digest(
         audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
     ):
@@ -8284,7 +8673,9 @@ async def settle_audit_ranges(
     if first_secret is not None:
         refused = ""
         try:
-            expected = _audit_row_mac(genesis, "", first_secret[0], first_secret[1])
+            expected = await cipher_call(
+                first_secret[1], _audit_row_mac, genesis, "", first_secret[0], first_secret[1]
+            )
         except AuditKeyVersionRefusedError as exc:  # the genesis row fails, as the walk reports it
             expected, refused = None, f" ({exc})"
         mac_ok = hmac.compare_digest(
@@ -8317,7 +8708,10 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            if out_secret is not None and not await cipher_call(
+                out_secret[1], _audit_tag_ok, parsed, out_secret
+            ):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -8453,7 +8847,9 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # different chain from the one the verify passed. The no-op below verifies too: its OK is read
     # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows()
-    ok, msg = verify_audit_rows(
+    ok, msg = await cipher_call(
+        host._audit_mac_fn,
+        verify_audit_rows,
         rows,
         mac_keys=host._audit_mac_keys,
         mac_fn=host._audit_mac_fn,
@@ -8483,12 +8879,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
+    # The handover tag is a MAC under the outgoing key, routed like the open's tag check (#3929).
+    # docs/CONNECTIONS.md, the Vault Transit bulk-cipher row, says where it runs today.
+    detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, out_secret),
+            detail=detail,
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:
@@ -8851,38 +9250,100 @@ def _sqlite_readonly_uri(path: str) -> str:
     return uri + "?mode=ro"
 
 
+#: How :func:`forget_store_salt` names an object holding ``store_salt`` that is not an ordinary
+#: table, keyed by ``lower(sqlite_master.type)``. A ``table`` row there failed the ordinary-table
+#: predicate, so it is normally a virtual table; an ordinary table whose row a hand edit gave a
+#: type in another case is named as one too, and refused.
+_FOREIGN_SALT_KINDS = {"table": "a virtual table", "view": "a view", "index": "an index"}
+
+
 def forget_store_salt(path: Path) -> bool:
-    """Drop the store salt from a CLOSED SQLite store file, so its next open mints a new one (ADR 0196).
+    """Drop the salt from a CLOSED SQLite store file, so its next salted open mints one (ADR 0196).
 
     For a store that is a copy of another: what ``restore`` places, and the scratch copy the full
     restore-verify opens. A copy carries the original's salt, so it would seal under the original's
     data sub-key while counting that key's use from the copy's older row -- the rewind ADR 0196
-    closes. With no salt row, the first open mints a salt and so a key nothing has used, before it
-    seals anything; every value already in the file names its own salt and still opens.
+    closes. With no salt row, the first open that binds a salt mints one and so a key nothing has
+    used, before it seals anything. Not every open binds one: ``bind_store_salt`` in ``gcm_bound``
+    names those that do not, at least the identity and ``vault_transit`` ciphers and the frozen v1
+    writer (``[store].aad_bind = false``), and for those this call changes no key. It does not change
+    how a value already in the file opens: a v4 value names its own salt in the value, a v1 or v2
+    value is sealed under the DEK itself, and a v3 value is the Transit cipher's, opened by Vault.
 
-    Returns whether a row was removed. A file from before ADR 0196 has no ``store_salt`` table and so
-    nothing to forget; its first open creates one. Synchronous, for the off-loop restore path.
+    Synchronous, for the off-loop restore path. What it returns or raises, in at least these cases:
 
-    **It proves the row is gone from the MAIN FILE, or raises ``sqlite3.OperationalError``.** A
-    snapshot can carry WAL mode in its header, and then a plain DELETE commits into ``-wal``. The
-    callers place or open only the main file, so a delete left in a WAL that was never checkpointed
-    would be silently dropped, and the copy would keep the original's salt. So the file is first
-    switched to ``journal_mode=DELETE``, which checkpoints the WAL and removes it, and which SQLite
-    refuses while another connection holds the file. After the delete, the main file is re-read with
-    no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
+    - **True**: an ordinary ``store_salt`` table held at least one row, the delete removed it, and
+      the re-read below found none left in the MAIN FILE.
+    - **False, with an ordinary table**: the ``store_salt`` table was there but the delete removed no
+      row, normally because it was empty, so there was nothing to forget.
+    - **False, with no object of that name**: a file from before ADR 0196 has no ``store_salt``, and
+      its first writable open creates the table. A path with no file is in this case too: the
+      connect creates an empty file there.
+    - **Raises** ``sqlite3.OperationalError`` naming the kind of object when there is no ordinary
+      ``store_salt`` table and the name is held by another object, at least a view, an index or a
+      virtual table another tool left. Such an object is neither read nor dropped and is left in
+      the file as it was, so nothing about a salt is proven. Before the raise the file has been
+      taken out of WAL mode, as below. A trigger of that name does not make the call raise: it has
+      a namespace of its own and does not stop the writable open creating the table. A trigger
+      defined ON ``store_salt`` still fires inside the delete, so it can change what the call does.
+    - **Raises** ``sqlite3.OperationalError`` when the file cannot be written as a closed file or
+      the write is not proven: at least when another connection's hold makes the journal-mode switch
+      or the delete fail (``database is locked``, or on a WAL file the switch refused), when a
+      non-empty ``-wal`` remains afterwards or its size cannot be read (the ``OSError`` is converted,
+      so a caller that catches ``sqlite3.Error`` refuses the copy), or when the read-only re-read
+      still finds a row in the ordinary table, whether or not the delete reported removing one.
+      SQLite does not refuse every other holder: on a file in rollback-journal mode an idle second
+      connection lets the call write, and on a WAL file so does one opened with ``immutable=1``,
+      which takes no lock. Other ``sqlite3.Error`` subclasses from opening or reading the file
+      propagate too.
+
+    **On each path that returns, it has re-read the MAIN FILE and found no row in an ordinary
+    table.** That re-read does not look for a view, index or virtual table; the check above runs on
+    the writing connection only when it finds no ordinary table. A snapshot can carry WAL mode in
+    its header, and then a plain DELETE commits into ``-wal``. The callers place or open only the main file, so a
+    delete left in a WAL that was never checkpointed would be silently dropped, and the copy would
+    keep the original's salt. So the file is first switched to ``journal_mode=DELETE``, which
+    checkpoints the WAL and removes it. After the delete, the main file is re-read with no ``-wal``
+    beside it. A raise is the caller's to report."""
+
+    # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
+    # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
+    # lower(), as schema_verify's salt read matches it: SQLite resolves the name case-blind, so a
+    # `Store_Salt` table is the one the next open reads. One helper holds the table-exists check that
+    # the drop and its proof both make, so those two checks cannot drift apart; it also means the proof
+    # cannot catch a table that check misses. The statement is spelled at the call rather than held in
+    # a local so tests/test_writer_txn_is_the_only_begin.py can read it.
+
+    def has_salt_table(conn: sqlite3.Connection) -> bool:
+        return bool(
+            conn.execute(
+                "SELECT count(*) FROM sqlite_master AS m"
+                f" WHERE {_ORDINARY_TABLE} AND lower(m.name) = 'store_salt'"
+            ).fetchone()[0]
+        )
 
     def drop(conn: sqlite3.Connection) -> bool:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
+        if has_salt_table(conn):
+            return conn.execute("DELETE FROM store_salt").rowcount > 0
+        # Fail closed on a name another tool's object holds: returning False there let a restore
+        # place a copy that its first writable open then refuses, with the salt question unasked.
+        # Tables, views and indexes share one namespace, so at most one such object matches. A
+        # trigger has a namespace of its own and does not stop the open creating the table.
+        foreign = conn.execute(
+            "SELECT lower(m.type) FROM sqlite_master AS m"
+            " WHERE lower(m.name) = 'store_salt' AND lower(m.type) <> 'trigger'"
         ).fetchone()
-        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        if foreign is not None:
+            kind = _FOREIGN_SALT_KINDS.get(str(foreign[0]), "an object of another kind")
+            raise _ClosedStoreWriteError(
+                f"store_salt is {kind}, not this build's salt table, so the store salt cannot be "
+                f"dropped from {path}"
+            )
+        return False
 
     def gone(proof: sqlite3.Connection) -> bool:
         return not (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
-            and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
+            has_salt_table(proof) and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
         )
 
     return _write_closed_store(
@@ -8892,6 +9353,20 @@ def forget_store_salt(path: Path) -> bool:
         what="its store salt cannot be dropped",
         proof_failed="still holds a store salt after it was dropped",
     )
+
+
+class _ClosedStoreWriteError(sqlite3.OperationalError):
+    """:func:`_write_closed_store`'s own refusals, and :func:`forget_store_salt`'s refusal of a
+    ``store_salt`` that is not an ordinary table, whose text the engine wrote: a store or ``-wal``
+    path, the journal mode SQLite reported, a kind word from ``_FOREIGN_SALT_KINDS`` or its fixed
+    fallback, and a fixed sentence, never a row's value or SQLite's message.
+    Marked :func:`~messagefoundry.redaction.engine_text_only`, so a renderer that withholds a
+    database driver's message keeps it (vault BACKLOG #8153). ``safe_exc`` and the DR reasons show
+    it as ``OperationalError``; a traceback names this class itself.
+    Still a ``sqlite3.OperationalError``, so every handler that caught one catches it."""
+
+
+engine_text_only(_ClosedStoreWriteError, named_as_driver=True)
 
 
 def _write_closed_store[T](
@@ -8905,32 +9380,42 @@ def _write_closed_store[T](
     """Run ``write`` on a CLOSED SQLite store file and prove it landed in the MAIN FILE, for
     :func:`forget_store_salt` and :func:`write_restore_marker`.
 
-    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it,
-    and which SQLite refuses while another connection holds the file; ``write`` then runs in
-    autocommit. Afterwards a non-empty ``-wal`` beside it, or a read-only re-read on which ``prove``
-    answers False, raises ``sqlite3.OperationalError``: a caller places or opens only the main
-    file, so a change left in a WAL nobody checkpoints would be silently dropped."""
+    The file is first switched to ``journal_mode=DELETE``, which checkpoints a WAL and removes it;
+    on a WAL file SQLite refuses the switch while another connection holds it through SQLite's
+    locks, but not every other holder is refused (:func:`forget_store_salt` says which). ``write``
+    then runs in autocommit. Afterwards a non-empty ``-wal`` beside it, a ``-wal`` whose size
+    cannot be read, or a read-only re-read on which ``prove`` answers False, raises
+    ``sqlite3.OperationalError``: a caller places or opens only the main file, so a change left in
+    a WAL nobody checkpoints would be silently dropped."""
     wal = path.with_name(path.name + "-wal")
     conn = sqlite3.connect(str(path), isolation_level=None)  # autocommit: each statement commits
     try:
         mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
         if mode != "delete":
-            raise sqlite3.OperationalError(
+            raise _ClosedStoreWriteError(
                 f"could not take {path} out of WAL mode (it is still {mode!r}); another "
                 f"connection holds it, so {what}"
             )
         result = write(conn)
     finally:
         conn.close()
-    if wal.exists() and wal.stat().st_size:
-        raise sqlite3.OperationalError(f"{wal} still holds changes after leaving WAL mode")
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    except OSError as exc:
+        # The callers catch sqlite3.Error, so an OSError here would escape their refusal; an
+        # unreadable -wal is an unproven write, and fails closed as one.
+        raise _ClosedStoreWriteError(f"{wal} could not be read after leaving WAL mode") from exc
+    if wal_size:
+        raise _ClosedStoreWriteError(f"{wal} still holds changes after leaving WAL mode")
     proof = sqlite3.connect(_sqlite_readonly_uri(str(path.absolute())), uri=True)
     try:
         proven = prove(proof)
     finally:
         proof.close()
     if not proven:
-        raise sqlite3.OperationalError(f"{path} {proof_failed}")
+        raise _ClosedStoreWriteError(f"{path} {proof_failed}")
     return result
 
 
@@ -8981,7 +9466,11 @@ def write_restore_marker(
     The sessions are ended here too, in the same transaction as the marker, because a revoke
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
-    raises every account's session epoch, which needs the key, and adds this count to its own.
+    revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
+    and each account's, the second of which needs the key, and adds this count to its own. An
+    account goes without its own raise where :func:`raise_account_epoch` says, at least on a seal
+    refusal and after a Vault Transit outage trips the revoke; the global epoch still ends its
+    sessions.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
@@ -9025,14 +9514,51 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path) -> None:
-    """Restrict a store file to its owner — it holds PHI at rest.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    """Restrict a file to the account this process runs as — a store file holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
-    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
-    an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
-    restriction is **logged** (STORE-2) so it isn't silently world-readable.
+    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
+    writes one protected DACL whole instead, granting full control to the account read from this
+    process's token. Written whole, the list replaces the entries the file carried: inherited ones,
+    and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
+    a file). The owner is not changed.
+
+    **What the one list carries over** (this is the one statement of the rule; ADR 0163 and the
+    helpers point here). Explicit entries only, never inherited ones, their SDDL text copied as
+    written, and ``icacls /grant:r`` kept each of them:
+
+    - every deny, placed first;
+    - the explicit OWNER RIGHTS entries, decided as a set: they are all dropped only when no deny
+      is carried and each is a plain allow (``A``) with no flags holding both READ_CONTROL and
+      WRITE_DAC; otherwise every one is carried.
+
+    Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
+    owner beyond the list, and those implicit rights are granted before any deny is read, so the
+    entries are decided together and against the carried denies. When they are carried, they stay
+    as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
+    WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
+    An object allow (``OA``) is always carried, as ``icacls /grant:r`` kept it: one carrying an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights
+    (measured). Either way an owner other than this account can end with less than
+    ``icacls /grant:r`` left it, since the one list drops every other principal's allow, one for
+    the owner's own account or groups included: a narrowing, not a loosening. A null DACL carries
+    nothing.
+
+    Where the current list cannot be read or parsed, or the write fails other than by access
+    denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
+    principals' allows included. For an unreadable list that is a deliberate choice: it is what
+    the code before this one-list write did, and the bare list, the other option, would drop a
+    deny or a narrowing OWNER RIGHTS entry it cannot see, so neither is strictly safer. Each of
+    these is **logged** (STORE-2). A restriction that is skipped, or refused with access denied,
+    leaves the file's access list as it was.
+
+    ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
+    and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
+    entries and replaces only this account's own grant, so every explicit entry the file carries
+    stays. ADR 0163 relies on that: an existing store file keeps the service account's trio entry
+    when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9051,38 +9577,150 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
-            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
-            # icacls is pinned to its absolute System32 path and invoked without a shell; the
-            # principal is a single argv token, never a shell word, so it can't inject a flag
-            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
-            # CreateProcess resolves an unqualified name through a search path that reaches the
-            # caller's working directory, and because this call only logs on a non-zero exit, a
-            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
-            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
-                check=False,
-                env=system_tool_environment(),  # the platform's start-up names only (#2716)
-                capture_output=True,
-                text=True,
-                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
-                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
-                # failed decode loses the output this warning logs. Only logged, so replace.
-                encoding="oem",
-                errors="replace",
-            )
-            if result.returncode != 0:
+            # The principal is the token's SID, never a name, so no environment variable or name
+            # lookup chooses who is granted (vault BACKLOG #5612).
+            if keep_explicit_entries:
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            current = _read_dacl_sddl(path)
+            kept = None if current is None else _entries_the_one_list_keeps(current)
+            if kept is None:
+                if current is not None:
+                    log.warning(
+                        "could not parse the access list of %s; restricting it with icacls, which "
+                        "keeps its explicit entries",
+                        path,
+                    )
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            denies, owner_rights = kept
+            # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
+            # unnamed principal's explicit entry while granting. Denies first, the canonical order.
+            sddl = "D:P" + "".join(denies) + f"(A;;FA;;;{sid})" + "".join(owner_rights)
+            result = _set_security_from_sddl(path, sddl, protected=True)
+            if result.failure is not None or result.dacl_status != 0:
                 log.warning(
-                    "icacls could not restrict %s (exit %s): %s",
+                    "could not restrict %s to this account: %s",
                     path,
-                    result.returncode,
-                    (result.stderr or result.stdout or "").strip(),
+                    result.failure or f"Win32 status {result.dacl_status}",
                 )
+                if result.dacl_status != _ERROR_ACCESS_DENIED:
+                    # The list may be what failed (a carried entry that does not convert, say);
+                    # icacls needs no list text. It needs the same WRITE_DAC, so not after a denial.
+                    log.warning(
+                        "restricting %s with icacls instead, which keeps its explicit entries", path
+                    )
+                    _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+#: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
+#: it for a file's mask), or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
+#: An SDDL right that includes READ_CONTROL: READ_CONTROL itself, and each file or generic right,
+#: since a file's generic mapping and each FILE_GENERIC_* right hold it (and key all).
+_SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
+    {"RC", "FA", "FR", "FW", "FX", "GA", "GR", "GW", "GX", "KA"}
+)
+_WRITE_DAC = 0x40000
+_READ_CONTROL = 0x20000
+_GENERIC_ALL = 0x10000000
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a
+#: file.
+_GENERIC_ANY = 0xF0000000
+#: OWNER RIGHTS, as an SDDL alias and as a SID.
+_OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+_ERROR_ACCESS_DENIED = 5
+
+
+def _grants_owner_implicit_rights(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
+    access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
+    answers ``False``, so the OWNER RIGHTS entries are carried, as ``icacls /grant:r`` kept them."""
+    if rights.startswith("0X"):
+        try:
+            mask = int(rights, 16)
+        except ValueError:
+            return False
+        return bool(mask & (_WRITE_DAC | _GENERIC_ALL)) and bool(
+            mask & (_READ_CONTROL | _GENERIC_ANY)
+        )
+    tokens = {rights[i : i + 2] for i in range(0, len(rights), 2)}
+    return bool(tokens & _SDDL_RIGHTS_WITH_WRITE_DAC) and bool(
+        tokens & _SDDL_RIGHTS_WITH_READ_CONTROL
+    )
+
+
+def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
+    """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
+    ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
+
+    The rule, and what the owner ends with, is stated once in :func:`_secure_file`'s docstring,
+    under *What the one list carries over*."""
+    start = sddl.find("D:")
+    body = sddl[start + 2 :] if start >= 0 else ""
+    end = body.find("S:")
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    if start >= 0 and "NO_ACCESS_CONTROL" in (body if first < 0 else body[:first]):
+        return [], []
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
+    texts = _SDDL_ACE.findall(body)
+    if len(texts) != len(dacl.aces):
+        return None
+    denies: list[str] = []
+    owner_rights: list[str] = []
+    all_full = True
+    for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
+        flag_set = _sddl_flag_set(flags)
+        if "ID" in flag_set:
+            continue
+        if kind in _SDDL_DENY_TYPES:
+            denies.append(f"({text})")
+        elif ace_sid in _OWNER_RIGHTS:
+            owner_rights.append(f"({text})")
+            all_full = all_full and (
+                kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
+            )
+    # A carried deny can withhold the owner's implicit READ_CONTROL and WRITE_DAC only while an
+    # OWNER RIGHTS entry stays: with none left, those two are granted before any deny is read.
+    return denies, ([] if all_full and not denies else owner_rights)
+
+
+def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
+    """:func:`_secure_file`'s ``keep_explicit_entries`` rewrite. Windows only; logs, never raises
+    except ``OSError``, which the caller logs."""
+    # icacls is pinned to its absolute System32 path and invoked without a shell; the principal is
+    # a single argv token in icacls's ``*S-...`` form, never a shell word, so it can't inject a
+    # flag (low-27/STORE-5). The pin is what makes "fixed system tool" true: CreateProcess resolves
+    # an unqualified name through a search path that reaches the caller's working directory, and
+    # because this call only logs on a non-zero exit, a planted icacls.exe that exits 0 would leave
+    # this PHI-adjacent file its inherited (possibly broad) ACL while reporting nothing (#1769).
+    result = subprocess.run(  # nosec B603 B607
+        [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
+        check=False,
+        env=system_tool_environment(),  # the platform's start-up names only (#2716)
+        capture_output=True,
+        text=True,
+        # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+        # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+        # failed decode loses the output this warning logs. Only logged, so replace.
+        encoding="oem",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9104,7 +9742,10 @@ def _grant_read(path: Path, principal: str) -> None:
             env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
-            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+            # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+            # failed decode loses the output this warning logs. Only logged, so replace.
+            encoding="oem",
             errors="replace",
         )
     except OSError as exc:
@@ -9122,8 +9763,10 @@ def _grant_read(path: Path, principal: str) -> None:
 async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
-    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
-    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
+    now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
+    subprocess again on the fallbacks :func:`_secure_file` names. Called straight from a
+    coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
@@ -9218,8 +9861,11 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
     plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
-    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
+    so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
+    owner-only rewrite. :func:`_secure_file` checks for a null DACL first, and for any other
+    ``None`` it cannot tell what a whole list would drop, so it runs the kept icacls rewrite, which
+    keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
@@ -9399,7 +10045,8 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
 
     GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
     names principals by SID, so the answer does not depend on the display language. A failure is
-    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    logged with its Win32 status, because the caller then falls back: a store-trio caller to the
+    owner-only rewrite, :func:`_secure_file` to the kept icacls rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -9542,7 +10189,9 @@ def _reaches_through_a_link(path: Path) -> bool:
             return True
         if attributes & reparse:
             log.warning(
-                "%s is reached through a link, so the store there is restricted owner-only", path
+                "%s is reached through a link, so the store there gets this account's grant and "
+                "keeps its explicit entries",
+                path,
             )
             return True
     return False
@@ -9570,7 +10219,8 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
-                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "%s is locked down but %s, so the store there gets the opener's grant and keeps its "
+                "explicit entries; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
                 "of 2026-09-24 and 2026-11-05)",
                 directory,
@@ -9724,7 +10374,9 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
+    icacls rewrite, exactly as before: it grants the opener and keeps every explicit entry.
+    Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9733,7 +10385,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path)
+        _secure_file(path, keep_explicit_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
@@ -9931,22 +10583,33 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
-DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
-statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
-alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
-missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
-The one exception is an operator inject, which always writes a message, so its ``None`` return is
-refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+DECIDED (BACKLOG #5069): a ``None`` return is allowed for a result that changed nothing, because it
+is the caller's own per-result statement that this result needs no row, which :func:`if_applied`
+relies on for an alert id that matched no row. What is refused, with :class:`TypeError` and before
+any write, is a missing audit: ``None`` or anything not callable in its place
+(:func:`require_operator_audit`). On replay, dead-letter replay, resend, re-ingress and purge, a
+``None`` return for a result that did change the store is refused too, inside the transaction, so
+the change rolls back (:func:`require_mutation_audit`). So is an operator inject's, which always
+writes a message (BACKLOG #5071, :func:`require_ingress_audit`).
 
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
 not read chain state."""
 
 
+type InjectAudit = Callable[[str], AuditAppend]
+"""An operator inject's :data:`OperatorAudit`, built from the new message id (BACKLOG #6589).
+
+It returns a row every time: an inject always writes a message, so it always records one, and
+:func:`require_ingress_audit` refuses a ``None`` row at runtime. Typed apart from
+:data:`OperatorAudit` so mypy refuses, at a typed caller, an inject audit that may build none."""
+
+
 def no_audit_row(_result: object) -> None:
     """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
 
-    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Replay, dead-letter replay, resend,
+    re-ingress and purge refuse it for a result that changed the store (BACKLOG #5069). Most of its callers end the sessions
     as the tail of a change that carries its own row, such as a password reset or a disable, so the
     revoke has nothing of its own to record."""
     return None
@@ -10124,19 +10787,31 @@ async def settle_transit_bound_attestation(
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
     (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
-    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
-    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
-    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
+    provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
+    that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
+    start. A 400 whose reply's wording reads as a version refusal, while the probe under the
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
+    Transit refused the check; the code reads only that wording, which a proxy can imitate. At
+    least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
+    an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG
+    #6707 items 24 and 73). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
-    except CipherError as exc:
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
+    except AuditKeyVersionRefusedError as exc:  # the reply's wording read as a version refusal
         return replace(
             attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
         )
+    except CipherError as exc:
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"
@@ -10372,41 +11047,100 @@ def require_operator_audit(audit: object, mutation: str) -> None:
         )
 
 
+def mutation_changed(result: object) -> bool:
+    """Whether the result of replay, dead-letter replay, resend, re-ingress or purge says it changed
+    the store (BACKLOG #5069). A count changed the store unless it is ``0``, so a driver's ``-1``,
+    an unknown count, counts as a change. A resend or re-ingress outcome changed nothing only as a
+    ``duplicate``. Any other result type raises :class:`TypeError`, so a new result type must be
+    classified here rather than read as no change."""
+    if isinstance(result, ResendOutcome | ReingressOutcome):
+        return result.status != "duplicate"
+    if isinstance(result, int) and not isinstance(result, bool):
+        return result != 0
+    raise TypeError(
+        f"an operator mutation returned {type(result).__name__}, which mutation_changed does not"
+        " classify (BACKLOG #5069)"
+    )
+
+
+def require_mutation_audit[R](audit: OperatorAudit[R], mutation: str) -> OperatorAudit[R]:
+    """The entry guard of replay, dead-letter replay, resend, re-ingress and purge (BACKLOG #5069),
+    and the audit each then runs.
+
+    It refuses a missing audit as :func:`require_operator_audit` does, before any write. The audit
+    it returns also refuses a ``None`` row for a result that changed the store
+    (:func:`mutation_changed`). The store calls it inside the mutation's transaction, before the
+    commit, so that :class:`TypeError` keeps the change from committing. It keys on the result the
+    mutation returns, not on every write the mutation made. A result that changed nothing may still
+    record nothing."""
+    require_operator_audit(audit, mutation)
+
+    def row_when_changed(result: R) -> AuditAppend | None:
+        row = audit(result)
+        if row is None and mutation_changed(result):
+            raise TypeError(
+                f"{mutation}'s audit returned no row for a result that changed the store, which"
+                " an operator mutation refuses (BACKLOG #5069)"
+            )
+        return row
+
+    return row_when_changed
+
+
 #: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
 #: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
 #: origin is a decision: the test classifies every member as operator or not.
 OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(
-    audit: OperatorAudit[str] | None, origin: MessageOrigin
-) -> OperatorAudit[str] | None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+def is_origin_actor(value: object) -> TypeGuard[str]:
+    """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
+    return isinstance(value, str) and bool(value) and value == value.strip()
 
-    Before anything is written, an operator origin with no audit or with one that is not callable,
-    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
-    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
-    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin, origin_actor: str | None
+) -> InjectAudit | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071, #6589), and the audit it then runs.
+
+    Before anything is written, :class:`TypeError` is raised for an operator origin (one in
+    :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
-    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
-    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
-    ``audit`` and always writes ``operator_upload``."""
+    ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
+    row. Nothing at the type level holds a direct caller of the store either, since ``audit`` stays
+    optional there. The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`,
+    requires its ``audit`` and ``actor`` and always writes ``operator_upload``."""
     operator = origin in OPERATOR_ORIGINS
     if not operator:
+        # An audit or an actor is an operator's inject; with this origin the message would be
+        # labelled as a receipt, so the caller forgot the origin.
         if audit is not None:
-            # An audit is an operator's inject; with this origin the message would be labelled
-            # as a receipt, so the caller forgot the origin.
             raise TypeError(
                 f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
                 " inject names its operator origin (BACKLOG #5071)"
+            )
+        if origin_actor is not None:
+            raise TypeError(
+                f"enqueue_ingress was given an origin_actor with origin {str(origin)!r}; only an"
+                " operator origin names its user (BACKLOG #6589)"
             )
         return None
     if not callable(audit):
         raise TypeError(
             f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
             f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not is_origin_actor(origin_actor):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs the origin_actor that names its"
+            f" user; got {origin_actor!r} (BACKLOG #6589)"
         )
     build = audit
 
@@ -10426,7 +11160,8 @@ def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend,
     """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
 
     A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
-    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    (BACKLOG #5069). A ``None`` RETURN is allowed here; :func:`require_mutation_audit` wraps the five
+    mutations' audit to refuse one for a result that changed the store. ``None`` in place
     of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
     is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
     require_operator_audit(audit, "an operator mutation")
@@ -10447,7 +11182,8 @@ def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
 
     Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
     here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
-    #5069)."""
+    #5069). Its callers take it as their first statement, so that refusal comes before any write
+    or lock (BACKLOG #6589)."""
     if not isinstance(audit, AuditAppend):
         raise TypeError(
             f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
@@ -11531,7 +12267,8 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction
+                                               -- (the database's clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
@@ -11917,6 +12654,25 @@ class MessageStore:
         # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
         return self._cipher.decrypt(value, aad=aad)
 
+    # BACKLOG #3929: async store methods call these rather than ``_enc``/``_dec`` and the cipher,
+    # so under a cipher that blocks on I/O (``vault_transit``) the call runs on the Transit pool and
+    # the event loop keeps serving. Under an in-process cipher it runs inline, as before.
+    async def _aenc(self, value: str | None, *, aad: bytes) -> str | None:
+        if not value:
+            return value
+        return await cipher_call(self._cipher, self._enc, value, aad=aad)
+
+    async def _adec(self, value: str | None, *, aad: bytes) -> str | None:
+        if value is None:
+            return value
+        return await cipher_call(self._cipher, self._dec, value, aad=aad)
+
+    async def _aencrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.encrypt, plaintext, aad=aad)
+
+    async def _adecrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return await cipher_call(self._cipher, self._cipher.decrypt, stored, aad=aad)
+
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
         return cipher_info(self._cipher)
@@ -12164,14 +12920,8 @@ class MessageStore:
             # Read now: close() empties the list, and a forced release must still reach each one.
             conns = [*(store._read_conns if store is not None else ()), db]
 
-            def _force_release() -> None:
-                # interrupt() aborts a statement the worker is running, so the close stop()
-                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
-                for conn in conns:
-                    raw = getattr(conn, "_connection", None)
-                    if raw is not None:
-                        _force_failed_open_release(raw.interrupt)
-                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+            def _force_release() -> bool:
+                return _force_stop_connections(conns)
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
@@ -12215,7 +12965,8 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each an ACL write on Windows, and outside a
+        # hardened directory an icacls subprocess (21 to 28 ms each, measured). Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)
@@ -12417,7 +13168,9 @@ class MessageStore:
             # #241 F2: decrypt+json.loads through the fail-closed helper — a keyless open of an
             # encrypted store raises an operator-facing StoreKeylessError (table + remedy), not a raw
             # JSONDecodeError, and never silently drops an encrypted row.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+            cache[(r["namespace"], r["key"])] = await cipher_call(
+                self._cipher,
+                decrypt_json_cell,
                 self._cipher,
                 r["value"],
                 aad=cell_aad("state", "value", r["namespace"], r["key"]),
@@ -12448,7 +13201,9 @@ class MessageStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])  # sealed (BACKLOG #1174)
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
                 # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
-                entry[r["key"]] = decrypt_json_cell(
+                entry[r["key"]] = await cipher_call(
+                    self._cipher,
+                    decrypt_json_cell,
                     self._cipher,
                     r["value"],
                     aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
@@ -12769,7 +13524,10 @@ class MessageStore:
         pending, never as a false plant beside its own new ciphertext.
         """
         keys = key_cols if key_cols is not None else aad_cols
-        pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
+        pending_where = f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+        # What this column's LIKE calls unmarked. On a sealed surface the opt-out seals only these,
+        # as it did before the exact test, so where LIKE folds case an `MFENC:` value is left alone.
+        folded_where = f"{column} NOT LIKE ?1 AND {column} <> ''"
         strict = not allows_unmarked(self._cipher)
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
@@ -12777,13 +13535,15 @@ class MessageStore:
         if blank_where is not None and not keyed:
             blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
-        if (blanks or (pending and strict)) and not keyed:
+        if (blanks or pending) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
                 # its legitimate seal is not reported as a plant. A blank here stays refused.
                 blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
+        if pending and is_sealed and not strict:
+            pending = await self._count_unmarked(table, folded_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
@@ -12809,12 +13569,13 @@ class MessageStore:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
             # The opt-out reseals plaintext, never a blank on a surface another process keyed.
+            unmarked_where = pending_where if claimed and not is_sealed else folded_where
             seal_where = (
-                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
+                f"({unmarked_where}) OR ({blank_where})" if blanks and claimed else unmarked_where
             )
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
-                # matching NOT LIKE and the loop terminates inside the one transaction.
+                # matching and the loop terminates inside the one transaction.
                 cur = await self._db.execute(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
                     f" WHERE {seal_where} LIMIT {int(batch)}",
@@ -12823,26 +13584,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
-                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = encrypt_many(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher,
-                    [
-                        (
-                            r["v"],
-                            aad_of(r)
-                            if aad_of is not None
-                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._db.executemany(
-                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
-                    [
-                        (value, *(r[c] for c in keys))
-                        for value, r in zip(sealed_values, rows, strict=True)
-                    ],
-                )
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=True,
+                ):
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                        [
+                            (value, *(r[c] for c in keys))
+                            for value, r in zip(sealed_values, chunk, strict=True)
+                        ],
+                        f"{table}.{column}",
+                        exact=True,
+                    )
                 sealed += len(rows)
             await self._commit()
         except BaseException as exc:
@@ -12852,6 +13611,26 @@ class MessageStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
         await self._charge_bound_batch()
         return sealed
+
+    async def _update_every_row(
+        self, sql: str, params: Sequence[Sequence[object]], cell: str, *, exact: bool = False
+    ) -> None:
+        """Run a seal or rotation UPDATE, refusing when a row it had to write stayed unwritten.
+
+        SQLite allows NULL in a non-INTEGER primary key, and ``key = NULL`` matches nothing, so such
+        a row would stay selected and its pass would encrypt it again forever (BACKLOG #5506). The
+        caller's guard or unwind rolls the uncommitted batch back. Names the cell, never a value.
+        ``exact`` is the seal's, whose read and write share one transaction, so any shortfall is a
+        fault. A rotation reads outside its write, so there only a NULL key refuses: a row another
+        process deleted in between has nothing left to rotate."""
+        cur = await self._db.executemany(sql, params)
+        missed = cur.rowcount != len(params)
+        if missed and (exact or any(v is None for p in params for v in p[1:])):
+            raise CipherError(
+                f"cipher column {cell}: an update wrote {cur.rowcount} of {len(params)} row(s), so"
+                " a row's key is NULL or changed. Nothing in this batch was kept; repair or remove"
+                " that row and retry"
+            )
 
     async def _surface_keyed(self, table: str, column: str) -> bool:
         """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
@@ -12864,7 +13643,7 @@ class MessageStore:
     async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
         """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
         cur = await self._db.execute(
-            f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
+            f"SELECT 1 FROM {table} WHERE {marker_test_sql(column, present=True)} LIMIT 1", (like,)
         )
         return await cur.fetchone() is not None
 
@@ -12961,7 +13740,7 @@ class MessageStore:
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
                     cur = await self._db.execute(
                         f"SELECT id, {column} FROM {table}"
-                        f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                        f" WHERE {self._rotation_scan(column)} LIMIT ?",
                         (active_like, batch),
                     )
                     rows = list(await cur.fetchall())
@@ -12979,7 +13758,9 @@ class MessageStore:
                         )
                         for r in rows
                     ]
-                    await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE id=?", updates, f"{table}.{column}"
+                    )
                     await self._commit()
                     await self._charge_bound_batch()
                     total += len(rows)
@@ -13028,6 +13809,17 @@ class MessageStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
+    def _rotation_scan(self, column: str) -> str:
+        """The rotation's "not under the active key" filter, whose pattern binds as ``?1``.
+
+        Byte-exact, so a value in another case is selected and the decrypt refuses it (BACKLOG
+        #5611). Under the opt-out that decrypt passes an unmarked value through, so the filter
+        stays the ``LIKE`` it was: this fix widens nothing there. It does not protect such a value
+        either: one that does not fold to the active prefix is selected and re-sealed."""
+        if allows_unmarked(self._cipher):
+            return f"{column} NOT LIKE ?1 AND {column} <> ''"
+        return f"{marker_test_sql(column, present=False)} AND {column} <> ''"
+
     @staticmethod
     def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any configured key) then re-encrypt under the active key, rebinding the
@@ -13062,10 +13854,22 @@ class MessageStore:
         matches the marker filter."""
         total = skipped = 0
         after = ""
+        # The page filter below never selects a NULL or empty id, so such a cell would stay under a
+        # prior key while the rotation reports success (BACKLOG #5506).
+        cur = await self._db.execute(
+            f"SELECT 1 FROM {table} WHERE (id IS NULL OR id = '')"
+            f" AND {self._rotation_scan(column)} LIMIT 1",
+            (active_like,),
+        )
+        if await cur.fetchone() is not None:
+            raise CipherError(
+                f"cipher column {table}.{column}: a row with a NULL or empty id cannot be rotated;"
+                " repair or remove that row and retry"
+            )
         while True:
             cur = await self._db.execute(
                 f"SELECT {select}, {column} AS v FROM {table}"
-                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id LIMIT ?",
+                f" WHERE {self._rotation_scan(column)} AND id > ? ORDER BY id LIMIT ?",
                 (active_like, after, batch),
             )
             rows = list(await cur.fetchall())
@@ -13106,7 +13910,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
-                " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('ciphertext')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13124,8 +13928,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?", updates
+            await self._update_every_row(
+                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
+                updates,
+                "attachment_chunk.ciphertext",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13143,7 +13949,7 @@ class MessageStore:
         rotated = 0
         while True:
             cur = await self._db.execute(
-                "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT ?",
+                f"SELECT hash, body FROM shared_body WHERE {self._rotation_scan('body')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13158,7 +13964,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE shared_body SET body=? WHERE hash=?", updates)
+            await self._update_every_row(
+                "UPDATE shared_body SET body=? WHERE hash=?", updates, "shared_body.body"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13198,7 +14006,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT namespace, key, value FROM state"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13214,8 +14022,8 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates, "state.value"
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13232,7 +14040,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT name, version, key, value FROM reference"
-                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('value')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13251,8 +14059,10 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany(
-                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?", updates
+            await self._update_every_row(
+                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
+                updates,
+                "reference.value",
             )
             await self._commit()
             await self._charge_bound_batch()
@@ -13273,7 +14083,7 @@ class MessageStore:
             while True:
                 cur = await self._db.execute(
                     f"SELECT message_id, destination_name, response_seq, {column} FROM response"
-                    f" WHERE {column} NOT LIKE ? AND {column} <> '' LIMIT ?",
+                    f" WHERE {self._rotation_scan(column)} LIMIT ?",
                     (active_like, batch),
                 )
                 rows = list(await cur.fetchall())
@@ -13298,10 +14108,11 @@ class MessageStore:
                     )
                     for r in rows
                 ]
-                await self._db.executemany(
+                await self._update_every_row(
                     f"UPDATE response SET {column}=?"
                     " WHERE message_id=? AND destination_name=? AND response_seq=?",
                     updates,
+                    f"response.{column}",
                 )
                 await self._commit()
                 await self._charge_bound_batch()
@@ -13318,7 +14129,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, message_id, ts, event, detail FROM message_events"
-                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('detail')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13335,7 +14146,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE message_events SET detail=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE message_events SET detail=? WHERE id=?", updates, "message_events.detail"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13350,7 +14163,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, connection, ts, kind, reason FROM connection_event"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13367,7 +14180,11 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE connection_event SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                updates,
+                "connection_event.reason",
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13383,7 +14200,7 @@ class MessageStore:
         while True:
             cur = await self._db.execute(
                 "SELECT id, event_type, connection, reason FROM alert_instance"
-                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                f" WHERE {self._rotation_scan('reason')} LIMIT ?",
                 (active_like, batch),
             )
             rows = list(await cur.fetchall())
@@ -13400,7 +14217,9 @@ class MessageStore:
                 )
                 for r in rows
             ]
-            await self._db.executemany("UPDATE alert_instance SET reason=? WHERE id=?", updates)
+            await self._update_every_row(
+                "UPDATE alert_instance SET reason=? WHERE id=?", updates, "alert_instance.reason"
+            )
             await self._commit()
             await self._charge_bound_batch()
             rotated += len(rows)
@@ -13728,8 +14547,12 @@ class MessageStore:
         open() with an opaque ``FOREIGN KEY constraint failed``: ``queue.message_id`` is FK-enforced
         and this INSERT runs under ``foreign_keys=ON``. A skipped orphan was unreplayable anyway (no
         message to view/route); we log how many were dropped."""
+        # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
+        # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'"
+            # Exact case, unlike the salt probe: nothing but this fold reads `outbox`, and it drops
+            # the table, so a case variant another tool left must be left alone.
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -13773,6 +14596,8 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the connections' worker threads stay running; this close is not cancel-safe.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
@@ -13855,9 +14680,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            f"{len(deliveries)} destination(s)",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                f"{len(deliveries)} destination(s)",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -13919,7 +14746,7 @@ class MessageStore:
             (
                 body_hash,
                 # Content-address cell (ASVS 11.3.3): the hash is over the plaintext, rotation-stable.
-                self._cipher.encrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
+                await self._aencrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
                 refs,
                 now,
             ),
@@ -14066,9 +14893,11 @@ class MessageStore:
             )
             async for row in cur:
                 # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
-                yield self._cipher.decrypt(
-                    row["ciphertext"],
-                    aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                yield (
+                    await self._adecrypt(
+                        row["ciphertext"],
+                        aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                    )
                 )
 
     async def attachments_for(
@@ -14324,7 +15153,7 @@ class MessageStore:
         # the store gains a key while the row is live, the first keyed open seals it (BACKLOG #3495),
         # because a keyed claim refuses a blank. Once the row is terminal, the blank stays and reads
         # as an erasure.
-        stored_payload = self._cipher.encrypt(
+        stored_payload = await self._aencrypt(
             payload if body_ref is None else body_ref,
             aad=queue_payload_aad(
                 row_id=row_id,
@@ -14386,17 +15215,19 @@ class MessageStore:
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(
-                    payload,
-                    aad=queue_payload_aad(
-                        row_id=row_id,
-                        message_id=mid,
-                        stage=Stage.ROUTED.value,
-                        channel_id=channel_id,
-                        destination_name=None,
-                        handler_name=handler_name,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        payload,
+                        aad=queue_payload_aad(
+                            row_id=row_id,
+                            message_id=mid,
+                            stage=Stage.ROUTED.value,
+                            channel_id=channel_id,
+                            destination_name=None,
+                            handler_name=handler_name,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 OutboxStatus.PENDING.value,
                 now,
@@ -14418,7 +15249,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
-        audit: OperatorAudit[str] | None = None,
+        audit: InjectAudit | None = None,
         origin: MessageOrigin = MessageOrigin.PARTNER,
         origin_actor: str | None = None,
     ) -> str:
@@ -14439,7 +15270,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin, origin_actor)  # BACKLOG #5071, #6589
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -14476,17 +15307,19 @@ class MessageStore:
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(
-                        raw,
-                        aad=queue_payload_aad(
-                            row_id=ingress_row_id,
-                            message_id=mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=channel_id,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            raw,
+                            aad=queue_payload_aad(
+                                row_id=ingress_row_id,
+                                message_id=mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=channel_id,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     now,
@@ -14505,9 +15338,11 @@ class MessageStore:
                         mid,
                         now,
                         "received",
-                        self._enc(
-                            "ingress",
-                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        (
+                            await self._aenc(
+                                "ingress",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            )
                         ),
                     ),
                 )
@@ -14686,9 +15521,11 @@ class MessageStore:
                 name,
                 version,
                 k,
-                self._cipher.encrypt(
-                    text,
-                    aad=cell_aad("reference", "value", name, version, k),
+                (
+                    await self._aencrypt(
+                        text,
+                        aad=cell_aad("reference", "value", name, version, k),
+                    )
                 ),
             )
             for k, text in encoded
@@ -14756,7 +15593,7 @@ class MessageStore:
             (
                 namespace,
                 key,
-                self._cipher.encrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
+                await self._aencrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
                 now,
                 message_id,
             ),
@@ -14841,7 +15678,9 @@ class MessageStore:
                 prow = await pcur.fetchone()
                 if prow is not None:
                     msg_channel = str(prow["channel_id"])
-                    pmeta_json = open_message_cell(
+                    pmeta_json = await cipher_call(
+                        self._cipher,
+                        open_message_cell,
                         self._cipher,
                         "metadata",
                         prow["metadata"],
@@ -14854,9 +15693,42 @@ class MessageStore:
             if pt_deliveries:
                 parent_meta: dict[str, Any] = {}
                 if pmeta_json:
-                    loaded = json.loads(pmeta_json)
-                    if isinstance(loaded, dict):
-                        parent_meta = loaded
+                    # BACKLOG #5758: refuse only a cell that would make the child's own reads raise,
+                    # by running them; a valid non-object still reads as no lineage. Raised outside
+                    # the except: json's error holds the whole cell.
+                    unreadable = False
+                    try:
+                        loaded = json.loads(pmeta_json)
+                        if isinstance(loaded, dict):
+                            child_depth = int(loaded.get("correlation_depth", 0) or 0) + 1
+                            str(child_depth)  # the child's cap branch formats it
+                            if child_depth <= correlation_depth_cap:  # else no child is encoded
+                                json.dumps(
+                                    {
+                                        "correlation_id": message_id,
+                                        "correlation_root_id": loaded.get("correlation_root_id")
+                                        or message_id,
+                                        "correlation_depth": child_depth,
+                                        "passthrough_from": message_id,
+                                    }
+                                )
+                            parent_meta = loaded
+                    except (ValueError, TypeError, OverflowError, RecursionError):
+                        unreadable = True
+                    if unreadable:
+                        # A keyless open hands an mfenc: cell back unchanged: the engine's fault,
+                        # so the runner re-pends the row rather than dead-lettering it.
+                        if pmeta_json.startswith(_ENC_MARKER_PREFIX) and not self._cipher.encrypts:
+                            raise StoreKeylessError(
+                                "store table 'messages' carries encrypted metadata (mfenc: markers)"
+                                " but no store encryption key is configured; set"
+                                " MEFOR_STORE_ENCRYPTION_KEY to the key that wrote it (fail-closed)"
+                            )
+                        err = UnreadableParentMetadataError(
+                            "messages", "metadata", message_id, msg_channel
+                        )
+                        log.warning("%s; the handoff was refused", str(err))
+                        raise err
                 inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = await self._insert_passthrough_child(
@@ -14896,11 +15768,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
-                        self._enc(
-                            merged,
-                            aad=message_cell_aad(
-                                "metadata", message_id=message_id, channel_id=msg_channel
-                            ),
+                        (
+                            await self._aenc(
+                                merged,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=message_id, channel_id=msg_channel
+                                ),
+                            )
                         ),
                         message_id,
                     ),
@@ -14974,20 +15848,29 @@ class MessageStore:
                 source_type,
                 control_id,
                 message_type,
-                self._cipher.encrypt(
-                    raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aencrypt(
+                        raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 status,
-                self._enc(
-                    error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                    )
                 ),
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
-                self._enc(
-                    summary, aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id)
+                (
+                    await self._aenc(
+                        summary,
+                        aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                    )
                 ),
-                self._enc(
-                    metadata,
-                    aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                (
+                    await self._aenc(
+                        metadata,
+                        aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                    )
                 ),
                 # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
                 origin.value,
@@ -15046,7 +15929,11 @@ class MessageStore:
                         mid,
                         now,
                         event,
-                        self._enc(error, aad=cell_aad("message_events", "detail", mid, now, event)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("message_events", "detail", mid, now, event)
+                            )
+                        ),
                     ),
                 )
             await self._commit()
@@ -15123,7 +16010,9 @@ class MessageStore:
         missing shared body (corruption / premature GC) raises like any undecryptable payload, so the
         caller dead-letters that one row rather than stalling the lane."""
         if row["body_ref"] is None:
-            return OutboxItem.from_row(row, open_queue_cell(self._cipher, row))
+            return OutboxItem.from_row(
+                row, await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
+            )
         async with self._read() as db:
             return OutboxItem.from_row(row, await self._open_queue_body(db, row, alert=False))
 
@@ -15142,7 +16031,7 @@ class MessageStore:
         (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
         way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
-            opened = open_queue_cell(self._cipher, row)
+            opened = await cipher_call(self._cipher, open_queue_cell, self._cipher, row)
         except QueueTagError as refused:
             if alert:
                 alert_queue_tag_failure(
@@ -15156,7 +16045,7 @@ class MessageStore:
         if br is None:
             raise CipherError(f"shared body {opened} missing")
         # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
-        return self._cipher.decrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
+        return await self._adecrypt(br["body"], aad=cell_aad("shared_body", "body", opened))
 
     async def _dead_letter_unopenable(
         self, row: aiosqlite.Row, exc: Exception
@@ -15697,7 +16586,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15754,7 +16643,7 @@ class MessageStore:
                 (
                     OutboxStatus.DEAD.value,
                     now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                 ),
@@ -15930,17 +16819,26 @@ class MessageStore:
                     message_id,
                     destination_name,
                     seq,
-                    self._enc(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
+                    (
+                        await self._aenc(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        )
                     ),
                     outcome,
-                    self._enc(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        )
                     ),
-                    self._enc(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
+                    (
+                        await self._aenc(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
+                            ),
+                        )
                     ),
                     now,
                 ),
@@ -15968,17 +16866,19 @@ class MessageStore:
                         reingress_to,
                         None,
                         None,
-                        self._enc(
-                            artifact_ref,
-                            aad=queue_payload_aad(
-                                row_id=work_row_id,
-                                message_id=message_id,
-                                stage=Stage.RESPONSE.value,
-                                channel_id=reingress_to,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aenc(
+                                artifact_ref,
+                                aad=queue_payload_aad(
+                                    row_id=work_row_id,
+                                    message_id=message_id,
+                                    stage=Stage.RESPONSE.value,
+                                    channel_id=reingress_to,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         0,
@@ -16115,17 +17015,19 @@ class MessageStore:
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(
-                        body,
-                        aad=queue_payload_aad(
-                            row_id=pt_ingress_id,
-                            message_id=new_mid,
-                            stage=Stage.INGRESS.value,
-                            channel_id=pt_channel,
-                            destination_name=None,
-                            handler_name=None,
-                            body_ref=None,
-                        ),
+                    (
+                        await self._aencrypt(
+                            body,
+                            aad=queue_payload_aad(
+                                row_id=pt_ingress_id,
+                                message_id=new_mid,
+                                stage=Stage.INGRESS.value,
+                                channel_id=pt_channel,
+                                destination_name=None,
+                                handler_name=None,
+                                body_ref=None,
+                            ),
+                        )
                     ),
                     OutboxStatus.PENDING.value,
                     0,
@@ -16179,17 +17081,19 @@ class MessageStore:
                 channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
-                self._cipher.encrypt(
-                    "",
-                    aad=queue_payload_aad(
-                        row_id=marker_id,
-                        message_id=parent_id,
-                        stage=Stage.OUTBOUND.value,
-                        channel_id=channel_id,
-                        destination_name=pt_name,
-                        handler_name=PASSTHROUGH_MARKER_HANDLER,
-                        body_ref=None,
-                    ),
+                (
+                    await self._aencrypt(
+                        "",
+                        aad=queue_payload_aad(
+                            row_id=marker_id,
+                            message_id=parent_id,
+                            stage=Stage.OUTBOUND.value,
+                            channel_id=channel_id,
+                            destination_name=pt_name,
+                            handler_name=PASSTHROUGH_MARKER_HANDLER,
+                            body_ref=None,
+                        ),
+                    )
                 ),
                 status,
                 0,
@@ -16326,7 +17230,11 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
+                        (
+                            await self._aenc(
+                                error, aad=cell_aad("queue", "last_error", response_row_id)
+                            )
+                        ),
                         now,
                         now,
                         response_row_id,
@@ -16339,7 +17247,7 @@ class MessageStore:
 
             ref_fault: QueueOpenFault | None = None
             try:
-                ref = open_queue_cell(self._cipher, wr) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except QueueTagError as err:
@@ -16416,12 +17324,11 @@ class MessageStore:
             open_fault: QueueOpenFault | None = None
             try:
                 body = (
-                    self._dec(
+                    await self._adec(
                         art["body"],
                         aad=cell_aad("response", "body", origin_msg_id, dest, seq),
                     )
-                    or ""
-                )
+                ) or ""
             except CipherError as exc:
                 if isinstance(exc, PROGRAMMING_ERRORS):
                     raise
@@ -16440,12 +17347,16 @@ class MessageStore:
             # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
             try:
                 meta_json = (
-                    open_message_cell(
-                        self._cipher,
-                        "metadata",
-                        mrow["metadata"],
-                        message_id=origin_id,
-                        channel_id=mrow["channel_id"],
+                    (
+                        await cipher_call(
+                            self._cipher,
+                            open_message_cell,
+                            self._cipher,
+                            "metadata",
+                            mrow["metadata"],
+                            message_id=origin_id,
+                            channel_id=mrow["channel_id"],
+                        )
                     )
                     if mrow
                     else None
@@ -16475,10 +17386,12 @@ class MessageStore:
                     " WHERE id=?",
                     (
                         OutboxStatus.DEAD.value,
-                        self._enc(
-                            f"re-ingress correlation depth exceeded "
-                            f"({child_depth} > {correlation_depth_cap})",
-                            aad=cell_aad("queue", "last_error", response_row_id),
+                        (
+                            await self._aenc(
+                                f"re-ingress correlation depth exceeded "
+                                f"({child_depth} > {correlation_depth_cap})",
+                                aad=cell_aad("queue", "last_error", response_row_id),
+                            )
                         ),
                         now,
                         now,
@@ -16541,17 +17454,19 @@ class MessageStore:
                             loopback_channel_id,
                             None,
                             None,
-                            self._cipher.encrypt(
-                                body,
-                                aad=queue_payload_aad(
-                                    row_id=reingress_row_id,
-                                    message_id=new_mid,
-                                    stage=Stage.INGRESS.value,
-                                    channel_id=loopback_channel_id,
-                                    destination_name=None,
-                                    handler_name=None,
-                                    body_ref=None,
-                                ),
+                            (
+                                await self._aencrypt(
+                                    body,
+                                    aad=queue_payload_aad(
+                                        row_id=reingress_row_id,
+                                        message_id=new_mid,
+                                        stage=Stage.INGRESS.value,
+                                        channel_id=loopback_channel_id,
+                                        destination_name=None,
+                                        handler_name=None,
+                                        body_ref=None,
+                                    ),
+                                )
                             ),
                             OutboxStatus.PENDING.value,
                             0,
@@ -16606,7 +17521,7 @@ class MessageStore:
             if row is None:
                 return None
             try:
-                ref = open_queue_cell(self._cipher, row) or ""
+                ref = await cipher_call(self._cipher, open_queue_cell, self._cipher, row) or ""
             except QueueTagError as err:
                 refused = err  # reported below, once the read connection is released
             else:
@@ -16627,7 +17542,7 @@ class MessageStore:
             )
             raise refused
         return (
-            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
+            await self._adec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
             else ""
         )
@@ -16665,12 +17580,20 @@ class MessageStore:
             seq = (int(seq_row["m"]) if seq_row else 0) + 1
             # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
             enc_body = (
-                self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        ack_body, aad=cell_aad("response", "body", message_id, dest, seq)
+                    )
+                )
                 if (ack_body and self._cipher.encrypts)
                 else None
             )
             enc_detail = (
-                self._enc(scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq))
+                (
+                    await self._aenc(
+                        scrubbed, aad=cell_aad("response", "detail", message_id, dest, seq)
+                    )
+                )
                 if scrubbed is not None
                 else None
             )
@@ -16714,40 +17637,46 @@ class MessageStore:
                 destination_name=r["destination_name"],
                 response_seq=r["response_seq"],
                 outcome=r["outcome"],
-                detail=self._dec(
-                    r["detail"],
-                    aad=cell_aad(
-                        "response",
-                        "detail",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                detail=(
+                    await self._adec(
+                        r["detail"],
+                        aad=cell_aad(
+                            "response",
+                            "detail",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 captured_at=r["captured_at"],
-                body=self._dec(
-                    r["body"],
-                    aad=cell_aad(
-                        "response",
-                        "body",
-                        r["message_id"],
-                        r["destination_name"],
-                        r["response_seq"],
-                    ),
+                body=(
+                    await self._adec(
+                        r["body"],
+                        aad=cell_aad(
+                            "response",
+                            "body",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
                 ),
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
                 headers=decode_response_headers(
-                    self._dec(
-                        r["resp_headers"],
-                        aad=cell_aad(
-                            "response",
-                            "resp_headers",
-                            r["message_id"],
-                            r["destination_name"],
-                            r["response_seq"],
-                        ),
+                    (
+                        await self._adec(
+                            r["resp_headers"],
+                            aad=cell_aad(
+                                "response",
+                                "resp_headers",
+                                r["message_id"],
+                                r["destination_name"],
+                                r["response_seq"],
+                            ),
+                        )
                     ),
                     row_id=r["message_id"],
                 ),
@@ -16802,7 +17731,7 @@ class MessageStore:
                 (
                     status,
                     next_at,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                     now,
                     outbox_id,
                     *(
@@ -16883,7 +17812,7 @@ class MessageStore:
                     (
                         status,
                         next_at,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                         *(
@@ -16943,7 +17872,7 @@ class MessageStore:
                     (
                         OutboxStatus.DEAD.value,
                         now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        await self._aenc(error, aad=cell_aad("queue", "last_error", outbox_id)),
                         now,
                         outbox_id,
                     ),
@@ -17126,7 +18055,7 @@ class MessageStore:
         skipped: list[Any] = []
         for row in orphans:
             try:
-                reason = self._enc(error, aad=cell_aad("queue", "last_error", row["id"]))
+                reason = await self._aenc(error, aad=cell_aad("queue", "last_error", row["id"]))
             except AADComponentError:
                 skipped.append(row)
                 continue
@@ -17314,7 +18243,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -17436,15 +18365,16 @@ class MessageStore:
 
         Rejects (raise, no mutation): :class:`ResendSourceNotFound` (no delivered source body),
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
-        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination), or
+        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination),
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
-        message/target — review #123-4).
+        message/target — review #123-4), or, on the edit path, :class:`ResendOriginMetadataUnreadable`
+        (the origin's correlation lineage cannot be carried onto the child, BACKLOG #5758).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -17515,29 +18445,16 @@ class MessageStore:
                     )
                 # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
                 # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = open_message_cell(
+                raw_meta = await cipher_call(
+                    self._cipher,
+                    open_message_cell,
                     self._cipher,
                     "metadata",
                     mrow["metadata"],
                     message_id=message_id,
                     channel_id=src_channel,
                 )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": message_id,
-                    }
-                )
+                child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                 # The child is created ROUTED with its single outbound delivery already in flight (it
                 # skips router/transform — the operator supplied the final body); the finalizer drives
                 # it to PROCESSED/ERROR from that row, exactly like any message at the outbound stage.
@@ -17670,14 +18587,15 @@ class MessageStore:
         double-delivers. Defense-in-depth: the child id is a deterministic content-address of the key +
         channel + body, pre-checked before INSERT, so even a partial-rollback re-run cannot double-inject.
 
-        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first) or
-        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
-        on a raise (the whole txn rolls back).
+        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first),
+        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target), or
+        :class:`ResendOriginMetadataUnreadable` (the origin's correlation lineage cannot be carried onto
+        the child, BACKLOG #5758). No mutation on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
-        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -17723,29 +18641,16 @@ class MessageStore:
                 return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-            raw_meta = open_message_cell(
+            raw_meta = await cipher_call(
+                self._cipher,
+                open_message_cell,
                 self._cipher,
                 "metadata",
                 orow["metadata"],
                 message_id=origin_message_id,
                 channel_id=channel_id,
             )
-            try:
-                parent_meta = json.loads(raw_meta) if raw_meta else {}
-            except (ValueError, TypeError):
-                parent_meta = {}
-            if not isinstance(parent_meta, dict):
-                parent_meta = {}
-            child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-            root = parent_meta.get("correlation_root_id") or origin_message_id
-            child_meta = json.dumps(
-                {
-                    "correlation_id": origin_message_id,
-                    "correlation_root_id": root,
-                    "correlation_depth": child_depth,
-                    "edited_from": origin_message_id,
-                }
-            )
+            child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
             new_mid = self._edit_resubmit_message_id(idempotency_key, channel_id, raw)
             # Explicit-id INSERT-OR-IGNORE ingress (defense-in-depth): a re-run after a rolled-back
             # partial re-derives the SAME id and skips the re-insert instead of minting a new one.
@@ -17780,17 +18685,19 @@ class MessageStore:
                         new_mid,
                         Stage.INGRESS.value,
                         channel_id,
-                        self._cipher.encrypt(
-                            raw,
-                            aad=queue_payload_aad(
-                                row_id=resubmit_row_id,
-                                message_id=new_mid,
-                                stage=Stage.INGRESS.value,
-                                channel_id=channel_id,
-                                destination_name=None,
-                                handler_name=None,
-                                body_ref=None,
-                            ),
+                        (
+                            await self._aencrypt(
+                                raw,
+                                aad=queue_payload_aad(
+                                    row_id=resubmit_row_id,
+                                    message_id=new_mid,
+                                    stage=Stage.INGRESS.value,
+                                    channel_id=channel_id,
+                                    destination_name=None,
+                                    handler_name=None,
+                                    body_ref=None,
+                                ),
+                            )
                         ),
                         OutboxStatus.PENDING.value,
                         now,
@@ -17859,7 +18766,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
-        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -17918,7 +18825,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
-        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
+        audit = require_mutation_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
@@ -17991,7 +18898,9 @@ class MessageStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return open_message_cell(
+        return await cipher_call(
+            self._cipher,
+            open_message_cell,
             self._cipher,
             "metadata",
             row["metadata"],
@@ -18047,7 +18956,9 @@ class MessageStore:
         out: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            withhold_message_cells(
+            await cipher_call(
+                self._cipher,
+                withhold_message_cells,
                 self._cipher,
                 d,
                 ("error", "summary", "metadata"),
@@ -18217,13 +19128,17 @@ class MessageStore:
             for r in await cur.fetchall():
                 d = dict(r)
                 # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-                d["last_error"] = open_listed_cell(
+                d["last_error"] = await cipher_call(
+                    self._cipher,
+                    open_listed_cell,
                     self._cipher,
                     d["last_error"],
                     cell_aad("queue", "last_error", r["outbox_id"]),
                     table="queue",
                 )
-                withhold_message_cells(
+                await cipher_call(
+                    self._cipher,
+                    withhold_message_cells,
                     self._cipher,
                     d,
                     ("summary",),
@@ -18331,7 +19246,12 @@ class MessageStore:
                 (message_id, Stage.OUTBOUND.value),
             )
             return [
-                self._decode_row(r, "queue", (r["id"],), "last_error") for r in await cur.fetchall()
+                (
+                    await cipher_call(
+                        self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                    )
+                )
+                for r in await cur.fetchall()
             ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
@@ -18352,7 +19272,9 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "queue", (r["id"],), "last_error")
+                d = await cipher_call(
+                    self._cipher, self._decode_row, r, "queue", (r["id"],), "last_error"
+                )
                 dead = r["status"] == OutboxStatus.DEAD.value
                 try:
                     d["payload"] = (
@@ -18373,8 +19295,15 @@ class MessageStore:
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
             return [
-                self._decode_row(
-                    r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+                (
+                    await cipher_call(
+                        self._cipher,
+                        self._decode_row,
+                        r,
+                        "message_events",
+                        (r["message_id"], r["ts"], r["event"]),
+                        "detail",
+                    )
                 )
                 for r in await cur.fetchall()
             ]
@@ -18397,17 +19326,21 @@ class MessageStore:
         # scans `FROM queue`). Deliberately no BEGIN of its own: the #1548 cancel-unwind tests use this
         # writer as their probe for an inherited open transaction
         # (tests/test_backlog1548_writer_txn_cancel_unwind.py). Its guard rolls one back on entry.
-        params = self._connection_event_params(
-            ConnectionEventWrite(
-                connection=connection,
-                transport=transport,
-                direction=direction,
-                kind=kind,
-                peer_host=peer_host,
-                message_id=message_id,
-                reason=reason,
-                now=now,
-            )
+        params = await cipher_call(
+            self._cipher,
+            self._connection_event_params,
+            stamped_connection_event(
+                ConnectionEventWrite(
+                    connection=connection,
+                    transport=transport,
+                    direction=direction,
+                    kind=kind,
+                    peer_host=peer_host,
+                    message_id=message_id,
+                    reason=reason,
+                    now=now,
+                )
+            ),
         )
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(_CONNECTION_EVENT_INSERT, params)
@@ -18417,7 +19350,10 @@ class MessageStore:
         # A burst in ONE transaction (BACKLOG #1731): the runner's drainer hands over everything
         # already queued, so a connect-per-message sender pays one commit per burst, not per event.
         # _writer_txn: the whole burst is one explicit transaction, so it commits or unwinds whole.
-        rows = [self._connection_event_params(ev) for ev in events]
+        stamped = [stamped_connection_event(ev) for ev in events]
+        rows = [
+            await cipher_call(self._cipher, self._connection_event_params, ev) for ev in stamped
+        ]
         if not rows:
             return
         async with _writer_txn(self._db, self._lock):
@@ -18489,11 +19425,17 @@ class MessageStore:
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
                     # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
-                    reason=open_listed_cell(
-                        self._cipher,
-                        r["reason"],
-                        cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
-                        table="connection_event",
+                    reason=(
+                        await cipher_call(
+                            self._cipher,
+                            open_listed_cell,
+                            self._cipher,
+                            r["reason"],
+                            cell_aad(
+                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
+                            ),
+                            table="connection_event",
+                        )
                     ),
                 )
                 for r in await cur.fetchall()
@@ -18546,9 +19488,11 @@ class MessageStore:
         # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
-            self._enc(
-                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
-                aad=cell_aad("alert_instance", "reason", event_type, connection),
+            (
+                await self._aenc(
+                    safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
+                    aad=cell_aad("alert_instance", "reason", event_type, connection),
+                )
             )
             if reason
             else None
@@ -18584,6 +19528,7 @@ class MessageStore:
         *,
         limit: int = 200,
         allowed_channels: Sequence[str] | None,
+        suspended_until_after: float | None = None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -18594,6 +19539,9 @@ class MessageStore:
         params: list[Any] = []
         if allowed_channels is not None:
             _append_channel_scope(where, params, "connection", allowed_channels)
+        if suspended_until_after is not None:  # vault BACKLOG #3100 item 14: the suspend prime
+            where.append("suspended_until > ?")
+            params.append(suspended_until_after)
         clause = " WHERE " + " AND ".join(where)
         params.append(limit)
         async with self._read() as db:
@@ -18604,7 +19552,10 @@ class MessageStore:
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
-            return [self._alert_instance_row(r, listed=True) for r in await cur.fetchall()]
+            return [
+                await cipher_call(self._cipher, self._alert_instance_row, r, listed=True)
+                for r in await cur.fetchall()
+            ]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -18645,7 +19596,11 @@ class MessageStore:
                 params,
             )
             row = await cur.fetchone()
-            return self._alert_instance_row(row, listed=False) if row is not None else None
+            return (
+                await cipher_call(self._cipher, self._alert_instance_row, row, listed=False)
+                if row is not None
+                else None
+            )
 
     def _alert_instance_row(self, r: aiosqlite.Row, *, listed: bool) -> AlertInstance:
         aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
@@ -18673,13 +19628,15 @@ class MessageStore:
         )
 
     async def _commit_alert_change(
-        self, written: AuditedWrite, audit: AuditAppend, applied: bool
+        self, written: AuditedWrite, audit_row: OperatorAudit[bool], applied: bool
     ) -> bool:
         """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
         one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
-        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
-        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
-        await self._append_operator_audit(written, if_applied(audit), applied)
+        no row. ``audit_row`` is the caller's :func:`if_applied`, taken as its first statement, so a
+        missing row was refused before the UPDATE (BACKLOG #6589). Each caller spells its UPDATE at
+        its own ``execute``, which the transaction-verb guard reads
+        (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, audit_row, applied)
         await self._commit()
         return applied
 
@@ -18693,6 +19650,7 @@ class MessageStore:
         now: float | None = None,
     ) -> None:
         """See :meth:`messagefoundry.store.base.QueueStore.set_connection_flag`."""
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             if flagged:
@@ -18706,7 +19664,7 @@ class MessageStore:
                     "DELETE FROM connection_flag WHERE connection=? AND direction=?",
                     (connection, direction),
                 )
-            await self._append_operator_audit(written, if_applied(audit), True)
+            await self._append_operator_audit(written, audit_row, True)
             await self._commit()
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -18719,6 +19677,7 @@ class MessageStore:
     async def ack_alert_instance(
         self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
         # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
@@ -18729,11 +19688,12 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> bool:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
@@ -18743,7 +19703,7 @@ class MessageStore:
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            return await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -18822,6 +19782,7 @@ class MessageStore:
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
         # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
@@ -18833,7 +19794,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -18841,6 +19802,7 @@ class MessageStore:
     async def resume_alert_instance(
         self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
+        audit_row = if_applied(audit)  # BACKLOG #6589: a missing row is refused before any write
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
         now = time.time() if now is None else now
@@ -18849,7 +19811,7 @@ class MessageStore:
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+            applied = await self._commit_alert_change(written, audit_row, cur.rowcount > 0)
         if not applied:
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
@@ -19001,10 +19963,16 @@ class MessageStore:
             )
             last = await cur.fetchone()
             # BACKLOG #1904: raises AuditHeadMovedError when the caller sealed a different head.
-            seq, row_hash = audit_seal_next(
+            seq, row_hash = await cipher_call(
+                self._audit_mac_fn,
+                audit_seal_next,
                 None if last is None else (last["seq"], last["row_hash"]),
                 expect_prev,
-                self._audit_append_mac,
+                held_append_mac(
+                    None if last is None else (last["seq"], last["row_hash"]),
+                    expect_prev,
+                    self._audit_append_mac,
+                ),
                 ts=now,
                 actor=actor,
                 action=action,
@@ -19298,6 +20266,9 @@ class MessageStore:
         ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
         is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
+        _refuse_new_non_finite(
+            sealer, new.seal_fields(), () if current is None else current.seal_fields()
+        )
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
@@ -19904,7 +20875,9 @@ class MessageStore:
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return verify_audit_rows(
+        return await cipher_call(
+            self._audit_mac_fn,
+            verify_audit_rows,
             await self._audit_rows(),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
@@ -19960,6 +20933,7 @@ class MessageStore:
         )
         # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
         # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        _refuse_new_non_finite(self._row_sealer, record.seal_fields())
         sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
@@ -20018,6 +20992,7 @@ class MessageStore:
             return None
         if changed.roles != current.roles:
             raise ValueError("a presealed user write may not change the account's role rows")
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
         return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
 
     async def _write_user(
@@ -20066,6 +21041,7 @@ class MessageStore:
                 changed = existing_roles_only(
                     current, changed, [str(r["id"]) for r in await cur.fetchall()]
                 )
+            _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
             updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
@@ -20109,7 +21085,9 @@ class MessageStore:
             if (
                 self._row_sealer is not None
                 and not removes_all
-                and passkey_digest(await self._account_passkeys(user_id)) != current.row.cred_digest
+                and not passkey_set_matches(
+                    await self._account_passkeys(user_id), current.row.cred_digest
+                )
             ):
                 raise RowSealError(USER_KIND)
         # With no account the statement runs as it always did: an INSERT meets the foreign key and
@@ -20382,8 +21360,8 @@ class MessageStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -20423,7 +21401,7 @@ class MessageStore:
         confirmed by :meth:`enable_totp` after the user proves a live code. Returns the stored cell,
         which :meth:`enable_totp` compares against, or ``None`` when nothing was written."""
         now = time.time() if now is None else now
-        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
+        sealed = await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, totp_stage(sealed, now))
             await self._commit()
@@ -20549,7 +21527,7 @@ class MessageStore:
         seed in place."""
         now = time.time() if now is None else now
         change = totp_replace(
-            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            sealed_secret=await self._aenc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             recovery_code_hashes=recovery_code_hashes,
             step=step,
             expected_enrolled_at=expected_enrolled_at,
@@ -21262,7 +22240,7 @@ class MessageStore:
             row = await cur.fetchone()
             effective_id = str(row["id"]) if row is not None else preset_id
             # Bound to the row id and its owner (BACKLOG #2593).
-            enc = self._enc(
+            enc = await self._aenc(
                 criteria,
                 aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
             )
@@ -21316,8 +22294,13 @@ class MessageStore:
             out = dict(row)
             # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner
             # outside the store refuses here.
-            out["criteria"] = open_preset_criteria(
-                self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
+            out["criteria"] = await cipher_call(
+                self._cipher,
+                open_preset_criteria,
+                self._cipher,
+                row["criteria"],
+                preset_id=preset_id,
+                owner_user_id=owner_user_id,
             )
         # Outside the _read() block: on the :memory: fallback path _read() holds self._lock, and the
         # pooled read connections are PRAGMA query_only=ON — the stamp must go to the writer.
@@ -21441,6 +22424,23 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             written = await self._write_user(user_id, scope_withdrawal(expected_scope, now))
+            await self._commit()
+        return written is not None
+
+    async def set_ad_channel_scope_if_unchanged(
+        self,
+        user_id: str,
+        scope_json: str,
+        *,
+        expected_scope: str | None,
+        expected_source: ChannelScopeSource | None,
+        now: float | None = None,
+    ) -> bool:
+        """The AD sign-in's compare-and-set scope write (BACKLOG #6887); see ``AuthStore``."""
+        now = time.time() if now is None else now
+        change = ad_scope_replacement(scope_json, expected_scope, expected_source, now)
+        async with _writer_guard(self._db, self._lock):
+            written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
 
@@ -21686,42 +22686,155 @@ class MessageStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
-        # _writer_txn, not a short writer: the account's row is read first in the same transaction
-        # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
-        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
-        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
-        async with _writer_txn(self._db, self._lock):
-            cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject, session_epoch,"
-                f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
-            # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
-            ):
-                await self._db.rollback()
+        # BACKLOG #5653: the seal is made BEFORE the writer transaction opens. Under a Vault Transit
+        # sealer it is an HTTP call, and under ``require_sign_in_eligible`` the transaction holds
+        # SQLite's write lock from its BEGIN, so sealing inside it would stall every writer on every
+        # engine shard behind Vault. The seal covers the account's and the store's session epochs,
+        # so they are read first, unlocked, and the transaction reads them again: if a revoke raised
+        # either in between, nothing is written and the record is sealed again over the new values.
+        busy = epoch_raised = 0
+        last_busy: sqlite3.OperationalError | None = None
+        for attempt in range(1, SESSION_MINT_ATTEMPTS + 1):
+            epochs = await self._session_epochs_unlocked(user_id)
+            if epochs is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+                # INSERT's foreign-key error. The locked read refuses one deleted after this read.
                 return False
-            record = new_session_record(
+            minted = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
-                now=now,
+                now=time.time() if now is None else now,
                 expires_at=expires_at,
                 client=client,
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
                 mfa_verified=mfa_verified,
+                user_epoch=epochs[0],
+                global_epoch=epochs[1],
+            )
+            _refuse_new_non_finite(self._row_sealer, minted.seal_fields())
+            record = await seal_session_async(self._row_sealer, minted)
+            try:
+                inserted = await self._insert_sealed_session(
+                    record,
+                    now=now,
+                    require_federated_subject=require_federated_subject,
+                    require_sign_in_eligible=require_sign_in_eligible,
+                )
+            except sqlite3.OperationalError as exc:
+                # Only the BEGIN IMMEDIATE path is run again: its busy arises at the BEGIN, once
+                # ``busy_timeout`` is outlasted, before anything is read or written.
+                if not require_sign_in_eligible or not _is_sqlite_busy(exc):
+                    raise
+                busy += 1
+                last_busy = exc
+                if attempt < SESSION_MINT_ATTEMPTS:
+                    log.info(
+                        "sqlite: a session insert met a busy database (attempt %d of %d);"
+                        " running it again",
+                        attempt,
+                        SESSION_MINT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+                continue
+            if inserted is not None:
+                return inserted
+            epoch_raised += 1
+        # Contention, not a refusal: ``False`` would tell the caller the account refused the
+        # session. The directory sign-in that asked has already written its roles and profile, so
+        # it fails as a temporary failure rather than see this escape. The cause and the counts
+        # cover every attempt, not only the last one.
+        log.warning(
+            "sqlite: a session insert gave up after %d attempts: %d met a busy database,"
+            " %d found the session epochs raised",
+            SESSION_MINT_ATTEMPTS,
+            busy,
+            epoch_raised,
+        )
+        raise SessionMintContended(
+            session_mint_cause(busy=busy, epoch_raised=epoch_raised), SESSION_MINT_ATTEMPTS
+        ) from last_busy
+
+    async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
+        """The account's session epoch and the store's global one, read on a reader connection
+        with no lock, or ``None`` for no such account. ``create_session`` seals over them and
+        compares them again in its writer transaction (BACKLOG #5653)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["session_epoch"]), global_epoch_or_refuse(row["global_epoch"])
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s writer transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
+        # _writer_txn, not a short writer: the account's row is read first in the same transaction
+        # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
+        # path's binding check; BACKLOG #5653 for the eligibility check). Within this process the
+        # asyncio lock is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, a disable, a lockout and every whole-account revoke, which
+        # take the same lock. Another engine shard on the same file takes only SQLite's own write
+        # lock. Under ``require_sign_in_eligible`` the transaction is BEGIN IMMEDIATE, so that lock
+        # is held before the read: a disable or lockout another shard commits first is read and
+        # refused. Under the deferred BEGIN the same write fails the INSERT as ``database is
+        # locked`` instead, an error rather than a refusal (BACKLOG #5653; BACKLOG #3078 F5 is the
+        # first-administrator grant's same choice).
+        # Each refusal below rolls back itself, as that helper's contract requires (ADR 0159).
+        async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
+            # Read once the locks are held, so a BEGIN that waited out another writer judges a
+            # lock's expiry at the time of the read, not when this sign-in began to wait.
+            judged_at = time.time() if now is None else now
+            cur = await self._db.execute(
+                "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                " second_step_locked_until,"
+                f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
+                (record.user_id,),
+            )
+            row = await cur.fetchone()
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        judged_at,
+                    )
+                )
+            ):
+                await self._db.rollback()
+                return False
+            if not session_epochs_current(
+                record,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
-            )
-            record = await seal_session_async(self._row_sealer, record)
+            ):
+                await self._db.rollback()
+                return None
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
@@ -21761,7 +22874,9 @@ class MessageStore:
         if current.revoked_at is not None:
             return None
         await session_writer_seal_check(self._row_sealer, current)
-        updated = await seal_session_async(self._row_sealer, change(current))
+        changed = change(current)
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
+        updated = await seal_session_async(self._row_sealer, changed)
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 
@@ -21834,33 +22949,36 @@ class MessageStore:
         ``anchor`` on any session but an OIDC one. Session issuance does not call this;
         :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
         (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
-        answer."""
+        answer.
+
+        ``BEGIN IMMEDIATE`` (vault BACKLOG #2964 item 23): the stamp reads the row before it writes,
+        and under a deferred ``BEGIN`` the write failed busy at once whenever a writer in another
+        process held SQLite's write lock, since a read transaction's upgrade waits for nobody, so a
+        factor just proved read as a store error. Taking the lock at the ``BEGIN`` waits that writer
+        out under ``busy_timeout`` instead. The lock is then held across the seal check and the
+        re-seal, which under a Vault transit sealer are Vault calls."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_session(token_hash, stamp)
             await self._commit()
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
         when the session was revoked out from under it. The lineage link is written in the same
-        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
-        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is the
+        database's clock when the link's own statement runs (vault BACKLOG #4276), after the re-key
+        has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await self._db.execute(
-                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
-                )
+                await self._db.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash))
             await self._commit()
         return rotated is not None
 
@@ -21874,10 +22992,10 @@ class MessageStore:
             await self._commit()
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke, then read the row back in the SAME transaction (BACKLOG #2146), following the
-        session lineage when ``lineage_since`` is given (vault BACKLOG #3028). See
+        session lineage when ``lineage_seconds`` is given (vault BACKLOG #3028). See
         :meth:`AuthStore.supersede_session`.
 
         Two statements per step rather than one ``UPDATE ... RETURNING``, because ``RETURNING``
@@ -21885,6 +23003,7 @@ class MessageStore:
         unit: the writer lock orders them against every in-process writer, ``rotate_session``
         included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
         holds it until the commit, so no other process can re-key a row while the walk runs."""
+        started = time.monotonic()  # before the lock, so its wait cannot shorten the window
 
         async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
@@ -21897,8 +23016,8 @@ class MessageStore:
             row = await cur.fetchone()
             return SessionRecord.from_mapping(dict(row)) if row else None
 
-        async def _successor(h: str, since: float) -> str | None:
-            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+        async def _successor(h: str, seconds: float) -> str | None:
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
@@ -21906,7 +23025,11 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             try:
                 ended = await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    started=started,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row; its revoke still commits.
@@ -22034,8 +23157,11 @@ class MessageStore:
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
-        The store's global session epoch is raised first (BACKLOG #5091), then every account's
-        epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
+        The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
+        account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
+        an account goes without its raise where :func:`raise_account_epoch` says, at least on a
+        seal refusal and after a Vault Transit outage trips the revoke, and the global epoch
+        still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).
@@ -22223,7 +23349,9 @@ class MessageStore:
                 )
             purged = cur.rowcount if cur.rowcount is not None else 0
             if lineage_seconds is not None:
-                await self._db.execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+                # Measured back from the database's clock, as the supersession measures its window,
+                # never from ``now`` (vault BACKLOG #4276).
+                await self._db.execute(_SESSION_LINEAGE_PURGE, (float(lineage_seconds),))
             await self._commit()
             return purged
 
@@ -22270,10 +23398,12 @@ class MessageStore:
         from messagefoundry.store.base import seed_filter_clause
 
         async with self._read() as db:
+            # schema_verify's own predicate, so the census and the schema reads cannot drift apart
+            # (BACKLOG #6719 item 5). The NULL-sql case the old copy also took is unreachable: SQLite
+            # refuses to load a schema holding a table row with no SQL.
             cur = await db.execute(
-                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
-                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+                " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]
             occupancy: dict[str, bool] = {}
@@ -22912,7 +24042,7 @@ class MessageStore:
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
-        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        # loop, so a synchronous ACL write here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
 
     async def _copy_snapshot(self, dest: Path, method: str) -> None:
@@ -23144,7 +24274,11 @@ class MessageStore:
                 now,
                 event,
                 destination,
-                self._enc(detail, aad=cell_aad("message_events", "detail", message_id, now, event)),
+                (
+                    await self._aenc(
+                        detail, aad=cell_aad("message_events", "detail", message_id, now, event)
+                    )
+                ),
             ),
         )
 

@@ -2955,6 +2955,9 @@ class _NlstOnlyFtp:
     def nlst(self, path: str) -> list[str]:
         return list(self._names)
 
+    def voidcmd(self, command: str) -> str:
+        return "200 ok"
+
     def size(self, path: str) -> int:
         self.sized.append(path)
         return 7
@@ -4166,7 +4169,7 @@ async def test_a_file_the_listing_drops_is_forgotten_after_the_miss_limit(
 ) -> None:
     """The map is bounded by the poll directory, not by every name it ever held.
 
-    Red mutation: delete the ``_prune_settle`` call. The removed file's entry is never forgotten."""
+    Red mutation: delete the ``_prune_memories`` call. The removed file's entry is never forgotten."""
     from messagefoundry.transports.file import SETTLE_MISS_LIMIT
 
     client = _FakeClient(files={"/in/a.hl7": _SETTLE_HEAD, "/in/b.hl7": _SETTLE_HEAD})

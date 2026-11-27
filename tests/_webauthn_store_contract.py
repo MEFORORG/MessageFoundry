@@ -151,7 +151,9 @@ async def _assert_webauthn_conditional_bind_contract(store: Any) -> None:
     assert len(await store.list_webauthn_credentials("wa-c1")) == 2
 
     # A TOTP alone is a factor too.
-    cell = await store.set_totp_secret("wa-c2", secret="JBSWY3DPEHPK3PXP", now=102.0)
+    cell = await store.set_totp_secret(
+        "wa-c2", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=102.0
+    )
     assert await store.enable_totp(
         "wa-c2", recovery_code_hashes=["rc"], expected_secret_cell=cell, now=103.0
     )
@@ -333,7 +335,8 @@ async def assert_a_session_for_a_missing_account_is_refused(store: Any) -> None:
     beside the passkey case above, so the three suites that run this module run both. Pass F found
     SQL Server committing one, for lack of the session's user foreign key. ``create_session`` now
     refuses a missing account itself, returning ``False`` before its INSERT, so this no longer
-    reaches the key; ``test_sqlserver_store.py`` checks the key is in force."""
+    reaches the key. Each backend's suite checks the key is in force on its own
+    (``test_webauthn_store.py``, ``test_postgres_store.py``, ``test_sqlserver_store.py``)."""
     written = await store.create_session(
         token_hash="o" * 64, user_id="no-such-account", expires_at=9e9
     )
@@ -356,14 +359,18 @@ async def _assert_totp_contract(store: Any) -> None:
 
     # Secret staging round-trip (cipher-covered column) + clear.
     assert await store.get_totp_secret("totp-u1") is None
-    first_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    first_cell = await store.set_totp_secret(
+        "totp-u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=2.0
+    )
     assert first_cell is not None
-    assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP"
+    assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     await store.disable_totp("totp-u1", now=3.0)
     assert await store.get_totp_secret("totp-u1") is None
 
     # Enable + recovery codes: single-use consumption is atomic (the double-spend guard).
-    staged_cell = await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
+    staged_cell = await store.set_totp_secret(
+        "totp-u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=4.0
+    )
     assert (
         await store.enable_totp(
             "totp-u1",
@@ -445,7 +452,7 @@ async def _assert_totp_contract(store: Any) -> None:
         return user.row.totp_secret
 
     # The old seed reversed: a different valid base32 seed, without a second key-shaped literal.
-    old_seed = "JBSWY3DPEHPK3PXP"
+    old_seed = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     new_seed = old_seed[::-1]
     replaced: dict[str, Any] = {"secret": new_seed, "recovery_code_hashes": ["n1"], "audit": audit}
     assert (
@@ -528,7 +535,9 @@ async def _assert_totp_contract(store: Any) -> None:
                 await store.replace_totp_enrolment(
                     "totp-u1", step=200, expected_enrolled_at=12.0, now=12.75, **replaced
                 )
-            assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXP", raised
+            assert await store.get_totp_secret("totp-u1") == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", (
+                raised
+            )
             assert await store.get_recovery_code_hashes("totp-u1") == ["o1", "o2"], raised
             user = await store.get_user("totp-u1")
             assert user is not None and user.totp_enabled is True, raised
@@ -614,10 +623,12 @@ async def _assert_totp_binding_contract(store: Any) -> None:
         password_generated=False,
         audits=(),
     )
-    verified = await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    verified = await store.set_totp_secret(
+        "totp-u2", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=2.0
+    )
     assert verified is not None
     # A second begin stages another secret after the first one was verified.
-    other_seed = "JBSWY3DPEHPK3PXP"[::-1]
+    other_seed = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"[::-1]
     replacing = await store.set_totp_secret("totp-u2", secret=other_seed, now=3.0)
     assert replacing is not None and replacing != verified
     assert (
@@ -650,8 +661,14 @@ async def _assert_totp_binding_contract(store: Any) -> None:
     assert await store.get_recovery_code_hashes("totp-u2") == ["y"]
 
     # Once TOTP is on, a stage writes nothing and the enabled secret stands.
-    assert await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXP", now=8.0) is None
+    assert (
+        await store.set_totp_secret("totp-u2", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=8.0)
+        is None
+    )
     assert await store.get_totp_secret("totp-u2") == other_seed
-    assert await store.set_totp_secret("missing-user", secret="JBSWY3DPEHPK3PXP") is None
+    assert (
+        await store.set_totp_secret("missing-user", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+        is None
+    )
 
     await store.delete_user("totp-u2")

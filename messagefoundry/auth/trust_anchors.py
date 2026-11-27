@@ -22,8 +22,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
    substitute the anchor and defeat the TLS check that trusts it) is **refused** at ``[security].enforcement = enforce``
-   and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
-   *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
+   and **warned + audited** at ``warn``. It reads the DACL with ``icacls`` as a *verify-only*
+   check — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
    engine could not read is ``acl_indeterminate``, audited, and never reported as owner-only (BACKLOG
    #1142). Item 6 says when it refuses.
@@ -58,7 +58,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    replace the anchor, so ``enforce`` refuses to load it. A configured SHA-256 pin that matches the
    bytes read lets it load anyway, with a warning and the audit row: since item 5 those bytes are the
    bytes the context loads, so the pin already defeats a substitution. ``warn`` warns and loads.
-   The refusal names both fixes: move the anchor, or set the pin.
+   The refusal names both fixes: move the anchor, or set the pin. Under a mount the check cannot
+   vouch for, it names no move, and offers the pin only where the path is not also replaceable and
+   the anchor's consumer loads the verified bytes.
 7. **The per-connection inbound CAs** (BACKLOG #1142, slice 3). Every inbound connection whose server
    context requires a peer certificate (``tls`` and ``tls_ca_file`` set: MLLP, the HTTP listener and
    the DICOM SCP) gets the same checks. The connector loads its CA through
@@ -223,22 +225,58 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       not run this check, though each new connect of its store reads the swapped file too.
     * A server that answers has at least three ways to keep the change out of the real store. It
       can answer the read with the new fingerprint: then the change check writes no row and logs
-      nothing, and where the file passes its other checks too, nothing in this preflight records
-      the swap. It can answer with no row: then a fresh ``observed`` row is written in place of
+      nothing, and where the file passes its other checks too, no row this preflight writes
+      records the swap; only the in-process compare below logs it, and only for a swap made
+      after the process first checked the pin. It can answer with no row: then a fresh ``observed`` row is written in place of
       ``changed``. Or it can acknowledge the ``changed`` row, which the real store never
       receives. Where a row is written and its commit returns, the audit tee
       (:mod:`messagefoundry.store.audit_tee`) still logs a copy. A collector receives it only
       where a log forwarder is configured and up, and the first way writes no ``changed`` or
       ``observed`` row to copy.
 
-    So the change audit in the store is only as good as the hop it is meant to catch. The file
+    So the change audit in the store is only as good as the hop it is meant to catch. **The
+    in-process compare** (vault BACKLOG #3714 step 9) does not read the store: each settings
+    preflight of the pin compares the file with the first pin bytes this engine process checked
+    and passed, at a store open or else at a preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
+    a WARNING at each check that finds them different; the baseline does not move until a
+    restart. It writes no row and refuses nothing. It reads the file only when a check runs, so
+    at least a swap undone before the next check is not seen. A restart starts a new baseline, so
+    it does not see a swap made before the process first checked the pin, and each engine process
+    holds its own. A pin that passes a preflight with only a warning, such as an expired one, can
+    become the baseline where no store open in this process passed one first. The file
     checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
-    be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
-    reload.** The store is not closed: the connections already in its pool can stay open,
-    whichever server they reach, and a new connect reads the file on disk then, as above. So
-    where the refusal follows a swap, correcting the file does not by itself end the pooled
-    connections opened under the swapped pin; a restart after the file is corrected does. Every
+    be read refuses before this anchor writes any row. **A refusal at a reload refuses the
+    reload, and at ``enforce`` it also stops new store connects** in the engine process that ran
+    the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
+    where the hold is stated; the code and messages that act on it point here.** What sets it: a
+    refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
+    device at the path refused as not a regular file among them (:func:`_transient_read_fault`),
+    or an ACL or path that could not be read, since whoever swapped the file can make its
+    ACL unreadable. Some file read faults set nothing
+    (:func:`_transient_read_fault`, which lists at least which and names the known residuals,
+    and says which of them reach a read at ``enforce``). Any other ``OSError`` sets the hold.
+    What the hold refuses: at least the new connects the
+    SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
+    store open's own database-options connects
+    (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
+    needs one of those connects fails while the hold stands. What lifts it: a later settings check
+    at ``enforce`` that passes the pin with no content warning, or a store open in that process
+    whose checks pass the pin at ``enforce``, in each case only where the pin is unchanged from
+    this process's in-process baseline (:func:`release_store_pin_refusal`). A changed pin keeps the
+    hold, with one ERROR, so a swapped pin cannot lift it by passing after an ACL fix; a renewal
+    then takes a restart. Where no baseline was held before such a check, the pin it passes
+    becomes the baseline first, and so lifts the hold. A restart once the file is corrected lifts
+    it too, since the hold is held in memory. A reload may not reach the pin's check: at least an
+    earlier anchor's refusal ends the preflight first, and a reload route that makes a store call
+    before the check fails there whenever that call needs a new connection, such as when no
+    pooled connection is free and the pool is below its size. Once no pooled connection is left,
+    as after a server restart or a failover, each such call needs one, so only a restart lifts
+    the hold. The store is not
+    closed: the connections already in its pool can stay open, whichever server they reach, and
+    the store goes on using them. At ``warn`` a new connect reads the file on disk then, as
+    above. So where the refusal follows a swap, correcting the file does not by itself end the
+    pooled connections opened under the swapped pin; a restart after the file is corrected does. Every
     login and query those connections carried went to the server the swapped pin admitted, so
     the store login and that traffic are to be treated as exposed. A
     restart with the swapped file still in place does not undo the swap: the start opens the
@@ -268,7 +306,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
-    leaving the pool open, holds for this CA too.
+    leaving the pool open, holds for this CA too, except the in-process compare and the refusal
+    of new connects, which run for the pin alone: a swap of this CA that the store's answer hides
+    is not logged, and a refused reload leaves the store connecting.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -281,8 +321,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value the build's remote-path check refuses is refused here as a
     setting, in every ``sslmode`` (BACKLOG #2705), for ``sslcapath``, ``sslcert`` and ``sslkey``
-    too, and for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18), though none
-    of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
+    too, and on Windows for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18),
+    though none of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -295,31 +335,31 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
     to choose whom to trust, is not an anchor at all: no ACL, path, content or audit check covers
-    it or its entries, only the remote-path check of the folder and of each entry. Nor
+    it or its entries, only the remote-path check of the folder and, on Windows, of each entry. Nor
     is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
 from __future__ import annotations
 
-import asyncio
+import base64
 import contextlib
 import errno
 import hashlib
-import io
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 import time
-from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, runtime_checkable
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
@@ -332,8 +372,10 @@ from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import ConnectorType, bool_setting, remote_file_protocol
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
+from messagefoundry.path_reach import is_unreachable
 from messagefoundry.redaction import codec_safe_str, log_timestamp, safe_exc
 from messagefoundry.service_status import _system_exe
+from messagefoundry.threadhop import to_thread_or_loop
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import (
@@ -630,7 +672,19 @@ def anchor_fingerprint(path: str | os.PathLike[str]) -> str:
 _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
+_PEM_DASHES = b"-----"
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The most bytes one read of OpenSSL's PEM reader takes: ``BIO_gets`` into its 255-byte line
+#: buffer, so 254 bytes, or fewer when an LF comes first (BACKLOG #5229, :func:`anchor_cadata`).
+_PEM_PIECE = 254
+#: What OpenSSL's PEM reader strips from the end of each read before it compares the text: at
+#: least every byte up to and including the space.
+_PEM_TRAILING = bytes(range(0x21))
+#: The oldest OpenSSL whose byte-order-mark rule :func:`anchor_cadata` follows, as measured: 3.5.7
+#: on CPython 3.14. Below it a file where the text would drop a mark refuses (BACKLOG #5229).
+_MARK_RULE_MEASURED_FROM = (3, 5, 0)
+#: Each byte at or above 0x80 as ``?``, so the text keeps every offset and every LF of the file.
+_HIGH_AS_QUERY = bytes(range(0x80)) + b"?" * 0x80
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: What :func:`has_encryption_header` matches, in the words :func:`anchor_cadata`'s refusal uses
@@ -706,8 +760,8 @@ def has_private_key_label_bytes(data: bytes) -> bool:
 
 def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
     """Refuse an anchor whose bytes hold a private-key label (BACKLOG #3745). It reads the raw
-    bytes, not the text :func:`anchor_cadata` keeps, so a key on a non-ASCII line it drops still
-    refuses. The refusal names the setting and the path, never the content."""
+    bytes, not the text :func:`anchor_cadata` builds from them. The refusal names the setting and
+    the path, never the content."""
     if has_private_key_label_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {PRIVATE_KEY_SCOPE}. A trust anchor "
@@ -799,29 +853,58 @@ _STORE_ANCHOR_LABELS = frozenset({"store_sqlserver_pin", "store_postgres_ca"})
 _STORE_CONTENT_RECORDED: dict[tuple[str, str], tuple[str, str]] = {}
 
 
+def _pem_reads(data: bytes) -> Iterator[tuple[int, int]]:
+    """The start and end of each read OpenSSL's PEM reader makes of ``data``: up to
+    :data:`_PEM_PIECE` bytes, ending after the first LF within them. A CR ends nothing. The reads
+    depend on the bytes alone, never on what the reader made of an earlier one."""
+    start = 0
+    while start < len(data):
+        lf = data.find(b"\n", start, start + _PEM_PIECE)
+        end = lf + 1 if lf >= 0 else min(start + _PEM_PIECE, len(data))
+        yield start, end
+        start = end
+
+
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     """The verified anchor bytes as the PEM text ``SSLContext.load_verify_locations(cadata=)`` takes.
 
     ``cadata=`` takes ASCII text only, while ``cafile=`` reads a file with any bytes between its PEM
     blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
     block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
-    as ``cadata`` raise. So this drops every non-ASCII line OUTSIDE a block, which OpenSSL skips
-    anyway, and a byte-order mark on the first line of the file and on the line straight after an
-    ``-----END`` line that closes a block in this function's line model, where any BEGIN opens
-    one. Measured, a mark ``cafile=`` drops loads the block behind it (two concatenated files), and
-    a mark it keeps hides that block, so stripping a mark it keeps would trust a certificate it
-    never loaded. ``tests/test_trust_anchor_byte_binding.py`` holds named shapes against
-    ``cafile=``. This is a line model, not OpenSSL's reader, so it does not match ``cafile=`` in
-    every shape, and the strip can fire where ``cafile=`` keeps the mark.
+    as ``cadata`` raise. **So the text is the file with each byte at or above 0x80 replaced by ``?``
+    where it stands** (BACKLOG #5229). Every LF stays where it is, so OpenSSL's reader, which reads
+    at most 254 bytes at a time and finds a BEGIN only at the start of one of those reads, starts
+    and ends each read of the text where it does in the file. For at least the comparisons OpenSSL
+    makes outside a block, ``?`` reads as the byte it replaced, with at least two exceptions: the
+    byte-order mark, handled next, and a read OpenSSL tests as a BEGIN, refused below. An earlier
+    version dropped non-ASCII lines and modelled OpenSSL's reader line by line; that model did not
+    match ``cafile=`` in every shape, and could trust a certificate ``cafile=`` does not show.
 
-    A line ends at an LF alone, as in OpenSSL's reader, so a lone CR does not end one, and dropping
-    a line never shows OpenSSL a block hidden behind a CR. A line holding ``-----BEGIN `` anywhere
-    opens a block for this rule, since OpenSSL finds a BEGIN mid-line in a long line, and the block
-    runs to the next line starting ``-----END``. The exception is a lone BEGIN straight behind a
-    byte-order mark this keeps, which hides that block as above. Every line of a block is kept
-    exactly, so a non-ASCII byte there refuses. That is stricter than ``cafile=`` in at least three
-    measured shapes, though ``cafile=`` refuses others (``PEM lib``). The text is derived from
-    ``data`` alone and nothing here opens a file, which is the point.
+    **One byte-order-mark rule is left.** OpenSSL drops a UTF-8 byte-order mark at the start of the
+    first read of each PEM object it looks for: the start of the file, and the read straight after
+    the one that ended a block. Elsewhere it keeps the mark, and a kept mark in front of a BEGIN
+    hides that block. To find those reads this follows OpenSSL's reads with two states, looking for
+    a BEGIN and inside a block, using the same tests OpenSSL applies to each read after stripping
+    its trailing bytes (:data:`_PEM_TRAILING`): a BEGIN read starts ``-----BEGIN `` and ends
+    ``-----``, and an END read starts ``-----END ``. Where OpenSSL drops a mark and the rest of that
+    read is a BEGIN, the text drops the mark too and puts three spaces at the end of the read, which
+    OpenSSL strips, so the read keeps its start and its end. Where the rest is not a BEGIN, ``???``
+    reads as the dropped mark would. Everything else this follows only decides which reads those
+    are.
+
+    **A non-ASCII byte refuses where OpenSSL could read it differently from ``?``.** That is at
+    least any read inside a block, from its BEGIN read to its END read, where the base64 decoder
+    and the blank-line test read it, and any read outside a block that starts ``-----BEGIN ``,
+    which OpenSSL tests as a BEGIN. This errs wide: it refuses at least some files ``cafile=``
+    reads. **A NUL anywhere refuses**, after the header and key checks: a PEM file
+    holds none. The text is derived from ``data`` alone and nothing here opens a file, which is the
+    point.
+
+    This rests on OpenSSL's PEM reader as measured on CPython 3.14 with OpenSSL 3.5.7, and
+    ``tests/test_trust_anchor_byte_binding.py`` holds it against ``cafile=`` itself. Another
+    OpenSSL, a later 3.5 or 3.x included, that reads differently can make the two differ again.
+    Below OpenSSL 3.5 (:data:`_MARK_RULE_MEASURED_FROM`) a file where this would drop a mark in
+    front of a BEGIN refuses instead.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -846,7 +929,11 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     the verdict is OpenSSL's own. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL``
     block refuses, and a well-formed CRL beside a certificate, in either order, loads the one
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
-    that the text loads, not that a certificate in it is a CA; a leaf still loads here.
+    that the text loads, not that a certificate in it is a CA; a leaf still loads here. A load that
+    stops at a damaged block without an error refuses too (:func:`_reads_to_the_end`, BACKLOG
+    #5229), since ``cafile=`` refuses that file, and so does text holding the certificate that check
+    appends. Not every damaged block refuses: at least an ``X509 CRL`` block whose base64 decodes
+    to bytes that are no CRL still loads.
 
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
     #2270), whether or not it sits inside a block. A
@@ -867,58 +954,64 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     and refuses here, and so does the header name in a comment between two blocks or after the
     last one. The
     same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
-    anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
-    ASCII, dropped above, is not checked.
+    anywhere before it, on its own line or an earlier one. The check reads the text the load would
+    get, which keeps every line, so a header name on a line that also holds a non-ASCII byte is
+    checked too.
 
     **A private-key label after the first BEGIN refuses, after the header check and before the
     load** (BACKLOG #3745, a Manager decision to refuse rather than warn). ``cadata=`` skips a key
     block and loads the certificate beside it, so without this a key of any label, a plain
     ``PRIVATE KEY``, a PKCS#8 ``ENCRYPTED PRIVATE KEY`` with no RFC 1421 header, or an ``RSA`` or
     ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
-    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
-    non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
-    header check first, with that check's text. Both checks run ahead of the non-ASCII refusal, so
-    a block that holds a non-ASCII byte as well still names the header or the key."""
-    kept: list[bytes] = []
-
-    inside = False
+    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes. A
+    legacy-encrypted key is refused by the header check first, with that check's text. Both checks
+    run ahead of the non-ASCII refusal, so a block that holds a non-ASCII byte as well still names
+    the header or the key."""
+    if _PEM_TRUSTED in data:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
+            "BEGIN marker, even outside a block, as in a comment. Converting such a block "
+            "discards its trust settings, so confirm the CA should be trusted without them. "
+            "The engine does not load such a block. Remove a comment that names the marker, "
+            "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
+            "CERTIFICATE block per run",
+            scope="trusted_certificate",
+        )
+    text_bytes = bytearray(data.translate(_HIGH_AS_QUERY))
+    inside = False  # between a BEGIN read and its END read
+    first = True  # the first read of a search for a BEGIN: OpenSSL drops a mark here
     blocks = 0
-    fresh = True  # the first line, or the line after a block's END line: OpenSSL drops a BOM there
-    for raw in io.BytesIO(data):  # splits at LF alone; bytes.splitlines also splits at a lone CR
-        line = raw[len(_UTF8_BOM) :] if fresh and raw.startswith(_UTF8_BOM) else raw
-        fresh = False
-        if _PEM_TRUSTED in line:
-            raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
-                "BEGIN marker, even outside a block, as in a comment. Converting such a block "
-                "discards its trust settings, so confirm the CA should be trusted without them. "
-                "The engine does not load such a block. Remove a comment that names the marker, "
-                "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
-                "CERTIFICATE block per run",
-                scope="trusted_certificate",
-            )
-        if line.startswith(_PEM_BEGIN):
+    non_ascii = False
+    mark_dropped = False
+    for start, end in _pem_reads(data):
+        piece = data[start:end]
+        if first and len(piece) > len(_UTF8_BOM) and piece.startswith(_UTF8_BOM):
+            piece = piece[len(_UTF8_BOM) :]
+            dropped = True
+        else:
+            dropped = False
+        first = False
+        if (inside or piece.startswith(_PEM_BEGIN)) and not piece.isascii():
+            non_ascii = True
+        line = piece.rstrip(_PEM_TRAILING)
+        if inside:
+            if line.startswith(_PEM_END):  # a bad END line fails the load, as it fails cafile=
+                inside, first = False, True
+        elif line.startswith(_PEM_BEGIN) and line.endswith(_PEM_DASHES):
+            inside = True
             blocks += 1
-        # Any BEGIN, rather than a model of OpenSSL's 254-byte pieces. For the non-ASCII check that
-        # refuses more. But ``inside`` also decides ``fresh`` below, and there a BEGIN OpenSSL did
-        # not read can strip a mark OpenSSL keeps. A BEGIN straight behind a mark does not count.
-        opens = _PEM_BEGIN in line.removeprefix(_UTF8_BOM + _PEM_BEGIN)
-        inside = inside or opens
-        if inside or line.isascii():
-            kept.append(line)
-        if line.startswith(_PEM_END):
-            # A stray END closes nothing, so OpenSSL keeps a mark after it. An END and a BEGIN on
-            # one line leave a block open: OpenSSL may read that BEGIN past 254 bytes.
-            fresh = inside and not opens
-            inside = opens
-    if not blocks:
+            if dropped:  # drop the mark too, and pad the read so no later offset moves
+                mark_dropped = True
+                body = piece.removesuffix(b"\n")
+                text_bytes[start:end] = body.translate(_HIGH_AS_QUERY) + b"   " + piece[len(body) :]
+    if not blocks and not non_ascii:  # a non-ASCII byte that hid the only BEGIN refuses as such
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust",
             scope="no_pem_block",
         )
-    joined = b"".join(kept)
-    if has_encryption_header_bytes(joined):
+    text = text_bytes.decode("ascii")
+    if has_encryption_header(text):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
@@ -929,17 +1022,30 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             scope="encryption_header",
         )
     _refuse_a_private_key(data, spec)
-    try:
-        text = joined.decode("ascii")
-    except UnicodeDecodeError as exc:
+    if b"\0" in data:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds a NUL byte. A PEM file holds "
+            "no NUL, so the engine does not load it: remove that byte",
+            scope="nul",
+        )
+    if mark_dropped and ssl.OPENSSL_VERSION_INFO < _MARK_RULE_MEASURED_FROM:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} has a UTF-8 byte-order mark in front "
+            "of a -----BEGIN line, and the engine has measured where OpenSSL drops such a mark "
+            f"only for OpenSSL 3.5 and later, while this interpreter uses {ssl.OPENSSL_VERSION}. "
+            "Save the file without a byte-order mark",
+            scope="byte_order_mark",
+        )
+    if non_ascii:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
-            "block, or on or below a line holding a -----BEGIN and above the next -----END line. "
-            "Remove that byte, or the -----BEGIN text if that line is a comment",
+            "block, or on a line holding a -----BEGIN that the TLS library would test as the "
+            "start of one. Remove that byte, or the -----BEGIN text if that line is a comment",
             scope="non_ascii",
-        ) from exc
+        )
+    trial = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
-        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
+        trial.load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
         why = _SSL_WHERE.sub("", str(exc))
         raise TrustAnchorError(
@@ -949,10 +1055,78 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "that checks revocation reads its CRL from its own CRL setting",
             scope="unloadable",
         ) from exc
+    loaded = trial.get_ca_certs(binary_form=True)
+    if _READ_TO_END_PROBE_DER in loaded:  # reaching the probe would then prove nothing
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds the certificate the engine "
+            "appends to test that the TLS library reads a trust anchor to its end. That "
+            "certificate is never trusted, so remove it",
+            scope="holds_probe",
+        )
+    try:
+        reaches_the_end = _reads_to_the_end(text, len(loaded))
+    except ssl.SSLError as exc:
+        why = _SSL_WHERE.sub("", str(exc))
+        raise TrustAnchorError(
+            f"{spec.setting}: the TLS library loads the trust anchor {spec.path!r} on its own, but "
+            f"raised an error ({why}) when the engine appended a test certificate to check that it "
+            "reads the file to its end, so the engine cannot tell what it would trust. Check that "
+            "each PEM block in it is well-formed",
+            scope="unloadable",
+        ) from exc
+    if not reaches_the_end:
+        raise TrustAnchorError(
+            f"{spec.setting}: the TLS library stops reading the trust anchor {spec.path!r} at a PEM "
+            "block it cannot use, without an error, so it would trust only the certificates before "
+            "that block, and a load by path refuses the file. Remove or repair the block at "
+            "which it stops",
+            scope="unloadable",
+        )
     return text
 
 
-# --- read-only DACL inspection (mirrors _secure_file's icacls mechanism, verify-only) -----------
+#: A throwaway self-signed CA, whose key was discarded when it was made, that
+#: :func:`_reads_to_the_end` appends to an anchor's text. It is loaded only into a context that is
+#: thrown away, so it is never trusted for anything (BACKLOG #5229).
+_READ_TO_END_PROBE = """-----BEGIN CERTIFICATE-----
+MIIBiDCCAS+gAwIBAgIUfBy5qrAZ0eAJzWkSztPHI0P6OoUwCgYIKoZIzj0EAwIw
+OjE4MDYGA1UEAwwvTWVzc2FnZUZvdW5kcnkgcmVhZC10by1lbmQgcHJvYmUsIG5l
+dmVyIHRydXN0ZWQwHhcNMjYwMTAxMDAwMDAwWhcNMjYwMTAyMDAwMDAwWjA6MTgw
+NgYDVQQDDC9NZXNzYWdlRm91bmRyeSByZWFkLXRvLWVuZCBwcm9iZSwgbmV2ZXIg
+dHJ1c3RlZDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKgx1XhF2xxCko9DB3z2
+6JrpcakJcGDUz6nDkHWSjGIjYQiZrNgqDHW55rydRcAPS4TROVKVryOiRK8Cf/CA
+7G6jEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgRxcGFzLQ
+LiyM+nx5SJtd7AHmNRRBO7ZA7lLrUDniuvECIBGFmLR4OxJFX+jrhGQtrNxabwcB
+JTQ7zlQBG0UQeXnz
+-----END CERTIFICATE-----
+"""
+_READ_TO_END_PROBE_DER = base64.b64decode("".join(_READ_TO_END_PROBE.splitlines()[1:-1]))
+
+
+def _reads_to_the_end(text: str, loaded: int) -> bool:
+    """Whether OpenSSL's ``cadata=`` load of ``text`` reads to its end (BACKLOG #5229).
+
+    At some damaged PEM blocks, at least a block that decodes to no data or holds a header line
+    OpenSSL cannot use, the ``cadata=`` load stops reading without an error and keeps the
+    certificates before that block, while ``cafile=`` refuses the whole file with ``PEM lib``. So
+    this loads ``text`` with :data:`_READ_TO_END_PROBE` after it into a throwaway context: a load
+    that stopped early never reaches the probe. A load that raises here raises its
+    :class:`ssl.SSLError` to the caller, which refuses with OpenSSL's reason.
+    ``loaded`` is how many CA certificates the load of ``text`` alone holds, and the load with the
+    probe must hold exactly one more and hold the probe. OpenSSL does not always drop a
+    certificate it is given twice (:func:`messagefoundry.pki._refuse_unless_openssl_loads` records
+    a case), so where ``text`` already holds the probe, the load may or may not count it twice, and
+    neither the count nor the probe's presence would show whether the load reached the end. The
+    caller refuses such ``text`` first.
+    It does not judge a block's contents once decoded: at least a ``X509 CRL`` block whose base64
+    decodes to bytes that are no CRL loads here and refuses under ``cafile=``."""
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    probe.load_verify_locations(cadata=text + "\n" + _READ_TO_END_PROBE)
+    reached = probe.get_ca_certs(binary_form=True)
+    return len(reached) == loaded + 1 and _READ_TO_END_PROBE_DER in reached
+
+
+# --- read-only DACL inspection (icacls, verify-only) ---------------------------------------------
 
 #: Group/world principals whose members are not the file owner — a WRITE grant to any of them means a
 #: non-owner can substitute the anchor. SYSTEM and Administrators are deliberately absent: they are
@@ -1260,7 +1434,7 @@ _ICACLS_TIMEOUT_S = 30.0
 def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     """Whether the anchor is writable only by its owner (+ the always-trusted SYSTEM/Administrators),
     i.e. no group/world principal can modify it. READ-ONLY: it never changes the file's ACL (unlike
-    ``_secure_file``, whose ``icacls`` mechanism it mirrors). ``None`` when the DACL cannot be
+    ``_secure_file``). ``None`` when the DACL cannot be
     determined. An inconclusive read is not a pass: under ``enforce``, :func:`_enforce_verdict`
     refuses the anchor unless a configured SHA-256 pin matches the bytes read, and under ``warn`` it
     warns and loads.
@@ -1279,7 +1453,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     if os.name == "nt":
         try:
             # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
-            # a single argv token, never a shell word (matches _secure_file's low-27/STORE-5 note).
+            # a single argv token, never a shell word (low-27/STORE-5).
             # No modifying flags. The pin is what makes "fixed system tool" true: CreateProcess
             # resolves an unqualified name through a search path that reaches the caller's working
             # directory, and this call's OUTPUT is what decides the verdict below, so a planted
@@ -1487,7 +1661,74 @@ def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _path_fix(verdict: AnchorVerdict) -> list[str]:
+#: The folder a POSIX fix suggests moving an anchor into.
+_POSIX_FOLDER = "/etc/messagefoundry/"
+_OVERLAY_NOTE = (
+    "the overlay note under 'Residuals / gotchas' in docker/README.md, in the MessageFoundry source"
+)
+
+
+def _untrusted_mount(verdict: AnchorVerdict) -> ChainFinding | None:
+    """The finding that a mount's type is one the check cannot vouch for, or could not be read.
+    The walk runs from ``/`` down, so the first is the topmost."""
+    return next((f for f in _findings(verdict, insecure=False) if f.mount), None)
+
+
+_NO_PIN = (
+    "A pin does not help here: this anchor is read again by path when it is used, so a pin "
+    "cannot vouch for the bytes loaded"
+)
+
+
+def _pin_verb(spec: AnchorSpec) -> str:
+    return f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
+
+
+def _pin_offer(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
+    """The pin to set, with no digest of a file whose path was found replaceable, or that a
+    non-owner can write, since those bytes may be substituted. Never called with a matching pin:
+    :func:`_enforce_verdict` loads such an anchor before it builds a fix, and a replaceable path
+    gets no pin offer."""
+    if verdict.path_ok is False or verdict.acl_ok is False:
+        return (
+            f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
+            "trust, taken from that CA, since this file could have been replaced."
+        )
+    return (
+        f"{_pin_verb(spec)} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to trust; "
+        f"this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA first. With "
+        "a matching pin the engine loads exactly those bytes, so it may load them without this check."
+    )
+
+
+def _mount_fix(
+    spec: AnchorSpec, verdict: AnchorVerdict, mount: ChainFinding, fixes: list[str]
+) -> list[str]:
+    """The fix under a mount the check cannot vouch for. It says nothing about moving the anchor:
+    each wording that did turned out false for some layout. ``fixes`` is what the path itself
+    needs, for a replaceable path; a pin is offered only where the path is not replaceable."""
+    kind = mount.fstype or "unread mount table"
+    lines = [
+        f"The check cannot vouch for the mount at {mount.path!r} ({kind}), so it cannot settle "
+        "any anchor below that mount.",
+        *fixes,
+    ]
+    if verdict.path_ok is not False and spec.loads_verified_bytes:
+        offer = _pin_offer(spec, verdict)
+        lines.append(offer[0].upper() + offer[1:])
+    elif not spec.loads_verified_bytes and spec.pin:
+        lines.append(f"{_NO_PIN}.")
+    lines.append(
+        "As it stands, at warn the anchor is used with a warning; at enforce it is refused."
+    )
+    if mount.path != "/" and mount.fstype:
+        lines.append(f"An anchor on a mount the check trusts, outside {mount.path!r}, can pass.")
+    if mount.fstype == "overlay":
+        lines.append(f"For an overlay mount, {_OVERLAY_NOTE}, says more.")
+    return lines
+
+
+def _path_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> list[str]:
     """The fix, as commands, for each insecure finding that a command can fix. The message must
     carry its own fix, as the file arm's (:func:`_acl_message`) does: the runbook that message once
     cited ships in neither a checkout nor a wheel.
@@ -1533,15 +1774,32 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
     #
     # Always -h: on a link it re-owns the link and not its target, and on anything else it acts
     # the same. The owner the finding names can swap its entry for a link before root runs this.
+    #
+    # Under a mount the check cannot vouch for, a fix in place does not make the anchor pass, so
+    # only the anchor's own file gets its commands, and its own folder the chmod alone: never a
+    # chown of a folder, which may be a user's home folder, nor a command on a folder above them.
+    # Both are the regular file the walk reached, resolved as the kernel resolves the path; a path
+    # that names no regular file has neither.
+    mount = _untrusted_mount(verdict)
+    reached = check.regular_file if check is not None else None
+    own = {reached} if reached else set()
+    own_folders = {posixpath.dirname(reached)} if reached else set()
     cmds: list[str] = []
     for obj in objects:
         q = shlex.quote(obj)
         here = [f for f in bad if f.path == obj]
-        if any(f.owner for f in here):
+        if any(f.owner for f in here) and (mount is None or obj in own):
             cmds.append(f"  chown -h root {q}")
-        if any(f.writable for f in here):
+        if any(f.writable for f in here) and (mount is None or obj in own | own_folders):
             cmds.append(f"  chmod go-w {q}")
-    lead = move + "can change, such as a root-owned 755 folder like /etc/messagefoundry/."
+    if mount is not None:
+        lead = "The path is also replaceable; fix that first"
+        fixes = [lead + ":", *cmds] if cmds else [lead + "."]
+        return _mount_fix(spec, verdict, mount, fixes)
+    lead = (
+        move + f"can change, such as a root-owned 755 folder like {_POSIX_FOLDER} on a file system "
+        "the check trusts."
+    )
     return [lead + " Or, to fix it in place:", *cmds] if cmds else [lead]
 
 
@@ -1557,7 +1815,7 @@ def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
             f"The check trusted the account it ran as ({check.engine}) as the engine's own. Run "
             "it as the account the service runs as, or it can answer differently."
         )
-    return "\n".join(lines + _path_fix(verdict))
+    return "\n".join(lines + _path_fix(spec, verdict))
 
 
 def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
@@ -1577,29 +1835,34 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
 
 
 def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
-    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. The pin is
+    """The two ways out of an indeterminate read: a folder the engine can read, or a pin. Under a
+    mount :func:`_untrusted_mount` finds, :func:`_mount_fix` says what is left instead. The pin is
     offered with this file's own digest, and with the warning that goes with it: pinning bytes the
-    engine could not vouch for is only as good as the operator's check of them."""
+    engine could not vouch for is only as good as the operator's check of them. The digest is left
+    out where the path was found replaceable or the file is writable by a non-owner, since those
+    bytes may be substituted (:func:`_pin_offer`)."""
     check = verdict.path_check
     windows = check.platform == "windows" if check is not None else os.name == "nt"
+    mount = _untrusted_mount(verdict)
+    if mount is not None and verdict.path_ok is False:
+        # The ACL could not be read beside a replaceable path: the path's own fix, which offers no
+        # pin for a replaceable path and no folder below the mount.
+        return "\n".join(_path_fix(spec, verdict))
+    if mount is not None:
+        return " ".join(_mount_fix(spec, verdict, mount, []))
     folder = (
         "the engine's data folder under C:\\ProgramData"
         if windows
-        else "a root-owned 755 folder like /etc/messagefoundry/"
+        else f"a root-owned 755 folder like {_POSIX_FOLDER} on a file system the check trusts"
     )
     if not spec.loads_verified_bytes:
         return (
             f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-            f"{folder}. A pin does not help here: this anchor is read again by path when it is "
-            "used, so a pin cannot vouch for the bytes loaded."
+            f"{folder}. {_NO_PIN}."
         )
-    pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
-        f"{folder}. Or {pin} the {ANCHOR_DIGESTS[ANCHOR_DIGEST].title} of the CA you mean to "
-        f"trust; this file's is {ANCHOR_DIGEST}:{verdict.fingerprint}. Check it against the CA "
-        "first. With a matching pin the engine "
-        "loads exactly those bytes, so it may load them without this check."
+        f"{folder}. Or {_pin_offer(spec, verdict)}"
     )
 
 
@@ -1697,6 +1960,114 @@ def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
 #: command that opens the store and runs no preflight still logs the warning at open.
 _WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
 
+#: The SQL Server store pin's in-process baseline (vault BACKLOG #3714 step 9), keyed by label and
+#: path: the fingerprint of the first pin bytes this process checked and passed, at a store open
+#: or, failing that, at a settings preflight (:func:`note_store_pin_checked`). Only the first is
+#: kept, so a later open or preflight of a swapped file cannot move it. The settings
+#: preflight compares the file with it (:func:`_warn_off_hop_pin_change`) without reading the
+#: store, so the compare does not ride the hop the pin secures (module item 11).
+_STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
+
+
+def note_store_pin_checked(spec: AnchorSpec, fingerprint: str) -> None:
+    """Record ``fingerprint`` as the SQL Server pin's in-process baseline unless one is already
+    held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open and the settings preflight call it once
+    their checks of the pin pass, so a file the open or the preflight refuses never becomes the
+    baseline."""
+    _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
+
+
+def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
+    """Log a WARNING when the SQL Server pin's bytes differ from its in-process baseline
+    (:data:`_STORE_PIN_FIRST_CHECKED`); with no baseline held, do nothing. It reads no store row,
+    so a server the swapped pin admits cannot answer it. Module item 11 states its limits."""
+    first = _STORE_PIN_FIRST_CHECKED.get((spec.label, spec.path))
+    if first is None or first == fingerprint:
+        return
+    log.warning(
+        "%s: the SQL Server pin %r on disk (%s %s) differs from the pin this engine process first "
+        "checked (%s). This compare reads no store row, so it does not depend on the store hop "
+        "the pin secures. Connections the store opened since the change trust the new file. If "
+        "the change is not a certificate renewal you made, treat the store login and the traffic "
+        "on those connections as exposed, correct the file, and restart each engine process that "
+        "uses this store. If it is a renewal you made, restart each engine process that uses this "
+        "store, so that it takes the renewed pin as its baseline: the baseline moves only at a "
+        "restart, so until then each check of the pin logs this warning",
+        spec.setting,
+        spec.path,
+        ANCHOR_DIGEST,
+        fingerprint,
+        first,
+    )
+
+
+#: SQL Server store pins an ``enforce`` settings preflight refused (vault BACKLOG #3714 step 11, as
+#: re-scoped by decision d20261122T111258871-87279a), keyed by label and path, each holding the
+#: refusal's text (:func:`store_pin_connect_refusal`). Module item 11 states what sets, refuses
+#: and lifts the hold. Holding and lifting each log once.
+_STORE_PIN_REFUSED: dict[tuple[str, str], str] = {}
+
+#: The held pins whose release was refused because their bytes differ from the baseline
+#: (:func:`release_store_pin_refusal`), so that ERROR is logged once per hold.
+_STORE_PIN_RELEASE_REFUSED: set[tuple[str, str]] = set()
+
+
+def store_pin_connect_refusal(spec: AnchorSpec) -> str | None:
+    """The text of the ``enforce`` settings refusal that holds ``spec``'s new store connects shut,
+    or ``None`` when none does (:data:`_STORE_PIN_REFUSED`)."""
+    return _STORE_PIN_REFUSED.get((spec.label, spec.path))
+
+
+def hold_store_pin_refused(spec: AnchorSpec, refusal: str) -> None:
+    """Hold ``spec``'s new store connects refused (:data:`_STORE_PIN_REFUSED`, module item 11),
+    logging an ERROR when that starts, since the reload's own refusal does not say that connects
+    stopped."""
+    key = (spec.label, spec.path)
+    if key not in _STORE_PIN_REFUSED:
+        _STORE_PIN_RELEASE_REFUSED.discard(key)
+        log.error(
+            "%s: a settings check at enforce refused the SQL Server pin %r, so this engine "
+            "process's store now refuses new connections; the ones already open stay open. "
+            "Fix what the refusal names; item 11 of the messagefoundry.auth.trust_anchors module docstring "
+            "says which checks then let it connect again, and a restart does. The refusal: %s",
+            spec.setting,
+            spec.path,
+            refusal,
+        )
+    _STORE_PIN_REFUSED[key] = refusal
+
+
+def release_store_pin_refusal(spec: AnchorSpec, fingerprint: str) -> None:
+    """Lift ``spec``'s hold (:data:`_STORE_PIN_REFUSED`) where ``fingerprint``, the pin the
+    caller's checks passed, equals the baseline (:data:`_STORE_PIN_FIRST_CHECKED`); otherwise
+    keep it and log an ERROR once per hold. Module item 11 states which checks call it."""
+    key = (spec.label, spec.path)
+    if key not in _STORE_PIN_REFUSED:
+        return
+    if _STORE_PIN_FIRST_CHECKED.get(key) != fingerprint:
+        if key not in _STORE_PIN_RELEASE_REFUSED:
+            _STORE_PIN_RELEASE_REFUSED.add(key)
+            log.error(
+                "%s: the SQL Server pin %r passed a check at enforce, but its bytes (%s %s) "
+                "differ from the pin this engine process first checked, so new store "
+                "connections stay refused. The pin changed: if the change is yours, restart each "
+                "engine process that uses this store; if it is not, treat the store login as "
+                "exposed and correct the file first",
+                spec.setting,
+                spec.path,
+                ANCHOR_DIGEST,
+                fingerprint,
+            )
+        return
+    _STORE_PIN_RELEASE_REFUSED.discard(key)
+    if _STORE_PIN_REFUSED.pop(key, None) is not None:
+        log.warning(
+            "%s: the SQL Server pin %r passed a check at enforce, so this engine process's store "
+            "connects again",
+            spec.setting,
+            spec.path,
+        )
+
 
 def enforced_anchor(
     spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
@@ -1750,8 +2121,10 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     Windows, CPython 3.14.6 / OpenSSL 3.5.7, with a real TCP socket to a localhost server, client side
     and server side: over a valid PEM, ``cadata=`` and ``cafile=`` each verify the right CA, each
     refuse a wrong one, and each hold exactly one anchor. ``tests/test_trust_anchor_byte_binding.py``
-    repeats the handshakes over memory BIOs. :func:`anchor_cadata` covers the inputs where the two
-    differ.
+    repeats the handshakes over memory BIOs. The two can differ on other inputs: at least on a
+    non-ASCII byte, which ``cadata=`` will not take, and on a byte-order mark. :func:`anchor_cadata`
+    says how its text tracks ``cafile=`` there, where it refuses instead, and that it rests on
+    OpenSSL's reader as measured, so it does not claim to match ``cafile=`` on every input.
 
     ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
     :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a
@@ -1903,6 +2276,39 @@ def _token_hop_reads_ca(settings: Mapping[str, Any]) -> bool:
     return smart_auth_configured(settings) or oauth2_auth_configured(settings)
 
 
+#: The boolean flags :func:`unread_ca_reason` reads, each with its default.
+_UNREAD_CA_FLAGS: tuple[tuple[str, bool], ...] = (
+    ("tls", False),
+    ("use_tls", True),
+    ("tls_verify", True),
+    ("verify_tls", True),
+)
+
+
+def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    """``bool_setting``, except that an unresolved ``env()`` reference reads as on: its value is
+    not known yet, so no CA reads as unread on it, and the check after resolution decides. Any
+    other non-bool is refused, as ``bool_setting`` refuses it (vault BACKLOG #3234). Imported here,
+    not at the top, for the reason :func:`_token_hop_reads_ca` gives."""
+    from messagefoundry.config.wiring import EnvRef
+
+    if isinstance(settings.get(key), EnvRef):
+        return True
+    return bool_setting(settings, key, default=default)
+
+
+def unread_ca_flags_refused(settings: Mapping[str, Any]) -> bool:
+    """Whether any flag in ``_UNREAD_CA_FLAGS`` holds a value the strict read refuses, whether or
+    not :func:`unread_ca_reason` would reach that flag on these settings, so a reader that collects
+    problems can leave that connection to the pass naming the literal."""
+    for key, default in _UNREAD_CA_FLAGS:
+        try:
+            _flag_or_unresolved(settings, key, default=default)
+        except ValueError:
+            return True
+    return False
+
+
 def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
@@ -1916,26 +2322,34 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
 
     A generic DATABASE connection's CA is its ``odbc_params`` ``sslca`` (module item 12), which
     its driver does not read under ``sslmode=disable``, or MySQL's ``SSLMODE=DISABLED``, in any
-    case (vault BACKLOG #3090)."""
+    case (vault BACKLOG #3090).
+
+    It reads the four flags in ``_UNREAD_CA_FLAGS`` (``tls``, ``use_tls``, ``tls_verify`` and
+    ``verify_tls``) strictly: when one it reads is neither a ``bool``, ``None``, an empty string
+    nor an ``env()`` reference, it raises :class:`ValueError`, as ``bool_setting`` refuses it
+    (vault BACKLOG #3234). It reads ``verify_tls`` only when no token hop reads the CA. It does not
+    read every flag that way: at least ``smart_enabled`` and ``ech_egress`` are still read by
+    truthiness, and ``oauth2_enabled`` through ``oauth2_auth_configured``, which reads a non-bool
+    as off and does not raise."""
     if _odbc_tls_disabled(settings):
         return "odbc_params sslmode turns TLS off, so the driver reads no CA"
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
     # #3230), so a None that turns nothing off does not make a read CA look unread.
     for key, default in (("tls", False), ("use_tls", True)):
-        if key in settings and not bool_setting(settings, key, default=default):
+        if key in settings and not _flag_or_unresolved(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
     # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
     # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
     protocol = settings.get("protocol")
     if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
         return "plain FTP (tls=False) builds no TLS context"
-    if not bool_setting(settings, "tls_verify", default=True):
+    if not _flag_or_unresolved(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
         return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
-    if not bool_setting(settings, "verify_tls", default=True):
+    if not _flag_or_unresolved(settings, "verify_tls", default=True):
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
     if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"
@@ -2061,9 +2475,10 @@ def database_ca_anchor_spec(
     answers ``None``, left to the build's refusal, which names the keyword.
 
     The other driver file keywords, ``sslcapath``, ``sslcert`` and ``sslkey``, are judged here
-    again the same way first, and each entry of an ``sslcapath`` folder too, so a path the build
-    cleared that leads off the host later is refused at the lane check (item 18). None of them is
-    read as an anchor: no ACL, path or audit check covers them (module item 12)."""
+    again the same way first, and on Windows each entry of an ``sslcapath`` folder too, so on
+    Windows a path the build cleared that leads off the host later is refused at the lane check
+    (item 18). None of them is read as an anchor: no ACL, path or audit check covers them (module
+    item 12)."""
     files = _lane_driver_files(settings)
     if not files:
         return None
@@ -2071,6 +2486,7 @@ def database_ca_anchor_spec(
         driver_file_rule,
         driver_file_spellings,
         file_keyword_verdicts,
+        judging_file_keyword,
         odbc_param_text,
     )
 
@@ -2087,8 +2503,9 @@ def database_ca_anchor_spec(
         odbc_param_text(keyword, value, connection=name)
     ca: tuple[object, Mapping[str, bool | None]] | None = None
     for keyword, value in values.items():
-        verdicts = file_keyword_verdicts(value)
-        rule = driver_file_rule(keyword, value, verdicts)
+        with judging_file_keyword(f"{kind} '{name}' odbc_params {keyword}"):
+            verdicts = file_keyword_verdicts(value)
+            rule = driver_file_rule(keyword, value, verdicts)
         if rule is not None:
             raise ValueError(f"{kind} '{name}' odbc_params {keyword} {rule}")
         if keyword == "sslca":
@@ -2760,6 +3177,80 @@ async def _preflight_one(
         raise
 
 
+#: ERROR_CONNECTION_ABORTED, which :func:`messagefoundry.path_reach.is_unreachable` does not
+#: read as a network loss, counted as one here (module item 11).
+_TRANSIENT_WINERRORS: frozenset[int] = frozenset({1236})
+
+#: What a refused anchor hop's WARNING names. A default executor that refuses the hop runs it on
+#: a thread of its own rather than failing a reload's lane check or its rollback
+#: (:func:`~messagefoundry.threadhop.to_thread_or_loop`, BACKLOG #5755, items 3 and 5). Only when
+#: no thread can start does it run on the loop; the read has no bound of its own (see
+#: ``_ICACLS_TIMEOUT_S``), so there a CA on a stalled share stalls the loop as long as it takes.
+_ANCHOR_HOP: Final = "trust anchor read"
+
+
+def _transient_read_fault(exc: OSError | ValueError) -> bool:
+    """Whether reading an anchor failed in a way that sets no store pin hold (module item 11),
+    since the next check may not repeat it. At least these: a ``FileNotFoundError``, as between
+    the two steps of some renewals; any ``PermissionError``; and a network or I/O fault, which is
+    a ``ConnectionError`` other than ``BrokenPipeError``, a ``TimeoutError``, ``EIO``, a share or
+    network :func:`~messagefoundry.path_reach.is_unreachable` reads as lost, or a Windows error
+    code in :data:`_TRANSIENT_WINERRORS`. On Windows at least ``os.stat`` and ``os.fstat`` carry
+    a Windows error code; at least some failures of the open and of the read itself carry none,
+    so where a pin location becomes networked after the store open, a share lost at those steps
+    can still set the hold.
+
+    **A pin whose path verdict at the store open is indeterminate or insecure does not reach this
+    read at** ``enforce``. The SQL Server store open refuses both verdicts
+    (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
+    open whatever the network does. On POSIX a share can read as either, depending on the owners
+    and mode bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`),
+    and so can at least a local disk of a type outside
+    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, any
+    overlay mount, whatever its layers (vault BACKLOG #8390 item 31), and any host without
+    ``/proc/self/mountinfo``. On Windows a path that reaches a share or a mapped
+    network drive reads as indeterminate, unless the walk already found an object others can
+    write, which reads as insecure; so does at least a local volume that is not NTFS or ReFS.
+    So at ``enforce`` this exemption
+    takes effect only for a pin whose path passed at the store open, such as on a trusted local
+    file system or on block-level network storage formatted with one; at ``warn`` no refusal sets
+    the hold at all.
+
+    **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
+    among them, since on Windows that is what a scanner holding the file arrives as and the read
+    cannot tell it from a denied read. The rule is the same on every platform, though POSIX has
+    no sharing violation. So a party who can deny the engine reads of the pin file, or on
+    Windows hold it open without sharing, can keep a refusal at ``enforce`` from setting the
+    hold, and new store connects go on while the file stays unreadable. The same holds for a
+    party who can make the read fail with one of the network or I/O faults above, at least one
+    who controls the network path to block-level storage whose path passes, or to a pin location
+    that becomes networked after the open, and for a read that fails with ``EIO``, as on a
+    failing disk or, on POSIX, a device swapped in between the stat and the open. On POSIX a
+    device already at the path when the stat runs is refused as not a regular file and sets
+    the hold. On Windows, as measured, a busy named pipe fails ``os.stat`` with Windows error 231,
+    which sets the hold, and a named pipe the account cannot open passes the stat and raises
+    ``PermissionError`` at the open, which sets none. Windows also reports at
+    least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
+    such check still refuses the reload. The path verdict does not gate this read at a later
+    check: :func:`evaluate_anchor` reads the file before it judges the path, so a pin whose path
+    becomes insecure or indeterminate after the open reaches this read, a read fault there is
+    judged here, and the path is not judged at that check.
+
+    What still sets the hold: at least a pipe or device refused as not a regular file, a
+    ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``
+    for a path Python will not pass to the OS, and any other ``OSError``."""
+    if isinstance(exc, BrokenPipeError):
+        return False
+    if isinstance(exc, (FileNotFoundError, PermissionError, ConnectionError, TimeoutError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno == errno.EIO or is_unreachable(exc):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(winerror, int) and winerror in _TRANSIENT_WINERRORS
+
+
 async def _preflight_checks(
     store: Store, spec: AnchorSpec, *, enforcing: bool, verdict: AnchorVerdict | OSError | None
 ) -> str:
@@ -2768,7 +3259,7 @@ async def _preflight_checks(
     pin_warning: PinReason | None = None  # why the store open would refuse a pin (item 11)
     try:
         if verdict is None:
-            verdict = await asyncio.to_thread(evaluate_anchor, spec)
+            verdict = await to_thread_or_loop(_ANCHOR_HOP, evaluate_anchor, spec)
         elif isinstance(verdict, OSError):
             raise verdict  # the caller's read failed: refused below, as this read's would be
         if verdict.pin_ok is not False:
@@ -2777,15 +3268,18 @@ async def _preflight_checks(
             # refuse a TRUSTED CERTIFICATE block its build accepts.
             try:
                 if spec.loads_verified_bytes:
-                    await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+                    await to_thread_or_loop(_ANCHOR_HOP, anchor_cadata, verdict.data, spec)
                 else:
-                    pin_warning = await asyncio.to_thread(
-                        _refuse_by_path_content, verdict.data, spec
+                    pin_warning = await to_thread_or_loop(
+                        _ANCHOR_HOP, _refuse_by_path_content, verdict.data, spec
                     )
             except TrustAnchorError as exc:
                 shape_error = exc
     except (OSError, ValueError) as exc:
-        raise _unreadable_anchor(spec, exc) from exc
+        unreadable = _unreadable_anchor(spec, exc)
+        if spec.server_pin and enforcing and not _transient_read_fault(exc):
+            hold_store_pin_refused(spec, str(unreadable))  # step 11, module item 11
+        raise unreadable from exc
     except MemoryError:
         # A resource fault, not a verdict on the file: no row and no refusal, so the next check
         # tries again (vault BACKLOG #4203).
@@ -2796,6 +3290,8 @@ async def _preflight_checks(
             spec.path,
         )
         raise
+    if spec.server_pin:
+        _warn_off_hop_pin_change(spec, verdict.fingerprint)  # before any store call (step 9)
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     if pin_warning is not None:
@@ -2840,7 +3336,15 @@ async def _preflight_checks(
             raise shape_error
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
+        # Step 11, module item 11. An ACL or path that could not be read holds too: the owner of
+        # a swapped file can make it unreadable on purpose.
+        if spec.server_pin and enforcing:
+            hold_store_pin_refused(spec, str(refusal))
         raise
+    if spec.server_pin:
+        note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
+        if enforcing and pin_warning is None:
+            release_store_pin_refusal(spec, verdict.fingerprint)  # step 11
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint
@@ -3156,7 +3660,9 @@ class _LaneAnchorCheck:
         # off the loop; any other lane's spec reads only the settings.
         try:
             if settings.get("odbc_params"):
-                spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
+                spec = await to_thread_or_loop(
+                    _ANCHOR_HOP, lane_anchor_spec, direction, name, settings
+                )
             else:
                 spec = lane_anchor_spec(direction, name, settings)
         except ValueError as exc:
@@ -3166,7 +3672,7 @@ class _LaneAnchorCheck:
             self._last.pop(lane, None)
             return
         try:
-            read = await asyncio.to_thread(self._read, spec)
+            read = await to_thread_or_loop(_ANCHOR_HOP, self._read, spec)
         except (ValueError, TrustAnchorError) as exc:
             # A path the OS will not take, such as one holding a NUL, or an env() pin that
             # resolved but does not parse, the one TrustAnchorError evaluate_anchor raises. Each

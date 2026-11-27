@@ -58,9 +58,12 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     driver can quote its DSN or a ``password=`` / ``PWD=`` pair, and a config module can raise
     anything. :func:`~messagefoundry.redaction.safe_text` is a PHI pass, and on such a text it left
     the DSN password and the ``PWD=`` and ``password=`` values in place
-    (``tests/test_verify_detail_redaction.py``). So the text also takes
-    :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
-    log filter and wiring's own diagnostics use.
+    (``tests/test_verify_detail_redaction.py``). So the text also takes the write-time credential
+    vocabulary the log filter and wiring's own diagnostics use, read as
+    :func:`~messagefoundry.secretscrub.scrub_credentials_without_tails`: without the masked tails and
+    the PRIVATE KEY block mask the log filter applies (BACKLOG #5546 to #5550), so a quoted Basic
+    token68, a bytes literal, a Digest parameter list and a key block body print here as they did
+    before those rows. The comment at the import below says why.
 
     NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment either
     order hid a copy of is hidden in the result. Credentials first: the credential pass read
@@ -85,21 +88,33 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     path, the words an operator needs here. This is best-effort, with at least the residuals
     ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
     capitalized two-word phrase such as ``Program Files``."""
-    from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, clamp_untrusted, redact
-    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.redaction import (
+        _DEFAULT_LIMIT,
+        _held_back,
+        clamp_untrusted,
+        redact_bounded_head,
+    )
+
+    # Without the masked tails (BACKLOG #5546 to #5550): _printed_by_both counts word fragments, and
+    # a tail's "x" run is a fragment neither result hid, so the tails printed words this hid.
+    from messagefoundry.secretscrub import scrub_credentials_without_tails as scrub_credentials
 
     bounded = clamp_untrusted(text)
     # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it
     # must outlive the length bound below, which would otherwise drop it with the tail.
     head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
-    phi_first = scrub_credentials(redact(head), placeholder=_PLACEHOLDER)
-    credentials_first = redact(scrub_credentials(head, placeholder=_PLACEHOLDER))
+    # Each PHI pass is told the note follows the head, so a value the clamp left last is not judged
+    # as ending the text and kept (BACKLOG #5925, as safe_text and the clamp route judge it).
+    phi_first = scrub_credentials(redact_bounded_head(head, note), placeholder=_PLACEHOLDER)
+    credentials_first = redact_bounded_head(scrub_credentials(head, placeholder=_PLACEHOLDER), note)
     cleaned = _printed_by_both(phi_first, credentials_first, head)
     # Not safe_text: every character of ``cleaned`` was scanned above, but its placeholders can push
     # it past safe_text's work window, whose note would then call scanned characters unscanned. So
     # the PHI pass once more over the whole of it, which the placeholders at most multiply from a
     # bounded head, then safe_text's length bound alone.
-    shown = _held_back(redact(cleaned).strip(), _DEFAULT_LIMIT if limit is None else limit)
+    shown = _held_back(
+        redact_bounded_head(cleaned, note), _DEFAULT_LIMIT if limit is None else limit
+    )
     return f"{shown} {note}" if note else shown
 
 
