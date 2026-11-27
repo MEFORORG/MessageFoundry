@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Batch 20008 Builder A (BACKLOG #5409 added item 1, the failing-test half): the Test Bench Debug
-// launch hands debugpy the interpreter options the CLI bridge launches with, so `-P` keeps the
-// workspace off the import path. b532w3-ide-debugpy.test.ts pins the wiring by reading testBench.ts's
-// source, and pins the program form that later replaced the module form; neither drives the launch.
-// This drives the real TestBench.debugRow, a method present before and after the fix, with `vscode`
-// stubbed, and asserts on the configuration it hands `vscode.debug.startDebugging`. With
-// testBench.ts at cc1b376f15^ (before engine PR 3127) the configuration carries no `pythonArgs`, so
-// the assertion below fails; with testBench.ts on main it passes.
+// launch hands debugpy the interpreter options the CLI bridge launches with, `-P` among them.
+// `-P` alone does not keep the workspace off the import path: debugpy builds before 1.8.22 add the
+// working directory for a MODULE launch whatever `-P` says, which is why the launch names a written
+// program (item 2), and a PYTHONPATH from the debuggee's environment stays open
+// (TEST_BENCH_DEBUG_PROGRAM's docblock in testBenchDebugProgram.ts says which builds and what).
+// b532w3-ide-debugpy.test.ts pins this wiring by reading testBench.ts's source; neither of its tests
+// drives the launch. This drives the real TestBench.debugRow, a method present before and after the
+// fix, with `vscode` stubbed, and asserts on the configuration it hands
+// `vscode.debug.startDebugging`. With testBench.ts at cc1b376f15^ (before engine PR 3127) the
+// configuration carries no `pythonArgs`, so the first test fails as an assertion; with testBench.ts
+// on main both pass.
 import * as assert from "assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+import { INTERPRETER_OPTIONS } from "../../engineControlModel";
+import { TEST_BENCH_DEBUG_PROGRAM, debugProgramFileName } from "../../testBenchDebugProgram";
 
 /** Every configuration the stubbed `vscode.debug.startDebugging` received. */
 let launched: { folder: unknown; config: Record<string, unknown> }[] = [];
@@ -117,9 +124,12 @@ launchSuite("b20008-a: the Test Bench Debug launch carries -P (BACKLOG #5409 add
     fs.rmSync(base, { recursive: true, force: true });
   });
 
+  /** The global storage folder the stubbed context hands debugRow. */
+  const storageDir = (): string => path.join(base, "storage");
+
   /** A TestBench with one loaded row, its debugRow driven for that row; returns what was launched. */
   async function debugOneRow(): Promise<Record<string, unknown>> {
-    const storage = path.join(base, "storage");
+    const storage = storageDir();
     const context = {
       subscriptions: [],
       globalStorageUri: { scheme: "file", fsPath: storage, with: () => ({ fsPath: storage }) },
@@ -136,18 +146,20 @@ launchSuite("b20008-a: the Test Bench Debug launch carries -P (BACKLOG #5409 add
     return config;
   }
 
-  test("the launch hands debugpy -P (or -I) in pythonArgs, so the workspace is off the import path", async () => {
+  test("item 1: the launch hands debugpy the CLI bridge's interpreter options, -P among them, as pythonArgs", async () => {
     const config = await debugOneRow();
     const args = config.pythonArgs;
-    assert.ok(
-      Array.isArray(args) && (args.includes("-P") || args.includes("-I")),
-      `the Debug launch carries no -P or -I in pythonArgs: ${JSON.stringify(config)}`,
-    );
+    assert.ok(Array.isArray(args) && args.includes("-P"), `the Debug launch carries no -P in pythonArgs: ${JSON.stringify(config)}`);
+    assert.deepStrictEqual(args, [...INTERPRETER_OPTIONS], JSON.stringify(config));
   });
 
-  test("the launch's pythonArgs are the CLI bridge's interpreter options, in order", async () => {
-    const { INTERPRETER_OPTIONS } = require("../../engineControlModel") as typeof import("../../engineControlModel");
+  test("item 2: the launch names the program writeDebugProgram wrote, never the module", async () => {
+    // Not this row's failing-test half (item 2 closed on its own evidence): it pins, by driving the
+    // launch, the form -P needs on the debugpy builds the header names.
     const config = await debugOneRow();
-    assert.deepStrictEqual(config.pythonArgs, [...INTERPRETER_OPTIONS], JSON.stringify(config));
+    assert.strictEqual(config.module, undefined, JSON.stringify(config));
+    const program = path.join(storageDir(), TEST_BENCH_DEBUG_PROGRAM.folder, debugProgramFileName(TEST_BENCH_DEBUG_PROGRAM.source));
+    assert.strictEqual(config.program, program, JSON.stringify(config));
+    assert.strictEqual(fs.readFileSync(program, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
   });
 });
