@@ -333,10 +333,12 @@ function Test-CoordRecordIsHere {
 }
 
 function Get-CoordSeatEnded {
-    # When the NEWEST seat record in one box's registry directory says its session ended itself
-    # (seat.ps1 -Close writes `closed`, -Close -Handback `handed`): @{ Lifecycle; At }, At a one-line
-    # printable stamp. Otherwise $null, and never a throw. A record is its writer's claim, never
-    # proof a session is gone.
+    # When the NEWEST seat record in one box's registry directory reads lifecycle `closed` or
+    # `handed` (seat.ps1 -Close writes `closed`, -Close -Handback `handed`, and later passes on that
+    # record carry it): @{ Lifecycle; At }, At a one-line printable stamp. Otherwise $null, and never
+    # a throw. Which session wrote that record, or set its lifecycle, is not established here: at
+    # least -SessionId, -Worktree and the shared nosid.json let another session write it. It is
+    # never proof a session is gone.
     #
     # NEWEST BY WHAT THE RECORD SAYS, never by file time, as seat.ps1 picks its prior: -ClearHandoff
     # rewrites a dead session's record without moving its asOf, and a copy moves the file time too.

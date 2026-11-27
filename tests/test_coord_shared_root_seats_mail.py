@@ -395,7 +395,7 @@ def test_a_send_to_a_seat_that_closed_itself_warns_and_still_queues(
 def test_the_closed_seat_warning_does_not_say_only_a_future_session_reads_it(
     repo: Path, shared: Path
 ) -> None:
-    """A session that ran -Close and stays open drains its box on its next turn, idle or not.
+    """A session that ran -Close and stays open, idle or not, can drain its box when it finishes its next turn, where the drain hook is wired.
 
     So the WARNING must not tell the sender that only a future session will read the mail: a
     `-To all` target is one presence has just measured live, and a sender acting on that line
@@ -408,7 +408,7 @@ def test_the_closed_seat_warning_does_not_say_only_a_future_session_reads_it(
     warnings = [ln for ln in proc.stderr.splitlines() if "WARNING" in ln]
     assert len(warnings) == 1, proc.stderr
     assert "read only by a future session" not in warnings[0]
-    assert "finishes another turn" in warnings[0]
+    assert "or one that started there finishes another turn" in warnings[0]
 
 
 def test_a_send_to_an_open_seat_does_not_warn(repo: Path, shared: Path) -> None:

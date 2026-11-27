@@ -887,7 +887,7 @@ def test_merging_main_INTO_the_branch_is_NOTHING_BUILT_not_a_squash(
 
 
 # --------------------------------------------------------------------------------------------------
-# The holder's own seat record saying it closed: evidence beside the state, never a licence
+# The newest seat record in the holder worktree's box reading closed: evidence beside the state, never a licence
 # --------------------------------------------------------------------------------------------------
 
 CLOSED_AT = "2026-11-20T10:00:00Z"

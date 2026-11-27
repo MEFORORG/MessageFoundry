@@ -229,22 +229,27 @@ function Get-PrintableField {
 }
 
 function Get-EndedSeatWarning {
-    # One WARNING line when the newest seat record in a recipient's box says its session ended
-    # itself (coord-root.ps1, Get-CoordSeatEnded), else $null. A warning and never a refusal: a
-    # later session in that worktree reads the box, and a record is a claim its writer made, not
-    # proof the session is gone. Any read failure says nothing, so the send still fails open.
+    # One WARNING line when the newest seat record in a recipient's box reads lifecycle `closed` or
+    # `handed` (coord-root.ps1, Get-CoordSeatEnded), else $null. That record need not be the
+    # recipient session's own: at least -SessionId, -Worktree, a CLI run from a cwd in that worktree
+    # and the shared nosid.json put other sessions' records in the box, and a later pass carries a
+    # lifecycle it did not set. So the line names what the record reads, never who wrote it or that
+    # anyone ended. A warning and never a refusal: a session that started in that worktree, the
+    # closer included, can still read the box. Any read failure says nothing, so the send still
+    # fails open.
     param([string]$SeatsDir, [string]$Key, [string]$Label)
     try {
         $ended = Get-CoordSeatEnded -Dir (Join-Path $SeatsDir $Key)
         if (-not $ended) { return $null }
         # Hedged, because the drain never reads lifecycle: where the drain hook is wired, a session
         # that closed and stays open, even idle, can drain the box when it finishes its next turn,
-        # and so can another one in that worktree. The drain runs at SessionStart and Stop, so the
-        # consequent names both, and says "may" because at least a root that does not wire the hook
-        # drains at neither.
+        # and so can another session that started in that worktree (the drain reads the box of the
+        # worktree a session started in, so one that cd'd in does not). The drain runs at
+        # SessionStart and Stop, so the consequent names both, and says "may" because at least a
+        # root that does not wire the hook drains at neither.
         return ("WARNING: the newest seat record for $(Get-PrintableField $Label) reads lifecycle " +
             "'$($ended.Lifecycle)' at $($ended.At). This mail may sit unread until a session starts " +
-            "in that worktree or one there finishes another turn, or expire unshown at its TTL.")
+            "in that worktree or one that started there finishes another turn, or expire unshown at its TTL.")
     } catch { return $null }
 }
 
@@ -694,9 +699,10 @@ if ($Send) {
 
     # On stderr, so -Json output stays parseable. Get-MailRoot above already refused an unresolved
     # shared root, so a throw here is only a read failure, and it says nothing.
-    # The records read are the ones under the box the mail went to, which is where the live session
-    # writes now; a legacy seat id's own directory is frozen and shared across PCs. Mail addressed
-    # to one session is not judged by the box's newest record of any session, so it gets none.
+    # The records read are the ones under the box the mail went to, which is where any session keyed
+    # to that box writes now; a legacy seat id's own directory is frozen and shared across PCs. Mail
+    # addressed to one session is not judged by the box's newest record of any session, so it gets
+    # none.
     $seatsDir = $null
     if (-not $ToSessionId) {
         try { $seatsDir = Get-SeatsDirForMail -MailRootUsed $root -Override $MailRoot } catch { }

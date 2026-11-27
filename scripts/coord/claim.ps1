@@ -130,8 +130,9 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 }
 . $coordRootScript
 $thisHost = Get-CoordHost
-# The box keyer, for reading a holder's seat record (Get-HolderSeatClose). Best-effort and never
-# fatal, like occupancy.ps1 above: without it that evidence is simply not shown.
+# The box keyer, for reading the newest seat record in a holder worktree's box (Get-HolderSeatClose).
+# Best-effort and never fatal, like occupancy.ps1 above: without it that evidence is simply not
+# shown.
 try { . "$PSScriptRoot/mail-key.ps1" } catch { }
 
 # THE MACHINE A RECORD WAS WRITTEN ON (docs/COORD-SHARED-ROOT.md, "The bug a plain path change would
@@ -465,13 +466,16 @@ function Get-OccupancyForHolder([string]$HeldPath) {
     catch { return $false }
 }
 
-# THE HOLDER'S OWN WORD THAT IT ENDED. seat.ps1 -Close writes lifecycle `closed` (`handed` with
-# -Handback) into the session's seat record as its last act, so the newest record in the holder
-# worktree's box can say the session declared itself finished. EVIDENCE, NEVER A LICENCE: the
-# record is the writer's claim, a resumed or later session in the same worktree may not have
-# declared yet, and nothing on this host proves a session gone (#1348 above). So it is a field
-# beside State, never a State of its own, and no branch below reads it to refuse, release or
-# recommend -Force. Any failure to look reads as no evidence at all.
+# WHAT THE NEWEST SEAT RECORD IN THE HOLDER WORKTREE'S BOX READS. seat.ps1 -Close writes lifecycle
+# `closed` (`handed` with -Handback) into a seat record, and later passes on that record carry it.
+# The record read here is the box's newest by asOf, and it need not be the claimant's, or any
+# closer's own: at least a run with -SessionId or -Worktree, a CLI run from a cwd in that worktree,
+# and every session with no id, which all share nosid.json, write into this box. So the line says
+# what that record reads, never who wrote it or that the claimant ended. EVIDENCE, NEVER A LICENCE:
+# at least a session that closed may still be working, a resumed or later session in the same
+# worktree may not have declared yet, and nothing on this host proves a session gone (#1348 above).
+# So it is a field beside State, never a State of its own, and no branch below reads it to refuse,
+# release or recommend -Force. Any failure to look reads as no evidence at all.
 $script:HolderSeatsDirs = @{}   # repository key -> its seats directory, once one resolved
 $script:HolderSeatClose = @{}   # holder path -> the evidence line, $null for none
 
