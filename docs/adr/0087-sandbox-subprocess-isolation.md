@@ -457,8 +457,8 @@ target, no `pickle` import left to mis-suppress:
   >   this amendment are accepted. The note *Owner acceptance 2026-11-27*, after the Manager's
   >   2026-11-10 list below, records the owner accepting two more: the forged lookup in this
   >   bullet, and the desync of the next message after a partial read of the request pipe and a
-  >   forged answer that keeps the worker. Each is accepted only in the scope that the Manager's
-  >   description of the option the owner chose gives it; that note cites the records and quotes
+  >   forged answer that keeps the worker. Each was accepted by choosing an option whose
+  >   description, in the Manager's words, gives its scope; that note cites the records and quotes
   >   both descriptions as the Manager's words.
   > - **A length header over the frame cap.** How the engine handles one is new since vault BACKLOG
   >   #3135, not a carried-over rule; the worker's own reader still treats one as a dead peer.
@@ -553,17 +553,16 @@ target, no `pickle` import left to mis-suppress:
   > owner ruling of 2026-11-24 recorded under record d20261110T165507353-b70f7b above, as the note
   > beside that ruling reads it. The last two are not named in that ruling.
   >
-  > *Owner acceptance 2026-11-27, in Manager jennings's chat (session
-  > 55031921-87e7-4ad3-813a-9cea7ef223de):* asked in two questions, in the Manager's own wording,
+  > *Owner acceptance 2026-11-27, in Manager jennings's chat (CLI session id
+  > `55031921-87e7-4ad3-813a-9cea7ef223de`):* asked in two questions, in the Manager's own wording,
   > whether to accept the cases the last two items in this list name (vault BACKLOG #3135 steps 11
   > and 12), the owner chose the option *"Accept it (Recommended)"* for step 11 and the option
   > *"Accept it (Recommended)"* for step 12 (records d20261127T133719996-73a18d for step 11 and
-  > d20261127T133721848-3b2fdf for step 12). Where a record's own text gives the scope, that text
-  > is the Manager's, not the owner's.
-  > *The Manager's words, not the owner's:* each option's description gave its scope, for step 11
-  > *"Same scope as owner record d20261110T165507353-b70f7b and its 2026-11-24 carry-over."* and for
-  > step 12 *"Same scope as d20261110T165507353-b70f7b and its carry-over."* *Not the owner's
-  > words:* a forged lookup's reply is written to the request pipe, which the forger can read
+  > d20261127T133721848-3b2fdf for step 12). Each option carried a description that gave its
+  > scope, in the Manager's words and not the owner's: for step 11 *"Same scope as owner record
+  > d20261110T165507353-b70f7b and its 2026-11-24 carry-over."* and for step 12 *"Same scope as
+  > d20261110T165507353-b70f7b and its carry-over."* Any scope text in the two records is the
+  > Manager's too. *Not the owner's words:* a forged lookup's reply is written to the request pipe, which the forger can read
   > (`_serve_bounded` in `messagefoundry/pipeline/sandbox.py`).
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
