@@ -1137,7 +1137,9 @@ def test_a_trailing_list_that_already_refuses_is_not_re_read() -> None:
     assert _run(env, _serve([_page([_commit(1, "Anon")], 1, False)])) == EXIT_REFUSED
 
 
-def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault() -> None:
+def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
     trailing = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
     newer = _page([_commit(2, "Anon")], 1, False, head="cd" * 20)
@@ -1146,6 +1148,76 @@ def test_a_trailing_list_whose_re_read_moves_to_a_newer_head_is_a_fault() -> Non
     signed = frozenset({90000001})
     assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
     assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+    # The judged read of CLA_HEAD_SHA is still the one reported, beside the stale re-reads.
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "this run is stale" in out
+
+
+def test_a_trailing_re_read_that_now_refuses_stops_there() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 1, False), _page([octo, _commit(2, "Anon")], 2, False)]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_REFUSED
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+
+
+def test_a_stale_head_and_a_trailing_list_share_one_budget_of_waits() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    stale = _page([octo], 1, False, head="cd" * 20)
+    trailing = _page([octo], 1, False)
+    replies = [stale, trailing, trailing]
+    waits: list[float] = []
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, waits.append) == EXIT_FAULT
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS) and replies == []
+
+
+def test_a_trailing_re_read_that_faults_outright_reports_the_judged_read(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    replies = [_page([octo], 1, False), {"errors": [{}]}]
+    signed = frozenset({90000001})
+    assert run(env, lambda _q, _v: replies.pop(0), lambda: signed, lambda _s: None) == EXIT_FAULT
+    out = capsys.readouterr().out
+    assert "the commits this read returned do not include CLA_HEAD_SHA" in out
+    assert "then a re-read faulted" in out
+
+
+def test_a_read_cut_short_by_the_commit_stop_is_not_re_read_for_its_head() -> None:
+    """GitHub stops the list at 250 (module docstring), so the newest commit, the head, is past
+    the stop on every read and a re-read cannot change the verdict."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    octo = {"name": "Octo", "user": {"databaseId": 90000001, "login": "octo-contributor"}}
+    stop = cla_precheck.GITHUB_COMMIT_STOP
+    commits: list[Mapping[str, Any]] = [
+        {"oid": f"{i:040x}", "author": octo, "committer": octo} for i in range(1, stop + 1)
+    ]
+    page = _page(commits, stop + 50, False)
+    signed = frozenset({90000001})
+    assert run(env, _serve([page]), lambda: signed, _no_sleep) == EXIT_FAULT
+
+
+def test_the_signature_file_is_read_once_across_re_reads() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    page_one = [_commit(i, "Octo", "octo-contributor", 90000001) for i in range(1, 3)]
+    late = _commit(3, "Late", "late-contributor", 90000002)
+    trailing = _page(page_one, 3, True)
+    rest = _page([late], 3, False)
+    replies = [trailing, rest] * (len(cla_precheck.HEAD_RETRY_DELAYS) + 1)
+    reads: list[int] = []
+
+    def signatures() -> frozenset[int]:
+        reads.append(1)
+        return frozenset({90000002})
+
+    assert run(env, lambda _q, _v: replies.pop(0), signatures, lambda _s: None) == EXIT_FAULT
+    assert replies == [] and reads == [1]
 
 
 def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
