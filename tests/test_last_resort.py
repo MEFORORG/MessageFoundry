@@ -5,10 +5,12 @@
 Verifies the asyncio loop handler + sys.excepthook + threading.excepthook route an otherwise-unhandled
 exception through ``safe_exc`` (PHI-redacted, type-preserving) → the log, and that a framed listener
 (MLLP) survives a handler that raises. A handler fault no longer reaches the listener's last-resort
-arm: the listener's handler-fault arm logs it redacted, records ``handler_error``, answers ``AE``
-and closes the connection (BACKLOG #1619), and the server stays up. The last-resort arm itself,
-``framing_error``, is pinned by ``test_a_codec_fault_in_the_listener_still_drops_as_framing_error``
-in tests/test_mllp_handler_failure.py.
+arm: on an inbound that owes a reply, the listener's handler-fault arm logs it redacted, records
+``handler_error``, answers ``AE`` and closes the connection (BACKLOG #1619), and the server stays
+up. A no-reply inbound holds the frame instead (BACKLOG #5022), as tests/test_mllp_handler_failure.py
+pins. That file's ``test_a_codec_fault_in_the_listener_still_drops_as_framing_error`` pins that a
+codec fault still reaches the last-resort arm and records ``framing_error``; it does not check that
+arm's redaction.
 """
 
 from __future__ import annotations
@@ -170,7 +172,7 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
     source.on_connection_event = capture
     await source.start(boom)
     try:
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
             writer.write(frame("MSH|^~\\&|s|f|r|rf|20260616||ADT^A01|1|P|2.5.1\rPID|1||x"))
             await writer.drain()
@@ -182,14 +184,21 @@ async def test_mllp_handler_exception_is_caught_and_redacted(
             assert msa in nak[1:-2].split(b"\r"), nak  # the whole MSA segment, text included
             assert b"DOE" not in nak and b"JANE" not in nak
             # then the connection closes; a reset is a close too, as on the Windows Proactor
+            tail = b""
             with contextlib.suppress(ConnectionResetError):
-                assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+                tail = await asyncio.wait_for(reader.read(), timeout=5)
+            assert tail == b"", tail  # nothing after the NAK
             writer.close()
-            await writer.wait_closed()
-        # the server survived — it still accepts a fresh connection
+            with contextlib.suppress(ConnectionResetError):
+                await writer.wait_closed()
+        # the server survived: a fresh connection is served, and answered the same way
         r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        w2.write(frame("MSH|^~\\&|s|f|r|rf|20260616||ADT^A01|2|P|2.5.1\rPID|1||x"))
+        await w2.drain()
+        assert b"MSA|AE|2|" in await asyncio.wait_for(r2.readuntil(b"\x1c\r"), timeout=5)
         w2.close()
-        await w2.wait_closed()
+        with contextlib.suppress(ConnectionResetError):
+            await w2.wait_closed()
     finally:
         await source.stop()
     logged = " ".join(r.getMessage() for r in caplog.records)
