@@ -507,8 +507,8 @@ def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
 ) -> None:
     # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
     # What a hex escape's bytes mean is ADR 0205's, *The hex escape's meaning*; the decoder maps
-    # each byte to one character, so it cannot tell a Latin-1 letter from part of a UTF-8 one.
-    # While that holds, keeping the escape as sent writes no byte the sender did not send.
+    # each byte to one character and reads no MSH-18, so casing the letter would mean guessing its
+    # character set. Keeping the escape as sent writes no byte the sender did not send.
     # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
     # every row here fails.
     m = _with_pid(sent)
@@ -516,7 +516,7 @@ def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
     assert m["PID-5"] == expected
 
 
-@pytest.mark.parametrize("path", ["PID-5", "PID-5.1"])
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1", "PID-5.1.1"])
 @pytest.mark.parametrize(
     ("sent", "expected"),
     [
@@ -527,6 +527,12 @@ def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
         # The mirror: AA, the last byte of the new shekel sign (E2 82 AA), decodes on its own to a
         # cased character, so a per-byte read kept the next word's first letter lower case.
         ("a \\XE282AA\\b", "A \\XE282AA\\B"),
+        # The run's bytes are read together, however the sender split them into escapes, and a
+        # stray byte before the last character does not hide it.
+        ("ren\\XC3\\\\XA9\\e", "Ren\\XC3\\\\XA9\\e"),
+        ("ren\\XFFC3A9\\e", "Ren\\XFFC3A9\\e"),
+        # Literal text ends the run, so a byte after it starts afresh.
+        ("a\\XC3\\b\\XA9\\c", "A\\XC3\\b\\XA9\\C"),
         # Not valid UTF-8, so each byte is its own character: E9 is a Latin-1 e-acute, cased.
         ("jos\\XE9\\e", "Jos\\XE9\\e"),
         ("o\\X41\\b", "O\\X41\\b"),
@@ -536,12 +542,24 @@ def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
     sent: str, expected: str, path: str
 ) -> None:
     # BACKLOG #5928: title case decides whether a letter starts a word from the character before
-    # it, and a hex escape's bytes are read as UTF-8 where they form it. NEGATIVE CONTROL: on
-    # d055c0e8590, which read each byte as its own character, the first three rows fail on both
-    # paths.
+    # it, and a run of hex escapes is read as UTF-8 where its bytes end in a UTF-8 character.
+    # NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character, the first five
+    # rows fail on every path.
     m = _with_pid(sent)
     convert_case(m, path, "title")
     assert m["PID-5"] == expected
+
+
+def test_convert_case_title_reads_no_msh18() -> None:
+    # The UTF-8 reading is a guess that reads no MSH-18, so a message declaring ISO 8859-1 gets it
+    # too: there the bytes C3 A9 are two characters, the last one uncased, so the "e" would start a
+    # word. Pinned so a change to the guess is seen; whether to read MSH-18 is the owner question
+    # BACKLOG #5928 step 1 raises.
+    msh = _MSH.replace("2.5.1\r", "2.5.1||||||8859/1\r")
+    m = Message.parse(msh + "PID|1||1||ren\\XC3A9\\e\r")
+    assert m["MSH-18"] == "8859/1"
+    convert_case(m, "PID-5", "title")
+    assert m["PID-5"] == "Ren\\XC3A9\\e"
 
 
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
