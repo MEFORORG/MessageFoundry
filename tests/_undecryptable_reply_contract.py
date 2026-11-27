@@ -818,6 +818,7 @@ HANDOFF_CASES: list[ContractCase] = [
     _unparseable_origin_dead_letters(f"not json {META_MARK}", "not_json"),
     _unparseable_origin_dead_letters(f'{{"correlation_depth": "{META_MARK}"}}', "word_depth"),
     _unparseable_origin_dead_letters('{"correlation_depth": [1]}', "list_depth"),
+    _unparseable_origin_dead_letters(f'["{META_MARK}"]', "not_an_object"),
     _worker_dead_letter_seal_failure_carries_no_open_error("reply", outage=True),
     _worker_dead_letter_seal_failure_carries_no_open_error("ref", outage=True),
     _outage_open_leaves_the_loop("worker_ref"),

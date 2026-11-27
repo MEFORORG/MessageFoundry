@@ -10126,6 +10126,9 @@ class SqlServerStore(ServerCipherWalk):
                 loaded: Any = {}
                 if meta_json:
                     loaded, refusal = json_loads_or_refusal(meta_json)
+                    if refusal is None and not isinstance(loaded, dict):
+                        # Valid JSON that is not an object holds no lineage, as on SQLite.
+                        refusal = f"not an object: {type(loaded).__name__}"
                 origin_meta = loaded if isinstance(loaded, dict) else {}
                 try:
                     child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1

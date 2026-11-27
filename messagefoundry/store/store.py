@@ -17414,6 +17414,10 @@ class MessageStore:
                 loaded, refusal = json_loads_or_refusal(meta_json)
                 if isinstance(loaded, dict):
                     origin_meta = loaded
+                elif refusal is None:
+                    # Valid JSON that is not an object (null, a list, a number, a string) holds no
+                    # lineage, and read as none it would restart a re-ingress loop's depth count.
+                    refusal = f"not an object: {type(loaded).__name__}"
             try:
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
             except (ValueError, TypeError, OverflowError) as exc:

@@ -6790,6 +6790,9 @@ class PostgresStore(ServerCipherWalk):
                         loaded, refusal = json_loads_or_refusal(meta_json)
                         if isinstance(loaded, dict):
                             origin_meta = loaded
+                        elif refusal is None:
+                            # Valid JSON that is not an object holds no lineage, as on SQLite.
+                            refusal = f"not an object: {type(loaded).__name__}"
                     try:
                         child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
                     except (ValueError, TypeError, OverflowError) as exc:
