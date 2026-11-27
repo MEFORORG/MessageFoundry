@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""branch-leak-scan.yml scans every commit in the pushed range, not only the tip (BACKLOG #5595).
+"""branch-leak-scan.yml scans every commit off main, not only the tip (BACKLOG #5595).
 
 The scan step's shipped ``run:`` body is EXECUTED under ``bash -e`` inside a throwaway git repository,
 with ``python`` replaced by a stub scanner that reports any file carrying a synthetic marker. The
 regression row is a branch whose first pushed commit adds the marker and whose second removes it: the
 tip tree is clean, so a tip-only scan passes, while the content stays public by SHA. A second row
-(BACKLOG #8244 item 63) is a later push whose earlier push's run never finished: the scan walks every
-commit not on main, so it still finds the earlier commit.
+(BACKLOG #8244 item 63) is a later push whose earlier push's run never finished: step 2 rescans what
+``before`` reaches off main, so it still finds the earlier commit.
 
 The stub stands in for ``scan_forbidden.py`` only, so these rows measure how the step picks and lays
 out what to scan, never the scanner's detectors.
@@ -181,38 +181,51 @@ def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
     bash: str, tmp_path: Path
 ) -> None:
     """BACKLOG #8244 item 63: the leak was the earlier push's, and that push's run errored, timed out
-    or never started. A ``before..after`` range began after it, so no run ever scanned it."""
+    or never started. A ``before..after`` range began after it, so no run ever scanned it. Step 1 is
+    this push's commits with the tip, step 2 the earlier ones, in that order."""
     repo = _Repo(tmp_path)
     leaked, removed = _leak_then_remove(repo)
     rc, out, calls = _run(bash, repo.path, tmp_path, leaked, removed)
     assert rc == 1, f"rc={rc}; the earlier push's commit was not rescanned\n{out}"
     assert "HIT docs/security/note.md" in out, out
-    assert len(calls) == 1 and leaked in calls[0], calls
+    assert len(calls) == 2, calls
+    assert calls[0] == "--path .", f"step 1 adds nothing but the tip: {calls}"
+    assert calls[1].startswith("--path .github/workflows ") and leaked in calls[1], calls
 
 
-def test_a_repeated_path_and_content_pair_is_written_once(bash: str, tmp_path: Path) -> None:
-    """The same blob at the same path is the same scan input, so it is copied once per run."""
+def test_a_step_one_hit_still_runs_step_two(bash: str, tmp_path: Path) -> None:
+    """One red reports both ranges, and step 1's status is kept."""
     repo = _Repo(tmp_path)
-    _commit(repo.path, "add", {"a.txt": "same\n"})
-    _commit(repo.path, "drop", {"a.txt": None})
-    after = _commit(repo.path, "re-add", {"a.txt": "same\n"})
-    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
+    leaked, removed = _leak_then_remove(repo)
+    after = _commit(repo.path, "again", {"b.txt": f"{_MARKER}\n"})
+    rc, out, calls = _run(bash, repo.path, tmp_path, removed, after)
+    assert rc == 1, f"rc={rc}\n{out}"
+    assert len(calls) == 2 and after in calls[0] and leaked in calls[1], calls
+    assert "HIT b.txt" in out and "HIT docs/security/note.md" in out, out
+
+
+def test_a_clean_branch_with_earlier_pushes_passes(bash: str, tmp_path: Path) -> None:
+    """The discriminating PASS for step 2: a step 2 that always failed would satisfy the rows above."""
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    after = _commit(repo.path, "two", {"b.txt": "y\n"})
+    rc, out, calls = _run(bash, repo.path, tmp_path, first, after)
     assert rc == 0, f"rc={rc}\n{out}"
-    assert "1 commit(s) with 1 distinct" in out, out
+    assert len(calls) == 2 and after in calls[0] and first in calls[1], calls
+    assert "step 2, earlier pushes: 1 commit(s) walked" in out, out
 
 
-def test_the_same_content_at_two_paths_or_two_contents_at_one_path_are_both_written(
+def test_a_force_push_with_a_known_before_rescans_the_dropped_commits(
     bash: str, tmp_path: Path
 ) -> None:
-    """The discriminating half of the row above: the key is path AND content, never either alone, so
-    a path detector still sees each path and a changed file is still read at each version."""
+    """The dropped commits stay public by SHA, and while the old head is here step 2 reaches them."""
     repo = _Repo(tmp_path)
-    _commit(repo.path, "one", {"a.txt": "same\n", "b.txt": "same\n"})
-    _commit(repo.path, "two", {"a.txt": f"{_MARKER}\n"})
-    after = _commit(repo.path, "three", {"a.txt": "clean again\n"})
-    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
-    assert rc == 1 and "HIT a.txt" in out, f"rc={rc}\n{out}"
-    assert "3 commit(s) with 4 distinct" in out, out
+    old = _commit(repo.path, "leak", {"docs/security/note.md": f"{_MARKER}\n"})
+    _git(repo.path, "reset", "-q", "--hard", repo.main)
+    after = _commit(repo.path, "rewritten", {"a.txt": "x\n"})
+    rc, out, calls = _run(bash, repo.path, tmp_path, old, after)
+    assert rc == 1 and "HIT docs/security/note.md" in out, f"rc={rc}\n{out}"
+    assert len(calls) == 2 and after in calls[0] and old in calls[1], calls
 
 
 def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) -> None:
@@ -250,15 +263,19 @@ def test_a_deleted_branch_scans_nothing(bash: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("bad", ["", "not-a-sha", "ABC123"])
-def test_a_malformed_push_sha_fails_closed(bad: str, bash: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_a_malformed_push_sha_fails_closed(side: str, bad: str, bash: str, tmp_path: Path) -> None:
     repo = _Repo(tmp_path)
-    rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, bad)
-    assert rc == 2, f"rc={rc}\n{out}"
+    head = _git(repo.path, "rev-parse", "HEAD")
+    before, after = (bad, head) if side == "before" else (repo.main, bad)
+    rc, out, calls = _run(bash, repo.path, tmp_path, before, after)
+    assert rc == 2 and not calls, f"rc={rc}, calls={calls}\n{out}"
 
 
 def test_no_push_scan_is_cancelled_by_a_later_one() -> None:
-    """A later push's range starts where the earlier one ended, so cancelling loses a range, and a
-    per-ref group without cancel-in-progress still drops an older PENDING run. So no group at all."""
+    """A force-push can drop the earlier commits from the branch, so a cancelled run's commits may be
+    reached by no later run, and a per-ref group without cancel-in-progress still drops an older
+    PENDING run. So no group at all."""
     doc = load_workflow(_WORKFLOW)
     assert "concurrency" not in doc, doc.get("concurrency")
     assert all("concurrency" not in job for job in jobs_of(_WORKFLOW).values())

@@ -48,18 +48,23 @@ name: Branch leak scan
 # just scanned: one ubuntu job, a full-history checkout plus setup-python plus a stdlib-only scanner,
 # no install step and no dependency resolution.
 #
-# WHAT IT SCANS (BACKLOG #5595): the TIP working tree, and then every file each commit on the branch
-# added or changed, at that commit. Scanning only the tip missed content added in one pushed commit
-# and removed in a later one: the earlier commit is still public by SHA while the tip is clean. The
-# commits are EVERY commit reachable from the pushed head and not from `origin/main`, on every push,
-# since main's content went through the merge queue's scan. It is NOT the push's `before..after`
-# (BACKLOG #8244 item 63): that range trusts the run for the earlier push to have finished, and a run
-# that errored, timed out or never started left its commits unscanned, with the next push's range
-# beginning after them. A commit a force-push dropped from the branch is reachable from neither, so it
-# is scanned only if the run for the push that carried it completed. A merge commit is diffed against
-# its FIRST parent, so content a conflict resolution introduced is scanned too. Each distinct file
-# path and content pair is written once per run, so a branch's earlier commits and its merges of
-# main cost one copy each rather than one per commit that repeats them.
+# WHAT IT SCANS (BACKLOG #5595): the TIP working tree, and then every file each commit added or
+# changed, at that commit. Scanning only the tip missed content added in one pushed commit and removed
+# in a later one: the earlier commit is still public by SHA while the tip is clean. Main's commits are
+# left out, since main's content went through the merge queue's scan. A merge commit is diffed against
+# its FIRST parent, so content a conflict resolution introduced is scanned too. Two scans, in order:
+#
+#   1. THIS PUSH: the tip and the push's `before..after`. A new branch (a zero `before`) and a
+#      force-push whose `before` is not in this clone fall back to everything not on `origin/main`.
+#   2. EARLIER PUSHES (BACKLOG #8244 item 63): every commit reachable from `before` and not from
+#      `origin/main`. Step 1 alone trusts the run for the earlier push to have finished; one that
+#      errored, timed out or never started left its commits unscanned. Step 2 rescans them on the
+#      branch's NEXT push. It runs second so that a long branch, whose merges of main can make it
+#      slow, never costs step 1 its result: a timeout in step 2 still leaves this push scanned.
+#
+# What neither step covers, at least: a branch whose failed run was its LAST push, or that was deleted
+# after one, is never rescanned; and a commit a force-push dropped is rescanned only while its old
+# head is still in this clone.
 
 on:
   push:
@@ -75,7 +80,8 @@ on:
 # to be a per-ref group with cancel-in-progress, on the premise that "the newer push runs the same scan
 # over a superset of the same refs". That premise is FALSE for a force-push: it can drop the earlier
 # commits from the branch, so the newer run no longer reaches them, yet they stay public by SHA, and
-# the cancelled run was the only one that would have scanned them. A per-ref group without
+# the cancelled run was the only one that would have scanned them. Cancelling would also turn a run's
+# step 1 into step 2 of the next one, which runs after the slow part. A per-ref group without
 # cancel-in-progress would not fix it either: GitHub keeps one pending run per group and cancels the
 # older pending one. tests/test_branch_leak_scan_range.py refuses the block's return.
 
@@ -127,8 +133,8 @@ jobs:
             exit 2
           fi
 
-          # THE PUSHED RANGE (BACKLOG #5595). Every git call below fails the step on error: a range that
-          # cannot be computed is not a clean range.
+          # THE COMMIT RANGES (BACKLOG #5595). Every git call below fails the step on error: a range
+          # that cannot be computed is not a clean range.
           set -euo pipefail
           zero=0000000000000000000000000000000000000000
           for sha in "$PUSH_BEFORE" "$PUSH_AFTER"; do
@@ -143,72 +149,94 @@ jobs:
             python scripts/security/scan_forbidden.py --path .
             exit 0
           fi
-          # EVERY commit not on origin/main, never only `before..after` (BACKLOG #8244 item 63): an
-          # earlier push's run may have errored, timed out or never started. `before` is validated
-          # above and never narrows the scan.
-          echo "scanning every commit reachable from the pushed head and not from origin/main."
-          commits="$(git rev-list "$PUSH_AFTER" --not refs/remotes/origin/main)"
           snap="$RUNNER_TEMP/branch-leak-scan-commits"
           rm -rf "$snap"
           mkdir -p "$snap"
-          roots=()
-          files=0
-          # One copy of each path-and-content pair: the same blob at the same path is the same scan
-          # input, and every push now walks the whole branch, its merges of main included.
-          declare -A seen=()
-          while read -r sha; do
-            [ -n "$sha" ] || continue
-            root="$snap/$sha"
-            # To a FILE, not a variable: the -z output carries NULs, which a shell variable drops, and
-            # a redirect keeps git's exit status, which `set -e` then acts on.
-            raw="$snap/$sha.raw"
-            base=(--root)
-            if git rev-parse -q --verify "${sha}^1" >/dev/null; then base=("${sha}^1"); fi
-            # --no-commit-id: with --root, diff-tree otherwise writes the commit id first, which shifts
-            # every meta/path pair below by one and skipped every file of a root commit.
-            git diff-tree -r -z --raw --no-renames --no-commit-id "${base[@]}" "$sha" > "$raw"
-            n=0
-            # -z raw records are ":oldmode newmode oldsha newsha status" NUL path NUL.
-            while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
-              read -r _ newmode _ blob status <<< "$meta"
-              case "$status" in A|M|T) ;; *) continue ;; esac
-              # A gitlink has no blob here. A symlink's blob is its target text, written as a regular
-              # file so the scanner reads that text and never follows the link.
-              case "$newmode" in 100644|100755|120000) ;; *) continue ;; esac
-              case "/$path/" in
-                //*|*/../*|*/./*|*/.git/*)
-                  echo "::error::pushed commit $sha names an unsafe path; refusing to write it." >&2
-                  exit 2
-                  ;;
-              esac
-              # The scanner skips this path so a working-tree scan on the owner's machine does not
-              # trip on the git-ignored real token list. Inside a pushed COMMIT it is committed by
-              # definition, so its presence is the leak.
-              if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
-                echo "::error::pushed commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
-                exit 1
+          # Writes each commit in $1 (one id per line) to its own root under $snap, every file that
+          # commit added or changed, and sets roots and files for the scan that follows.
+          snapshot() {
+            roots=()
+            files=0
+            while read -r sha; do
+              [ -n "$sha" ] || continue
+              root="$snap/$sha"
+              # To a FILE, not a variable: the -z output carries NULs, which a shell variable drops, and
+              # a redirect keeps git's exit status, which `set -e` then acts on.
+              raw="$snap/$sha.raw"
+              base=(--root)
+              if git rev-parse -q --verify "${sha}^1" >/dev/null; then base=("${sha}^1"); fi
+              # --no-commit-id: with --root, diff-tree otherwise writes the commit id first, which shifts
+              # every meta/path pair below by one and skipped every file of a root commit.
+              git diff-tree -r -z --raw --no-renames --no-commit-id "${base[@]}" "$sha" > "$raw"
+              n=0
+              # -z raw records are ":oldmode newmode oldsha newsha status" NUL path NUL.
+              while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+                read -r _ newmode _ blob status <<< "$meta"
+                case "$status" in A|M|T) ;; *) continue ;; esac
+                # A gitlink has no blob here. A symlink's blob is its target text, written as a regular
+                # file so the scanner reads that text and never follows the link.
+                case "$newmode" in 100644|100755|120000) ;; *) continue ;; esac
+                case "/$path/" in
+                  //*|*/../*|*/./*|*/.git/*)
+                    echo "::error::branch commit $sha names an unsafe path; refusing to write it." >&2
+                    exit 2
+                    ;;
+                esac
+                # The scanner skips this path so a working-tree scan on the owner's machine does not
+                # trip on the git-ignored real token list. Inside a COMMIT it is committed by
+                # definition, so its presence is the leak.
+                if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
+                  echo "::error::branch commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
+                  exit 1
+                fi
+                case "$path" in
+                  */*) mkdir -p "$root/${path%/*}" ;;
+                  *) mkdir -p "$root" ;;
+                esac
+                git cat-file blob "$blob" > "$root/$path"
+                n=$((n + 1))
+              done < "$raw"
+              if [ "$n" -gt 0 ]; then
+                roots+=("$root")
+                files=$((files + n))
               fi
-              key="$blob $path"
-              if [ -n "${seen[$key]+x}" ]; then continue; fi
-              seen[$key]=1
-              case "$path" in
-                */*) mkdir -p "$root/${path%/*}" ;;
-                *) mkdir -p "$root" ;;
-              esac
-              git cat-file blob "$blob" > "$root/$path"
-              n=$((n + 1))
-            done < "$raw"
-            if [ "$n" -gt 0 ]; then
-              roots+=("$root")
-              files=$((files + n))
-            fi
-          done <<< "$commits"
-          echo "branch range: ${#roots[@]} commit(s) with $files distinct added or changed file(s)."
+            done <<< "$1"
+          }
+          count() { [ -z "$1" ] && echo 0 || printf '%s\n' "$1" | wc -l; }
+
+          # STEP 1, THIS PUSH: `before..after` less origin/main, or everything not on origin/main
+          # when `before` is zero or not in this clone.
+          this_push=(--not refs/remotes/origin/main)
+          earlier=""
+          if [ "$PUSH_BEFORE" != "$zero" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            this_push+=("$PUSH_BEFORE")
+            earlier="$(git rev-list "$PUSH_BEFORE" --not refs/remotes/origin/main)"
+          else
+            echo "no usable 'before' (new branch, or a force-push whose old head is not here): step 1 scans everything not on origin/main."
+          fi
+          commits="$(git rev-list "$PUSH_AFTER" "${this_push[@]}")"
+          snapshot "$commits"
+          echo "step 1, this push: $(count "$commits") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
           # ONE scan of the tip tree and every commit root. Each commit is its own root, so a path
           # detector keyed on `docs/security/` still sees the repository-relative path, and the tip
           # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
           # files sit under a directory the scanner skips.
-          python scripts/security/scan_forbidden.py --path . "${roots[@]}"
+          # A hit here still lets step 2 run, so one red reports both ranges; the step's status is
+          # step 1's when that is non-zero, step 2's otherwise.
+          rc=0
+          python scripts/security/scan_forbidden.py --path . "${roots[@]}" || rc=$?
+
+          # STEP 2, EARLIER PUSHES (BACKLOG #8244 item 63): what `before` reaches off main, which is
+          # disjoint from step 1's commits. On a force-push whose old head is still here it also
+          # holds the commits the push dropped, which stay public by SHA.
+          snapshot "$earlier"
+          echo "step 2, earlier pushes: $(count "$earlier") commit(s) walked, $files added or changed file(s) under ${#roots[@]} commit root(s)."
+          if [ "${#roots[@]}" -gt 0 ]; then
+            # .github/workflows always holds text, this file included, so a range of binary files
+            # alone cannot trip the zero-files refusal, at a fraction of a tip scan's cost.
+            python scripts/security/scan_forbidden.py --path .github/workflows "${roots[@]}" || { r=$?; [ "$rc" -ne 0 ] || rc=$r; }
+          fi
+          exit "$rc"
       - name: Say what a failure here does and does not mean
         if: failure()
         run: |
