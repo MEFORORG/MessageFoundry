@@ -123,14 +123,21 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
+**Caution: the published web console 0.5.0 wheel refuses engine 0.5.3.** Engine 0.5.3 moved the UI
+seam, and when it was released no console release supported it. Installed as
+`messagefoundry==0.5.3` beside `messagefoundry-webconsole==0.5.0`, the engine refuses to start
+while the console is on. The caution in
+[INSTALL-GUIDE.md, *Launching the admin console*](https://github.com/MEFORORG/MessageFoundry/blob/v0.5.3/docs/INSTALL-GUIDE.md#launching-the-admin-console-in-a-browser)
+says what works until one ships.
+
 **Web console 0.5.0 is the one that pairs with engine 0.5.2.** The browser console
 (`/ui`) ships as its own wheel, `messagefoundry-webconsole`, with its own version numbers. It does
 not share the engine's version, so do not pin the console at the engine's version. The engine
 mounts a console only if it was built against this engine's UI seam, the version of the interface
 between the two. Console 0.5.0 was built against engine 0.5.2's seam, which differs from the seam
 engines 0.5.0 and 0.5.1 shared with console 0.4.0. Console 0.5.0 is published after engine 0.5.2,
-under its own `webconsole-v0.5.0` tag. Pin the pair: `messagefoundry==0.5.2` with
-`messagefoundry-webconsole==0.5.0`. Without that console, engine 0.5.2 behaves like this:
+under its own `webconsole-v0.5.0` tag. Pin both versions, as a pair whose seams match. Without that
+console, engine 0.5.2 behaves like this:
 
 - **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
   set `[security].serve_web_console = true`, it refuses to start instead.

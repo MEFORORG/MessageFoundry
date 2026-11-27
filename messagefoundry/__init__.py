@@ -121,7 +121,7 @@ if TYPE_CHECKING:
     )
 
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 #: Every name in ``__all__`` except ``__version__``, mapped to the module that defines it.
 #: Grouped and ordered to mirror the ``TYPE_CHECKING`` block above, so the two are reviewable

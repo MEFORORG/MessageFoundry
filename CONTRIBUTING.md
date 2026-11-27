@@ -260,17 +260,31 @@ version.
      `requirements.txt` line in the INSTALL-GUIDE layout diagram;
    - the phrases *console for engine `<version>`* and *built for engine `<version>`*, which sit
      beside the web console pins in `docs/INSTALL-GUIDE.md` and `docs/USER-GUIDE.md`, and any
-     *engine `<version>` wheel* phrase. They move with the engine.
+     *engine `<version>` wheel* phrase. They move with the engine. Where the seam moved, a
+     *for engine* phrase that would then pair the published console with the new engine is false:
+     reword it as item 5 says, rather than move it.
 
    The test sweeps all six documents `docs/README.md` lists under *Start here*, so an engine pin,
    console pin or *for engine* phrase added to any of them is held too. A `$V` line is held only in
    the two guides named above. Run the test after the bump.
 5. The console pairing prose. **Check the UI seam first** (below). Move the engine pin in the
-   pairing install line of `README.md` and of `packaging/messagefoundry-webconsole/README.md` on
-   every bump: the same test holds both to `__version__`, so they cannot wait. The console pin
+   console paragraph of `README.md` and in the pairing install line of
+   `packaging/messagefoundry-webconsole/README.md` on every bump: the same test holds both to
+   `__version__`, so they cannot wait. Where the seam moved, the `README.md` pin sits in the caution
+   below, and the install line carries a comment that it refuses. The console pin
    beside each stays, as *does not move* says. Only if the seam did not move, move by hand the
    engine versions that prose names as sharing the console's seam. Move the engine version in the
-   *Admin console* section of `docs/SERVICE.md` on every bump. No test holds those.
+   *Admin console* section of `docs/SERVICE.md` on every bump where the seam did not move, and the
+   engine wheel name in that file's `install-service.ps1 -EngineWheel` example on every bump. No
+   test holds those. **If the seam moved**, write one caution, in *Launching the admin console* in
+   `docs/INSTALL-GUIDE.md`: the published console refuses the new engine, and what works until a
+   console release that supports it ships. Every other document that names the pairing, at least
+   the ones this item and item 4 name, `docs/EARLY-ADOPTER-GUIDE.md` and the `CHANGELOG.md` version
+   preamble, says so in a line that points there. A later engine bump before that console release
+   moves the engine version in the caution and every pointer. The console release removes the
+   caution and every pointer, except the released `CHANGELOG.md` section, which stays as written,
+   and rewrites the comment beside each console pin, which no test holds, to name the engine it
+   pairs with; in `README.md` it restores a pairing line that names both pins.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the
@@ -282,7 +296,7 @@ What an engine bump does not move:
 - **The `messagefoundry-webconsole==` pins.** The console has its own version line, and the same
   test holds the pins in the documents it sweeps to `__version__` in
   `messagefoundry_webconsole/__init__.py`. They move when the console releases, not when the engine
-  does. A *for engine* phrase next to one still moves, under item 4.
+  does. A *for engine* phrase next to one still moves, under item 4, unless the seam moved.
 - **The early-access cautions** in `docs/INSTALL-GUIDE.md` and `docs/EARLY-ADOPTER-GUIDE.md`. They
   name no version on purpose; keep it that way.
 - Pre-release spelling examples such as `0.5.0rc1` and `v0.5.0-rc1`, and a version named as

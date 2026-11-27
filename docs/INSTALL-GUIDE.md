@@ -156,7 +156,7 @@ venv that anyone but administrators can write, as a `.venv` in your own folder u
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1                 # development only, on Linux/macOS: . .venv/bin/activate
-pip install "messagefoundry==0.5.2"          # pin the exact version (core runtime only)
+pip install "messagefoundry==0.5.3"          # pin the exact version (core runtime only)
 ```
 
 > **CAUTION: early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
@@ -189,7 +189,7 @@ the **GitHub CLI** (`gh` 2.68.0 or later is required, and 2.102.0 or later is re
 optionally `sigstore` (`pip install sigstore`); install **only** the file that passes.
 
 ```powershell
-$V = "0.5.2"   # the exact version you intend to install, as its wheel spells it
+$V = "0.5.3"   # the exact version you intend to install, as its wheel spells it
 # Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
 $TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 
@@ -236,7 +236,7 @@ re-resolve the package name against the folder at install time, or `pip` could s
 different file than the one you just checked:
 
 ```powershell
-$V = "0.5.2"
+$V = "0.5.3"
 # Its tag's spelling. A pre-release wheel says 0.5.0rc1, while its tag is v0.5.0-rc1.
 $TagVersion = $V -replace '^(\d+\.\d+\.\d+)((a|b|rc)\d+)$', '$1-$2'
 pip download "messagefoundry==$V" --no-deps -d .\verify
@@ -292,7 +292,7 @@ my-config-repo/
 ├─ environments/prod.toml
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
-├─ requirements.txt                # pins the engine:  messagefoundry==0.5.2
+├─ requirements.txt                # pins the engine:  messagefoundry==0.5.3
 ├─ requirements-dev.txt            # pins the toolkit at the same version, for authoring machines only
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
@@ -425,10 +425,21 @@ It ships as a separate wheel (`messagefoundry-webconsole`) on its **own version 
 *not* lockstep with the engine — that the engine mounts in-process. The pair is checked at startup
 against the engine's UI-seam version and a mismatched pair is **refused**, so install the console
 release built for the engine version you pinned. The console is **on by default**, so on a local
-instance installing it is all you need:
+instance installing a console that matches the engine is all you need.
+
+> **Caution: there is no published console for engine 0.5.3 yet.** Engine 0.5.3 moved the UI seam
+> to `2fdef0ec34ace13d`. The published `messagefoundry-webconsole` 0.5.0 wheel supports only engine
+> 0.5.2's seam, `6d8b36eb7bb94bf0`, so with that wheel installed and the console on, engine 0.5.3
+> refuses to start. Until a console release that supports engine 0.5.3 ships, run engine 0.5.3 with
+> `[security].serve_web_console = false`, or with no console installed, which serves the JSON API
+> only unless `[security].serve_web_console = true` is set explicitly, in which case it refuses to
+> start. A console installed from the `v0.5.3` source checkout
+> (`pip install -e packaging/messagefoundry-webconsole`) also reports version 0.5.0 but supports
+> engine 0.5.3's seam; it is built from source, not the published wheel. The published wheel below
+> pairs with engine 0.5.2.
 
 ```powershell
-pip install "messagefoundry-webconsole==0.5.0"    # the /ui web console for engine 0.5.2, into the same venv
+pip install "messagefoundry-webconsole==0.5.0"    # the published /ui web console wheel; pairs with engine 0.5.2 (see the caution above), into the same venv
 # then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```

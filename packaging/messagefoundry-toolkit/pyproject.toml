@@ -66,7 +66,7 @@ dependencies = [
     # (corepoint_import). anon/ imports only the stdlib, the engine's own `parsing` and this
     # package's generators/_hl7data.py. A change to the engine's core set must be checked against
     # them.
-    "messagefoundry==0.5.2",
+    "messagefoundry==0.5.3",
 ]
 
 [project.scripts]
