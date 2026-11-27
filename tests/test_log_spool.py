@@ -1796,9 +1796,11 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """And the control: a directory another process holds is NOT named, because that process sends
-    what it holds. Its WARNING names the remedy instead, a different ``[logging].forward_spool_dir``
-    (BACKLOG #5400); an unusable directory's does not, since a directory of its own does not cure
-    that. Either way the opener returns ``None``, so the forwarder runs without a spool (#1966)."""
+    what it holds. Its WARNING names the remedy instead (BACKLOG #5400): for a second start of the
+    same service, stop one of them; for a different service, give THIS process, not the one holding
+    the lock, its own ``[logging].forward_spool_dir``. An unusable directory's does not, since a
+    directory of its own does not cure that. Either way the opener returns ``None``, so the
+    forwarder runs without a spool (#1966)."""
     from messagefoundry.config.settings import load_settings
 
     # The names the remedy gives are the real ones: the variable reaches the setting.
@@ -1816,20 +1818,39 @@ def test_a_spool_that_cannot_be_opened_names_the_segments_it_strands(
     assert "[logging].forward_spool_dir" in in_use.getMessage()
     assert "MEFOR_LOGGING_FORWARD_SPOOL_DIR" in in_use.getMessage()
     message = in_use.getMessage()
-    # Moving a duplicate start of one service would strand its segments, so that case says stop,
-    # and it comes first: a duplicate start also meets the other remedy's condition.
-    duplicate = message.index("second start of the same service, stop the duplicate")
-    assert "would strand the segments already in it" in message
-    assert "then restart this one once the other has exited" in message
-    assert "until it restarts, this process runs without a spool" in message
-    other = message.index("If a different service or deployment shares this directory")
-    assert duplicate < other
-    assert "as an absolute path" in message
-    # In a supervise deployment the setting is the root every process's directory sits under
-    # (``__main__._forward_spool_root``), so moving it for one process strands the others.
+    _, prefix, remedy = message.partition("off-box log forwarding runs without an on-disk spool")
+    assert prefix, message
+    # For a second start of one service, moving the lock holder would strand its segments and
+    # moving this one would leave both starts running, so that case says stop one of them, and it
+    # comes first, ahead of the remedy that moves a directory. Nothing in it tells the operator to
+    # move every process but one: "each of the others" was the wording that did.
+    assert remedy.startswith(
+        ". If this is a second start of the same service, stop one of them; if you stop the other "
+        "one, restart this one once it has exited"
+    )
+    assert "each of the others" not in remedy
+    assert "until it restarts this process runs without a spool" in remedy
     assert (
-        "Never change it for one process of a supervise deployment, whose engine shards and "
-        "supervisor share that root." in message
+        "moving the one holding the lock would strand the segments already in this directory, and "
+        "moving this one would leave both starts running." in remedy
+    )
+    # A different service: THIS process could not take the lock, so this run wrote no segments
+    # there, and moving it strands nothing of the other's. Moving the one holding the lock would
+    # strand its unsent ones.
+    assert (
+        "If a different service or deployment shares this directory, give this process its own "
+        "[logging].forward_spool_dir" in remedy
+    )
+    assert "as an absolute path, and restart it." in remedy
+    assert (
+        "Leave the process holding the lock where it is, because moving that one would strand "
+        "its unsent segments." in remedy
+    )
+    # In a supervise deployment the setting is the root every process's directory sits under
+    # (``__main__._forward_spool_root``), so changing it under a running one strands the others.
+    assert (
+        "Never change the root of a running supervise deployment, whose engine shards and "
+        "supervisor share that root." in remedy
     )
     assert message.endswith(".")
     earlier.close()
