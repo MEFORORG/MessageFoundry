@@ -28,12 +28,14 @@ _REPO = Path(__file__).resolve().parents[1]
 
 _WORKFLOW = "branch-leak-scan.yml"
 _STEP = "Scan the pushed tree and every pushed commit for forbidden content"
+_STEP2 = "Rescan the commits earlier pushes added"
+_SENTINEL = ".github/workflows/branch-leak-scan.yml"
 _ZERO = "0" * 40
 _MARKER = "SYNTHETIC-LEAK-MARKER"
 
 #: Reports each scanned file holding the marker, by its path relative to the scan root it came from,
 #: and exits 1 on any hit. Every call's arguments are logged so a row can tell the tip scan from the
-#: range scan.
+#: range scan. A named root that does not exist exits 2, as the real scanner's unreadable path does.
 _STUB = f"""#!/usr/bin/env bash
 shift
 echo "$*" >> "$SCAN_LOG"
@@ -41,6 +43,7 @@ echo "$*" >> "$SCAN_LOG"
 shift
 hit=0
 for root in "$@"; do
+  [ -e "$root" ] || {{ echo "missing root $root" >&2; exit 2; }}
   while IFS= read -r -d '' f; do
     if grep -q '{_MARKER}' "$f"; then echo "HIT ${{f#"$root"/}}"; hit=1; fi
   done < <(find "$root" -path "$root/.git" -prune -o -type f -print0)
@@ -53,11 +56,14 @@ def _steps() -> list[dict]:
     return jobs_of(_WORKFLOW)["branch-leak-scan"]["steps"]
 
 
-def _body() -> str:
-    matches = [s for s in _steps() if s.get("name") == _STEP]
-    assert len(matches) == 1, f"expected one step named {_STEP!r}, found {len(matches)}"
-    step = matches[0]
-    body = str(step["run"])
+def _step(name: str) -> dict:
+    matches = [s for s in _steps() if s.get("name") == name]
+    assert len(matches) == 1, f"expected one step named {name!r}, found {len(matches)}"
+    return matches[0]
+
+
+def _body(name: str = _STEP) -> str:
+    body = str(_step(name)["run"])
     assert "${{" not in body, "the scan body interpolates an Actions expression"
     return body
 
@@ -90,7 +96,10 @@ class _Repo:
         _git(self.path, "config", "user.email", "test@example.invalid")
         _git(self.path, "config", "user.name", "test")
         _git(self.path, "config", "core.autocrlf", "false")
-        self.main = _commit(self.path, "base", {"README.md": "clean\n"})
+        # Step 2 names the workflow file as its always-text root, so the stand-in repo carries one.
+        self.main = _commit(
+            self.path, "base", {"README.md": "clean\n", _SENTINEL: "name: stand-in\n"}
+        )
         _git(self.path, "update-ref", "refs/remotes/origin/main", self.main)
         _git(self.path, "switch", "-q", "-c", "feature")
 
@@ -102,16 +111,15 @@ def bash(tmp_path_factory: pytest.TempPathFactory) -> str:
     return require_bash(tmp_path_factory.mktemp("bash-probe"))
 
 
-def _run(
-    bash: str, repo: Path, tmp_path: Path, before: str, after: str
-) -> tuple[int, str, list[str]]:
+def _run_steps(
+    bash: str, repo: Path, tmp_path: Path, before: str, after: str, *, steps: tuple[str, ...] = ()
+) -> tuple[list[int], str, list[str]]:
+    """Run step 1 then step 2, as the job does: step 2 runs whatever step 1 returned."""
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir(exist_ok=True)
     stub = stub_dir / "python"
     stub.write_text(_STUB, encoding="utf-8", newline="\n")
     stub.chmod(0o755)
-    script = tmp_path / "scan.sh"
-    script.write_text(_body(), encoding="utf-8", newline="\n")
     log = tmp_path / "scan.log"
     log.write_text("", encoding="utf-8")
     runner_temp = tmp_path / "runner-temp"
@@ -133,16 +141,31 @@ def _run(
         [bash, "-c", "command -v python"], capture_output=True, text=True, timeout=60, env=env
     ).stdout.strip()
     assert stub_dir.name in which.replace("\\", "/"), f"the python stub lost to {which!r}"
-    proc = subprocess.run(
-        [bash, "-e", script.as_posix()],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-    )
+    rcs: list[int] = []
+    out = ""
+    for i, name in enumerate(steps or (_STEP, _STEP2)):
+        script = tmp_path / f"step{i}.sh"
+        script.write_text(_body(name), encoding="utf-8", newline="\n")
+        proc = subprocess.run(
+            [bash, "-e", script.as_posix()],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        rcs.append(proc.returncode)
+        out += proc.stdout + proc.stderr
     calls = log.read_text(encoding="utf-8").splitlines()
-    return proc.returncode, proc.stdout + proc.stderr, calls
+    return rcs, out, calls
+
+
+def _run(
+    bash: str, repo: Path, tmp_path: Path, before: str, after: str
+) -> tuple[int, str, list[str]]:
+    """The job's verdict: red when either step is, with step 1's code first."""
+    rcs, out, calls = _run_steps(bash, repo, tmp_path, before, after)
+    return next((rc for rc in rcs if rc), 0), out, calls
 
 
 def _leak_then_remove(repo: _Repo) -> tuple[str, str]:
@@ -166,15 +189,18 @@ def test_content_added_then_removed_in_one_push_is_found(bash: str, tmp_path: Pa
 def test_a_new_branch_scans_everything_not_on_main(bash: str, tmp_path: Path) -> None:
     repo = _Repo(tmp_path)
     _leaked, removed = _leak_then_remove(repo)
-    rc, out, _ = _run(bash, repo.path, tmp_path, _ZERO, removed)
+    rc, out, calls = _run(bash, repo.path, tmp_path, _ZERO, removed)
     assert rc == 1, f"rc={rc}\n{out}"
+    assert len(calls) == 1, f"step 1 already walked everything, so step 2 has nothing: {calls}"
+    assert "step 2, earlier pushes: 0 commit(s)" in out, out
 
 
 def test_a_force_push_with_an_unknown_before_falls_back_to_main(bash: str, tmp_path: Path) -> None:
     repo = _Repo(tmp_path)
     _leaked, removed = _leak_then_remove(repo)
-    rc, out, _ = _run(bash, repo.path, tmp_path, "f" * 40, removed)
+    rc, out, calls = _run(bash, repo.path, tmp_path, "f" * 40, removed)
     assert rc == 1, f"rc={rc}\n{out}"
+    assert len(calls) == 1, f"step 1 already walked everything, so step 2 has nothing: {calls}"
 
 
 def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
@@ -190,18 +216,45 @@ def test_a_later_push_rescans_an_earlier_push_whose_run_never_finished(
     assert "HIT docs/security/note.md" in out, out
     assert len(calls) == 2, calls
     assert calls[0] == "--path .", f"step 1 adds nothing but the tip: {calls}"
-    assert calls[1].startswith("--path .github/workflows ") and leaked in calls[1], calls
+    assert calls[1].startswith(f"--path {_SENTINEL} ") and leaked in calls[1], calls
 
 
-def test_a_step_one_hit_still_runs_step_two(bash: str, tmp_path: Path) -> None:
-    """One red reports both ranges, and step 1's status is kept."""
+def test_each_step_reports_its_own_range(bash: str, tmp_path: Path) -> None:
+    """Step 1's verdict is its own step's conclusion, never deferred behind step 2's."""
     repo = _Repo(tmp_path)
     leaked, removed = _leak_then_remove(repo)
     after = _commit(repo.path, "again", {"b.txt": f"{_MARKER}\n"})
-    rc, out, calls = _run(bash, repo.path, tmp_path, removed, after)
-    assert rc == 1, f"rc={rc}\n{out}"
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, removed, after)
+    assert rcs == [1, 1], f"rcs={rcs}\n{out}"
     assert len(calls) == 2 and after in calls[0] and leaked in calls[1], calls
     assert "HIT b.txt" in out and "HIT docs/security/note.md" in out, out
+
+
+def test_a_step_one_hit_with_clean_earlier_pushes_reds_only_step_one(
+    bash: str, tmp_path: Path
+) -> None:
+    repo = _Repo(tmp_path)
+    first = _commit(repo.path, "one", {"a.txt": "x\n"})
+    after = _commit(repo.path, "two", {"b.txt": f"{_MARKER}\n"})
+    rcs, out, _ = _run_steps(bash, repo.path, tmp_path, first, after)
+    assert rcs == [1, 0], f"rcs={rcs}\n{out}"
+
+
+def test_step_two_without_step_one_s_record_fails_closed(bash: str, tmp_path: Path) -> None:
+    """No recorded range is not an empty range."""
+    repo = _Repo(tmp_path)
+    leaked, removed = _leak_then_remove(repo)
+    rcs, out, calls = _run_steps(bash, repo.path, tmp_path, leaked, removed, steps=(_STEP2,))
+    assert rcs == [2] and not calls, f"rcs={rcs}, calls={calls}\n{out}"
+
+
+def test_step_two_runs_after_a_failed_step_one_under_its_own_timeout() -> None:
+    names = [s.get("name") for s in _steps()]
+    assert names.index(_STEP2) == names.index(_STEP) + 1, names
+    step2 = _step(_STEP2)
+    assert step2.get("if") == "${{ !cancelled() }}", step2.get("if")
+    job_limit = jobs_of(_WORKFLOW)["branch-leak-scan"]["timeout-minutes"]
+    assert 0 < step2["timeout-minutes"] < job_limit, (step2.get("timeout-minutes"), job_limit)
 
 
 def test_a_clean_branch_with_earlier_pushes_passes(bash: str, tmp_path: Path) -> None:
@@ -270,6 +323,7 @@ def test_a_malformed_push_sha_fails_closed(side: str, bad: str, bash: str, tmp_p
     before, after = (bad, head) if side == "before" else (repo.main, bad)
     rc, out, calls = _run(bash, repo.path, tmp_path, before, after)
     assert rc == 2 and not calls, f"rc={rc}, calls={calls}\n{out}"
+    assert "step 1 recorded no earlier range" in out, out
 
 
 def test_no_push_scan_is_cancelled_by_a_later_one() -> None:
