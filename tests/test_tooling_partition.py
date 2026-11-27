@@ -171,7 +171,9 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # Reads docker/Dockerfile's ENTRYPOINT and rglobs messagefoundry/**.py, and holds ci.yml's
         # `docker` path arm to the named engine start-path modules (vault BACKLOG #3455). What
         # breaks it includes at least a start-path module renamed or removed, an ENGINE diff, and an
-        # ENTRYPOINT edit, a docker/ diff. Neither of those trips the tooling path gate.
+        # ENTRYPOINT edit, a docker/ diff. Neither of those trips the tooling path gate. It also
+        # holds two tests of tests/_workflow_contexts.py, an edit to which alone trips no tooling
+        # arm either (BACKLOG #5472).
         "test_ci_docker_gate.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and

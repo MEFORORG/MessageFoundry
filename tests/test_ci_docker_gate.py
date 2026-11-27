@@ -306,8 +306,9 @@ _COPY = re.compile(
 )
 
 
-#: The start of a heredoc on an instruction line: ``<<EOF``, ``<<-EOF`` or a quoted word.
-_HEREDOC = re.compile(r"""<<-?["']?(?P<word>\w+)["']?""")
+#: The start of a heredoc on an instruction line: ``<<EOF``, ``<<-EOF`` or a quoted word. Not a
+#: here-string (``<<<``), and not a shift such as ``1<<2``, whose word does not start with a letter.
+_HEREDOC = re.compile(r"""(?<!<)<<-?["']?(?P<word>[A-Za-z_][\w-]*)["']?""")
 
 
 def _checkout_sources_copied(dockerfile: str) -> list[str]:
@@ -317,7 +318,8 @@ def _checkout_sources_copied(dockerfile: str) -> list[str]:
     a trailing backslash, the default escape character. Comment lines go first, as Docker drops
     them before it joins continuations, and a heredoc body is skipped, so neither is read as an
     instruction. A leading ``./`` is dropped from a source. A ``--from`` copy reads another build
-    stage, not the checkout, so it is skipped. Not read, at least: a heredoc SOURCE, and a
+    stage, not the checkout, so it is skipped. Blank lines go too: Docker skips one inside a
+    continuation. Not read, at least: a heredoc SOURCE, and a
     ``# escape=`` directive that changes the escape character.
     """
     kept: list[str] = []
@@ -327,7 +329,7 @@ def _checkout_sources_copied(dockerfile: str) -> list[str]:
             if line.strip() == terminator:
                 terminator = None
             continue
-        if line.lstrip().startswith("#"):
+        if line.lstrip().startswith("#") or not line.strip():
             continue
         kept.append(line)
         heredoc = _HEREDOC.search(line)
@@ -378,6 +380,10 @@ def _root_files_the_image_copies() -> set[str]:
         ("# see C:\\\nCOPY LICENSE ./\n", ["LICENSE"]),
         ("COPY ./README.md ./messagefoundry ./\n", ["README.md", "messagefoundry"]),
         ("RUN <<EOF\ncopy NOTICE /tmp/x\nEOF\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("RUN <<END-OF-FILE\nadd x y\nEND-OF-FILE\nCOPY LICENSE ./\n", ["LICENSE"]),
+        ("RUN echo $((1<<2))\nCOPY CHANGELOG.md ./\n", ["CHANGELOG.md"]),
+        ("RUN cat <<<hello\nCOPY CHANGELOG.md ./\n", ["CHANGELOG.md"]),
+        ("COPY README.md \\\n\n    CHANGELOG.md ./\n", ["README.md", "CHANGELOG.md"]),
     ],
 )
 def test_the_copy_reader_on_planted_dockerfiles(dockerfile: str, expected: list[str]) -> None:
@@ -458,4 +464,6 @@ def test_a_parsed_workflow_is_a_fresh_copy_each_call() -> None:
     second = workflow_contexts.load_workflow("ci.yml")
     assert first == second
     assert first is not second
-    assert first["jobs"] is not second["jobs"]
+    first["jobs"]["changes"]["steps"].append({"planted": True})
+    again = workflow_contexts.load_workflow("ci.yml")
+    assert again == second, "a mutation of one caller's parse reached the next caller's"

@@ -93,7 +93,9 @@ WORKDIR /src
 COPY ci/locks/release-tools.lock /tmp/release-tools.lock
 RUN python -m pip install --require-hashes -r /tmp/release-tools.lock
 # Only what the wheel build needs (version is single-sourced from messagefoundry/__init__.py; PEP 639
-# license-files are LICENSE + NOTICE). Copying these before the package keeps the layer cache warm.
+# license-files are LICENSE, NOTICE and messagefoundry/_vendor/defusedxml/LICENSE, the last copied
+# with the package). Copying these before the package keeps the layer cache warm. CORRECTED
+# 2026-11-26 (BACKLOG #5472): this read "license-files are LICENSE + NOTICE".
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY messagefoundry ./messagefoundry
 RUN python -m build --wheel --outdir /wheels .

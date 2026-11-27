@@ -47,6 +47,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 
 
+@functools.cache
 def _gate_regex() -> str:
     """Pull the tooling arm's `grep -qE '...'` pattern out of the workflow.
 

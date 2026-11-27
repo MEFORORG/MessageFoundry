@@ -264,8 +264,9 @@ def _engine_modules_imported_by(text: str) -> dict[str, str]:
     ``importlib.import_module``. The ``tests/`` helpers a suite imports are not followed HERE: this
     reads one source, and ``_helpers_reached_by_server_db_suites`` hands it each helper. Measured
     2026-11-23: ``messagefoundry/__init__.py``, ``messagefoundry/auth/__init__.py`` and
-    ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route, and the
-    ``serverdb`` regex admits none of them. Closing that is a ``ci.yml`` edit, not made here.
+    ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route; the
+    ``serverdb`` regex admits all three since #5472, and ``messagefoundry_toolkit/__init__.py``,
+    reached the same way. CORRECTED 2026-11-26: this read "admits none of them".
     """
     modules: list[str] = []
     for node in ast.walk(ast.parse(text)):
@@ -355,12 +356,20 @@ def _helpers_reached_by_server_db_suites() -> frozenset[str]:
 
 
 def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
-    """Each ``messagefoundry`` module those suites, or the helpers they reach, import, by path."""
+    """Each ``messagefoundry`` module those suites, or the helpers they reach, import, by path.
+
+    A fresh dict over one memoised scan, so a caller may change what it gets.
+    """
+    return dict(_engine_scan())
+
+
+@functools.cache
+def _engine_scan() -> tuple[tuple[str, str], ...]:
     paths: dict[str, str] = {}
     for path in sorted(_server_db_suite_files() | _helpers_reached_by_server_db_suites()):
         text = (REPO_ROOT / path).read_text(encoding="utf-8")
         paths.update(_engine_modules_imported_by(text))
-    return paths
+    return tuple(paths.items())
 
 
 @pytest.mark.parametrize(
@@ -394,11 +403,19 @@ def test_serverdb_path_gate_admits_every_tests_helper_those_suites_import() -> N
     """
     pattern = _serverdb_full_pattern()
     helpers = _helpers_reached_by_server_db_suites()
-    assert len(helpers) >= 50, (
-        f"the helper scan reached {len(helpers)} files, under the 64 measured on 2026-11-26; "
+    assert len(helpers) >= 100, (
+        f"the helper scan reached {len(helpers)} files, under the 107 measured on 2026-11-26; "
         "either it or the step parsing in _files_run_by_server_db_steps has drifted"
     )
-    assert "tests/_session_seal_contract.py" in helpers, sorted(helpers)
+    # One sentinel per route the scan follows: a tests.* import, a bare sys.path name, a harness.*
+    # import, and the conftest seed. Dropping any one route reds here, whatever the count.
+    sentinels = {
+        "tests/_session_seal_contract.py",
+        "tests/_failover_load_support.py",
+        "harness/load/failover.py",
+        "tests/conftest.py",
+    }
+    assert sentinels <= helpers, f"the scan lost a route: {sorted(sentinels - helpers)}"
     missed = sorted(path for path in helpers if not pattern.match(path))
     assert not missed, (
         f"{len(missed)} tests/ file(s) a SQL Server / PostgreSQL suite imports are not matched by "
@@ -563,7 +580,20 @@ def test_the_serverdb_gate_still_refuses_unrelated_paths() -> None:
     """
     pattern = _serverdb_full_pattern()
 
-    never_engine = [path for path in ("README.md", "docs/BACKLOG.md") if pattern.match(path)]
+    never_engine = [
+        path
+        for path in (
+            "README.md",
+            "docs/BACKLOG.md",
+            # SHAPE probes for the helper arms #5472 added: each matches only if an arm loses its
+            # `$`, or widens to the whole of tests/ or harness/.
+            "tests/_live_scratch.py.orig",
+            "tests/fixtures/_x.py",
+            "tests/test_retention.py",
+            "harness/window.py",
+        )
+        if pattern.match(path)
+    ]
     assert not never_engine, (
         f"the `serverdb` regex admits {never_engine}, which no server-DB leg asserts against — the "
         "source arms have over-widened"
