@@ -39,7 +39,6 @@ those). Every other cipher error fails the read, as it did before #5970.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import functools
 import inspect
@@ -61,11 +60,10 @@ from messagefoundry.store.crypto import (
     UnauthenticatedCipherError,
     UnmarkedCipherError,
     cell_aad,
-    cipher_blocks_on_io,
     gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import is_tag_failure
-from messagefoundry.store.row_seal import cipher_call, seal_bytes
+from messagefoundry.store.row_seal import seal_bytes
 
 if TYPE_CHECKING:
     from messagefoundry.store.crypto import Cipher
@@ -93,7 +91,6 @@ __all__ = [
     "open_listed_cell",
     "open_message_cell",
     "open_message_record",
-    "open_message_record_off_loop",
     "open_preset_criteria",
     "open_tagged_cell",
     "preset_criteria_aad",
@@ -469,7 +466,7 @@ def open_message_cell(
 def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
     """Open a whole ``messages`` row's cells in place, each under the tag its row's id and channel
     build (ASVS 11.3.3, BACKLOG #2593), so a cell that fails that tag refuses the whole read. Every
-    backend's ``get_message`` runs it through :func:`open_message_record_off_loop` (BACKLOG #5981)."""
+    backend's ``get_message`` runs it through ``asyncio.to_thread`` (BACKLOG #5981)."""
     for column in MESSAGE_TAG_CELLS:
         record[column] = open_message_cell(
             cipher,
@@ -478,20 +475,6 @@ def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
             message_id=record["id"],
             channel_id=record["channel_id"],
         )
-
-
-async def open_message_record_off_loop(cipher: Cipher, record: dict[str, Any]) -> None:
-    """:func:`open_message_record`, never on the event loop (BACKLOG #5981).
-
-    Under a cipher that blocks on I/O (``vault_transit``) it runs on the Transit pool, through
-    :func:`~messagefoundry.store.row_seal.cipher_call`, as the store's other cell opens do. So a
-    slow Vault fills that bounded pool, not asyncio's default executor. Under any other cipher it
-    runs through :func:`asyncio.to_thread`: the record holds the raw body, so opening it inline
-    would hold the loop for the length of the body."""
-    if cipher_blocks_on_io(cipher):
-        await cipher_call(cipher, open_message_record, cipher, record)
-    else:
-        await asyncio.to_thread(open_message_record, cipher, record)
 
 
 def open_preset_criteria(

@@ -3,9 +3,12 @@
 """BACKLOG #5981, #5969: the message reads behind the API's message routes.
 
 Two halves. First, under the ``vault_transit`` cipher every cell decrypt is a Transit HTTP round
-trip. So the message list, ``get_message`` and the per-message sub-reads make their Transit calls
-on the Transit pool, never on the event loop. The sub-reads are ``events_for``, ``outbox_for`` and
-``outbox_payloads_for``. All three backends are pinned. The SQLite store is driven for real. The
+trip. So the message list and the per-message sub-reads make their Transit calls on the Transit
+pool, never on the event loop. The sub-reads are ``events_for``, ``outbox_for`` and
+``outbox_payloads_for``. ``get_message`` is pinned off the loop only: it opens its record through
+:func:`asyncio.to_thread`, so its pool check is off. Moving it onto the Transit pool is not done
+here, because that bounded pool also carries the row sealer's authorization checks, and a slow
+Vault would then queue those behind message opens. All three backends are pinned. The SQLite store is driven for real. The
 Postgres and SQL Server stores have their database calls faked, as in
 ``tests/test_store_transit_off_loop_servers.py``. That file holds the measuring helper these reuse,
 and the negative controls that show its three checks fire; they run there, not here.
@@ -165,7 +168,7 @@ async def test_a_server_outbox_payload_read_decrypts_off_the_loop(cls: type[Any]
 async def test_a_server_get_message_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit, cipher = _transit()
     store = _prepare(cls, cipher, [_message_row(cipher, "m1")])
-    row = await _measure(transit, lambda: store.get_message("m1"))
+    row = await _measure(transit, lambda: store.get_message("m1"), pool=False)
     assert (row["raw"], row["error"], row["summary"], row["metadata"]) == (_RAW, "boom", "S", "{}")
 
 
@@ -198,7 +201,10 @@ async def test_the_sqlite_message_reads_decrypt_off_the_loop(tmp_path: Path) -> 
             "payloads": lambda: store.outbox_payloads_for(mid),
             "message": lambda: store.get_message(mid),
         }
-        got = {name: await _measure(transit, read) for name, read in reads.items()}
+        got = {
+            name: await _measure(transit, read, pool=name != "message")
+            for name, read in reads.items()
+        }
         # The list is metadata only: it fetches no body, so it opens none.
         assert sorted(r["id"] for r in got["list"]) == sorted(mids)
         assert all("raw" not in r and r["summary"] == "S" for r in got["list"])

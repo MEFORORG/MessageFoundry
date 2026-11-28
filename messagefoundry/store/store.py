@@ -116,7 +116,7 @@ from messagefoundry.store.cell_tag import (
     message_cell_aad,
     open_listed_cell,
     open_message_cell,
-    open_message_record_off_loop,
+    open_message_record,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
@@ -18977,7 +18977,7 @@ class MessageStore:
             return None
         record = dict(row)
         # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
-        await open_message_record_off_loop(self._cipher, record)
+        await asyncio.to_thread(open_message_record, self._cipher, record)
         return record
 
     async def message_channel_id(self, message_id: str) -> str | None:
