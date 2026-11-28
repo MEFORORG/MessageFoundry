@@ -3592,8 +3592,9 @@ async def run_engine_ladder(
     stop_poll_grace: float = 10.0,
     post_drain_grace: float = 8.0,
     soak_timeout: float = 900.0,
-    #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every engine shard PROCESS. None
-    #: ⇒ resolve from the ambient env, else the PRODUCT default (40) — never the old hardcoded 8.
+    #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every engine shard PROCESS.
+    #: None => resolve from the ambient env, else the PRODUCT default (40) -- never the
+    #: old hardcoded 8.
     store_pool_size: int | None = None,
     #: BACKLOG #5953 (S27-74): run a pool at/over the ADR 0062 cliff anyway (``--force-store-pool-size``).
     force_store_pool_size: bool = False,
@@ -3881,7 +3882,8 @@ async def run_drive_ladder(
     # The routing mode the engine box served, learned with the rest of the shape. BROADCAST until a rung
     # reports — the same "nothing served yet" posture as the zeros above, and the correct default anyway.
     routing = BROADCAST
-    # ARTIFACT 5: lanes-per-engine-shard — the OTHER half of G, learned from the same SHARDS_READY post as the shape.
+    # ARTIFACT 5: lanes per engine shard (``lanes_per_shard``) -- the OTHER half of G, learned from
+    # the same SHARDS_READY post as the shape.
     # The drive has always received it (it slices sender bands with it) and always dropped it on the floor.
     lanes_per_shard = 1
     # The EFFECTIVE sink_count. `sink_count=None` means "derive from the engine's advertised band width"
