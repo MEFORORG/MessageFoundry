@@ -238,8 +238,7 @@ and uses your user value or the default instead, until you trust the workspace (
   fallback, `messagefoundry.toml` in the workspace folder; the alert list and `cert inventory`
   check nothing for a blank value. The check reads the named path only, so a link below it is still followed, such
   as a linked folder under `configDir`. The security editor does not run this check. It makes its
-  own: it collapses a `..` rather than refusing it, except in the `.code-workspace` case below,
-  and it refuses a link anywhere on the named
+  own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
   path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space, holds a colon, or is a device name.
   The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
@@ -255,15 +254,12 @@ and uses your user value or the default instead, until you trust the workspace (
   be accepted as written; where the workspace folder reports no file id, a UNC alias of it is
   accepted as written, no looser than before; an alias whose target passes through a link the
   repository holds, at any depth (an alias onto `ws\linked\deeper`, measured), is followed where
-  that link leads, unchecked; and a link made or a folder renamed between the check and the CLI's
-  write is not seen. In a window opened from a `.code-workspace` file, which
+  that link leads, unchecked; in a `.code-workspace` window, a relative user value that leaves the
+  workspace folder by `..` is read against the folder the file chose, and is accepted as written
+  when it reaches no folder inside; and a link made or a folder renamed between the check and the
+  CLI's write is not seen. In a window opened from a `.code-workspace` file, which
   chooses the workspace folder, a path inside that folder, the default one included, is refused
-  unless the folder lies inside the folder holding the file. When it does not, a user value that is
-  not a full path and leaves the workspace folder is refused too, a `..` climb included; on
-  Windows a full path is a drive path (`C:\...`) or a UNC path naming a server and a share, so at
-  least `\x`, `\\x` and `\\\x` are not. The other writers of this setting, at least connection
-  edits and Start and Restart, do not make this check: they hand such a value to the CLI as
-  written, read from the folder the file chose (an open limit). The rules and the open limits are in the
+  unless the folder lies inside the folder holding the file. The rules and the open limits are in the
   `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
