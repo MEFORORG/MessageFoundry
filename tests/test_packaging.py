@@ -1102,7 +1102,9 @@ def test_every_lockstep_distribution_is_one_under_packaging() -> None:
     case fail on a missing file, but a dropped name would just stop being checked, so say which
     ones are expected."""
     assert set(_LOCKSTEP_DISTRIBUTIONS) <= set(_SEPARATE_DISTRIBUTIONS), _SEPARATE_DISTRIBUTIONS
-    assert "messagefoundry-webconsole" in _LOCKSTEP_DISTRIBUTIONS, _LOCKSTEP_DISTRIBUTIONS
+    assert {"messagefoundry-harness", "messagefoundry-toolkit", "messagefoundry-webconsole"} <= set(
+        _LOCKSTEP_DISTRIBUTIONS
+    ), _LOCKSTEP_DISTRIBUTIONS
 
 
 def _version_drift(pyproject: Path, engine_init: Path) -> str | None:
@@ -1126,9 +1128,10 @@ def _version_drift(pyproject: Path, engine_init: Path) -> str | None:
 
 @pytest.mark.parametrize("distribution", _LOCKSTEP_DISTRIBUTIONS)
 def test_each_lockstep_distribution_ships_at_the_engine_version(distribution: str) -> None:
-    """The toolkit and harness read the engine's ``__version__``, so they match by construction and
-    this guards that construction. The web console keeps its own literal, set by hand, and this is
-    the check that the hand edit happened."""
+    """The web console keeps its own literal, set by hand, and this is the check that the hand edit
+    happened. For the toolkit and harness, which read the engine's ``__init__.py``, the case can
+    only fail if that file has no literal; their pin tests' ``root == _ENGINE_INIT`` asserts are
+    what hold the construction itself, so do not drop those as redundant with this."""
     drift = _version_drift(_REPO / "packaging" / distribution / "pyproject.toml", _ENGINE_INIT)
     assert drift is None, drift
 

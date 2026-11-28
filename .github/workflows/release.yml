@@ -371,10 +371,9 @@ jobs:
     # was already flipped to `==` at the cutover; release.yml was missed.
     #
     # `==` is also the safe form now: a fork, or the retired private vault, still cannot release.
-    # NOT on a console tag: the console has its own job below, run on its own tag. The two numbers
-    # are the same by rule, so the engine's version check would not catch an engine release fired
-    # from `webconsole-v*`; this `if:` and the tag-spelling step below, which refuses any
-    # `webconsole-` tag, both keep it out.
+    # NOT on a console tag: the console has its own job below, run on its own tag. This `if:` keeps
+    # a `webconsole-v*` tag out; behind it, the tag-spelling step below refuses any `webconsole-`
+    # tag, and the version check, which strips only a leading `v`, cannot parse one either.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     # The two engine SBOMs it signs; the comment above `sbom-linux` says why they are built apart.
     # And the provenance gate, so nothing here is built from a commit that is not on main.

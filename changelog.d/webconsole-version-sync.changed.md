@@ -1,6 +1,6 @@
 - **The web console carries the engine's version, and every release includes it.** The web
   console now carries the engine's version, as the toolkit and the harness already did, and every
-  release ships all four at that number, the console included when it did not change. A
+  release includes all four at that number, the console included when it did not change. A
   console-only fix ships as a patch release of all four, never as a `.postN` release. The console
   keeps its own `webconsole-v*` tag, pushed by hand once the engine is on PyPI, and its own
   changelog. A test fails while the console's version differs from the engine's, and the console

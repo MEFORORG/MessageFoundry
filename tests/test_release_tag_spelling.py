@@ -110,7 +110,10 @@ def test_a_console_refusal_names_the_whole_tag_and_the_console_shape(
     assert "--source-ref" not in out, out
 
 
-@pytest.mark.parametrize("argv", [["--prefix", "webconsole-"], ["--prefix", "", "v0.5.3"], []])
+@pytest.mark.parametrize(
+    "argv",
+    [["--prefix"], ["--prefix", "webconsole-"], ["--prefix", "", "v0.5.3"], []],
+)
 def test_a_malformed_prefix_call_is_a_usage_error(argv: list[str]) -> None:
     assert main(argv) == 2
 

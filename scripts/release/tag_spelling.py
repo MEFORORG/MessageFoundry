@@ -33,7 +33,7 @@ _NUMBER = r"(?:0|[1-9][0-9]*)"
 #: The only engine tag spellings a release may carry.
 TAG = re.compile(rf"v{_NUMBER}\.{_NUMBER}\.{_NUMBER}(?:-(?:a|b|rc){_NUMBER})?")
 
-_SHAPE = "vX.Y.Z or vX.Y.Z-(a|b|rc)N"
+_SHAPES = ("vX.Y.Z", "vX.Y.Z-(a|b|rc)N")
 
 
 def allowed(tag: str, prefix: str = "") -> bool:
@@ -44,13 +44,16 @@ def allowed(tag: str, prefix: str = "") -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     prefix = ""
-    if len(args) == 3 and args[0] == "--prefix" and args[1]:
-        prefix, args = args[1], args[2:]
+    if args and args[0] == "--prefix":
+        if len(args) != 3 or not args[1]:
+            args = []
+        else:
+            prefix, args = args[1], args[2:]
     if len(args) != 1:
         print("usage: tag_spelling.py [--prefix <prefix>] <tag>", file=sys.stderr)
         return 2
     tag = args[0]
-    shape = " or ".join(f"{prefix}{s}" for s in _SHAPE.split(" or "))
+    shape = " or ".join(f"{prefix}{s}" for s in _SHAPES)
     if allowed(tag, prefix):
         print(f"tag {tag} is spelled {shape}")
         return 0

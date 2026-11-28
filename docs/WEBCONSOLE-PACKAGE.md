@@ -41,7 +41,9 @@ the extraction does and does not decouple).
   toolkit and the harness carry one version number (owner ruling 2026-11-28). Every release ships
   each of them at that number, the console included when it did not change, and a console-only fix
   ships as a patch release of all four, never as a `.postN` release. So console 0.5.3 pairs with
-  engine 0.5.3. **Nothing tags the console for you.** The engine tag does not build or publish it:
+  engine 0.5.3. Each package still reaches PyPI only through its own publish job and gate; the
+  harness's upload, for one, waits on `PUBLISH_HARNESS` (release.yml's header). **Nothing tags the
+  console for you.** The engine tag does not build or publish it:
   a maintainer pushes `webconsole-v<version>` once the engine release is on PyPI
   ([`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) step 6), and no job checks that
   the engine is there first. The console still keeps its **own** `__version__` in

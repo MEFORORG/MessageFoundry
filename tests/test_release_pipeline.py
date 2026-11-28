@@ -953,10 +953,10 @@ def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
 
     If the two guards ever overlap, an engine tag would publish the console inside the engine's run,
     where its engine floor may not yet resolve from PyPI, and a console tag would start the ENGINE
-    release from whatever commit the console tag names. The version-check steps cannot catch
-    either, because the numbers are the same by rule. Each job's tag-spelling step refuses the
-    other namespace's tag as a second guard (tests/test_release_tag_spelling.py); this test holds
-    the first.
+    release from whatever commit the console tag names. Behind these guards, each job's
+    tag-spelling step refuses the other namespace's tag (tests/test_release_tag_spelling.py), and
+    the engine's version check cannot parse a console tag; but the console's version check would
+    pass an engine tag, since the numbers are the same by rule. This test holds the first guard.
 
     Mutation: drop either ``startsWith(github.ref_name, 'webconsole-')`` clause. Red here.
     """
