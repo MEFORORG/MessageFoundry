@@ -486,10 +486,12 @@ case; a replacing stream never raises, so on serve's default stdout that escape 
 line carried `?`. The escape holds for every line the guard writes: the stdout sink's record
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
-least these. A stream with no `encoding`, or one whose `encoding` does not name the encoder it
-uses, is written as the line came, and only when that raises `UnicodeEncodeError` is the line
-written again with everything outside ASCII escaped; such a stream that writes in chunks can then
-hold the line's prefix twice. An `encoding` that is unknown or not a text encoding escapes
+least these. A stream with no `encoding` is written as the line came. One whose `encoding` names
+a codec other than the one it uses is written escaped for the named codec, so it escapes more
+than it needs to where the named codec is the narrower, and nothing where it is the wider. Either
+way, only when the write raises `UnicodeEncodeError` is the line written again with everything
+outside ASCII escaped, and such a stream that writes in chunks can then hold the line's prefix
+twice. An `encoding` that is unknown or not a text encoding escapes
 everything outside ASCII. The stream's own `errors` is never read, so a `surrogateescape` stream
 gets the log's spelling of a lone surrogate, not the byte it stood for. Where a line was escaped
 and landed, neither stage runs: the escape is counted on the rate-limited stderr format-fault

@@ -1026,6 +1026,61 @@ def test_the_last_faults_of_a_burst_are_said_at_the_next_flush_and_at_close(
     assert "could not format a record ('TypeError')" in closed and "(x1)" in closed
 
 
+def test_the_stdout_sink_says_a_bursts_last_faults_at_the_next_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The test above, on the stdout sink, whose emit writes through the guard's own write: that
+    # write must still end in the handler's flush, which is where an interval that has passed is
+    # said.
+    # NEGATIVE CONTROL: with _write_raw flushing the stream directly rather than through
+    # self.flush(), the counted fault was said only at close.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    stream = io.StringIO()
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("count %d", "a"))  # said at once
+    capsys.readouterr()
+    clock.now += 1
+    handler.emit(_record("count %d", "b"))  # counted
+    assert capsys.readouterr().err == ""
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("formats fine"))
+
+    assert "could not format a record ('TypeError')" in capsys.readouterr().err
+
+
+def test_a_stdout_with_no_flush_is_written_not_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The stdlib handler skips a stream with no flush; the stdout sink's emit, which writes through
+    # the guard, must too, or a stream that takes every write is recorded unwritable.
+    # NEGATIVE CONTROL: with _write_raw calling self.stream.flush() directly, the sink was
+    # recorded unwritable and the stop asked for.
+    class _NoFlush:
+        encoding = "utf-8"
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, text: str) -> int:
+            self.text += text
+            return len(text)
+
+    stream = _NoFlush()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("hello"))
+
+    assert events == []
+    assert stream.text == "hello\n"
+
+
 def test_the_stand_in_escapes_the_logger_name_once(tmp_path: Path) -> None:
     # The logger name is escaped for the notice and then quoted. ``repr`` on the escaped value
     # doubled every backslash the escape wrote.
@@ -1082,8 +1137,8 @@ def test_a_line_the_stream_cannot_encode_is_escaped_not_a_sink_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The stdout sink on a strict cp1252 stream, which is also the live sys.stdout, so a roll
-    # re-resolves to the same stream. The record formats; the stream refuses a character in it. The
-    # line is written again with that character escaped, nothing pages and the sink stays healthy.
+    # re-resolves to the same stream. The record formats; the stream has no byte for a character in
+    # it. The line is written with that character escaped, nothing pages and the sink stays healthy.
     # NEGATIVE CONTROL: on 53abdb235b8 the guard rolled onto the same stream, failed the re-write
     # and recorded the sink unwritable, asking for a stop, with nothing of the line on the stream.
     raw, stream = _strict_cp1252()

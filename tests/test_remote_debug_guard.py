@@ -629,8 +629,8 @@ def test_without_the_escape_a_name_outside_cp1252_needs_the_guard_to_escape_it(
 ) -> None:
     """CONTROL for the test above: the same sinks, with the name passed as it came. A printable
     character the strict cp1252 stdout cannot encode is not in the log escape's alphabet, so
-    without ``_ascii`` the stdout write fails, and the log write guard writes the line again with
-    the character escaped and says so on stderr (BACKLOG #5813). The test above asserts that
+    without ``_ascii`` the log write guard has to write the stdout line with the character
+    escaped, and says so on stderr (BACKLOG #5813). The test above asserts that
     stderr line is absent, so its stdout assertions do rest on ``_ascii``. The UTF-8 file takes
     the line either way.
 
