@@ -7,4 +7,6 @@
 
   What still prints includes at least the residuals stated in the comments on `_WIDE_DSN_PASSWORD`
   and `_DSN_MEMBER_TAIL` in `messagefoundry/secretscrub.py`; that list is not complete.
+  A `messagefoundry verify` report does not take these readings, so it still prints each value
+  above, as it did before this change; the comment above `_WIDE_DSN_PASSWORD` says why.
   (`BACKLOG #5386`)

@@ -502,9 +502,9 @@ def test_the_credential_pass_reads_only_the_work_window(monkeypatch: pytest.Monk
     # verify_leaf reads the credential pass without the masked tails (BACKLOG #5546 to #5550).
     real = secretscrub.scrub_credentials_without_tails
 
-    def spy(text: str, **kwargs: str) -> str:
+    def spy(text: str, *, placeholder: str, new_dsn_readings: bool) -> str:
         seen.append(len(text))
-        return real(text, **kwargs)
+        return real(text, placeholder=placeholder, new_dsn_readings=new_dsn_readings)
 
     monkeypatch.setattr(secretscrub, "scrub_credentials_without_tails", spy)
     text = f"PWD={_PLANTED} " + "word " * (_REDACT_WINDOW // 2)

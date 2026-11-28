@@ -1880,6 +1880,14 @@ _DSN_WIDE_SEGMENT = r"(?>" + _DSN_PLACEHOLDER_WORD + r"(?=@)|" + _DSN_EMPTY_USER
 #: The segment of the two readings batch 20010 added: the same, with :data:`_DSN_QUALIFIED_RUN`'s
 #: stop, for the reason given there.
 _DSN_QUALIFIED_WIDE_SEGMENT = _DSN_WIDE_SEGMENT.replace(_DSN_RUN_STOP, _DSN_QUALIFIED_RUN_STOP)
+# NOT IN A VERIFY DETAIL (the Lander's hold on engine PR 3397, code review).
+# ``verify_leaf.safe_detail_text``, and so ``safe_exc_detail`` and ``safe_exc_text``, read without
+# the two readings batch 20010 added here and without :data:`_DSN_MEMBER_TAIL`
+# (:func:`scrub_credentials_without_tails` says why), so a verify detail prints the shapes those
+# three readings hide wherever ``origin/main`` printed them: at least the value of each line the
+# changelog fragment for BACKLOG #5386 lists, such as ``Kv9x`` in
+# ``x postgres://ops@srv:@Kv9x@db.invalid`` and ``ss_Sec9`` in
+# ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``.
 _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+"
     r"(?:(@)[a-z0-9.\-]++(?:(?P<more_at>@)[a-z0-9.\-]++)*+)?):"
@@ -2395,6 +2403,9 @@ def _mask_member(m: re.Match[str]) -> str:
 # ``x accessToken=(Bearer Tk9~redis://ops@srv:Kv9@db`` prints
 # ``x accessToken=<redacted>:<redacted>@<redacted>``. The two readings batch 20010 added no longer
 # do (:func:`_without_new_dsn_readings`).
+#
+# A verify detail reads without this pass: the comment above :data:`_WIDE_DSN_PASSWORD` says what
+# that prints.
 _DSN_MEMBER_TAIL = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]++://[^\s:/@]++):(?=[^\s/@]*?;"
     + _MEMBER_KEY_RUN
@@ -2715,26 +2726,56 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     return _scrub_credentials(text, placeholder, folded)
 
 
-def scrub_credentials_without_tails(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+def scrub_credentials_without_tails(
+    text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER, new_dsn_readings: bool = True
+) -> str:
     """:func:`scrub_credentials` as it read before the masked tails and the key-block pass, for a
-    caller that compares the two readings itself (``support/redact.py``)."""
+    caller that compares the two readings itself (``support/redact.py``).
+
+    ``new_dsn_readings`` False also leaves out the three DSN readings batch 20010 added (BACKLOG
+    #5386): the JDBC member-tail pass (:data:`_DSN_MEMBER_TAIL`), and in the widened pass a user
+    holding a second "@" and the "@" signs after ``user@host:`` (:func:`_without_new_dsn_readings`).
+    So the DSN passes read as they did before that batch. For ``verify_leaf.safe_detail_text``,
+    which hides a word holding a copy of a fragment a pass hid: where one of those readings hid or
+    masked the last copy, nothing was left to mark the word, and it printed. In
+    ``jdbc:sqlserver://db:1433;sslpassword=P@Passw0rd:1433;`` the member-tail pass masked the
+    second ``1433`` and ``Passw0rd`` printed (the Lander's hold on engine PR 3397). With that pass
+    alone left out, as a first draft of the repair did, the "@"-lead reading hid the second ``P``
+    in ``jdbc:sqlserver://db:1433;sslpassword=P@ss_Sec9;x;postgres://ops@srv:@P@h`` and
+    ``ss_Sec9`` printed (code review). ``origin/main`` printed one placeholder for each."""
     folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
-    return _scrub_credentials(text, placeholder, folded, tails=False)
+    return _scrub_credentials(
+        text, placeholder, folded, tails=False, new_dsn_readings=new_dsn_readings
+    )
 
 
 def _scrub_credentials(
-    text: str, placeholder: str, folded: str | None, *, tails: bool = True
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    *,
+    tails: bool = True,
+    new_dsn_readings: bool = True,
 ) -> str:
     """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
     tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
     printed. With it True, that reading's output wherever the tailed one is not that output with
     characters written as "x" (:func:`_mask_only`), and the tailed one otherwise, either one with
     the key-block mask run over it once more where a key block's hint is in the text; a line no
-    tail could fire on takes one reading, which the two share there."""
+    tail could fire on takes one reading, which the two share there. ``new_dsn_readings`` as
+    :func:`scrub_credentials_without_tails`, which alone passes it, with ``tails`` False; the
+    readings with ``tails`` True never read it."""
     if not tails:
-        return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+        return _one_reading(
+            text,
+            placeholder,
+            folded,
+            _without_tails,
+            _without_tails_sub,
+            new_dsn_readings=new_dsn_readings,
+        )
     tailed = _one_reading(text, placeholder, folded, _same, None)
     if not _could_take_a_tail(folded):
         return tailed
@@ -2754,12 +2795,15 @@ def _one_reading(
     folded: str | None,
     read: Callable[[re.Pattern[str]], re.Pattern[str]],
     sub: _Sub | None,
+    *,
+    new_dsn_readings: bool = True,
 ) -> str:
     """One reading of ``text``: each pattern through ``read``, applied by ``sub``, and through
-    :func:`_union` on a line the camelCase reading could change."""
+    :func:`_union` on a line the camelCase reading could change. ``new_dsn_readings`` as
+    :func:`_run`."""
     if _reads_camel(text, folded, placeholder):
-        return _union(text, placeholder, folded, read, sub)
-    return _run(text, placeholder, folded, sub)
+        return _union(text, placeholder, folded, read, sub, new_dsn_readings=new_dsn_readings)
+    return _run(text, placeholder, folded, sub, new_dsn_readings=new_dsn_readings)
 
 
 #: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
@@ -3030,7 +3074,13 @@ def has_credential_like_segment(text: str) -> bool:
 
 
 def _run(
-    text: str, placeholder: str, folded: str | None, sub: _Sub | None = None, *, wide: bool = True
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    sub: _Sub | None = None,
+    *,
+    wide: bool = True,
+    new_dsn_readings: bool = True,
 ) -> str:
     """The pass itself. Straight-line rather than a table, so a test monkeypatching one pattern on this
     module reaches the object this function reads -- a table would hold the pre-patch pattern by
@@ -3058,7 +3108,11 @@ def _run(
     reading reads, because every segment of the widened match stops at a label word
     (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
     ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
-    ``pw``, which the pass hides."""
+    ``pw``, which the pass hides.
+
+    ``new_dsn_readings`` False leaves out :data:`_DSN_MEMBER_TAIL`, and applies the widened pass
+    less the two readings batch 20010 added (:func:`_without_new_dsn_readings`), for
+    :func:`scrub_credentials_without_tails`, which says why."""
     apply = _plain_sub if sub is None else sub
     # FIRST, so no label pass reads a key body (BACKLOG #5550; see the pattern).
     if _admits(folded, _KEY_BLOCK_HINT):
@@ -3086,7 +3140,7 @@ def _run(
 
         # Before the narrow pass, which would take the member's key (see the pattern). Its ";",
         # "@" and key word are required, so the gate skips only lines it cannot match.
-        if member_words and ";" in text and "@" in text:
+        if new_dsn_readings and member_words and ";" in text and "@" in text:
             text = apply(
                 _DSN_MEMBER_TAIL,
                 lambda m: _dsn_member_tail_repl(m, placeholder),
@@ -3095,7 +3149,10 @@ def _run(
             )
         text = apply(_DSN_PASSWORD, dsn_repl, text, None)
         if wide:
-            text = apply(_WIDE_DSN_PASSWORD, dsn_repl, text, None)
+            widened = _WIDE_DSN_PASSWORD
+            if not new_dsn_readings:
+                widened = _without_new_dsn_readings(widened)
+            text = apply(widened, dsn_repl, text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
     if ";" in text and member_words:
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
@@ -3467,6 +3524,8 @@ def _union(
     folded: str | None,
     read: Callable[[re.Pattern[str]], re.Pattern[str]] | None = None,
     sub: _Sub | None = None,
+    *,
+    new_dsn_readings: bool = True,
 ) -> str:
     """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
     :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
@@ -3474,7 +3533,9 @@ def _union(
     would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
     they are by default; :func:`_scrub_credentials` passes the reading without the tails. The
     traced shipped reading also leaves out the two readings batch 20010 added to the widened DSN
-    pass (:func:`_without_new_dsn_readings`); the shortcut, which applies ``sub``, does not."""
+    pass (:func:`_without_new_dsn_readings`); the shortcut, which applies ``sub``, does not.
+    ``new_dsn_readings`` reaches every :func:`_run` here, the probes and the reading before
+    included."""
     before = _Trace(len(text), _pre_camel)
     shipped_read = _same if read is None else read
     # Without the two widened DSN readings batch 20010 added; the function says why.
@@ -3501,20 +3562,34 @@ def _union(
         # code review).
         fallback = True
         try:
-            _run(text, placeholder, folded, _narrow_probe_sub, wide=False)
+            _run(
+                text,
+                placeholder,
+                folded,
+                _narrow_probe_sub,
+                wide=False,
+                new_dsn_readings=new_dsn_readings,
+            )
         except _Changed:
             pass
         else:
             try:
-                _run(text, placeholder, folded, _probe_sub, wide=False)
+                _run(
+                    text,
+                    placeholder,
+                    folded,
+                    _probe_sub,
+                    wide=False,
+                    new_dsn_readings=new_dsn_readings,
+                )
             except _Changed:
                 fallback = False
             else:
-                return _run(text, placeholder, folded, sub)
-        old = _run(text, placeholder, folded, before.sub)
-        new = _run(text, placeholder, folded, shipped.sub)
+                return _run(text, placeholder, folded, sub, new_dsn_readings=new_dsn_readings)
+        old = _run(text, placeholder, folded, before.sub, new_dsn_readings=new_dsn_readings)
+        new = _run(text, placeholder, folded, shipped.sub, new_dsn_readings=new_dsn_readings)
     except _Untraceable:
-        return _run(text, placeholder, folded, _pre_camel_sub)
+        return _run(text, placeholder, folded, _pre_camel_sub, new_dsn_readings=new_dsn_readings)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
     old_masks: dict[int, str] = {}

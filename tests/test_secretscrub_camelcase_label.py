@@ -591,7 +591,9 @@ def test_the_differential_finds_the_trade_without_the_union(
     monkeypatch.setattr(
         secretscrub,
         "_union",
-        lambda text, ph, folded, _read=None, sub=None: secretscrub._run(text, ph, folded, sub),
+        lambda text, ph, folded, _read=None, sub=None, *, new_dsn_readings=True: secretscrub._run(
+            text, ph, folded, sub, new_dsn_readings=new_dsn_readings
+        ),
     )
     newly, _hidden = _newly_printed(monkeypatch, _dense_lines(2000, 5545))
     assert newly
