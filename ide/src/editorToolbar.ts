@@ -10,11 +10,17 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
+import { segmentsBelowOnDisk } from "./pathFold";
 
 /**
  * True when `fileFsPath` is a Python module under the configured config dir of `workspaceFsPath`.
- * Pure (no vscode/fs) so it is unit-testable; containment is tested with path.relative so a sibling
- * sharing a name prefix (".../config-other" vs ".../config") does not false-match.
+ * No vscode, so it is unit-testable. Containment is compared segment by segment, so a sibling sharing
+ * a name prefix (".../config-other" vs ".../config") does not false-match. On Windows only ASCII case
+ * is folded, not with path.relative's toLowerCase(), which reads a directory spelled with U+212A
+ * KELVIN SIGN as the config dir's "k" one (pathFold.ts, BACKLOG #5832); a path that differs from the
+ * config dir by another case outside A-Z is asked of the file system, so e-acute against E-acute,
+ * which NTFS folds, is still inside when the config dir exists and can be read; when it cannot, the
+ * file reads as outside and gets no toolbar (pathFold.segmentsBelowOnDisk).
  */
 export function isConfigFile(
   fileFsPath: string,
@@ -25,8 +31,8 @@ export function isConfigFile(
     return false;
   }
   const dir = path.resolve(workspaceFsPath, configDirRel);
-  const rel = path.relative(dir, fileFsPath);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  const below = segmentsBelowOnDisk(dir, fileFsPath);
+  return below !== undefined && below.length > 0;
 }
 
 export type ElementKind = "router" | "handler" | "inbound" | "outbound";

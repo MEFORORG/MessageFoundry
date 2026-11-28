@@ -7,6 +7,7 @@
 // Node-side unit-tested (no Extension Host) like graphModel/engineStatusModel.
 
 import * as path from "node:path";
+import { segmentsBelowOnDisk } from "./pathFold";
 
 /** Quiet period before a coalesced refresh fires. Long enough to absorb a save's watcher echo and a
  *  multi-file checkout; short enough that the tree still feels live after an external edit. */
@@ -69,7 +70,9 @@ export class RefreshCoalescer {
 /**
  * The absolute directory a config-dir FileSystemWatcher should watch, or undefined when no watcher
  * can be created: no workspace folder, or a configDir that resolves OUTSIDE the workspace folder
- * (an absolute path elsewhere, or a relative one that escapes via `..`). Outside-the-workspace
+ * (an absolute path elsewhere, or a relative one that escapes via `..`). A configDir spelling the
+ * workspace with another case outside A-Z is asked of the file system, so it is inside only when
+ * that folder exists and reads as the workspace (pathFold.segmentsBelowOnDisk). Outside-the-workspace
  * stays unwatched by design — the graceful degradation is "manual refresh still works", never a
  * crash or a watcher over an unrelated part of the filesystem.
  */
@@ -81,12 +84,12 @@ export function watchableConfigDir(
     return undefined;
   }
   const abs = path.isAbsolute(configDir) ? configDir : path.join(workspace, configDir);
-  const rel = path.relative(workspace, abs);
-  if (rel === "") {
-    return workspace; // the config dir IS the workspace root
-  }
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+  // Not path.relative: on Windows it folds case with toLowerCase(), so a directory spelled with
+  // U+212A KELVIN SIGN would read as the workspace's "k" one (pathFold.ts, BACKLOG #5832). A
+  // non-ASCII case difference NTFS does fold is settled by the file system instead.
+  const below = segmentsBelowOnDisk(workspace, abs);
+  if (below === undefined) {
     return undefined; // outside the workspace — no watcher, no crash
   }
-  return abs;
+  return below.length === 0 ? workspace : abs; // no segments: the config dir IS the workspace root
 }
