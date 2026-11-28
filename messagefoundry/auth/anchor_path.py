@@ -519,6 +519,21 @@ def _is_dos_device_name(name: str) -> bool:
 
 
 _DEVICE_NAME = "a name in the path is a DOS device name, which Windows opens as the device"
+_TRAILING = "a name in the path ends in a space or a dot"
+
+
+def walk_name_cause(name: str, child: str, *, device: bool) -> WalkCause | None:
+    """Why :func:`windows_chain` stops at the one ``name`` it reached as ``child``, before probing
+    it, or ``None``: a stream name, a name ending in a space or a dot, and, where ``device`` is set,
+    a DOS device name (:data:`_DOS_DEVICE_NAMES`). The one copy of the walk's name rules, so a
+    caller that clears a name with one probe instead of the walk reads the same rules."""
+    if ":" in name:
+        return WalkCause.plain(_STREAM)
+    if name.endswith((" ", ".")) and name not in (".", ".."):
+        return WalkCause(f"{child!r} ends in a space or a dot", _TRAILING)
+    if device and _is_dos_device_name(name):
+        return WalkCause(f"{child!r}: {_DEVICE_NAME}", _DEVICE_NAME)
+    return None
 
 
 #: A probe answers ``(kind, link target or None)`` for one path, without following a final link.
@@ -644,9 +659,14 @@ def windows_chain(
     *,
     volume_cause: Callable[[str], str | None] = _no_volume_cause,
     drive_target: Callable[[str], str | None] = _no_drive_target,
+    last_is_folder: bool = False,
 ) -> tuple[list[tuple[str, str]], WalkCause | None]:
     """The chain of ``(object path, kind)`` from the volume root to the anchor, and a cause when the
     walk could not finish. The cause is a :class:`WalkCause`, whose ``kind`` names no path.
+
+    ``last_is_folder`` says the open passes through the path's last name as a folder, as a caller
+    that walks the folder holding a file, or a folder whose entries a driver opens, does. A DOS
+    device name there is then refused too (:func:`walk_name_cause`).
 
     Win32 collapses ``.`` and ``..`` in the text before any link is followed, so each pass
     normalizes first. A link's target is spliced in: a relative one against the directory holding
@@ -692,8 +712,8 @@ def windows_chain(
       folder, or as its last name once a link or ``subst`` target is spliced in. The walk probes
       and reads each object by its own Win32 text, which opens the device, where the open passes
       through a folder of that name, and reads a file of it after a link. The caller's own last
-      name is walked, since the open reads the device there too; ``restricted_file.py``, which
-      walks a key's folder, refuses that folder's device name itself.
+      name is walked, since the open reads the device there too, unless the caller walks a
+      folder the open passes through and says so (``last_is_folder``).
     - A relative path under a working directory whose first four characters are a device prefix,
       in any slashes: a rooted one (``\\x``); one under a working directory that strips to a bare
       drive, or keeps a ``\\\\?\\`` prefix with nothing after its drive or volume part; and one
@@ -791,20 +811,16 @@ def windows_chain(
         cur = root
         spliced = False
         for i, name in enumerate(parts):
-            if ":" in name:
-                return chain, WalkCause.plain(_STREAM)
             child = ntpath.join(cur, name)
-            if name.endswith((" ", ".")) and name not in (".", ".."):
-                return chain, WalkCause(
-                    f"{child!r} ends in a space or a dot",
-                    "a name in the path ends in a space or a dot",
-                )
-            if _is_dos_device_name(name) and (hops or i != len(parts) - 1):
-                # The probe and the security read would open the device, where the open passes
-                # through a folder of that name, or reads a file of it after a link or a subst
-                # splice. The caller's own last name is the device for the open too, so it is
-                # walked; a caller that walks a file's folder judges that folder's name itself.
-                return chain, WalkCause(f"{child!r}: {_DEVICE_NAME}", _DEVICE_NAME)
+            # A device name is refused where the open passes through it as a folder, or reads a
+            # file of that name after a link or a subst splice. The caller's own last name is the
+            # device for the open too, so it is walked unless the caller says the open passes
+            # through it (``last_is_folder``).
+            name_cause = walk_name_cause(
+                name, child, device=bool(hops) or i != len(parts) - 1 or last_is_folder
+            )
+            if name_cause is not None:
+                return chain, name_cause
             try:
                 kind, target = probe(child)
             except OSError as exc:

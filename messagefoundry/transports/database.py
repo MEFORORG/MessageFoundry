@@ -54,6 +54,7 @@ import contextlib
 import errno
 import json
 import logging
+import ntpath
 import os
 import re
 import sys
@@ -75,6 +76,7 @@ from messagefoundry.auth.anchor_path import (
     WinProbe,
     _win_probe,
     query_drive_target,
+    walk_name_cause,
     windows_chain,
 )
 from messagefoundry.auth.trust_anchors import (
@@ -1306,7 +1308,24 @@ def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
 def _capath_folder_clear(folder: str) -> bool:
     """Whether no entry of ``folder`` leads off the host or is a path the walk cannot clear, for
     :func:`_capath_entries_leave_host`. A reason it is not is logged as the walk logs one
-    (:func:`_not_cleared`)."""
+    (:func:`_not_cleared`).
+
+    A folder whose own last name is a DOS device name is refused unlisted: the folder's walk read
+    that name as the device, the caller's own last name, where the driver passes through it to an
+    entry (vault BACKLOG #5515, #5197). The name is the one that walk ends on before any link, the
+    folder joined to the working directory when relative and normalized, so ``..`` is judged as
+    the folder it names. A link or ``subst`` drive onto such a name, the walk refuses itself."""
+    try:
+        text = folder
+        if not ntpath.isabs(text) and text[:2].replace("/", "\\") != "\\\\":
+            text = ntpath.join(os.getcwd(), text)
+    except OSError as exc:  # the working directory
+        _not_cleared(f"the working directory could not be read: {_why(exc)}", exc)
+        return False
+    name_cause = walk_name_cause(ntpath.basename(ntpath.normpath(text)), text, device=True)
+    if name_cause is not None:
+        _not_cleared(name_cause.kind, name_cause)
+        return False
     try:
         # Not found and not a folder are tolerated at the open only. Raised while the folder is
         # listed, they leave part of it unjudged, so they refuse below as any listing error does.
@@ -1352,10 +1371,10 @@ def _capath_entry_clear(path: str, name: str) -> bool:
     """Whether the ``sslcapath`` entry ``name``, at ``path`` in a folder whose own walk cleared it,
     is clear. An entry the probe reads as a plain file or folder is: the walk of its full path
     would pass the folder's own chain, then end at this probe with no cause. Anything else takes
-    that full walk (:func:`_path_verdict`): a link, an entry the probe cannot read, and a name the
-    walk ends on (a stream, or a trailing space or dot). So one ``lstat`` judges a plain entry,
-    not a walk from the volume root, and no entry the walk would refuse is cleared."""
-    if ":" not in name and not name.endswith((" ", ".")):
+    that full walk (:func:`_path_verdict`): a link, an entry the probe cannot read, and a name
+    ``anchor_path.walk_name_cause`` stops at, the walk's own name rules. So one ``lstat`` judges a
+    plain entry, not a walk from the volume root, and no entry the walk would refuse is cleared."""
+    if walk_name_cause(name, path, device=True) is None:
         try:
             kind, _target = _win_probe(path)
         except OSError as exc:
