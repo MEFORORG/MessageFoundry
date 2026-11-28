@@ -53,6 +53,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pki import PIN_FILE_MAX_BYTES
 from messagefoundry.store import MessageStore
+from tests._encrypted_pem_probe import PRIVATE_KEY_LABELS
 
 _posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits (icacls is the nt path)")
 
@@ -2450,7 +2451,7 @@ def test_the_vault_hop_states_the_same_scope() -> None:
 # Every label is split in the source and every body is fake, so no committed byte reads as a key.
 
 _PRIVATE = "PRIVATE" + " KEY"
-_KEY_LABELS = (_PRIVATE, "ENCRYPTED " + _PRIVATE, "RSA " + _PRIVATE, "EC " + _PRIVATE)
+_KEY_LABELS = PRIVATE_KEY_LABELS
 _NON_ASCII = b"\xc3\xa9 "  # a UTF-8 e-acute and a space
 
 
@@ -2527,12 +2528,13 @@ def test_a_certificate_only_anchor_still_loads() -> None:
     assert not ta.has_private_key_label(_key_block(_PRIVATE).decode().replace("-----BEGIN ", ""))
 
 
+@pytest.mark.parametrize("label", _KEY_LABELS)
 async def test_a_cafile_anchor_refuses_a_key_and_still_takes_a_trusted_block(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
 ) -> None:
     """An anchor whose hop loads cafile= (loads_verified_bytes False) skips the shape check, so a
-    TRUSTED CERTIFICATE block still passes it, but a key block refuses (BACKLOG #3745). Red with
-    the private-key check removed from _preflight_one."""
+    TRUSTED CERTIFICATE block still passes it, but a key block of each label vault BACKLOG #3745
+    step 2 names refuses. Red with the private-key check removed from _preflight_one."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
 
@@ -2543,10 +2545,11 @@ async def test_a_cafile_anchor_refuses_a_key_and_still_takes_a_trusted_block(
             "tls_internal_ca", "[tls].internal_ca_file", str(path), loads_verified_bytes=False
         )
 
-    keyed = spec(_real_ca("crl-test-ca")[0] + _key_block("EC " + _PRIVATE), "keyed.pem")
+    keyed = spec(_real_ca("crl-test-ca")[0] + _key_block(label), "keyed.pem")
     with pytest.raises(TrustAnchorError) as err:
         await run_anchor_preflight([keyed], store, enforcing=True)
     assert ta.PRIVATE_KEY_SCOPE in str(err.value) and "[tls].internal_ca_file" in str(err.value)
+    assert "AAAA" not in str(err.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "tls_internal_ca")}
     # The control: the shape check stays off for this anchor.
     trusted = spec(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", "trusted.pem")
