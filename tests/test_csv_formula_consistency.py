@@ -390,16 +390,22 @@ def test_no_unrecorded_spreadsheet_writer_exists() -> None:
 def test_the_runbook_hook_recorded_as_read_only_writes_no_workbook() -> None:
     # Its record above says READ-ONLY. This binds that claim: the hook makes no `.save(` call, builds
     # no openpyxl Workbook, opens nothing write_only, and still opens its workbook read_only.
+    def save_lines(calls: list[ast.Call]) -> list[int]:
+        return [
+            c.lineno for c in calls if isinstance(c.func, ast.Attribute) and c.func.attr == "save"
+        ]
+
+    def calls_in(tree: ast.AST) -> list[ast.Call]:
+        return [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    # Negative control: the detector does catch a planted save.
+    assert save_lines(calls_in(ast.parse("wb = load()\nwb.save(p)\n"))) == [2]
     rel = "scripts/hooks/runbook_take_prompt.py"
     source = (_REPO / rel).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    saves = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "save"
-    ]
+    calls = calls_in(tree)
+    assert len(calls) >= 20, f"{rel}: the walk found only {len(calls)} calls"
+    saves = save_lines(calls)
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
         n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
     }
