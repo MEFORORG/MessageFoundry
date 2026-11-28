@@ -4,8 +4,9 @@
 BACKLOG #8341 items 2 and 4). Synthetic data only.
 
 Item 4: a listing error that reads as absence, as a lost drive's does, ended the pass at 0 with no
-log, so retention reported clean passes for good. Now only a root that reads as never made, under
-a folder that answers, is an empty pass; anything else raises, and ``prune_expired`` logs it.
+log, so retention reported clean passes for good. Now a pin error that reads as absence is an
+empty pass only when the root reads as never made, under a folder that answers, or as a folder by
+the time the sweep looks again; anything else raises, and ``prune_expired`` logs it.
 
 Item 2, in part: a sidecar the file system reports absent sent its body to the unlink even when the
 uploads root was no longer the folder the sweep listed, as after a share remounted under it. The
@@ -200,7 +201,7 @@ async def test_a_root_swapped_after_the_listing_keeps_the_body(
         assert removed == 0 and body.exists(), "a body was unlinked under a root that changed"
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1 and "orphan sweep stopped" in errors[0]
-        assert "now answers as a different folder" in errors[0]
+        assert "now answers with a different file identity" in errors[0]
     else:
         assert removed == 1 and not body.exists()
 
@@ -419,6 +420,6 @@ def test_a_root_swapped_between_the_pin_and_the_listing_logs_a_true_reason(
 
     assert removed == 0 and (store._root / name).exists() and (other / name).exists()
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1 and "now answers as a different folder" in errors[0]
+    assert len(errors) == 1 and "now answers with a different file identity" in errors[0]
     assert "the one the sweep listed" not in errors[0]
     assert "read before its listing" in errors[0]

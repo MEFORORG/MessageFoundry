@@ -18,8 +18,8 @@ and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_re
 transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph.
 The cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
-no store module beyond the two pure ones above is imported. All disk + crypto + split work runs **off the event loop**
-(``asyncio.to_thread``).
+no store module beyond the two pure ones above is imported. All disk + crypto + split work runs
+**off the event loop** (``asyncio.to_thread``).
 
 **PHI.** An uploaded file is real HL7 PHI at rest. Bodies are never logged at INFO+; every access is
 gated + audited by the API layer. The on-disk **identity** is a random 32-hex ``file_id`` — the
@@ -348,13 +348,14 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
     """Why the uploads root no longer reads as the folder the sweep pinned, whose ``stat`` was
     ``pinned``, taken before the listing, or ``None`` when it still does. Its own ``stat`` failed,
     which is read as the root being lost, since an entry's own error cannot show that: a dangling
-    link can raise the codes a lost share does. Or it answers as another file (``os.path.samestat``), as a share remounted, or
-    a folder swapped in, under the root's name does (BACKLOG #8341 item 2). An answer proves nothing
-    about the entries under it, and a file system that reports no stable identity, such as one that
-    answers every ``st_ino`` as 0, cannot show a swap, and one that mints an identity on the
-    client, at least a CIFS mount with ``noserverino`` or a FUSE mount without stable inode numbers,
-    can stop a sound pass, which then removes nothing more. Text and not the exception, whose
-    traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+    link can raise the codes a lost share does. Or it answers with another identity
+    (``os.path.samestat``), as a share remounted, or a folder swapped in, under the root's name does
+    (BACKLOG #8341 item 2). An answer proves nothing about the entries under it. A file system that
+    reports no stable identity, such as one that answers every ``st_ino`` as 0, cannot show a swap
+    that keeps the same ``st_dev``, and one that mints an identity on the client, at least a CIFS
+    mount with ``noserverino`` or a FUSE mount without stable inode numbers, can stop a sound pass,
+    which then removes nothing more. Text and not the exception, whose traceback would hold the
+    sweep's frame, and so its whole listing, until a cyclic collection."""
     try:
         now = root.stat()
     except OSError as exc:
@@ -364,10 +365,14 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
     return None
 
 
-#: :func:`_root_fault`'s reason for a root that answers as another folder than the one pinned. It
-#: names the pin, the ``stat`` taken before the listing, and not the listing: a swap between the two
-#: leaves the root answering as the folder listed, which is still not the folder pinned.
-_ROOT_SWAPPED = "now answers as a different folder than the one the sweep read before its listing"
+#: :func:`_root_fault`'s reason for a root whose identity is not the one pinned. It names the pin,
+#: the ``stat`` taken before the listing, and not the listing: a swap between the two leaves the
+#: root answering as the folder listed, which is still not the folder pinned. It says identity, not
+#: folder, because ``samestat`` proves no more: the root may now be a file, or a mount that mints
+#: identities on the client may answer the same folder under a new one.
+_ROOT_SWAPPED = (
+    "now answers with a different file identity than the one the sweep read before its listing"
+)
 
 
 def _root_never_made(root: Path) -> bool:
