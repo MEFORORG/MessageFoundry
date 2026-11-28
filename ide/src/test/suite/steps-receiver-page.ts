@@ -55,7 +55,12 @@ export function stepsReceiverBody(): string {
   );
 }
 
-/** The page's scripts in the provider's order: the inline guard and shape helpers, then the file. */
+/** The page's two scripts in the provider's order: the inline guard and shape helpers, then the file. */
+export function stepsReceiverScripts(token: string): [string, string] {
+  return [`${guardScript(token)}\n${SHAPE_HELPERS}`, STEPS_JS];
+}
+
+/** The same two scripts joined, for a loader that runs one script. */
 export function stepsReceiverScript(token: string): string {
-  return `${guardScript(token)}\n${SHAPE_HELPERS}\n${STEPS_JS}`;
+  return stepsReceiverScripts(token).join("\n");
 }

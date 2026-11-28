@@ -3112,12 +3112,12 @@ export async function drainHeldEdits(
       // failure needs.
     }
   };
-  const carry = (msg: EditMessage, kind: EditKind): EditMessage => {
+  const carry = (msg: EditMessage): EditMessage => {
     if (rebase === undefined) {
       return msg;
     }
     try {
-      return rebase.rebaser.rebase(msg, rebase.readSource, kind);
+      return rebase.rebaser.rebase(msg, rebase.readSource);
     } catch (err) {
       failed("read", err);
       return msg;
@@ -3144,7 +3144,7 @@ export async function drainHeldEdits(
   };
   try {
     let kind = firstKind;
-    let current: EditMessage | undefined = carry(first, kind);
+    let current: EditMessage | undefined = carry(first);
     while (current) {
       let wrote: AppliedRewrite | void = undefined;
       try {
@@ -3160,7 +3160,7 @@ export async function drainHeldEdits(
       record(current, kind, wrote);
       const next = guard.takePending();
       kind = "typed";
-      current = next === undefined ? undefined : carry(next, kind);
+      current = next === undefined ? undefined : carry(next);
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
@@ -3254,11 +3254,11 @@ interface KeptProjection {
   base: number | undefined;
 }
 
-/** Where the chain stood when a render read the buffer it projects ({@link QueuedEditRebaser.mark}). */
-export interface ChainMark {
-  readonly gen: number;
-  readonly seq: number;
-}
+/**
+ * Where the chain stood when a render read the buffer it projects ({@link QueuedEditRebaser.mark}): a
+ * chain position. Positions are never reused, so a mark from an earlier chain names no buffer.
+ */
+export type ChainMark = number;
 
 /**
  * Carries an edit's `expectSrc` forward over the param writes applied since the page it was made on
@@ -3294,16 +3294,16 @@ export interface ChainMark {
  *  - its projection is kept and has a base, and its `rowVer`, when it has one, was acknowledged to it;
  *  - its `expectSrc` is the row's text in the buffer at that base or version;
  *  - every write since on a row overlapping the edit's row is on that same row, and each one that wrote
- *    the edit's own param is a typed write from the edit's own page, and the edit itself is typed. A
- *    write of another param of the row is carried over: the edit sets its own param only;
+ *    the edit's own param is a typed write from the edit's own page. A write of another param of the
+ *    row is carried over: the edit sets its own param only. The edit may be typed or a pick: a pick
+ *    replaces the param's value with one the page's own field seeded, so it does not depend on a value
+ *    the page never showed;
  *  - the live buffer, read just before the edit is sent, is exactly the chain's end. A change made
  *    between recorded writes (an undo, a structural op, another panel, split-view typing) leaves the
  *    edit unrebased. Split-view typing made while a rewrite is in flight is not covered: applyOne
  *    overwrites it with the rewrite's output, as it always has, and the write is recorded as clean.
  */
 export class QueuedEditRebaser {
-  // Bumped whenever the chain is replaced, so a mark taken before is not read against the new chain.
-  private gen = 0;
   // Every chain position ever issued, so a version is never reused across chains.
   private seqCounter = 0;
   private start: string | undefined;
@@ -3339,8 +3339,9 @@ export class QueuedEditRebaser {
    * they were.
    */
   private rowWritesSince(from: number, msg: EditMessage, ok: (w: ChainWrite) => boolean): boolean {
-    for (const w of this.writes) {
-      if (w.seq <= from || w.lineEnd < msg.lineStart || w.lineStart > msg.lineEnd) {
+    for (let i = Math.max(0, from - this.startSeq); i < this.writes.length; i++) {
+      const w = this.writes[i];
+      if (w.lineEnd < msg.lineStart || w.lineStart > msg.lineEnd) {
         continue;
       }
       if (w.lineStart !== msg.lineStart || w.lineEnd !== msg.lineEnd || !ok(w)) {
@@ -3352,7 +3353,6 @@ export class QueuedEditRebaser {
 
   /** Start a new chain at `buffer`; only a kept projection projected from exactly `buffer` keeps a base. */
   private restart(buffer: string): void {
-    this.gen++;
     this.start = buffer;
     this.startSeq = ++this.seqCounter;
     this.writes = [];
@@ -3367,7 +3367,7 @@ export class QueuedEditRebaser {
     if (this.start === undefined || source !== this.bufferAt(this.endSeq)) {
       return undefined;
     }
-    return { gen: this.gen, seq: this.endSeq };
+    return this.endSeq;
   }
 
   /**
@@ -3376,10 +3376,10 @@ export class QueuedEditRebaser {
    */
   project(id: number, source: string, at: ChainMark | undefined = this.mark(source)): void {
     let base: number | undefined;
-    if (at !== undefined && at.gen === this.gen && this.bufferAt(at.seq) === source) {
-      base = at.seq;
+    if (at !== undefined && this.bufferAt(at) === source) {
+      base = at;
     } else {
-      base = this.mark(source)?.seq;
+      base = this.mark(source);
     }
     const prevId = this.latest;
     const prev = prevId === undefined ? undefined : this.projections.get(prevId);
@@ -3414,7 +3414,7 @@ export class QueuedEditRebaser {
    * Record what applying `msg` through `kind` wrote (`undefined` when nothing was written). Returns the
    * acknowledgement to post to the page, when the page shows everything written on the row.
    */
-  record(msg: EditMessage, write: AppliedRewrite | void, kind: EditKind = "typed"): RowSourceAck | undefined {
+  record(msg: EditMessage, write: AppliedRewrite | void, kind: EditKind): RowSourceAck | undefined {
     if (write === undefined) {
       return undefined;
     }
@@ -3470,7 +3470,6 @@ export class QueuedEditRebaser {
 
   /** End the chain: no edit is rebased until a write or a projection starts a new one. */
   latch(): void {
-    this.gen++;
     this.start = undefined;
     this.writes = [];
     this.acked.clear();
@@ -3479,8 +3478,8 @@ export class QueuedEditRebaser {
     }
   }
 
-  /** `msg`, made through `kind`, with its `expectSrc` rebased onto the live row's text, or `msg` unchanged. */
-  rebase(msg: EditMessage, readSource: () => string, kind: EditKind = "typed"): EditMessage {
+  /** `msg` with its `expectSrc` rebased onto the live row's text, or `msg` unchanged. */
+  rebase(msg: EditMessage, readSource: () => string): EditMessage {
     const id = msg.projection;
     const p = id === undefined ? undefined : this.projections.get(id);
     if (msg.expectSrc === undefined || id === undefined || p === undefined || p.base === undefined) {
@@ -3500,7 +3499,7 @@ export class QueuedEditRebaser {
     const carried = this.rowWritesSince(
       base,
       msg,
-      (w) => w.name !== msg.name || (kind === "typed" && w.kind === "typed" && w.projection === id),
+      (w) => w.name !== msg.name || (w.kind === "typed" && w.projection === id),
     );
     if (!carried) {
       return msg;

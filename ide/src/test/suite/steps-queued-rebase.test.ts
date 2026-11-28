@@ -226,7 +226,7 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
 
   test("an edit is rebased onto the live row; one on another row, or not reading its projection, is not", () => {
     const r = fresh();
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     assert.strictEqual(r.rebase(edit("B"), () => after).expectSrc, afterRow);
     const otherRow: EditMessage = { ...edit("B"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg" };
     assert.strictEqual(r.rebase(otherRow, () => after), otherRow, "an unrewritten row is already current");
@@ -236,7 +236,7 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
 
   test("an edit with no projection id, or one the rebaser never saw, is sent as posted", () => {
     const r = fresh();
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     const noId: EditMessage = { ...edit("B"), projection: undefined };
     assert.strictEqual(r.rebase(noId, () => after), noId);
     const unknown = edit("B", "value", `    ${ROW}`, 7);
@@ -249,8 +249,8 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
       { ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg", projection: undefined },
     ]) {
       const r = fresh();
-      r.record(edit("A"), { before, after });
-      r.record(bad, { before: after, after: after.replace("    return msg", "    return None") });
+      r.record(edit("A"), { before, after }, "typed");
+      r.record(bad, { before: after, after: after.replace("    return msg", "    return None") }, "typed");
       const queued = edit("B");
       assert.strictEqual(r.rebase(queued, () => after), queued);
     }
@@ -258,11 +258,11 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
 
   test("a recorded write whose input is neither the chain's output nor its projection's buffer ends the chain", () => {
     const r = fresh();
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     // Something outside the recorded writes changed the buffer, then a write on another row landed.
     const gap = `${after}\n# typed`;
     const gapAfter = gap.replace("    return msg", "    return None");
-    r.record({ ...edit("Y"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg" }, { before: gap, after: gapAfter });
+    r.record({ ...edit("Y"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg" }, { before: gap, after: gapAfter }, "typed");
     const queued = edit("B");
     assert.strictEqual(r.rebase(queued, () => gapAfter), queued);
   });
@@ -279,18 +279,18 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     const e1: EditMessage = { ...edit("E1"), lineStart: 4, lineEnd: 4, projection: 1 };
     const e1After = physicalLines(shifted);
     e1After[3] = '    msg.set("PID-5", "E1")';
-    r.record(e1, { before: shifted, after: e1After.join("\n") });
+    r.record(e1, { before: shifted, after: e1After.join("\n") }, "typed");
     const e2: EditMessage = { ...edit("E2"), lineStart: 4, lineEnd: 4, projection: 1 };
     assert.strictEqual(r.rebase(e2, () => e1After.join("\n")), e2, "E2 is sent as posted, so F7 refuses it");
   });
 
   test("an in-chain projection keeps the one before it; an older or out-of-chain one is dropped", () => {
     const r = fresh();
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     r.project(2, after); // a re-projection mid-drain, of the buffer A wrote
     assert.strictEqual(r.rebase(edit("B"), () => after).expectSrc, afterRow, "projection 1 is still kept");
     const after2 = source('msg.set("PID-5", "B")');
-    r.record(edit("B", "value", afterRow, 2), { before: after, after: after2 });
+    r.record(edit("B", "value", afterRow, 2), { before: after, after: after2 }, "typed");
     r.project(3, after2);
     const old = edit("C");
     assert.strictEqual(r.rebase(old, () => after2), old, "projection 1 is two projections back: dropped");
@@ -310,14 +310,14 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     };
     r.rebase(edit("B"), read);
     assert.strictEqual(reads, 0, "nothing recorded: no buffer copy");
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     r.rebase(edit("B"), read);
     assert.strictEqual(reads, 1);
   });
 
   test("drainEdits logs a throw from the buffer read", async () => {
     const r = fresh();
-    r.record(edit("A"), { before, after });
+    r.record(edit("A"), { before, after }, "typed");
     const logged: string[] = [];
     const rebase = {
       rebaser: r,
@@ -370,7 +370,7 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     ];
     for (const { thrown, log } of cases) {
       const r = fresh();
-      r.record(edit("A"), { before, after });
+      r.record(edit("A"), { before, after }, "typed");
       const guard = new EditLoopGuard();
       const sent: EditMessage[] = [];
       guard.beginEdit();

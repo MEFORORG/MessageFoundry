@@ -522,13 +522,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // rather than stranding a pending second edit until the user types again.
     // Lets an edit on a row rewritten since the last projection carry its expectSrc over, and tells the
     // page a row's new source after a typed write it already shows (#5943). The acknowledgement goes
-    // only to the page still showing the projection it names; the page checks the id again.
+    // only to the page still showing the projection it names; the page checks the id again. The
+    // panel's own record of that page's rows moves with it, or a structural insert anchored on the
+    // acknowledged row would lose its fan-out flags (anchorFor matches on the row's source).
     const rebase: EditRebase = {
       rebaser,
       readSource: () => document.getText(),
       log: (text) => console.warn(text),
       onAck: (ack) => {
         if (!disposed && ack.projection === projectionId) {
+          panelState.reSource(ack.handler, ack.lineStart, ack.lineEnd, ack.from, ack.to);
           void postToWebview(panel.webview, { ...ack }).then(undefined, (err: unknown) =>
             console.warn(`Steps row-source acknowledgement failed: ${errorText(err)}`),
           );

@@ -17,7 +17,8 @@ import {
   type RowSourceAck,
 } from "../../stepsModel";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
-import { stepsReceiverBody, stepsReceiverScript } from "./steps-receiver-page";
+import { StepsPanelProjection } from "../../stepsPanel";
+import { stepsReceiverBody, stepsReceiverScripts } from "./steps-receiver-page";
 
 // BACKLOG #5943, the remainder: a typed edit queued behind a field pick was sent with its projected
 // source, and the rebaser's pruning, which ordered buffers by last use, could drop the buffer of the
@@ -124,18 +125,27 @@ suite("Steps edit -- the field-picker drain carries a queued typed edit over the
     assert.strictEqual(ed.text, source("PID-7", "OLD"));
   });
 
-  test("a pick is carried over a typed write of another param, and refused over one of its own param", async () => {
-    for (const [name, refused] of [
-      ["value", [] as string[]],
-      ["path", ["PID-7"]],
-    ] as const) {
+  test("a pick is carried over the same page's typed write of either param, never another page's", async () => {
+    // Review round 1 finding 3: a pick replaces the param with a value the page's own field seeded, so
+    // a typed write of that param from the same page is one the pick already saw.
+    for (const name of ["value", "path"]) {
       const ed = new FakeEditor(source());
       const guard = new EditLoopGuard();
       await drainEdits(guard, edit("TYPED", name), ed.apply, undefined, undefined, ed.rebase);
       // The pick was requested on the same page before that write was re-projected.
       await pick(guard, ed, edit("PID-7", "path"));
-      assert.deepStrictEqual(ed.refused, refused, `a pick after a typed ${name} write`);
+      assert.deepStrictEqual(ed.refused, [], `a pick after a typed ${name} write`);
+      assert.deepStrictEqual(ed.applied, ["TYPED", "PID-7"]);
     }
+    // The control: the typed write came from projection 1, and the pick from projection 2, whose page
+    // was projected before that write landed, so it never showed it.
+    const ed = new FakeEditor(source());
+    const at = ed.rebaser.mark(source());
+    ed.rebaser.project(2, source(), at);
+    const guard = new EditLoopGuard();
+    await drainEdits(guard, edit("TYPED", "path"), ed.apply, undefined, undefined, ed.rebase);
+    await pick(guard, ed, edit("PID-7", "path", ROW("PID-5", "OLD"), 2));
+    assert.deepStrictEqual(ed.refused, ["PID-7"]);
   });
 
   test("a typed edit is checked against a pick even when the pick's output repeats an earlier buffer", async () => {
@@ -163,9 +173,9 @@ suite("Steps edit -- the rebaser keeps the shown projection's buffer by position
     const b1 = source("PID-5", "A");
     const b2 = source("PID-5", "B");
     r.project(1, b0);
-    r.record(edit("A"), { before: b0, after: b1 });
+    r.record(edit("A"), { before: b0, after: b1 }, "typed");
     const r2 = r.mark(b1); // render R2 reads the buffer, then awaits its parse
-    r.record(edit("B", "value", ROW("PID-5", "A")), { before: b1, after: b2 });
+    r.record(edit("B", "value", ROW("PID-5", "A")), { before: b1, after: b2 }, "typed");
     r.project(2, b2, r.mark(b2)); // render R3 finishes first
     r.project(3, b1, r2); // R2 finishes last: the page shows projection 3, projected from b1
     return { r, b1, b2 };
@@ -201,7 +211,7 @@ suite("Steps edit -- the rebaser keeps the shown projection's buffer by position
     const stale = r.mark(b0);
     r.latch();
     r.project(2, b1, stale); // b1 is not the end of any chain: a new chain starts there
-    r.record(edit("X", "value", ROW("PID-5", "A"), 2), { before: b1, after: source("PID-5", "X") });
+    r.record(edit("X", "value", ROW("PID-5", "A"), 2), { before: b1, after: source("PID-5", "X") }, "typed");
     const msg = edit("Y", "path", ROW("PID-5", "A"), 2);
     assert.strictEqual(r.rebase(msg, () => source("PID-5", "X")).expectSrc, ROW("PID-5", "X"));
   });
@@ -211,7 +221,7 @@ suite("Steps edit -- the row-source acknowledgement (BACKLOG #5943)", () => {
   test("a typed write from the page shown is acknowledged with the row as the page holds it and after", () => {
     const ed = new FakeEditor(source());
     const r = ed.rebaser;
-    const a1 = r.record(edit("A"), { before: source(), after: source("PID-5", "A") });
+    const a1 = r.record(edit("A"), { before: source(), after: source("PID-5", "A") }, "typed");
     assert.ok(a1);
     assert.deepStrictEqual(
       { from: a1.from, to: a1.to, projection: a1.projection, line: a1.lineStart, command: a1.command },
@@ -220,7 +230,7 @@ suite("Steps edit -- the row-source acknowledgement (BACKLOG #5943)", () => {
     const a2 = r.record(edit("B", "value", ROW("PID-5", "A")), {
       before: source("PID-5", "A"),
       after: source("PID-5", "B"),
-    });
+    }, "typed");
     assert.ok(a2);
     assert.strictEqual(a2.from, ROW("PID-5", "A"), "the next one starts from the row the first one gave the page");
     assert.ok(a2.version > a1.version);
@@ -232,7 +242,7 @@ suite("Steps edit -- the row-source acknowledgement (BACKLOG #5943)", () => {
   test("a version the host never sent that page, for that row, is not trusted", () => {
     const r = new QueuedEditRebaser();
     r.project(1, source());
-    const a1 = r.record(edit("A"), { before: source(), after: source("PID-5", "A") });
+    const a1 = r.record(edit("A"), { before: source(), after: source("PID-5", "A") }, "typed");
     assert.ok(a1);
     const live = (): string => source("PID-5", "A");
     for (const forged of [
@@ -251,19 +261,19 @@ suite("Steps edit -- the row-source acknowledgement (BACKLOG #5943)", () => {
     // A typed write of another param after the pick: the page still does not show the picked path.
     const after = source("PID-7", "A");
     assert.strictEqual(
-      r.record(edit("A", "value", ROW("PID-7", "OLD")), { before: source("PID-7"), after }),
+      r.record(edit("A", "value", ROW("PID-7", "OLD")), { before: source("PID-7"), after }, "typed"),
       undefined,
     );
     // A write from projection 1 after projection 2 is shown is not acknowledged to either.
     r.project(2, after);
     const after2 = source("PID-7", "B");
-    assert.strictEqual(r.record(edit("B", "value", ROW("PID-7", "A")), { before: after, after: after2 }), undefined);
+    assert.strictEqual(r.record(edit("B", "value", ROW("PID-7", "A")), { before: after, after: after2 }, "typed"), undefined);
     // Nor is projection 2's own write after it: page 2 never showed projection 1's value B.
     const after3 = source("PID-7", "C");
-    assert.strictEqual(r.record(edit("C", "value", ROW("PID-7", "B"), 2), { before: after2, after: after3 }), undefined);
+    assert.strictEqual(r.record(edit("C", "value", ROW("PID-7", "B"), 2), { before: after2, after: after3 }, "typed"), undefined);
     // Once a page is projected from that buffer, its own typed write is acknowledged from its base.
     r.project(3, after3);
-    const own = r.record(edit("D", "value", ROW("PID-7", "C"), 3), { before: after3, after: source("PID-7", "D") });
+    const own = r.record(edit("D", "value", ROW("PID-7", "C"), 3), { before: after3, after: source("PID-7", "D") }, "typed");
     assert.ok(own, "projection 3's own typed write is acknowledged");
     assert.strictEqual(own.from, ROW("PID-7", "C"), "from the row projection 3 was projected with");
   });
@@ -366,9 +376,12 @@ function loadSteps(): StepsPage {
     setState: () => undefined,
     postMessage: (m: Record<string, unknown>) => void posted.push(m),
   });
-  const el = window.document.createElement("script");
-  el.textContent = stepsReceiverScript(TOKEN);
-  window.document.body.appendChild(el);
+  // Two script elements, as the provider serves them: the inline guard, then the static file.
+  for (const text of stepsReceiverScripts(TOKEN)) {
+    const el = window.document.createElement("script");
+    el.textContent = text;
+    window.document.body.appendChild(el);
+  }
   assert.deepStrictEqual(errors.map(String), [], "the Steps page threw while loading");
   return {
     window,
@@ -422,6 +435,17 @@ suite("Steps page -- the row-source receiver (BACKLOG #5943)", () => {
     assert.strictEqual(sent[0].expectSrc, '    msg.set_field("PID-3", "B")');
     assert.strictEqual(sent[0].rowVer, 4);
     assert.strictEqual(sent[0].projection, 1);
+  });
+
+  test("an acknowledgement moves the selection's source too, so a delete of the row carries it", () => {
+    const p = loadSteps();
+    const row = p.window.document.querySelector('li.row[data-line-start="2"]');
+    row.dispatchEvent(new p.window.Event("click", { bubbles: true }));
+    p.deliver(ack(row.dataset.expectSrc as string));
+    p.window.document.querySelector('#stepsCtxMenu .ctx-item[data-cmd="deleteRow"]').click();
+    const del = p.posted.filter((m) => m.command === "deleteRow");
+    assert.strictEqual(del.length, 1);
+    assert.strictEqual(del[0].expectSrc, '    msg.set_field("PID-3", "B")');
   });
 
   test("an edit posted before any acknowledgement carries no version", () => {
@@ -486,6 +510,29 @@ suite("Steps edit -- the provider wires the acknowledgement and the pick drain (
     assert.ok(onAck.includes("postToWebview(panel.webview,"));
     assert.ok(src.includes("const { nonce: n, token } = openChannel(webview);"));
     assert.ok(/<script nonce="\$\{n\}">\$\{guardScript\(token\)\}/.test(src), "the guard is inline and nonced");
+  });
+
+  test("the panel's row record moves with an acknowledgement, so an insert anchor keeps its flags", () => {
+    // Review round 1 finding 1: anchorFor matches on the row's source, and the page sends the moved one.
+    const panel = new StepsPanelProjection();
+    const row = {
+      kind: "send" as const,
+      lineStart: 3,
+      lineEnd: 3,
+      nesting: 0,
+      expectSrc: "    yield Send('OB')",
+      appended: true,
+    };
+    panel.update({ module: "m", handlers: [] }, [{ handler: "h", rows: [row] } as never]);
+    const at = { handler: "h", lineStart: 3, lineEnd: 3, kind: "send" };
+    assert.strictEqual(panel.anchorFor({ ...at, expectSrc: "    yield Send('OB2')" })?.appended, false, "control");
+    panel.reSource("h", 3, 3, "    something else", "    yield Send('OB2')");
+    assert.strictEqual(panel.anchorFor({ ...at, expectSrc: "    yield Send('OB2')" })?.appended, false, "not from `from`");
+    panel.reSource("h", 3, 3, "    yield Send('OB')", "    yield Send('OB2')");
+    assert.strictEqual(panel.anchorFor({ ...at, expectSrc: "    yield Send('OB2')" })?.appended, true);
+    const src = read("src", "stepsView.ts");
+    const onAck = src.slice(src.indexOf("onAck: (ack) =>"), src.indexOf("const applyEdit = (msg"));
+    assert.ok(onAck.includes("panelState.reSource(ack.handler, ack.lineStart, ack.lineEnd, ack.from, ack.to);"));
   });
 
   test("every post that writes a row echoes the projection and the row version", () => {

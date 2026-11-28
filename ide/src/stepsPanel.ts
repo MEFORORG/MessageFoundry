@@ -66,6 +66,19 @@ export class StepsPanelProjection {
     }
   }
 
+  /**
+   * The page now holds `to` as a row's source, after a row-source acknowledgement (BACKLOG #5943). Moved
+   * only where this projection still holds `from` for that row, so {@link anchorFor} keeps matching the
+   * source the page sends; the row's kind and flags are unchanged by a param write.
+   */
+  reSource(handler: string, lineStart: number, lineEnd: number, from: string, to: string): void {
+    const key = rowKey(handler, lineStart, lineEnd);
+    const row = this.rows.get(key);
+    if (row !== undefined && row.expectSrc === from) {
+      this.rows.set(key, { ...row, expectSrc: to });
+    }
+  }
+
   typeOf(handler: string): HandlerType | undefined {
     return this.types.get(handler);
   }

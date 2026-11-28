@@ -236,9 +236,13 @@
           el.dataset.rowVer = String(d.version);
         }
       }
-      if (selected && sameRow(selected.handler, selected.lineStart, selected.lineEnd) && selected.expectSrc === d.from) {
-        selected.expectSrc = d.to;
-      }
+      // `selected` is declared further down; if the wiring between here and there threw, it was never
+      // initialized, and reading it would throw on every acknowledgement. The rows above still moved.
+      try {
+        if (selected && sameRow(selected.handler, selected.lineStart, selected.lineEnd) && selected.expectSrc === d.from) {
+          selected.expectSrc = d.to;
+        }
+      } catch (_) { /* no selection state to move */ }
     }
     // Origin, source, channel token and payload shape are checked — see webviewMessaging.ts.
     window.addEventListener('message', (ev) => {
