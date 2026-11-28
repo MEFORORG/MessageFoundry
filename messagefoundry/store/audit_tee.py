@@ -313,8 +313,10 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     :func:`~messagefoundry.redaction.redact_bounded_head`); with no note, this is
     ``safe_text(kept)``. ``kept`` is the handler chain's scrub of the head, which reads no note, so
     a value that chain already rewrote can still print here where ``old`` masks it. The line check
-    then sees a word ``old`` hid, and :func:`_tee_line` ships the detail hidden whole: the safe
-    direction, at the cost of the diagnostic."""
+    then sees a word ``old`` hid, and :func:`_tee_line` rejects the scrubbed line: it ships the
+    line with every field the C0 scrub changed as ``[redacted]``, the detail with its note, or,
+    where that line does not parse on a sink where the old one did, the old line, without the C0
+    scrub. The safe direction for the value, at the cost of the diagnostic."""
     shipped = safe_text(kept, follows=note) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)

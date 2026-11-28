@@ -122,6 +122,11 @@ def _main() -> Iterator[None]:
         # after the root fix this stand-in measures.
         if hasattr(redaction, "_mask_keeping_glue_head"):
             patch.setattr(redaction, "_mask_keeping_glue_head", lambda rest: None)
+        # Main copied an end tag naming no open element as it stood (#5925 item 13, also later).
+        if hasattr(redaction, "_stray_end_tag_name"):
+            patch.setattr(
+                redaction, "_stray_end_tag_name", lambda text, tag, mask, **_: tag.group()
+            )
         yield
 
 

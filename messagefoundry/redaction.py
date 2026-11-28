@@ -1938,17 +1938,23 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
 _XML_STRUCTURE_NAMES = frozenset({*_PHI_LEAF_KEYS, *_PHI_VALUE_KEYS, _VALUE_MEMBER})
 
 
-def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool) -> str:
+def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool, *, noted: bool) -> str:
     """An end tag inside a leaf element that names no open element, with its local name masked in
     place (BACKLOG #5925 item 13). Its name is text of the element, not markup: ``</family:Zqxdoe>``
     reads as a qualified name whose local part is the value, and it printed. Masked only where
     the name carries a prefix and its local part names no element a pass reads
     (:data:`_XML_STRUCTURE_NAMES`): masking ``</name`` itself let a later call read the element
     differently, and a value after it printed (measured by the composed-join differential). And
-    only where whitespace or the tag's ``>`` follows the name, so no caller's text can be glued to
-    it, and where :func:`_rest_words` and :func:`_ends_in_unbounded_word` allow it as they allow a
-    rest the tag's ``>`` ends. Otherwise, or with ``mask`` False, the tag is kept as it stood, at
-    least an unprefixed ``</Zqxdoe>`` and a ``</family:Zqxdoe`` that ends the text."""
+    only where whitespace or the tag's ``>`` follows the name, and where :func:`_rest_words` and
+    :func:`_ends_in_unbounded_word` allow it as they allow a rest the tag's ``>`` ends. Where only
+    whitespace follows the name to the text's end and no bound note follows (``noted`` False), the
+    stripped answer ends on the name and a caller's text can be glued to it, so the name keeps its
+    glue head (:func:`_mask_keeping_glue_head`: ``</family:ZqxM `` masks to ``</family:XxxM``), or
+    is kept whole where that mask refuses it. Otherwise, or with ``mask`` False, the tag is kept as
+    it stood, at least an unprefixed ``</Zqxdoe>`` and a ``</family:Zqxdoe`` that ends the text.
+    The prefix is never masked (``</Zqxdoe:x>`` prints ``Zqxdoe``), and only a leaf frame's stray
+    tag is read, so one inside an element whose text is read as one value prints its local part
+    (``<telecom>555</ns:Zqx4455>``)."""
     whole = tag.group()
     local = tag.group(3)
     if (
@@ -1962,7 +1968,13 @@ def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool) -> str:
     rest = " " + local
     if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
         return whole
-    return whole[: len(whole) - len(local)] + local.translate(_SHAPE)
+    head = whole[: len(whole) - len(local)]
+    if not noted and _TRAILING_SPACE.match(text, tag.end()) is not None:
+        # Only whitespace runs to the text's end, so the stripped answer ends on the name and a
+        # caller's text can be glued to it: keep the glue head, as an end tag's rest keeps it.
+        masked = _mask_keeping_glue_head(rest)
+        return whole if masked is None else head + masked[1:]
+    return head + local.translate(_SHAPE)
 
 
 def _scrub_xml_element(
@@ -1998,7 +2010,7 @@ def _scrub_xml_element(
             pos = rest.end() if rest is not None else tag.end()
             is_open = open_names.get(qname)
             stray = not is_open and stack[-1][1] == _LEAF
-            out.append(_stray_end_tag_name(text, tag, mask) if stray else tag.group())
+            out.append(_stray_end_tag_name(text, tag, mask, noted=noted) if stray else tag.group())
             out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
             if is_open:
                 while stack:
@@ -2659,9 +2671,10 @@ def _glued_end_tag_rest(
     every rest here (:func:`_scrub_field_runs`), where the walk can still mask one once the JSON
     pass has scrubbed the opener. The #3318 rule refusing a last word of two letters or fewer
     glued to what follows is not applied by this arm itself: it guards a string prefix before a
-    quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). :func:`_end_tag_rest`
-    still applies it where only whitespace follows the rest and that whitespace opens with a line
-    break, short of a bound note (``a|b|</family Li`` then a line break keeps ``Li``).
+    quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). Where only
+    whitespace follows the rest and that whitespace opens with a line break, short of a bound note,
+    :func:`_end_tag_rest` reads the line break as the text's end and masks the word but for its glue
+    head (:func:`_mask_keeping_glue_head`: ``a|b|</family Li`` then a line break masks ``Li``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
     read on ``text`` ran into the note, took its punctuation, and was refused where the walk masks

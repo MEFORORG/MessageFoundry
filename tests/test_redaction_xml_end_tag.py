@@ -69,7 +69,9 @@ def _main() -> Iterator[None]:
         patch.setattr(redaction, "_masked_only", _never_masked_only)
         # Main copied an end tag naming no open element as it stood (BACKLOG #5925 item 13).
         if hasattr(redaction, "_stray_end_tag_name"):
-            patch.setattr(redaction, "_stray_end_tag_name", lambda text, tag, mask: tag.group())
+            patch.setattr(
+                redaction, "_stray_end_tag_name", lambda text, tag, mask, **_: tag.group()
+            )
         yield
 
 
@@ -441,7 +443,12 @@ _STARTS = (
     "<family> ", '<identifier><system value="urn:x">', "<identifier><value>",
 )  # fmt: skip
 _CONTENT = ("Smith", "Smith Doe", "", "1980", "Doe\n", "A^B^C", "(0010,1000) Doe")
-_ENDS = ("</family", "</given", "</other", "</ns:family", "</name", "</system", "</value")
+#: The last two are prefixed local names no element takes, so the stray end-tag mask (item 13) is
+#: exercised here; the end-of-text shape glued text completes is pinned below, not reached here.
+_ENDS = (
+    "</family", "</given", "</other", "</ns:family", "</name", "</system", "</value", "</x:ZqxM",
+    "</ns:zqxP",
+)  # fmt: skip
 _LABELS = (
     "password:", "password: ", "token=", "Bearer ", "Authorization: Bearer ", "MRN ", "MRN: ",
     "mrn=", '"name": "', "'family': '", "(0010,0010) ", "PatientName=", "PatientID: ", "id=",
@@ -765,3 +772,46 @@ def test_an_end_tag_name_the_rules_refuse_stays_as_main_left_it(text: str) -> No
     with _main():
         main = redact(text)
     assert redact(text) == main
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("<family>Smith</family:ZqxM ", "<family>[redacted]</family:XxxM"),
+        ("<family>Smith</x:zqxP\n", "<family>[redacted]</x:xxxP"),
+        ("<given>Jo</y:Zqnon\t", "<given>[redacted]</y:Xxnon"),
+        ("<family>Smith</family:Zqxdoe ", "<family>[redacted]</family:Xxxxxx"),
+    ],
+)
+def test_a_stray_end_tag_name_ending_the_text_keeps_its_glue_head(text: str, want: str) -> None:
+    """Code review of the item-13 mask: where only whitespace follows the name to the text's end,
+    the stripped answer ends on the name, so it keeps the end a caller's glued text could complete,
+    as an end tag's rest that ends the text keeps it."""
+    assert safe_text(text) == want
+    assert safe_text(want) == want
+
+
+@pytest.mark.parametrize(
+    ("a", "raw", "value"),
+    [
+        ("<family>Smith</family:ZqxM ", "SH*^~\\&*A*B\rPID*1**DOEX$JANEX", "DOEX"),
+        ("<family>Smith</x:zqxP\n", "assword: s3cr3tvalue99", "s3cr3tvalue99"),
+        ("<family>Smith</y:Zqnon ", "numeric port: 'hunterpw@host'", "hunterpw"),
+    ],
+)
+def test_text_glued_after_a_stray_end_tag_name_still_completes_its_word(
+    a: str, raw: str, value: str
+) -> None:
+    """Code review of the item-13 mask: masking the whole name lost the head of the word glued text
+    completes, and a value main's answer hid printed (measured on the head before this repair)."""
+
+    def joined() -> str:
+        return secretscrub.scrub_credentials(redact(safe_text(a) + raw))
+
+    with _main():
+        assert value not in joined()  # the premise: main's answer hid it
+    assert value not in joined()
+    # THE POSITIVE CONTROL: the name masked whole, as before this repair, and the value prints.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_glue_head_start", len)
+        assert value in joined()
