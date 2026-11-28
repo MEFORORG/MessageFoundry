@@ -101,6 +101,7 @@ __all__ = [
     "LINUX_HOST_FILE_SYSTEMS",
     "MOUNT_TABLE_INCOMPLETE",
     "MOUNT_TABLE_UNREAD",
+    "MOUNT_TABLE_UNSETTLED",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
     "OwnerRefused",
@@ -1215,14 +1216,15 @@ class UncheckedProblem(str):
     clears it, so a caller says that ``path`` could not be fully checked and appends no
     owner-and-mode remedy of its own. Told apart from a finding by its type, never by its text.
     The type is lost by any operation that builds a new string, so a caller tests the answer as
-    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`) and one that
-    leaves a part of the path with no type judged (:data:`MOUNT_TABLE_INCOMPLETE`) are answered this
-    way; other answers that the check could not be completed are still plain strings."""
+    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`), one that leaves
+    a part of the path with no type judged (:data:`MOUNT_TABLE_INCOMPLETE`) and one that did not
+    settle while the path was walked (:data:`MOUNT_TABLE_UNSETTLED`) are answered this way; other
+    answers that the check could not be completed are still plain strings."""
 
     __slots__ = ()
 
 
-#: The sentence both not-fully-checked mount answers end with.
+#: The sentence every not-fully-checked mount answer ends with.
 _MOUNT_TABLE_NOT_CLEARED = (
     "Changing the owner or mode of the checked path or of the folders above it, or replacing what "
     "is at that path, does not clear it"
@@ -1256,9 +1258,7 @@ MOUNT_TABLE_INCOMPLETE: Final = (
 )
 
 #: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
-#: ``/proc/self/mountinfo`` did not give one settled answer while the path was walked: only one of
-#: the reads before and after the walk succeeded, or the two placed a part of the path on different
-#: mounts and the read after the second walk failed or placed it elsewhere again
+#: ``/proc/self/mountinfo`` did not give one settled answer while the path was walked
 #: (:func:`_posix_link_problem` states the rule, vault BACKLOG #5636). Answered, like
 #: :data:`MOUNT_TABLE_UNREAD`, only where the rest of the POSIX check finds nothing, and worded for
 #: a refusal and a warning alike.
@@ -1300,13 +1300,13 @@ def _posix_link_problem(
     and the table is read a third time. The findings of both walks are kept, and the first walk's
     parts are still judged on both tables, so a link re-pointed between the walks cannot hide a
     refusal only the first walk's placement shows. Where only one of the first two calls answers
-    ``None``, or the third answers ``None`` or places the second walk's parts on different mounts
-    than the second call did, the walk could not be checked against a settled table, so where
-    nothing else is found the answer is :data:`MOUNT_TABLE_UNSETTLED`, never a pass. Each
-    placement is judged by :func:`_posix_mounts_judged`: a type any table refuses is refused, since
-    the owner and mode
-    bits this whole check reads are not what decides who reaches the file there (vault BACKLOG
-    #5657 step 6 (f)), and where the last table read leaves a part with no type judged, and nothing
+    ``None``, the two walks visit different parts, or the third call answers ``None`` or places the
+    second walk's parts on different mounts than the second call did, the path was not checked
+    against a settled table, so where nothing else is found the answer is
+    :data:`MOUNT_TABLE_UNSETTLED`, never a pass. Each placement is judged by
+    :func:`_posix_mounts_judged`: a type any table refuses is refused, since the owner and mode bits
+    this whole check reads are not what decides who reaches the file there (vault BACKLOG #5657
+    step 6 (f)), and where the last placement made leaves a part with no type judged, and nothing
     else is found, the answer is :data:`MOUNT_TABLE_INCOMPLETE`. A local mount that a later mount
     on a folder above it hides is judged by that later mount, since the walk visits that folder,
     which ``mount_of`` places on it. Kept free of I/O so the decision is testable everywhere."""
@@ -1349,19 +1349,22 @@ def _posix_link_problem(
         judged.append(place(walks[0][2], after))
         if before is not None and judged[0] != judged[1]:
             # Appended, never in place of walk 1's: a link re-pointed between the walks must not
-            # hide a refusal only walk 1's placement on the after table shows.
+            # hide a refusal only walk 1's placement on the after table shows. A path whose walks
+            # differ did not stay put, so what walk 1 alone saw is never cleared by walk 2.
             walks.append(walk())
             judged.append(place(walks[1][2], after))
+            unsettled = walks[0][2] != walks[1][2]
             settled = read()
             if settled is None:
                 unsettled = True
             else:
                 judged.append(place(walks[1][2], settled))
-                unsettled = judged[-1] != judged[-2]
+                unsettled = unsettled or judged[-1] != judged[-2]
     refused: str | None = None
     unjudged = False
     for placed in judged:
-        # Any table's refusal stands; the last table read decides what was not judged.
+        # Any table's refusal stands. The last placement made decides what was not judged; where
+        # that is not the last table read, the reads did not settle, answered before this is.
         found, unjudged = _posix_mounts_judged(placed)
         refused = refused or found
 
@@ -1424,7 +1427,7 @@ def _posix_host_link_problem(path: Path) -> str | None:
     tables this does not read, no type is judged. Where the table is read, a part of the path no
     mount it lists holds, as a table read inside a chroot whose root is not a mount can leave, is
     answered as not judged (:data:`MOUNT_TABLE_INCOMPLETE`). The table is read before and after
-    the walk, as :func:`_posix_link_problem` says. A type the rule does not name is still not
+    the walk, and a third time after a second walk, as :func:`_posix_link_problem` says. A type the rule does not name is still not
     judged. ``docs/PHI.md`` lists at least these cases
     too. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
@@ -1455,7 +1458,7 @@ def _posix_host_link_problem(path: Path) -> str | None:
     tables: list[list[tuple[str, str]] | None] = []
 
     def mounts_fn() -> list[tuple[str, str]] | None:
-        # Kept, so an answer of no table from both reads is told apart from one from a table.
+        # Kept, so an answer of no table from every read is told apart from one from a table.
         tables.append(read_mounts())
         return tables[-1]
 
@@ -1613,8 +1616,9 @@ def broad_access_problem(
     :func:`_posix_mount_refused` refuses, since those owner and mode bits do not decide who
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
     with it the mount check, is skipped under ``holder_judged``. Its answers where the table
-    cannot be read (:data:`MOUNT_TABLE_UNREAD`) or reads but leaves a part of the path with no type
-    judged (:data:`MOUNT_TABLE_INCOMPLETE`), and at least some of what it does not judge, are
+    cannot be read (:data:`MOUNT_TABLE_UNREAD`), reads but leaves a part of the path with no type
+    judged (:data:`MOUNT_TABLE_INCOMPLETE`), or does not settle while the path is walked
+    (:data:`MOUNT_TABLE_UNSETTLED`), and at least some of what it does not judge, are
     :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. Each answer
     is an :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
     file's own owner and mode were judged first, and the text carries its own remedy. It is

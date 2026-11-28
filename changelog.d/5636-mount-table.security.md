@@ -7,7 +7,7 @@
   passed. The table is read both before and after the walk of the key's path, so a mount the walk
   triggers is judged; where the two reads place the path on different mounts it is walked again,
   both walks' placements are judged, and the table is read a third time. Where only one of the
-  first two reads succeeds, or the third fails or places the path on a different mount again, it
-  is answered as not fully checked.
+  first two reads succeeds, the two walks visit different folders, or the third read fails or
+  places the path on a different mount again, it is answered as not fully checked.
   [PHI.md](../docs/PHI.md) section 2 lists at least some of what the check still does not judge.
   (`BACKLOG #5636`)

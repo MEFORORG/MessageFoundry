@@ -1226,6 +1226,7 @@ def test_a_posix_walk_run_again_keeps_the_first_walks_finding() -> None:
         mounts_fn=mounts_fn,
     )
     assert problem is not None and "a folder holding or above a junction or link" in problem
+    assert not reads
 
 
 @pytest.mark.parametrize("unread_first", [True, False])
@@ -1244,13 +1245,16 @@ def test_a_posix_mount_table_read_only_once_of_twice_is_unchecked(unread_first: 
     assert isinstance(problem, restricted_file.UncheckedProblem)
     # Not the unread table's text, whose remedy is to make the table readable at all.
     assert problem == restricted_file.MOUNT_TABLE_UNSETTLED
+    # Worded for a warning too, with no owner-and-mode remedy, as the other unchecked answers are.
+    assert "refus" not in problem and "chmod" not in problem and "chown" not in problem
+    assert problem.endswith(restricted_file._MOUNT_TABLE_NOT_CLEARED)
 
 
-def test_a_posix_link_re_pointed_between_walks_keeps_the_first_walks_mount_refusal() -> None:
-    """Vault BACKLOG #5636, review round-5622bdd5 finding 1: the first walk runs through a link
-    onto an NFS mount the table after it lists, so the two tables differ and the path is walked
-    again; the link is re-pointed onto a local folder before that second walk. The first walk's
-    placement on the after table is still judged, so its refusal is kept."""
+def _re_pointed_link_problem(first: str, fstype: str) -> tuple[str | None, int]:
+    """:func:`_posix_link_problem` for ``/srv/link/k.key``, root's link onto ``first`` until the
+    second table read, then onto the local ``/private/tmp/keys``. The table read before the walk
+    holds ``/`` alone; every later one adds a ``/net/keys`` mount of ``fstype``. Answers the problem
+    and the number of table reads."""
     state = {"reads": 0}
     tree = {
         **_KEY_TREE,
@@ -1268,11 +1272,11 @@ def test_a_posix_link_re_pointed_between_walks_keeps_the_first_walks_mount_refus
 
     def readlink_fn(part: str) -> str:
         assert part == "/srv/link"
-        return "/net/keys" if state["reads"] < 2 else "/private/tmp/keys"
+        return first if state["reads"] < 2 else "/private/tmp/keys"
 
     def mounts_fn() -> list[tuple[str, str]]:
         state["reads"] += 1
-        return [("/", "ext4")] if state["reads"] == 1 else [("/", "ext4"), ("/net", "nfs")]
+        return [("/", "ext4")] if state["reads"] == 1 else [("/", "ext4"), ("/net/keys", fstype)]
 
     problem = restricted_file._posix_link_problem(
         "/srv/link/k.key",
@@ -1282,8 +1286,33 @@ def test_a_posix_link_re_pointed_between_walks_keeps_the_first_walks_mount_refus
         readlink_fn=readlink_fn,
         mounts_fn=mounts_fn,
     )
+    return problem, state["reads"]
+
+
+def test_a_posix_link_re_pointed_between_walks_keeps_the_first_walks_mount_refusal() -> None:
+    """Vault BACKLOG #5636, review round-5622bdd5 finding 1: the first walk runs through a link
+    onto an NFS mount the table after it lists, so the two tables differ and the path is walked
+    again; the link is re-pointed onto a local folder before that second walk. The first walk's
+    placement on the after table is still judged, so its refusal is kept."""
+    problem, reads = _re_pointed_link_problem("/net/keys", "nfs")
     assert problem is not None and "on a mount of type nfs" in problem
-    assert state["reads"] == 3
+    assert reads == 3
+
+
+def test_a_posix_link_re_pointed_between_walks_is_unchecked_where_walk_1_was_not_judged() -> None:
+    """A path whose two walks visit different parts did not stay put: here walk 1 ended on an
+    automount point not mounted, which walk 2, through the re-pointed link, never visits. That is
+    answered as not fully checked, never passed."""
+    problem, reads = _re_pointed_link_problem("/net/keys", "autofs")
+    assert isinstance(problem, restricted_file.UncheckedProblem)
+    assert problem == restricted_file.MOUNT_TABLE_UNSETTLED
+    assert reads == 3
+
+
+def test_a_posix_link_that_never_reaches_the_new_mount_passes_with_two_reads() -> None:
+    """The negative control: the same tables, with the link onto the local folder in both walks,
+    place every visited part as before, so there is no second walk and the path passes."""
+    assert _re_pointed_link_problem("/private/tmp/keys", "nfs") == (None, 2)
 
 
 @pytest.mark.parametrize(

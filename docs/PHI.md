@@ -503,8 +503,8 @@ than a path is not checked
   overlay mount, or a file in the secrets directory that is a mount of its own. Where that file
   reads but lists no mount under a part of the path, as in a chroot whose root is not a mount, or
   the path ends on an automount point not mounted yet, or only one of the check's reads of that
-  file before and after its walk succeeds, or the mounts on the path still change after a second
-  walk, the path is answered as not fully checked, as where the file cannot be read (vault
+  file before and after its walk succeeds, or the path or the mounts on it still change after a
+  second walk, the path is answered as not fully checked, as where the file cannot be read (vault
   BACKLOG #5636). Keep key files on a local file system. It reads no
   access list itself, so it can pass a key that a file system of a type it does not judge, or an
   access list such as an NFSv4 or macOS one, lets another account reach. Check
