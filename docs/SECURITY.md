@@ -1831,7 +1831,12 @@ a writer with direct database access that keeps changing a tampered row's userna
 or federated pair cannot make it vanish from these reads. One that keeps changing the row's own
 `id` still can: a re-read by the old id finds nothing, so the row reads as gone under that id,
 unreported. Honest writes that race all three checks the same way would be a false alarm
-too. **Two honest role writes to the account that commit across both of those reads
+too. A sign-in, and at least provision-admin and the directory rename refresh, that looks an
+account up by username, directory id or federated pair is read the same way: a row that still
+holds the key after all three checks raced is refused and reported, under the same audit row and
+alert, so an operator can trace the refused sign-in to it; a different row holding the key by then
+is checked once instead and not reported unless that check fails. Unlike the admin reads, these
+lookups report nothing of their own for a Vault transit answer. **Two honest role writes to the account that commit across both of those reads
 are still answered as a failing record and reported**, a false alarm the reads cannot tell from
 tampering, because the role rows are read apart from the account's row. Since BACKLOG #5520,
 `PUT /users/{user_id}/roles`, and the console's `POST /ui/users/{user_id}/roles` that calls it,

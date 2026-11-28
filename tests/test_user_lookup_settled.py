@@ -8,8 +8,10 @@ AD sign-in, the local sign-in's read by name and the directory rename refresh, a
 ``_load_user_by_federated_subject`` the federated sign-in. Each took one check and dropped whether
 it had established anything, so a check that raced a delete, rename or re-key read as a record
 that fails its seal (``refused``): the honest race refused the caller. They now read again while
-the check raced, up to ``_CHECKED_READ_PASSES`` checks, and fail closed as ``_checked_by_id``
-does. Each test stands a raced or failed check in for the contention by stubbing ``_verified``.
+the check raced, up to ``_CHECKED_READ_PASSES`` checks, then refuse and report the row the last
+check read if it still holds the key, as ``_checked_by_id`` does for a row that raced every check;
+another row holding the key by then is checked once instead. Each test stands a raced or failed
+check in for the contention by stubbing ``_verified``.
 Synthetic accounts only.
 """
 
@@ -23,11 +25,13 @@ import pytest
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
+    AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
     AuthService,
     _SealCheck,
     _UserLookup,
 )
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.row_seal import USER_KIND, TransitSealUnverifiableError
 from messagefoundry.store.store import MessageStore
 
 _OBJECT_ID = "6f1c2a4e-0000-4000-8000-000000000001"
@@ -190,3 +194,89 @@ async def test_an_account_gone_is_not_held(store: MessageStore, key: str) -> Non
     service = AuthService(store, AuthSettings())
     found = await _lookup(service, key)
     assert found.user is None and not found.held
+
+
+async def _second_account(store: MessageStore) -> None:
+    """Another account, ``u2``, which the tests below put behind the first account's key."""
+    await store.create_user(
+        user_id="u2",
+        username="asmith",
+        auth_provider="ad",
+        password_generated=False,
+        directory_object_id="6f1c2a4e-0000-4000-8000-000000000002",
+        audits=(),
+    )
+
+
+def _other_row_at_final_read(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Past the raced passes, the key's reader answers ``u2``: the first account was renamed off
+    the key and another account took it before the lookup's final read."""
+    name = _READERS[key]
+    original = getattr(store, name)
+    reads = [0]
+
+    async def swapped(*args: Any, **kw: Any) -> Any:
+        reads[0] += 1
+        if reads[0] > _PASSES:
+            return await store.get_user("u2")
+        return await original(*args, **kw)
+
+    monkeypatch.setattr(store, name, swapped)
+
+
+@pytest.mark.parametrize("key", _KEYS)
+async def test_a_different_row_at_the_final_read_is_checked_not_reported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """RED when: after every check raced, the lookup reports whichever row now holds the key. That
+    row was never checked, so an intact account that took the name after a rename would be filed
+    under ``integrity.authority_seal_failed`` and its sign-in refused. It is checked once instead,
+    and served when it passes."""
+    await _account(store)
+    await _second_account(store)
+    service = AuthService(store, AuthSettings())
+    calls = _race_first(service, monkeypatch, races=_PASSES)
+    _other_row_at_final_read(store, monkeypatch, key)
+    found = await _lookup(service, key)
+    assert found.user is not None and found.user.id == "u2"
+    assert not found.refused
+    assert calls[0] == _PASSES + 1
+    assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=100) == []
+
+
+@pytest.mark.parametrize("key", _HELD_KEYS)
+async def test_a_different_row_whose_one_check_races_is_refused_unreported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Control: where the different row's one check races too, nothing established anything about
+    either record, so the key is refused, held, and nobody is reported."""
+    await _account(store)
+    await _second_account(store)
+    service = AuthService(store, AuthSettings())
+    _race_first(service, monkeypatch, races=_PASSES + 1)
+    _other_row_at_final_read(store, monkeypatch, key)
+    found = await _lookup(service, key)
+    assert found.refused
+    assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=100) == []
+
+
+@pytest.mark.parametrize("key", _KEYS)
+async def test_an_unverifiable_answer_propagates_unreported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Pins what the lookup's docstring states: it has none of ``_checked_by_id``'s Vault transit
+    arms, so an Unverifiable answer reaches the caller unreported here. The directory reconciler's
+    rename reads rely on that (``test_a_transit_answer_at_a_rename_read``). RED when: the lookup
+    swallows the answer, or reports it."""
+    await _account(store)
+    service = AuthService(store, AuthSettings())
+
+    async def unverifiable(user: Any) -> _SealCheck:
+        raise TransitSealUnverifiableError(USER_KIND, 1, 2)
+
+    monkeypatch.setattr(service, "_verified", unverifiable)
+    with pytest.raises(TransitSealUnverifiableError):
+        await _lookup(service, key)
+    assert await store.list_audit(action=AUTHORITY_SEAL_UNVERIFIABLE_ACTION, limit=100) == []

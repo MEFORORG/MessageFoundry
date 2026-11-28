@@ -4349,7 +4349,8 @@ class _SealCheck:
 #: item 7), which reads again on a failed check too. What happens once every pass has raced is
 #: each reader's to say: the id's settled read answers refused and reports only what each
 #: ``_verified`` check reported, while :meth:`AuthService._checked_by_id` and the key lookups read
-#: the row once more and report a seal failure for one still there.
+#: once more and report a seal failure for the row the last check read, if it is still there; a
+#: key lookup that finds another row holding the key by then checks that row instead.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -14231,18 +14232,34 @@ class AuthService:
         reported (:meth:`_verified`), so it is not taken as a record that fails its seal: the next
         read decides, and one that finds no row by the key is gone. A record :meth:`_verified`
         established fails, the unreadable stand-in included, is refused at once, so a row gone
-        from the key on a later read cannot clear it. A row still holding the key after every
-        check raced fails closed as :meth:`_checked_by_id` does: each of its checks failed its
-        seal, so it is handed to :meth:`_user_seal_failed` and refused. One gone from the key by
-        that read is gone."""
+        from the key on a later read cannot clear it. Once every check raced, the key is read once
+        more. The row the last check read, still holding the key, is refused and reported as
+        :meth:`_checked_by_id` reports a row that raced every check: each of its checks failed
+        its seal, so it is handed to :meth:`_user_seal_failed`. A different row holding the key
+        by then was never checked, so it is not reported on that ground: it is checked once, and
+        answered as that check settles it. Where that check races too, it is refused, held and
+        unreported, since nothing established that its record fails. One gone from the key by
+        that read is gone.
+
+        Unlike :meth:`_checked_by_id`, this lookup has no Vault transit arms: an Unverifiable or
+        an Outage answer from :meth:`_verified` propagates to the caller unreported here. The
+        directory reconciler's rename reads rely on that, logging an Unverifiable answer at ERROR
+        with no page and paging an Outage once for the pass (vault BACKLOG #3069 item 1)."""
+        last_id = ""
         for _pass in range(_CHECKED_READ_PASSES):
             raw = await read_user_or_unreadable(read())
             check = await self._verified(raw)
             if raw is None or check.settled:
                 return _UserLookup(check.user, raw is not None)
+            last_id = raw.id
         still_there = await read_user_or_unreadable(read())
         if still_there is None:
             return _UserLookup(None, False)
+        if still_there.id != last_id:
+            # Another account took the key after the last check (a rename, then a new holder of
+            # the name): reporting it would file a seal failure against a record nobody checked.
+            other = await self._verified(still_there)
+            return _UserLookup(other.user, True)
         await self._user_seal_failed(still_there.id)
         return _UserLookup(None, True)
 

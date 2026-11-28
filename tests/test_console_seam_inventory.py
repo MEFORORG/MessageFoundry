@@ -517,6 +517,7 @@ _SEAM_FIELDS: dict[str, Field] = {
             "PUT /users/{user_id}/roles",
             "PUT /users/{user_id}/channel-scope",
             "POST /users/{user_id}/reset-password",
+            "POST /users/{user_id}/reset-mfa",
         ),
     ),
     "admin.list_custom_roles": _endpoint("GET /roles/custom"),
