@@ -6,7 +6,8 @@
 // Item 16: a user-set serviceConfig that reaches the workspace folder by another spelling, a UNC
 // loopback admin share (`\\localhost\C$\...`) or a junction outside the folder onto it or a folder
 // below it, was accepted as written, so no link the repository holds was checked on it. The editor
-// now reads each folder on the path, by real path and by device and file id, and checks the part
+// now reads each folder on the path by real path, compares the folders on each real path by device
+// and file id, and checks the part
 // below the workspace folder. Item 57: in a window opened from a `.code-workspace` file, that file
 // chooses the workspace folder and holds the workspace settings, so a path inside that folder is
 // refused unless the folder lies inside the folder holding the file. Item 102: the real-path compare
@@ -162,7 +163,8 @@ windowsSuite("b20008 F: a user-set path that reaches the workspace by another sp
       const got = securityConfigTarget(ws, "D:\\elsewhere\\x.toml", user, fsx);
       assert.ok(!got.ok && got.problem.includes("could not read"), JSON.stringify(got));
     }
-    // A long-path or device prefix does not split into folders, so it is refused, not walked.
+    // A long-path or device prefix before a drive does not split into folders, so it is refused, not
+    // walked. A one-component one (`\\.\x.toml`) is parsed whole as the root and accepted as written.
     for (const spelled of ["\\\\?\\D:\\elsewhere\\x.toml", "\\\\.\\D:\\elsewhere\\x.toml"]) {
       const got = securityConfigTarget(ws, spelled, user, modelFs({ ids: { ...base, "D:\\elsewhere": "2:5" } }));
       assert.ok(!got.ok && got.problem.includes("could not read"), `${spelled} ${JSON.stringify(got)}`);
@@ -507,7 +509,7 @@ suite("b20008 F: in a .code-workspace window, a path inside a workspace folder o
       for (const lead of ["\\", "/", "\\\\", "\\\\\\", "//"]) {
         const rooted = `${lead}${name}`;
         const onDrive = path.win32.resolve(chosen, rooted);
-        assert.strictEqual(onDrive.toUpperCase(), `${chosen.slice(0, 2)}\\${name}`.toUpperCase(), rooted);
+        assert.strictEqual(onDrive.toUpperCase(), `${path.win32.parse(chosen).root}${name}`.toUpperCase(), rooted);
         assert.deepStrictEqual(securityConfigTarget(chosen, rooted, inWindow(user, workspaceFile), real), { ok: true, path: onDrive }, rooted);
       }
     }

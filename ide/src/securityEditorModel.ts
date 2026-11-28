@@ -141,7 +141,8 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
 }
 
 /** `p`'s root (drive, UNC share or `/`) and the segments below it, as `p` spells them, or undefined
- *  for a spelling the root does not split, at least a `\\?\` or `\\.\` prefix. */
+ *  for a spelling the root does not split, at least a `\\?\` or `\\.\` prefix before a drive. A
+ *  one-component prefixed spelling (`\\.\x.toml`) is parsed whole as the root, with no segments. */
 function rootAndSegments(p: string): { readonly head: string; readonly segments: readonly string[] } | undefined {
   const head = path.parse(p).root;
   const segments = segmentsBelow(head, p);
@@ -345,7 +346,7 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    real path and file id, with the same open limits.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
- *    and the folder itself is refused. Otherwise every folder and file name on its whole path gets
+ *    and the folder itself is refused. Otherwise every folder and file name below its root gets
  *    rule 2's name checks first, before any file-system call: on Windows, a name ending in a dot or a space,
  *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
  *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
@@ -362,8 +363,8 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    least not on ReFS) can cause a refusal but never send the CLI to a file the setting does not
  *    name. When no folder on it is inside, it is accepted as written, but for rule 2's
  *    `.code-workspace` case. A dangling link on it, any other read error, a long-path or device
- *    prefix (`\\?\`, `\\.\`), or a caller that passes no `fileId`, refuses; an entry with no file id
- *    is placed by real path only.
+ *    prefix before a drive (`\\?\C:\...`, `\\.\C:\...`), or a caller that passes no `fileId`,
+ *    refuses; an entry with no file id is placed by real path only.
  *
  * On Windows a spelling is inside the folder when it matches with only ASCII case ignored, not
  * toLowerCase()'s fold (pathFold.ts, BACKLOG #5832). A path that
@@ -394,7 +395,12 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * `..`, or on Windows a rooted value with no drive, at least `\x.toml`, `/x.toml`, `\\x.toml`,
  * `\\\x.toml` and `//x.toml` (path.win32.resolve reads each on the folder's drive, measured; a
  * `\\server\share\` value is a UNC path instead), is read against the
- * folder the file chose, or its drive, and is accepted as written when no folder on it is inside.
+ * folder the file chose, or its drive or share root, and is accepted as written when no folder on
+ * it is inside. The name checks skip the path's root, so a UNC server or share name is not
+ * name-checked, and a one-component long-path or device spelling (`\\?\x.toml`, `\\.\cfg.`, measured
+ * with standalone Node v24.20.0), which path.parse reads whole as the root, is accepted as written
+ * with no name check: no looser than before #8237 item 16, when every user-set path outside the
+ * folder was.
  * Nor does this check cover the files the CLI creates beside the target, or a link made or a
  * folder renamed between this check and the CLI's write, since the CLI opens the path itself, later.
  */
