@@ -13,4 +13,6 @@
   cases: before its anchor preflight where the engine reads it, at the runner's reads, and when a
   demotion stopped the graph during the step, which before was recorded active with nothing
   bound. A lease lost after the runner's second read while the graph runs is still not refused.
-  A node that holds the lease, and a single node, are unchanged. (`BACKLOG #5906`)
+  A graph stopped during the run-profile step on a node that holds the lease, or on a single
+  node, is refused too, with kind `profile`; such a node is otherwise unchanged.
+  (`BACKLOG #5906`)

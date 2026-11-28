@@ -158,9 +158,10 @@ _RUN_ON_THE_LEASE_HOLDER: Final = "run the activation on the node that holds the
 
 class DrProfileNotLeading(RuntimeError):
     """The ``activate_profile`` callback refused because this cluster node does not hold the
-    lease, before it changed any lane (BACKLOG #5906). The engine raises it from its own read
-    before the preflight, or from the runner's refusal of the reload, so this module does not
-    import the runner. Its abort keeps kind ``profile``, the step that refused."""
+    lease, before it changed any lane (BACKLOG #5906). The engine raises it at least from its own
+    read before the preflight and from the runner's refusals of the reload, the lease read and the
+    stopped-graph read, so this module does not import the runner. Its abort keeps kind
+    ``profile``, the step that refused."""
 
 
 class DrActivationError(RuntimeError):

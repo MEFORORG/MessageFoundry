@@ -117,6 +117,7 @@ from messagefoundry.pipeline.wiring_runner import (
     FhirLookupAnchorPass,
     RegistryRunner,
     RunnerLeaseLostError,
+    RunnerNotRunningError,
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
@@ -462,6 +463,14 @@ class ReloadStepFailure:
 
     step: str
     detail: str
+
+
+def _dr_profile_not_leading() -> DrProfileNotLeading:
+    """The DR profile step's lease refusal (BACKLOG #5906), in its own words: a follower's graph
+    has already stopped, and a DR activation is not a reload to retry on the leader."""
+    return DrProfileNotLeading(
+        "this node does not hold the cluster lease, so the DR profile step applied nothing"
+    )
 
 
 def _outbound_close_failure(close_failures: Sequence[tuple[str, str]]) -> ReloadStepFailure:
@@ -1342,8 +1351,8 @@ class Engine:
         # What an operator had bound before this call, which a failed activation does not unbind.
         # It does not bind again one the attempt's own reload had parked.
         listening = rr.listening_inbounds() if rr is not None else frozenset()
-        # Whether the graph ran when the profile step began, so one that stops during it is
-        # refused below rather than recorded active with nothing bound (BACKLOG #5906).
+        # Whether the graph ran when the profile step began, so the reload refuses one that has
+        # stopped since, rather than binding nothing on a box recorded active (BACKLOG #5906).
         was_running = rr is not None and rr.running
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
         # graph is what the operator last applied, through whatever approval that reload needed, so
@@ -1365,7 +1374,7 @@ class Engine:
             # reload_detail refuses first. The coordinator's test, not the runner's alone: a node
             # demoted during the takeover hook has a stopped runner, whose reload would answer
             # with nothing bound. Nothing is changed yet, so nothing is rolled back.
-            raise DrProfileNotLeading(str(RunnerLeaseLostError.for_reload()))
+            raise _dr_profile_not_leading()
         try:
             lookups: FhirLookupAnchorPass | None = None
             if rr is not None:
@@ -1376,19 +1385,12 @@ class Engine:
                 # (vault BACKLOG #3094, #3582), unless a reload landed first and changed the graph.
                 # The reload's build check and executor build still load each lookup CA file,
                 # with no bound, as a lane's build loads its own.
-                close_failures = await rr.reload(fhir_lookup_anchors=lookups)
-                if was_running and not rr.running:
-                    # BACKLOG #5906: the graph stopped during this step, as Engine._stop_graph
-                    # stops it on a demotion that lands during the preflight or before the
-                    # reload takes its lock. The reload then applied the graph to a stopped
-                    # runner and bound nothing, so the activation must not be recorded active.
-                    # Read after the reload, not after the preflight, so a stop that waits on the
-                    # reload lock is caught too. A graph that stops after this read is not.
-                    if self._dr_not_leading():
-                        raise DrProfileNotLeading(str(RunnerLeaseLostError.for_reload()))
-                    raise RuntimeError(
-                        "the engine's graph stopped during the activation, so nothing was bound"
-                    )
+                # require_running: a demotion whose Engine._stop_graph finishes during the
+                # preflight, or while the reload waits on its lock, leaves the graph stopped. The
+                # runner refuses that under its lock, before it changes anything (BACKLOG #5906).
+                close_failures = await rr.reload(
+                    fhir_lookup_anchors=lookups, require_running=was_running
+                )
         except BaseException as exc:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1421,10 +1423,13 @@ class Engine:
                         "DR activation failed, and closing the outbound sessions it had opened "
                         "failed too; POST /config/reload closes them"
                     )
-            if isinstance(exc, RunnerLeaseLostError):
+            if isinstance(exc, RunnerLeaseLostError) or (
+                isinstance(exc, RunnerNotRunningError) and self._dr_not_leading()
+            ):
                 # BACKLOG #5906: the DR coordinator's own type, so its abort row can name the
-                # lease without importing the runner.
-                raise DrProfileNotLeading(str(exc)) from exc
+                # lease without importing the runner. A graph stopped on a node that still leads
+                # keeps the runner's own refusal.
+                raise _dr_profile_not_leading() from exc
             raise
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).

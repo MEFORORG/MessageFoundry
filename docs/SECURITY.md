@@ -3062,10 +3062,10 @@ the last of those reads, once any takeover hook has run, is refused at the profi
 `profile` in at least these cases: when the engine's read before the preflight finds it; when
 the runner's two reads of a reload find it, after the preflight has read the anchors and written
 their rows; and when the graph stopped during the step, as a demotion's teardown stops it, which
-the engine reads once the reload returns. At least these are still not refused: a lease lost
-after the runner's second read while the graph keeps running, whose reload binds and resumes
-lanes, so the activation is recorded active though the teardown then takes them down; and a
-graph that stops after the engine's read following the reload.
+the runner reads once its reload holds the lock every teardown also holds. At least this is still
+not refused: a lease lost after the runner's second read while the graph keeps running, whose
+reload binds and resumes lanes, so the activation is recorded active though the teardown then
+takes them down once the reload releases the lock.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
