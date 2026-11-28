@@ -487,7 +487,7 @@ async def test_a_lease_taken_after_the_last_release_never_gets_a_pool_being_shut
         taken.append(row_seal._transit_pool())
 
     real_shutdown = row_seal.shutdown_transit_pools
-    real_drain = row_seal._drain_pools
+    real_drain = getattr(row_seal, "_drain_pools", None)  # None before the fix
 
     async def shutdown(timeout: float | None = None) -> bool:
         take_one()
@@ -495,10 +495,11 @@ async def test_a_lease_taken_after_the_last_release_never_gets_a_pool_being_shut
 
     async def drain(pools: Any, timeout: float | None) -> bool:
         take_one()
+        assert real_drain is not None
         return await real_drain(pools, timeout)
 
     monkeypatch.setattr(row_seal, "shutdown_transit_pools", shutdown)
-    monkeypatch.setattr(row_seal, "_drain_pools", drain)
+    monkeypatch.setattr(row_seal, "_drain_pools", drain, raising=False)
     await last.release(1.0)
     new_lease, pool = taken
     pool.submit(int).result(5)  # the new lease's pool still takes calls
