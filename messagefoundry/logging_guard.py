@@ -849,8 +849,10 @@ def _encoding_read_can_fail(cls: type) -> bool:
     failed rather than an attribute that is not there: a class on ``cls``'s own MRO defines
     ``encoding``, other than a member descriptor (an empty ``__slots__`` member, or a C-level one
     such as ``io.TextIOWrapper``'s), so a property raised it. The metaclass
-    is not searched, and a proxy forwarding through ``__getattr__`` or ``__getattribute__`` does
-    not count: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not.
+    is not searched, and forwarding through ``__getattr__`` or ``__getattribute__`` does not count
+    by itself: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not. A
+    proxy whose class inherits a property ``encoding``, as an ``io.TextIOBase`` subclass does, is
+    read as failed.
     Raises what reading an exotic class's MRO or namespace raises; :meth:`_write_line` reads that
     as "no encoding" and counts it, so classifying never turns a healthy stream into a failed
     write. Walked per call, with no cache to hold classes."""
@@ -1252,25 +1254,25 @@ class _GuardedSinkMixin(_SinkBase):
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
         propagates. An ``encoding`` that is missing or not a string is "no encoding": the line
         goes as it came, so on a replacing stream it can carry ``?``. That includes a forwarding
-        proxy whose target has none or is gone, and an ``io.TextIOBase`` subclass whose
-        ``encoding`` is ``None``. An ``encoding`` whose read fails (:func:`_encoding_read_can_fail`
+        proxy whose class inherits no ``encoding`` definition, when its target has none or is gone,
+        and an ``io.TextIOBase`` subclass whose ``encoding`` is ``None``. An ``encoding`` whose read fails (:func:`_encoding_read_can_fail`
         says which ``AttributeError`` counts) is escaped for ASCII, and each line is counted under
         that cause instead of as an escape, whether or not it lands. A write whose line was escaped
         is counted for the stderr format-fault line. Called under the handler's lock, which that
         count needs."""
-        unreadable: str | None = None
+        unreadable: str | None = None  # the cause that made an ASCII escape, which counts it
         encoding: object
         try:
             encoding = self.stream.encoding
         except Exception as exc:
             # A stream that has no ``encoding`` is written as the line came, a forwarding proxy
-            # whose target has none or is gone included (:func:`_encoding_read_can_fail`). Any
-            # other failure is a stream whose class defines ``encoding`` but cannot read it: not a
-            # failed write, and not "no encoding" either, since on a replacing stream that would
-            # write ``?`` unseen. So the line is
-            # escaped for ASCII, which almost every text stream takes, and the cause is counted
-            # before the write, so a write that then fails does not hide it. A stream that refuses
-            # even that line (cp864 has no byte for ``%``) fails the write; the stages decide.
+            # whose class inherits no ``encoding`` definition included
+            # (:func:`_encoding_read_can_fail`). Any other failure is a stream whose class defines
+            # ``encoding`` but cannot read it: not a failed write, and not "no encoding" either,
+            # since on a replacing stream that would write ``?`` unseen. So the line is escaped for
+            # ASCII, which almost every text stream takes, and the cause is counted before the
+            # write, so a write that then fails does not hide it. A stream that refuses even that
+            # line (cp864 has no byte for ``%``) fails the write; the stages decide.
             read_failed = True
             if isinstance(exc, AttributeError):
                 try:
@@ -1278,9 +1280,9 @@ class _GuardedSinkMixin(_SinkBase):
                 except Exception as classify_exc:
                     # An exotic class: read as "no encoding", never a failed write, but said.
                     read_failed = False
-                    unreadable = _type_name(classify_exc)
                     self._note_format_fault(
-                        f"{_CLASSIFY_FAULT} ({unreadable}); its lines are written as they came"
+                        f"{_CLASSIFY_FAULT} ({_type_name(classify_exc)}); its lines are read as "
+                        "having no encoding"
                     )
             if not read_failed:
                 encoding = None
@@ -1291,16 +1293,23 @@ class _GuardedSinkMixin(_SinkBase):
                     f"{_ENCODING_UNREADABLE_FAULT} ({unreadable}); lines to it are escaped for "
                     "ASCII"
                 )
-        if isinstance(encoding, str):
-            # A plain str: a subclass may be unhashable, and the shortcut's cache hashes it.
-            encoding = str.__str__(encoding)
+        # A plain str, read with type() rather than isinstance(), which an object faking
+        # __class__ would pass; a str subclass is copied, since it may be unhashable and the
+        # shortcut's cache hashes it. Anything else is no encoding.
+        codec: str | None
+        if type(encoding) is str:
+            codec = encoding
+        elif issubclass(type(encoding), str):
+            codec = str.__str__(encoding)
+        else:
+            codec = None
         written = line
-        if isinstance(encoding, str) and not (line.isascii() and _encodes_ascii(encoding)):
+        if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
             try:
-                line.encode(encoding)
+                line.encode(codec)
             except (LookupError, ValueError, TypeError):
                 # ValueError covers UnicodeEncodeError; the rest are a name codecs refuses.
-                written = _encodable(line, encoding)
+                written = _encodable(line, codec)
         try:
             self._write_raw(written)
         except UnicodeEncodeError:
@@ -1310,7 +1319,6 @@ class _GuardedSinkMixin(_SinkBase):
             self._write_raw(ascii_only)
             written = ascii_only
         # An unreadable encoding is what made the escape, so it is not also counted as one.
-        # ``unreadable`` also marks a classify failure, whose own entry counts the line.
         if unreadable is None and written != line:
             self._note_format_fault(_ESCAPED_FAULT)
         # After the count, so an escape made now is said with any whose interval has passed.

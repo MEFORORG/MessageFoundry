@@ -491,8 +491,10 @@ least these. A stream whose `encoding` reads as a string is escaped for that cod
 replacing stream such a line can carry `?` with nothing said, except where classifying
 failed, below. That covers a stream with no
 `encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
-`__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose target has none or is
-gone. A read that raises `AttributeError` counts as missing, unless a class on the stream's MRO
+`__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose class inherits no
+`encoding` definition, when its target has none or is gone; an `io.TextIOBase` subclass
+proxy inherits one, so it falls under the next rule instead. A read that raises `AttributeError` counts as missing,
+unless a class on the stream's MRO
 defines `encoding` as something other than a member descriptor. A member descriptor is a
 `__slots__` member or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything
 else, or raises `AttributeError` from such a definition, is unreadable. An unreadable stream is

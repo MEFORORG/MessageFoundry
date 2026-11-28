@@ -39,6 +39,7 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 from pydantic import ValidationError
@@ -1427,7 +1428,8 @@ def test_a_stream_with_no_encoding_is_written_as_the_line_came(
     # encoding was never set included, is not a proxy whose read failed, so nothing is escaped
     # and nothing counted.
     # NEGATIVE CONTROL: with every AttributeError read as unreadable, both lines were escaped for
-    # ASCII and the unreadable-encoding cause was counted twice.
+    # ASCII and the unreadable-encoding cause was counted twice; with a None encoding read as
+    # ASCII, the io.StringIO line was escaped.
     counted: list[str] = []
     real = logging_guard._GuardedSinkMixin._note_format_fault
 
@@ -1658,6 +1660,58 @@ def test_a_flap_bound_trip_says_a_pending_cause(
     assert logging_guard._ENCODING_UNREADABLE_FAULT in err
 
 
+def test_an_encoding_faking_str_does_not_fail_the_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An object passing isinstance(x, str) by faking __class__ is not a str: it is no encoding,
+    # and the line goes as it came rather than failing the write.
+    # NEGATIVE CONTROL: with isinstance() deciding, str.__str__ raised TypeError on it and the
+    # sink reached stage 2.
+    class _Writer(io.StringIO):
+        encoding = mock.NonCallableMock(spec=str)
+
+    stream = _Writer()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("caf%s", chr(0xE9)))
+
+    assert events == []
+    assert stream.getvalue() == "caf" + chr(0xE9) + "\n"
+
+
+def test_a_classify_failure_still_counts_an_ascii_escape(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A classify failure does not make the escape, so a line the strict stream refuses, and the
+    # ASCII fallback lands, is counted as an escape too.
+    # NEGATIVE CONTROL: with the classify failure suppressing the escape count, stderr named only
+    # the classify failure.
+    class _BadMro(type):
+        @property
+        def __mro__(cls) -> tuple[type, ...]:
+            raise TypeError("no mro")
+
+    raw, inner = _strict_cp1252()
+
+    def write(self: object, text: str) -> int:
+        return inner.write(text)
+
+    stream = _BadMro("Writer", (), {"write": write})()
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("a %s b", chr(0x4E2D)))
+
+    assert raw.getvalue().decode("cp1252").splitlines() == ["a " + "\\" + "u4e2d b"]
+    err = capsys.readouterr().err
+    assert logging_guard._CLASSIFY_FAULT in err
+    assert logging_guard._ESCAPED_FAULT in err
+
+
 def test_an_unhashable_str_encoding_does_not_fail_the_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1725,7 +1779,11 @@ def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
         stream.fail_next = True
         handler.emit(_record("rolls on"))
 
-    assert capsys.readouterr().err.count("format faults since") == 0
+    err = capsys.readouterr().err
+    assert err.count("format faults since") == 0
+    # Positive control: those rolls did take the repeat path into stage 2.
+    assert "IS UNWRITABLE" in err
+    assert [st.state for st in handler._guard.status()] == ["unwritable"]
 
 
 def test_a_stream_class_that_cannot_be_classified_is_said(
