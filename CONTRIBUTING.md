@@ -270,7 +270,8 @@ version.
    every bump: the same test holds both to `__version__`, so they cannot wait. The console pin
    beside each stays, as *does not move* says. Only if the seam did not move, move by hand the
    engine versions that prose names as sharing the console's seam. Move the engine version in the
-   *Admin console* section of `docs/SERVICE.md` on every bump. No test holds those.
+   *Admin console* section of `docs/SERVICE.md`, and the engine wheel name in that file's
+   `install-service.ps1 -EngineWheel` example, on every bump. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the
