@@ -4,9 +4,10 @@
 // The host-side checks of the Security Settings editor (securityEditor.ts), kept free of `vscode` so
 // the unit suite runs them (BACKLOG #5411). The editor writes the `[security]` posture, so each
 // check fails closed: a refusal names what is wrong and nothing is run.
+import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { isSamePath, nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
+import { isPathWithin, isSamePath, nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
   CASE_RULE,
@@ -43,11 +44,33 @@ export type ConfigTarget = { readonly ok: true; readonly path: string } | { read
 /** The file-system reads the link check makes, as fs.lstatSync and fs.realpathSync.native make
  *  them: each throws an error carrying `code` for a path it cannot read. `fileId`, a file's device
  *  and file id as text, as fs.statSync reads them, places a case-variant spelling of the workspace
- *  where its real path keeps the spelling's case; without it such a spelling is refused. */
+ *  where its real path keeps the spelling's case, and a user-set path spelled outside the workspace
+ *  that reaches it by another spelling; without it both are refused. It throws, as statSync does,
+ *  for a path it cannot read, and with code {@link NO_FILE_ID} for an entry that has no file id. */
 export interface LinkFs {
   lstat(p: string): { isSymbolicLink(): boolean };
   realpath(p: string): string;
   fileId?(p: string): string;
+}
+
+/** The error code {@link LinkFs.fileId} throws for an entry whose file system reports no file id. */
+export const NO_FILE_ID = "ENOFILEID";
+
+/** {@link LinkFs.fileId} as the editor reads it: `p`'s device and file id from fs.statSync, which
+ *  follows links. A file id of 0, which a file system that keeps none can report for every entry,
+ *  throws {@link NO_FILE_ID} rather than match another entry's. */
+export function securityFileId(p: string): string {
+  const st = fs.statSync(p, { bigint: true });
+  if (st.ino === 0n) {
+    throw Object.assign(new Error("no file id"), { code: NO_FILE_ID });
+  }
+  return `${st.dev}:${st.ino}`;
+}
+
+/** The `.code-workspace` file VS Code's `workspace.workspaceFile` names, as a path, or undefined for
+ *  none and for an untitled workspace, whose folders and settings the operator chose. */
+export function workspaceFilePath(file: { readonly scheme: string; readonly fsPath: string } | undefined): string | undefined {
+  return file === undefined || file.scheme === "untitled" ? undefined : file.fsPath;
 }
 
 /** Whether `e` says only that the path does not exist, the one lstat error the check passes over. */
@@ -117,11 +140,172 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
   }
 }
 
+/** `p`'s root (drive, UNC share or `/`) and the segments below it, as `p` spells them, or undefined
+ *  for a spelling the root does not split, at least a `\\?\` or `\\.\` prefix before a drive. A
+ *  one-component prefixed spelling (`\\.\x.toml`) is parsed whole as the root, with no segments. */
+function rootAndSegments(p: string): { readonly head: string; readonly segments: readonly string[] } | undefined {
+  const head = path.parse(p).root;
+  const segments = segmentsBelow(head, p);
+  return segments === undefined ? undefined : { head, segments };
+}
+
+/** The path `head` and the first `n` of `segments` spell. */
+function prefixOf(head: string, segments: readonly string[], n: number): string {
+  return path.join(head, ...segments.slice(0, n));
+}
+
+/**
+ * Where `target`, spelled outside the workspace folder `root`, reaches that folder by another
+ * spelling (BACKLOG #5411, #8237 item 16): the segments below the workspace folder of the first
+ * folder on `target`, shallowest first and the drive or share root included, that is inside it,
+ * followed by the segments of `target` below that folder; and whether it was placed by file id
+ * (`byId`) rather than by real path. A folder is inside when its real path is inside the folder's,
+ * which was measured to place a junction and a directory symbolic link onto the folder or one below
+ * it (a subst drive is UNMEASURED), or when a folder on its real path has the workspace folder's
+ * {@link LinkFs.fileId}, which was measured to place a UNC loopback admin share: Node keeps a UNC spelling's server and share, so the real path
+ * of `\\localhost\C$\ws` is that spelling and not `C:\ws`, while the device and file id are the same
+ * (measured 2026-11-27 on Windows 11 with standalone Node v24.20.0, not the editor's Electron
+ * runtime, through `\\localhost\D$` and `\\127.0.0.1\D$`). An entry with no file id ({@link NO_FILE_ID}), the workspace folder's own
+ * included, is placed by real path only, so where the workspace folder, or a folder on an alias's
+ * real path, has none, a UNC alias of it is not placed (an open limit below). False when no folder on `target` is inside, the walk
+ * stopping at the first that does not exist; undefined when the workspace folder cannot be read,
+ * a folder on `target` is a dangling link, any other read fails, a spelling cannot be split into
+ * its folders ({@link rootAndSegments}), or there is no `fileId`.
+ *
+ * Open limit: a real path follows every link at once, so an alias whose target passes through a
+ * link the repository holds, at any depth, is placed where that link leads, not in the workspace
+ * folder, and the repository's link is not checked: an alias onto `ws\linked` or onto
+ * `ws\linked\deeper`, where `ws\linked` is the repository's link (measured). Only a walk that
+ * follows each link one hop at a time would see it pass through the folder.
+ */
+function reachesWorkspace(
+  root: string,
+  target: string,
+  fsx: LinkFs,
+): { readonly rest: string[]; readonly byId: boolean } | false | undefined {
+  if (fsx.fileId === undefined) {
+    return undefined;
+  }
+  // Each id read once: consecutive folders on a path share their real path's ancestors.
+  const ids = new Map<string, string | undefined>();
+  const idOf = (p: string): string | undefined => {
+    if (!ids.has(p)) {
+      try {
+        ids.set(p, fsx.fileId?.(p));
+      } catch (e) {
+        if (typeof e !== "object" || e === null || (e as { code?: unknown }).code !== NO_FILE_ID) {
+          throw e;
+        }
+        ids.set(p, undefined);
+      }
+    }
+    return ids.get(p);
+  };
+  let realRoot: string;
+  let rootId: string | undefined;
+  try {
+    realRoot = fsx.realpath(root);
+    rootId = idOf(root);
+  } catch {
+    return undefined;
+  }
+  const spelled = rootAndSegments(target);
+  if (spelled === undefined) {
+    return undefined;
+  }
+  for (let i = 0; i <= spelled.segments.length; i++) {
+    const prefix = prefixOf(spelled.head, spelled.segments, i);
+    const tail = spelled.segments.slice(i);
+    let real: string;
+    try {
+      real = fsx.realpath(prefix);
+    } catch (e) {
+      if (!missing(e)) {
+        return undefined;
+      }
+      try {
+        fsx.lstat(prefix);
+        return undefined; // the entry exists but its target does not: a dangling link
+      } catch (e2) {
+        return missing(e2) ? false : undefined;
+      }
+    }
+    const below = segmentsBelow(realRoot, real);
+    if (below !== undefined) {
+      return { rest: [...below, ...tail], byId: false };
+    }
+    if (rootId === undefined) {
+      continue;
+    }
+    const onReal = rootAndSegments(real);
+    if (onReal === undefined) {
+      return undefined;
+    }
+    for (let j = 0; j <= onReal.segments.length; j++) {
+      try {
+        if (idOf(prefixOf(onReal.head, onReal.segments, j)) === rootId) {
+          return { rest: [...onReal.segments.slice(j), ...tail], byId: true };
+        }
+      } catch {
+        return undefined; // the folders on an existing real path exist, so any error refuses
+      }
+    }
+  }
+  return false;
+}
+
+/** The refusal for a user-set path {@link reachesWorkspace} could not read. */
+const UNREAD_PATH =
+  "messagefoundry.serviceConfig, set in user settings, names a path this check could not read to tell " +
+  "whether it reaches the workspace folder by another spelling: at least a folder on it that cannot be " +
+  "read, a dangling link on it, or a long-path or device prefix. Name a path whose folders can be read, " +
+  "spelled without such a prefix, or one inside the workspace folder";
+
+/** The refusal for a folder or file name in `rel` that Windows can open as another entry or a
+ *  device ({@link hasTrailingDotOrSpaceName}, {@link hasColonInName}, {@link hasReservedDeviceName}),
+ *  or undefined. `inWhere` names where the path is, with a leading space, or is empty. */
+function nameProblem(rel: string, inWhere: string): string | undefined {
+  if (hasTrailingDotOrSpaceName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that ends in ` +
+      "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space"
+    );
+  }
+  if (hasColonInName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that holds ` +
+      "a colon, which Windows opens as a stream on another entry. Remove the colon"
+    );
+  }
+  if (hasReservedDeviceName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that is ` +
+      "a Windows device name such as nul or com1, which Windows can open as the device. Rename the folder or file"
+    );
+  }
+  return undefined;
+}
+
+/** Whether the workspace folder `root` lies inside the folder that holds the `.code-workspace` file
+ *  `workspaceFile`, an absolute path, as spelled and by real path; any realpath error refuses. */
+function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: LinkFs): boolean {
+  const home = path.dirname(workspaceFile);
+  if (!isPathWithin(home, root)) {
+    return false;
+  }
+  try {
+    return isPathWithin(fsx.realpath(home), fsx.realpath(root));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), resolved against
  * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused. The
  * value is resolved as text, so a `..` is collapsed before any check, and the path returned is the
- * one the checks ran on: the CLI is handed exactly that path.
+ * one the checks ran on, but for an alias rule 3 places by file id alone: the CLI is handed exactly
+ * that path.
  *
  * 1. Untrusted workspace (`scope.trusted` false): refused before anything else, so this check makes
  *    no file-system call there. That bounds this check only; it says nothing of what VS Code itself
@@ -148,12 +332,39 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
  *    because lstat does not report every reparse point as a link, at least not a junction onto a
  *    volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error, the
  *    folder's own included, refuses. An 8.3 short name below the folder is refused too, since
- *    realpath spells it in full. The workspace folder the operator opened, or trusted, is taken as
- *    given and is not checked for a link: it may be one, and a repository's `.code-workspace` file
- *    can choose it, since the workspace folder used is the first in `folders`.
+ *    realpath spells it in full. The workspace folder the operator opened is taken as given and is
+ *    not checked for a link: it may be one. But in a window opened from a `.code-workspace` file
+ *    (`scope.workspaceFile`, VS Code's `workspace.workspaceFile`), that file holds the workspace
+ *    settings and chooses the folder, the first in its `folders`. So there, once the name checks
+ *    above pass and before the link walk, a path these checks run on is refused, at either scope,
+ *    unless the workspace folder lies inside the folder that holds the file, both as spelled and
+ *    by real path; any realpath error refuses (BACKLOG #8237 item 57). And since the file may choose
+ *    a folder below its own as the workspace folder, a user-set path spelled inside the file's
+ *    folder but outside the workspace folder, that rule 3 places nowhere in the workspace folder,
+ *    gets the name checks and the link walk above from the file's folder instead. A path spelled
+ *    outside the file's folder is placed in it as rule 3 places one in the workspace folder, by
+ *    real path and file id, with the same open limits.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
- *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
- *    is refused. Otherwise it is accepted as written, with no file-system call, except in one case.
+ *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
+ *    and the folder itself is refused. Otherwise every folder and file name below its root gets
+ *    rule 2's name checks first, before any file-system call: on Windows, a name ending in a dot or a space,
+ *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
+ *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
+ *    once the case variant below is settled, each folder on its path is read, shallowest first and the drive or share root included, down to
+ *    the first that does not exist (BACKLOG #8237 item 16). The first that is inside the workspace
+ *    folder by real path, or whose real path passes through a folder with the workspace folder's
+ *    device and file id ({@link LinkFs.fileId}), means the path reaches the folder by another
+ *    spelling. Measured: a junction or a directory symbolic link onto the folder or one below it,
+ *    by real path, and a UNC loopback admin share (`\\localhost\C$\...`), by file id; other
+ *    spellings, a subst drive among them, are UNMEASURED (Open limits). The part below the workspace folder
+ *    then gets rule 2's checks, spelled from the workspace folder, after those reads. Placed by real path, the path
+ *    returned is spelled from the workspace folder; placed by file id alone, it is returned as
+ *    written, so two entries that report one id (file ids are not unique on every file system, at
+ *    least not on ReFS) can cause a refusal but never send the CLI to a file the setting does not
+ *    name. When no folder on it is inside, it is accepted as written, but for rule 2's
+ *    `.code-workspace` case. A dangling link on it, any other read error, a long-path or device
+ *    prefix before a drive (`\\?\C:\...`, `\\.\C:\...`), or a caller that passes no `fileId`,
+ *    refuses; an entry with no file id is placed by real path only.
  *
  * On Windows a spelling is inside the folder when it matches with only ASCII case ignored, not
  * toLowerCase()'s fold (pathFold.ts, BACKLOG #5832). A path that
@@ -161,20 +372,42 @@ function isWorkspaceFolder(root: string, head: string, fsx: LinkFs): boolean | u
  * folds at least e-acute against E-acute. Set in workspace settings, it is refused. Set in user
  * settings, the real path of the folder it names at the workspace's depth is read: when that is the
  * workspace folder, the path gets rule 2's checks, spelled from the workspace folder; when it does
- * not exist or is another folder, it is accepted as written; any other error, a dangling link
+ * not exist or is another folder, rule 3's id walk decides; any other error, a dangling link
  * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
  * a caller that passes no `fileId` refuses then.
  *
- * Open limit: rule 3 compares spellings only, but for the case variant above. A user-set path that reaches the workspace folder by
- * an alias is accepted as written, and no link the repository holds is checked on it. That covers at
- * least a subst drive, an 8.3 short name, a UNC spelling of the folder, a junction or symbolic link
- * outside the folder that leads into it, and a mapped network drive. Nor does this check cover the
- * files the CLI creates beside the target, or a link made between this check and the CLI's write.
+ * Open limits, at least these. Rule 3's placement was measured on Windows 11 with standalone Node v24.20.0, not
+ * the editor's Electron runtime, for a junction and a directory symbolic link (by real path) and a
+ * UNC loopback admin share (by file id), and nothing else: at least a subst or mapped drive, an
+ * 8.3 short name, a bind mount and a macOS firmlink are UNMEASURED, and may be accepted as written
+ * with no link check. Where the
+ * workspace folder, or a folder on an alias's real path, reports no file id ({@link NO_FILE_ID}),
+ * an alias only a file id would place, a UNC alias among them, is accepted as written with no
+ * link check: a fail-open, though no looser than before #8237 item 16, when every
+ * user-set path outside the folder was. A real path follows every link at once, so an alias whose
+ * target passes through a link the repository holds, at any depth, is placed where that link
+ * leads and the repository's link is not checked: measured for an alias onto `ws\linked\deeper`,
+ * where `ws\linked` is the repository's junction. Following each link one hop at a time would be
+ * needed to see it. Where the
+ * native realpath fails, at least with EISDIR on some RAM disks and virtual drives, every user-set
+ * path refuses, as every rule 2 path already did. Its reads are synchronous, so a user-set path on a slow share holds the extension host while they
+ * run. In a `.code-workspace` window a relative user value that leaves the workspace folder by
+ * `..`, or on Windows a rooted value with no drive, at least `\x.toml`, `/x.toml`, `\\x.toml`,
+ * `\\\x.toml` and `//x.toml` (path.win32.resolve reads each on the folder's drive, measured; a
+ * `\\server\share\` value is a UNC path instead), is read against the
+ * folder the file chose, or its drive or share root, and is accepted as written when no folder on
+ * it is inside. The name checks skip the path's root, so a UNC server or share name is not
+ * name-checked, and a one-component long-path or device spelling (`\\?\x.toml`, `\\.\cfg.`, measured
+ * with standalone Node v24.20.0), which path.parse reads whole as the root, is accepted as written
+ * with no name check: no looser than before #8237 item 16, when every user-set path outside the
+ * folder was.
+ * Nor does this check cover the files the CLI creates beside the target, or a link made or a
+ * folder renamed between this check and the CLI's write, since the CLI opens the path itself, later.
  */
 export function securityConfigTarget(
   workspace: string,
   setting: unknown,
-  scope: { readonly fromWorkspace: boolean; readonly trusted: boolean },
+  scope: { readonly fromWorkspace: boolean; readonly trusted: boolean; readonly workspaceFile?: string },
   fsx: LinkFs,
 ): ConfigTarget {
   if (!scope.trusted) {
@@ -185,6 +418,11 @@ export function securityConfigTarget(
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
+  // Set when the path reaches the workspace folder by file id alone, so it is returned as written.
+  let aliasById = false;
+  // The folder the checks below run from: the workspace folder, or the one holding the window's
+  // .code-workspace file for a user-set path inside that folder but outside the workspace folder.
+  let base = root;
   let below = segmentsBelow(root, target);
   if (below === undefined) {
     const variant = nonAsciiCaseVariant(root, target);
@@ -200,63 +438,92 @@ export function securityConfigTarget(
               "in user settings",
       };
     }
-    if (variant === undefined) {
-      return { ok: true, path: target };
+    // Every folder and file name on a user-set path outside the folder, before any read: Node reads
+    // `ws.` as written and finds nothing, while the CLI's Win32 open drops the dot, so an alias of
+    // the folder spelled that way would pass the walk below and reach the folder's links (BACKLOG
+    // #8237 item 16, review round-d1ff257d). Refused, never normalised and accepted.
+    const spelled = rootAndSegments(target);
+    const named = spelled === undefined ? undefined : nameProblem(spelled.segments.join(path.sep), "");
+    if (named !== undefined) {
+      return { ok: false, problem: named };
     }
-    const same = isWorkspaceFolder(root, variant.head, fsx);
-    if (same === undefined) {
-      return {
-        ok: false,
-        problem:
-          "messagefoundry.serviceConfig spells a folder on its path with a case outside A-Z that differs from the " +
-          "workspace folder's, and whether it is the workspace folder could not be read. Spell it with the " +
-          `folder's own case ${CASE_RULE}`,
-      };
+    if (variant !== undefined) {
+      const same = isWorkspaceFolder(root, variant.head, fsx);
+      if (same === undefined) {
+        return {
+          ok: false,
+          problem:
+            "messagefoundry.serviceConfig spells a folder on its path with a case outside A-Z that differs from the " +
+            "workspace folder's, and whether it is the workspace folder could not be read. Spell it with the " +
+            `folder's own case ${CASE_RULE}`,
+        };
+      }
+      if (same) {
+        below = [...variant.rest];
+      }
     }
-    if (!same) {
-      return { ok: true, path: target };
+    if (below === undefined) {
+      const reached = reachesWorkspace(root, target, fsx);
+      if (reached === undefined) {
+        return { ok: false, problem: UNREAD_PATH };
+      }
+      if (reached !== false) {
+        below = reached.rest;
+        aliasById = reached.byId;
+      } else {
+        // In a .code-workspace window the file's own folder is checked too, since the file may have
+        // chosen a folder below it as the workspace folder (BACKLOG #8237 item 57), and is placed
+        // the same way: by spelling, then by real path and file id.
+        const home = scope.workspaceFile === undefined ? undefined : path.dirname(scope.workspaceFile);
+        if (home === undefined) {
+          return { ok: true, path: target };
+        }
+        below = segmentsBelow(home, target);
+        if (below === undefined) {
+          const viaHome = reachesWorkspace(home, target, fsx);
+          if (viaHome === undefined) {
+            return { ok: false, problem: UNREAD_PATH };
+          }
+          if (viaHome === false) {
+            return { ok: true, path: target };
+          }
+          below = viaHome.rest;
+          aliasById = viaHome.byId;
+        }
+        base = home;
+      }
     }
-    below = [...variant.rest];
   }
+  const where = base === root ? "the workspace folder" : "the folder that holds this window's .code-workspace file";
   // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
   if (below.length === 0) {
-    return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
+    return { ok: false, problem: `messagefoundry.serviceConfig names ${where} itself, not a file` };
   }
   const rel = below.join(path.sep);
-  if (hasTrailingDotOrSpaceName(rel)) {
+  const named = nameProblem(rel, ` in ${where}`);
+  if (named !== undefined) {
+    return { ok: false, problem: named };
+  }
+  if (base === root && scope.workspaceFile !== undefined && !insideWorkspaceFileFolder(root, scope.workspaceFile, fsx)) {
     return {
       ok: false,
       problem:
-        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that ends in " +
-        "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space",
+        "messagefoundry.serviceConfig names a path in the workspace folder, and this window's .code-workspace " +
+        "file chose that folder from outside the folder that holds the file, or its real path could not be read. " +
+        "Open the workspace folder itself, or name a file outside it in user settings",
     };
   }
-  if (hasColonInName(rel)) {
+  if (!noLinkBelow(base, rel, fsx)) {
     return {
       ok: false,
       problem:
-        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that holds " +
-        "a colon, which Windows opens as a stream on another entry. Remove the colon",
-    };
-  }
-  if (hasReservedDeviceName(rel)) {
-    return {
-      ok: false,
-      problem:
-        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that is " +
-        "a Windows device name such as nul or com1, which Windows can open as the device. Rename the folder or file",
-    };
-  }
-  if (!noLinkBelow(root, rel, fsx)) {
-    return {
-      ok: false,
-      problem:
-        "messagefoundry.serviceConfig names a path in the workspace folder that passes through a link, " +
+        `messagefoundry.serviceConfig names a path in ${where} that passes through a link, ` +
         "or whose folders cannot be read. Name a path whose folders are all plain folders",
     };
   }
-  // Spelled from the workspace folder as the walk was, so the CLI opens the path that was checked.
-  return { ok: true, path: path.join(root, rel) };
+  // Spelled from the workspace folder as the walk was, so the CLI opens the path that was checked;
+  // an alias placed by file id alone keeps its own spelling, for the reason rule 3 gives.
+  return { ok: true, path: aliasById ? target : path.join(base, rel) };
 }
 
 /** The file one editor panel now shows (BACKLOG #5411). Save writes only to this file, so a setting

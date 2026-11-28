@@ -20,8 +20,10 @@ import {
   saveUpdatesProblem,
   securityConfigInput,
   securityConfigTarget,
+  securityFileId,
   securitySetArgs,
   securityShowArgs,
+  workspaceFilePath,
 } from "./securityEditorModel";
 
 interface ShowResult {
@@ -100,13 +102,12 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
   // A value cli.ts's containment dropped (BACKLOG #5404) is checked as written; securityConfigInput.
   const { value, fromWorkspace } = securityConfigInput(seen, writerCheckSetting("serviceConfig"));
-  const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+  // A `.code-workspace` file holds the workspace settings and chooses the folder (BACKLOG #8237 item 57).
+  const workspaceFile = workspaceFilePath(vscode.workspace.workspaceFile);
+  const target = securityConfigTarget(ws, value, { fromWorkspace, trusted: vscode.workspace.isTrusted, workspaceFile }, {
     lstat: fs.lstatSync,
     realpath: fs.realpathSync.native,
-    fileId: (p: string): string => {
-      const st = fs.statSync(p, { bigint: true });
-      return `${st.dev}:${st.ino}`;
-    },
+    fileId: securityFileId,
   });
   if (!target.ok) {
     postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
