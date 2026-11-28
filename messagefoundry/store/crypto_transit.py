@@ -1618,7 +1618,8 @@ def build_transit_cipher(
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
-    # The bulk pool is process-wide; this cipher's calls are the ones it runs (BACKLOG #3929).
+    # The bulk pool is process-wide, so this sizes it for every Transit store in the process; the
+    # last build's value wins for the next pool built (BACKLOG #3929).
     configure_transit_bulk_workers(settings.transit_bulk_workers)
     return TransitCipher(
         client,

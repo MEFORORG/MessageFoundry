@@ -4,8 +4,8 @@
   an audit chain walk, a Postgres or SQL Server reference cache decode, SQL Server's state cache
   load at open and each at-open seal batch. Eight such walks at once, the seal pool's size, would
   leave a seal check waiting for a thread for as long as the walks ran; fewer took that many
-  threads from the checks and from single cell calls. They now run on a separate bulk pool, so the seal pool
-  stays free for seal checks and single cell calls. Its size is the new
+  threads from the checks and from single cell calls. They now run on a separate bulk pool, so none
+  holds a seal pool thread; single cell calls still share that pool with the seal checks. Its size is the new
   `[store].transit_bulk_workers` (`MEFOR_STORE_TRANSIT_BULK_WORKERS`), default `2`, from `1` to
   `64`; any other value is refused when the settings load. The default is a judgement, not a
   measurement. Past that bound a bulk walk waits behind the others, with no deadline, so at most

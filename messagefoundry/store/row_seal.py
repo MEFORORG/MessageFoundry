@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -649,6 +650,22 @@ def configure_transit_bulk_workers(value: object) -> None:
         )
 
 
+def _join_in_own_thread(pool: ThreadPoolExecutor) -> asyncio.Event:
+    """An event set once every thread of ``pool`` (already shut down) has ended. The join runs in
+    a daemon thread of its own, never in asyncio's default executor, which slow Transit calls made
+    through :func:`asyncio.to_thread` may fill."""
+    loop = asyncio.get_running_loop()
+    ended = asyncio.Event()
+
+    def join() -> None:
+        pool.shutdown(wait=True)
+        with contextlib.suppress(RuntimeError):  # the loop closed first: nobody waits any more
+            loop.call_soon_threadsafe(ended.set)
+
+    threading.Thread(target=join, name="mefor-transit-pool-join", daemon=True).start()
+    return ended
+
+
 async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     """Shut down the seal pool and the bulk pool; each is built again on its next use. Returns
     whether every call they held finished within ``timeout`` seconds (None waits for them all).
@@ -657,7 +674,7 @@ async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     holds, queued ones included. A bulk call can make many round trips, each bounded only by the
     Vault client's own timeout, so the wait for them is bounded here, never the calls: one still
     running past ``timeout`` keeps its thread, and interpreter exit waits for it. The wait runs in
-    worker threads, so the event loop keeps serving. A call handed to a pool while the detach runs
+    a thread of its own per pool, so the event loop keeps serving. A call handed to a pool while the detach runs
     can be refused, which reads as an outage
     (:class:`~messagefoundry.store.crypto.CipherUnavailableError`); a later one gets a new pool."""
     pools = [pool for pool in (_SEAL_POOL.detach(), _BULK_POOL.detach()) if pool is not None]
@@ -666,13 +683,22 @@ async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     if not pools:
         return True
     # Drained at once, so the wait is for the slower pool, not for the sum of both.
-    joins = [asyncio.ensure_future(asyncio.to_thread(pool.shutdown, wait=True)) for pool in pools]
-    _done, pending = await asyncio.wait(joins, timeout=timeout)
-    return not pending
+    ended = [_join_in_own_thread(pool) for pool in pools]
+    try:
+        async with asyncio.timeout(timeout):
+            for event in ended:
+                await event.wait()
+    except TimeoutError:
+        return False
+    return True
 
 
 async def _in_pool[**P, T](
-    pool: Callable[[], ThreadPoolExecutor], call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    pool: Callable[[], ThreadPoolExecutor],
+    call: Callable[P, T],
+    /,
+    *args: P.args,
+    **kwargs: P.kwargs,
 ) -> T:
     """``call(*args, **kwargs)`` on ``pool()``, in a copy of the caller's context as
     :func:`asyncio.to_thread` runs it."""
@@ -696,20 +722,20 @@ async def _in_pool[**P, T](
     return await future
 
 
-async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+async def _in_transit_pool[**P, T](call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
     """``call(*args, **kwargs)`` on the row-seal Transit pool (:func:`_in_pool`)."""
     return await _in_pool(_transit_pool, call, *args, **kwargs)
 
 
 async def _in_transit_bulk_pool[**P, T](
-    call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
 ) -> T:
     """``call(*args, **kwargs)`` on the Transit bulk pool (:func:`_in_pool`)."""
     return await _in_pool(_transit_bulk_pool, call, *args, **kwargs)
 
 
 async def cipher_call[**P, T](
-    cipher: object, call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    cipher: object, call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
 ) -> T:
     """``call(*args, **kwargs)``, on the Transit pool when ``cipher`` blocks on I/O, else inline.
 
@@ -726,7 +752,7 @@ async def cipher_call[**P, T](
 
 
 async def cipher_bulk_call[**P, T](
-    cipher: object, call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    cipher: object, call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
 ) -> T:
     """:func:`cipher_call` for a bulk walk: on the Transit BULK pool when ``cipher`` blocks on I/O,
     else inline, as :func:`cipher_call` runs it.

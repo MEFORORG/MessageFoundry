@@ -205,7 +205,8 @@ class _StopBudget:
     """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
 
     The budgeted waits are the retention runner's stop (BACKLOG #6526), the CRL reload runner's
-    stop, the remote-debug refusal watch's stop and the alert-state drain. With no budget each
+    stop, the remote-debug refusal watch's stop, the alert-state drain and, after the store closes,
+    the Transit pools' drain (BACKLOG #3929). With no budget each
     keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left
     of the budget once the time kept for the steps after it is taken out, and never less than
     :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
@@ -4554,11 +4555,11 @@ class Engine:
             if not drained:
                 log.warning(
                     "Transit calls were still running when the engine stopped; the process exit "
-                    "waits for them, each bounded by the Vault client's own timeout"
+                    "waits for them, and for any queued behind them, to finish"
                 )
         except asyncio.CancelledError:
             cancelled = True
-        except Exception:
+        except Exception:  # noqa: BLE001 - logged; the stop's own result must not be lost to it
             log.exception("the Transit call pools did not shut down cleanly")
         cancelled = cancelled or (me is not None and me.cancelling() > baseline)
         if failure is not None and not isinstance(failure, Exception):
