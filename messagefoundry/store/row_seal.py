@@ -55,6 +55,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 from messagefoundry.controlchars import scrub_control_chars
@@ -1042,10 +1043,11 @@ class ResealOutcome:
     under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
     made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
     15). Those the passes refused never hold a rotation open: failing on a seal no key re-seals
-    would fail every later run too. ``appeared`` counts the ``refused`` ones beyond what the passes
-    themselves refused, pass by pass, which only a write made during the run can leave: such a
-    seal may be sound and still under a prior key, so the command does not report the rotation
-    complete (vault BACKLOG #5635)."""
+    would fail every later run too. ``appeared`` counts, at the read after the cell passes, the
+    ``refused`` ones beyond what the passes themselves refused, pass by pass, plus any ``unheld``
+    one, which a write made during the run leaves: such a seal may be sound and still under a
+    prior key, so the command stops before its audit roll (vault BACKLOG #5635). It compares
+    counts, not rows, so it can miss such a write; ``classify_unrotated`` says when."""
 
     unheld: int = 0
     refused: int = 0
@@ -1054,9 +1056,26 @@ class ResealOutcome:
     unheld_key_ids: tuple[str, ...] = ()
 
 
-#: The re-seal pass that refuses a table's seals, where it is not the table's own name: the role
-#: pass also re-seals both directory maps.
-_RESEAL_PASS_OF: Final = {"authority_set_seal": "roles"}
+#: The re-seal pass whose refusals each table of the read-back is held to: the role pass also
+#: re-seals both directory maps.
+_RESEAL_PASS_OF: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "users": "users",
+        "roles": "roles",
+        "authority_set_seal": "roles",
+        "pending_approvals": "pending_approvals",
+    }
+)
+
+
+def reseal_pass_refusals(
+    users: tuple[int, int], roles: tuple[int, int], approvals: tuple[int, int]
+) -> Mapping[str, int]:
+    """What each re-seal pass refused, from its ``(re-sealed, refused)``, for
+    :func:`classify_unrotated` (vault BACKLOG #5635)."""
+    return MappingProxyType(
+        {"users": users[1], "roles": roles[1], "pending_approvals": approvals[1]}
+    )
 
 
 def classify_unrotated(
@@ -1070,14 +1089,14 @@ def classify_unrotated(
     Transit sealer, or no sealer, nothing is: ``rotate-key`` refuses vault_transit before it opens
     the store.
 
-    ``pass_refused`` is what each re-seal pass refused, keyed ``users``, ``roles`` and
-    ``pending_approvals``. Given it, the refused seals of a pass's tables beyond that pass's own
-    count are counted ``appeared``. A pass checks every non-active seal it selects, re-seals each
-    that holds and counts each that fails, so after it a non-active seal over its count was
-    written after the pass reached it, by a writer running alongside. The approval and user
-    passes can also refuse a row this read does not select, a closed request or a seal under the
-    active key, so the count can miss such a write but never counts a seal a re-run with nothing
-    else writing would meet again."""
+    ``pass_refused`` is :func:`reseal_pass_refusals`. Given it, every ``unheld`` seal, and the
+    refused seals of a pass's tables beyond that pass's own count, are counted ``appeared``. A
+    pass checks every non-active seal it selects, re-seals each that holds and counts each that
+    fails, and the read-back selects no seal its pass does not (``unrotated_seal_queries``), so a
+    non-active seal over its count was written after the pass reached it. The count never counts
+    a seal a re-run with nothing else writing would meet again, but it can miss such a write: a
+    refused row that is then removed or repaired, or one a pass refused that the read does not
+    select, a closed request or a user seal under the active key, cancels one out."""
     if not isinstance(sealer, RowSealer):
         return ResealOutcome()
     unheld = refused = 0
@@ -1093,10 +1112,10 @@ def classify_unrotated(
             key_ids.add(str(stored)[len(SEAL_PREFIX) :].partition(":")[0])
         else:
             refused += 1
-            group = _RESEAL_PASS_OF.get(table, table)
+            group = _RESEAL_PASS_OF[table]
             per_pass[group] = per_pass.get(group, 0) + 1
     appeared = (
-        sum(max(0, n - pass_refused.get(group, 0)) for group, n in per_pass.items())
+        unheld + sum(max(0, n - pass_refused[group]) for group, n in per_pass.items())
         if pass_refused is not None
         else 0
     )

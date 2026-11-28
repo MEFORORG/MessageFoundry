@@ -94,3 +94,13 @@ async def assert_reseal_outcome_contract(store: Any, raw: RawSql) -> None:
         await store.reencrypt_to_active()
     decided = store.reseal_outcome()
     assert (decided.unheld, decided.refused) == (after.unheld - 1, after.refused)
+
+    # Vault BACKLOG #5635: seals the re-seal passes refuse, on every table the read-back reads,
+    # are not counted as written during the run, so a run with nothing else writing completes.
+    await raw("UPDATE roles SET seal=? WHERE id=?", (MALFORMED_SEAL, unheld_role))
+    await raw("UPDATE users SET authz_seal=? WHERE id=?", (MALFORMED_SEAL, user))
+    await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (MALFORMED_SEAL, AD_ROLE_MAP))
+    await store.reencrypt_to_active()
+    settled = store.reseal_outcome()
+    assert (settled.unheld, settled.appeared) == (0, 0)
+    assert settled.refused - base.refused >= 4

@@ -216,6 +216,7 @@ from messagefoundry.store.row_seal import (
     SealPager,
     cipher_call,
     classify_unrotated,
+    reseal_pass_refusals,
     row_sealer_for_cipher,
     seal_chunks,
 )
@@ -10865,11 +10866,11 @@ class SqlServerStore(ServerCipherWalk):
         report_role_reseal(*roles)
         approvals = await self.reseal_approval_records()
         report_approval_reseal(*approvals)
-        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        # Vault BACKLOG #5635: what the passes left under another key, read again at the end;
+        # store.py's twin says why.
+        refused_by_pass = reseal_pass_refusals(users, roles, approvals)
         self._reseal_outcome = classify_unrotated(
-            self._row_sealer,
-            await self._unrotated_seals(),
-            pass_refused={"users": users[1], "roles": roles[1], "pending_approvals": approvals[1]},
+            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
         )
         if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
             raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
@@ -11108,6 +11109,9 @@ class SqlServerStore(ServerCipherWalk):
         ended = len(await self._execute_output("DELETE FROM sessions OUTPUT deleted.token_hash"))
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
+        self._reseal_outcome = classify_unrotated(
+            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
+        )
         return total
 
     def _rotation_scan(self, column: str) -> str:

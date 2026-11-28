@@ -227,6 +227,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     require_seal_for_write,
+    reseal_pass_refusals,
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
@@ -5729,7 +5730,9 @@ RESEALED_SEAL_COLUMNS: Final = (
     ("users", "authz_seal", ""),
     ("roles", "seal", ""),
     ("pending_approvals", "seal", " AND status IN ('pending', 'executing', 'interrupted')"),
-    ("authority_set_seal", "seal", ""),
+    # Only the maps the role pass re-seals (AD_MAPS, below), so a stray row it never reaches is not
+    # read as a seal written during the run (vault BACKLOG #5635).
+    ("authority_set_seal", "seal", " AND name IN ('ad_group_role_map', 'ad_group_scope_map')"),
 )
 
 
@@ -5769,8 +5772,10 @@ def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tupl
     """``(table, SELECT)`` for each of :data:`RESEALED_SEAL_COLUMNS`: its seals that are not blank
     and do not name the active key, whose ``LIKE`` pattern the one ``placeholder`` takes. Each
     backend runs these after its re-seal passes and hands the rows to ``classify_unrotated``.
-    ``collate`` is SQL Server's binary collation. The filter only saves work, and does not
-    mirror each pass's own: ``classify_unrotated`` decides what counts."""
+    ``collate`` is SQL Server's binary collation. Each filter must select no seal its re-seal
+    pass does not also select: ``classify_unrotated`` counts a refused seal beyond its pass's own
+    refusals as written during the run, so a wider filter here would fail every rotation on a
+    seal no pass reaches (vault BACKLOG #5635). A narrower one only lets such a write go unseen."""
     return tuple(
         (
             table,
@@ -13763,11 +13768,11 @@ class MessageStore:
         approvals = await self.reseal_approval_records()
         report_approval_reseal(*approvals)
         # Vault BACKLOG #5635: what the passes left under another key, for the command to read,
-        # with what each pass refused, so a seal written during the run is told apart.
+        # with what each pass refused, so a seal written during the run is told apart. Read again
+        # at the end, below, for a seal written during the cell passes.
+        refused_by_pass = reseal_pass_refusals(users, roles, approvals)
         self._reseal_outcome = classify_unrotated(
-            self._row_sealer,
-            await self._unrotated_seals(),
-            pass_refused={"users": users[1], "roles": roles[1], "pending_approvals": approvals[1]},
+            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
         )
         if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
             raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
@@ -13858,6 +13863,9 @@ class MessageStore:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
+        self._reseal_outcome = classify_unrotated(
+            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
+        )
         return total
 
     def _rotation_scan(self, column: str) -> str:

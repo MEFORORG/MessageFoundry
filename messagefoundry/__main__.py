@@ -13135,6 +13135,17 @@ class _UploadsRootLost(Exception):
     (BACKLOG #4940). Raised before the audit roll, so the run stops short of it."""
 
 
+class _SealsAppeared(Exception):
+    """``rotate-key``'s store pass read more user, role, open approval or directory-map seals
+    under another key after its cell passes than its re-seal passes refused (vault BACKLOG
+    #5635, :attr:`ResealOutcome.appeared`). Raised before the uploads pass and the audit roll, so
+    the run stops short of both, as for :class:`_UploadsRootLost`."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(count)
+        self.count = count
+
+
 def _uploads_root_refusal(uploads_dir: str) -> str | None:
     """Why ``rotate-key`` refuses the configured uploads directory, or ``None`` (BACKLOG #4940).
     Checked before anything is written, so a refusal costs nothing, the audit roll included. Why a
@@ -13420,6 +13431,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # Vault BACKLOG #5635: what the store pass left under a key it holds and could not
             # re-seal, for the note below. A record under a key it does not hold aborted the pass.
             seals = store.reseal_outcome()
+            if seals.appeared:
+                # One written during the run may be sound and under the prior key: stop before
+                # the one-way audit roll, so nothing is rolled, stamped or closed.
+                raise _SealsAppeared(seals.appeared)
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
             # uploaded file under the retired key, so the operator's next step (dropping that key)
@@ -13459,14 +13474,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            # A seal written during the run may be sound and under the prior key (#5635), so it
-            # holds the rotation open as a skipped upload does.
-            if (
-                isinstance(store, SecretRotationMetaStore)
-                and rolled[0]
-                and not uploads.incomplete
-                and not seals.appeared
-            ):
+            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.incomplete:
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -13562,6 +13570,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    except _SealsAppeared as exc:
+        # Vault BACKLOG #5635. Exit 1, as above: the store pass has re-encrypted under the active
+        # key. A seal its re-seal passes refused is not counted, so a re-run with nothing else
+        # writing does not meet this again on its account.
+        print(
+            f"error: rotation aborted -- {exc.count} user, role, open approval or directory-map "
+            "record(s) were found sealed under a key other than the active one after the store "
+            "pass, more than its re-seal passes refused, so something wrote to the store during "
+            "this run, such as an engine still running, and each may still be sealed under the "
+            "prior key. The run stopped before its uploads pass and its audit chain step, so no "
+            "uploaded file was re-sealed, the audit chain did not roll and the key's rotation "
+            "date was not stamped; a rotation record this run opened stays open. Stop every "
+            "engine using this store and re-run rotate-key BEFORE retiring any prior key "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
+            file=sys.stderr,
+        )
+        return 1
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     done = (
@@ -13570,9 +13595,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     )
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
-    # uploaded file may still be under that key (BACKLOG #3181), or while a record sealed during the
-    # run may be (vault BACKLOG #5635).
-    complete = rolled_ok and not uploads.incomplete and not seals.appeared
+    # uploaded file may still be under that key (BACKLOG #3181).
+    complete = rolled_ok and not uploads.incomplete
     print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
@@ -13673,18 +13697,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "sound and still under the prior key: stop every engine using this store and re-run "
             "before dropping that key. A re-run may count such a record again; do not remove an "
             "account on this count alone."
-        )
-    if seals.appeared:
-        # Vault BACKLOG #5635: more of them than the re-seal passes refused, so these were written
-        # after their pass reached them. Such a seal may be sound and under the prior key, so
-        # this run fails and stamps nothing; a re-run with nothing else writing settles it.
-        print(
-            f"error: {seals.appeared} of those record(s) were written during this run, after the "
-            "re-seal passes reached them, so each may still be sealed under the prior key. This "
-            "run did not stamp the key's rotation date, and the rotation stays open. Stop every "
-            "engine using this store and re-run rotate-key BEFORE retiring any prior key "
-            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
-            file=sys.stderr,
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
