@@ -504,13 +504,14 @@ async def test_a_lease_taken_after_the_last_release_never_gets_a_pool_being_shut
     new_lease, pool = taken
     pool.submit(int).result(5)  # the new lease's pool still takes calls
     assert row_seal._leases == 1
+    await new_lease.release(1.0)  # before undo, so the restored count is not decremented
     monkeypatch.undo()
-    await new_lease.release(1.0)
 
 
 async def test_a_join_that_raises_still_ends_the_wait() -> None:
     """Item G: the join thread tells its waiter in a finally, so a join that raises does not leave
-    the shutdown waiting forever."""
+    the shutdown waiting forever, and the drain reads it as not drained, since it never confirmed
+    the threads ended."""
     from concurrent.futures import ThreadPoolExecutor
 
     class _Unjoinable(ThreadPoolExecutor):
@@ -520,4 +521,50 @@ async def test_a_join_that_raises_still_ends_the_wait() -> None:
                 raise RuntimeError("synthetic join failure")
 
     row_seal._SEAL_POOL._pool = _Unjoinable(max_workers=1)
-    assert await asyncio.wait_for(shutdown_transit_pools(None), 3.0) is True
+    assert await asyncio.wait_for(shutdown_transit_pools(None), 3.0) is False
+
+
+class _FailingBackupRunner:
+    async def stop(self) -> None:
+        raise RuntimeError("synthetic stop step failure")
+
+
+async def test_a_stop_that_raises_before_the_close_keeps_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 1: a stop that raises before it reaches the store's close keeps the lease, since the
+    store and the graph may still use the pools; a later stop that reaches the close releases it."""
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    eng = await _engine(tmp_path / "e.db")
+    pool = row_seal._transit_pool()
+    eng._backup_runner = _FailingBackupRunner()
+    with pytest.raises(RuntimeError, match="synthetic stop step failure"):
+        await eng.stop()
+    assert row_seal._leases == 1
+    assert row_seal._transit_pool() is pool, "the early raise detached pools still in use"
+    eng._backup_runner = None
+    await eng.stop()
+    assert row_seal._leases == 0
+
+
+async def test_an_engine_constructor_that_raises_takes_no_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4: the lease is taken last in Engine.__init__, so a raise before it leaks none."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import engine as engine_module
+    from messagefoundry.pipeline.engine import Engine
+
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    store = await MessageStore.open(tmp_path / "x.db")
+    try:
+
+        def refuse() -> None:
+            raise RuntimeError("synthetic constructor failure")
+
+        monkeypatch.setattr(engine_module, "SandboxSettings", refuse)
+        with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+            Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    finally:
+        await store.close()
+    assert row_seal._leases == 0

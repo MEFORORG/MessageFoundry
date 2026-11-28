@@ -12,6 +12,7 @@
   that many run at once where up to 8 could before. When the last engine in the process
   stops, or its start fails, the two pools are now detached and shut down after its store closes:
   queued calls are cancelled, and a later Transit call builds new pools. A stop waits off the event
-  loop up to 2 seconds, or what is left of its stop budget, for calls still running, then leaves
+  loop up to 2 seconds, or what is left of its stop budget but never less than 0.1 seconds,
+  for calls still running, then leaves
   them to finish; a cancelled stop and a failed start do not wait. Nothing changes under `aesgcm`. See
   [CONFIGURATION.md](../docs/CONFIGURATION.md). (`BACKLOG #3929`)

@@ -649,26 +649,30 @@ def configure_transit_bulk_workers(value: object) -> None:
         )
 
 
-def _join_in_own_thread(pool: ThreadPoolExecutor) -> asyncio.Event:
-    """An event set once every thread of ``pool`` (already shut down) has ended. The join runs in
-    a daemon thread of its own, never in asyncio's default executor, which slow Transit calls made
-    through :func:`asyncio.to_thread` may fill."""
-    loop = asyncio.get_running_loop()
-    ended = asyncio.Event()
+class _Join:
+    """One pool's join, run in a daemon thread of its own, never in asyncio's default executor,
+    which slow Transit calls made through :func:`asyncio.to_thread` may fill. ``ended`` is set
+    once the join returns or raises; ``joined`` says whether it returned."""
 
-    def join() -> None:
+    def __init__(self, pool: ThreadPoolExecutor) -> None:
+        self.ended = asyncio.Event()
+        self.joined = False
+        self._pool = pool
+        self._loop = asyncio.get_running_loop()
+        threading.Thread(target=self._run, name="mefor-transit-pool-join", daemon=True).start()
+
+    def _run(self) -> None:
+        loop, ended = self._loop, self.ended
         try:
-            pool.shutdown(wait=True)
-        except Exception:  # noqa: BLE001 - logged; the waiter below is still told, in the finally
+            self._pool.shutdown(wait=True)
+            self.joined = True
+        except Exception:  # noqa: BLE001 - logged, and read as not drained; told in the finally
             log.exception("a Transit pool's threads could not be joined")
         finally:
             try:
                 loop.call_soon_threadsafe(ended.set)
             except RuntimeError as exc:  # the loop closed first, so nobody waits for this any more
                 log.info("a Transit pool ended after its event loop closed: %s", exc)
-
-    threading.Thread(target=join, name="mefor-transit-pool-join", daemon=True).start()
-    return ended
 
 
 async def shutdown_transit_pools(timeout: float | None = None) -> bool:
@@ -699,20 +703,21 @@ def _detach_pools() -> list[ThreadPoolExecutor]:
 
 async def _drain_pools(pools: list[ThreadPoolExecutor], timeout: float | None) -> bool:
     """Whether the calls still running on ``pools``, already detached, end within ``timeout``. A
-    ``timeout`` of 0 or less waits for nothing, and is False where there were pools."""
+    ``timeout`` of 0 or less waits for nothing, and is False where there were pools; so is a join
+    that raised, since it never confirmed the threads ended."""
     if not pools:
         return True
     if timeout is not None and timeout <= 0:
         return False
     # Drained at once, so the wait is for the slower pool, not for the sum of both.
-    ended = [_join_in_own_thread(pool) for pool in pools]
+    joins = [_Join(pool) for pool in pools]
     try:
         async with asyncio.timeout(timeout):
-            for event in ended:
-                await event.wait()
+            for join in joins:
+                await join.ended.wait()
     except TimeoutError:
         return False
-    return True
+    return all(join.joined for join in joins)
 
 
 _leases_lock: Final = threading.Lock()

@@ -653,8 +653,6 @@ class Engine:
         owned_settings: Sequence[object] = (),
     ) -> None:
         self.store = store
-        # This engine's hold on the process-wide Transit pools, released by stop (BACKLOG #3929).
-        self._transit_pool_lease = TransitPoolLease()
         # Settings models this engine is not otherwise handed ([auth], [security], [tls], ...), read
         # only for the directories they name, which the `.processed` archive sweep must never reach
         # (BACKLOG #1188, engine_owned_dirs).
@@ -1029,6 +1027,10 @@ class Engine:
         # vault BACKLOG #3109: the shared version whose stored initiator's digest was last logged
         # as unreadable, so a version the runner retries every tick logs it once.
         self._initiator_digest_warned: int | None = None
+        # This engine's hold on the process-wide Transit pools (BACKLOG #3929), released once the
+        # stop reaches the store's close. Taken last, so a constructor that raises leaks none.
+        self._store_close_reached = False
+        self._transit_pool_lease = TransitPoolLease()
 
     def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
         """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
@@ -4383,20 +4385,24 @@ class Engine:
         they wait for (the owner ruled on 2026-11-22 that the budget wins).
         docs/SERVICE.md, *Start / stop / status*, says what each cut loses.
 
-        Last, on every way out, this engine's lease on the Transit pools is released, once
-        (BACKLOG #3929). It waits for their running calls only when the steps ended or raised an
-        ordinary error; a cancel, KeyboardInterrupt or SystemExit gets no wait."""
+        Last, once the store's close has run or raised, this engine's lease on the Transit pools
+        is released, once (BACKLOG #3929). A stop that raises before it reaches the close keeps the
+        lease, since the store and the graph may still be using the pools; a later stop that
+        reaches the close releases it. It waits for the pools' running calls only when the steps
+        ended or raised an ordinary error; a cancel, KeyboardInterrupt or SystemExit gets no
+        wait."""
         budget = _StopBudget(budget_seconds)
-        raised: BaseException | None = None
+        waits = False
         try:
             await self._stop_steps(budget)
-        except BaseException as exc:
-            raised = exc
+            waits = True
+        except Exception:
+            waits = True
             raise
         finally:
-            waits = raised is None or isinstance(raised, Exception)
-            drain = budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0) if waits else 0.0
-            await self.release_transit_pools(drain)
+            if self._store_close_reached:
+                drain = budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0) if waits else 0.0
+                await self.release_transit_pools(drain)
 
     async def release_transit_pools(self, timeout: float) -> None:
         """Release this engine's lease on the Transit pools, once; later calls do nothing. Where it
@@ -4573,6 +4579,7 @@ class Engine:
             cancelled = True
         except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised
             failure = exc
+        self._store_close_reached = True  # stop() releases the Transit pool lease from here on
         try:
             await self.store.close()
         except Exception as exc:
