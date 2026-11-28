@@ -3,4 +3,6 @@
   dot, so `https://localhost.:8765` refuses a
   certificate naming only `localhost`, and the reverse. The engine's startup bind check ignored
   the dot and served the old pair, so the tray would have shown a running engine as down. It now
-  re-mints the pair, audited as `bind_changed`. (`BACKLOG #5973`)
+  re-mints the pair, audited as `bind_changed`. A bind spelled with the dot is not a loopback
+  bind, so `serve` serves the generated pair there only under `[security].enforcement=warn` with
+  `--allow-insecure-bind`. (`BACKLOG #5973`)

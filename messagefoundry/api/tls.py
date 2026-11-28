@@ -350,10 +350,10 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
 
     Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
     ``::1``, matched by :func:`_host_key` (:data:`_LOOPBACK_KEYS`): of those three, every one the
-    old certificate names, and the default ``[api].host``, which the CLI, the IDE and the harness
-    dial by default. :func:`_make_generated` drops one that is the bind's own SAN entry
-    (:func:`_san_key`), so a ``localhost.`` bind keeps ``localhost``, which a client verifies as a
-    different name (#8291 item 1). A bind :attr:`ApiSettings.is_loopback`
+    old certificate names, with or without a trailing dot, and the default ``[api].host``, which
+    the CLI, the IDE and the harness dial by default. :func:`_make_generated` drops one that is the
+    bind's own SAN entry (:func:`_san_key`), so a ``localhost.`` bind keeps ``localhost``, which
+    Python's ``ssl`` verifies as a different name (#8291 item 1). A bind :attr:`ApiSettings.is_loopback`
     lists gets all three from :func:`_generated_sans` anyway, so this matters for a wildcard bind
     and for another spelling, such as ``LOCALHOST`` or ``[::1]``: a re-mint for a move from
     ``::`` to ``0.0.0.0`` keeps the ``::1`` the old certificate named, and a renewal at ``::`` of a
@@ -368,8 +368,12 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     if dialled not in _LOOPBACK_KEYS:
         return []
     default = ApiSettings.model_fields["host"].default
+    # The dotted spelling counts too: san_names keeps the dot, as Python's ssl does, but a client
+    # that ignores it verified the old pair at the undotted name, so a re-mint keeps that name.
     return [
-        name for name in _GENERATED_LOOPBACK_SANS if name == default or pki.san_names(old_pem, name)
+        name
+        for name in _GENERATED_LOOPBACK_SANS
+        if name == default or any(pki.san_names(old_pem, n) for n in (name, f"{name}."))
     ]
 
 

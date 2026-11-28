@@ -755,12 +755,8 @@ def test_a_wildcard_spelling_windows_cannot_bind_stays_monitor_only(host: str) -
     assert cfg.monitor_only is True
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
-@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
-def test_windows_refuses_a_listener_on_those_wildcard_spellings(host: str) -> None:
-    """The premise of the test above, measured where the tray runs: ``uvicorn.run`` reaches
-    ``loop.create_server``, and that refuses both hosts. If this starts passing a bind, the tray's
-    handling of the spelling is a live question again."""
+def _listen_once(host: str) -> None:
+    """Open and close a listener on ``host``, as ``uvicorn.run`` reaches ``loop.create_server``."""
     import asyncio
 
     async def bind() -> None:
@@ -768,8 +764,24 @@ def test_windows_refuses_a_listener_on_those_wildcard_spellings(host: str) -> No
         server.close()
         await server.wait_closed()
 
+    asyncio.run(bind())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
+@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
+def test_windows_refuses_a_listener_on_those_wildcard_spellings(host: str) -> None:
+    """The premise of the test above, measured where the tray runs: ``loop.create_server`` refuses
+    both hosts. If this starts passing a bind, the tray's handling of the spelling is a live
+    question again. The control is the test below: the same helper binds loopback, so a refusal
+    here is about the spelling, not a box or runner that refuses every listener."""
     with pytest.raises(OSError):
-        asyncio.run(bind())
+        _listen_once(host)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
+def test_the_listener_helper_binds_loopback() -> None:
+    """The positive control for the test above. Loopback, so no firewall prompt is raised."""
+    _listen_once("127.0.0.1")
 
 
 def test_a_tray_toml_engine_url_clears_the_wildcard_hold() -> None:

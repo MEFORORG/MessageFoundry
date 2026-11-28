@@ -4378,6 +4378,10 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
         ("localhost.", "localhost", ["localhost", "127.0.0.1", "::1"]),
         ("myhost.example", "myhost.example.", ["myhost.example."]),
+        # A client that ignores the dot verified the old localhost. pair at localhost, so a
+        # re-mint for a bind dialled on loopback keeps localhost, as it did before the bind
+        # check kept the dot.
+        ("localhost.", "0.0.0.0", ["0.0.0.0", "127.0.0.1", "localhost"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
@@ -4425,6 +4429,10 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     assert again == []
 
 
+#: OpenSSL's ``X509_V_ERR_HOSTNAME_MISMATCH``, the ``verify_code`` of a refusal for the name.
+_X509_V_ERR_HOSTNAME_MISMATCH = 62
+
+
 @pytest.mark.parametrize(
     ("old_names", "then"),
     [
@@ -4453,13 +4461,15 @@ def test_a_bind_move_across_a_trailing_dot_serves_a_pair_that_verifies_at_the_ne
     write_restricted_file(old_key, key_pem)
     old_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     old_server.load_cert_chain(old_cert, old_key)
-    with pytest.raises(ssl.SSLCertVerificationError):
+    with pytest.raises(ssl.SSLCertVerificationError) as refused:
         _handshake(
             old_server,
             ssl.create_default_context(cafile=str(old_cert)),
             client_cert=None,
             server_hostname=then,
         )
+    # Refused for the name, not for another reason the re-mint might also clear.
+    assert refused.value.verify_code == _X509_V_ERR_HOSTNAME_MISMATCH
 
     events: list[GeneratedPairReplaced] = []
     cert, key = ensure_api_tls_material(
