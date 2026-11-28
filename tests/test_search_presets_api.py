@@ -604,6 +604,9 @@ async def _layered_with_decrypt_raising(
             patched.setattr(cipher, "is_encrypted", lambda _stored: True)
             # And it declares, as Transit does, that it cannot name its keys.
             patched.setattr(cipher, "names_no_keys", True, raising=False)
+            # And that it encrypts, as Transit does: a keyless store refuses a sealed criteria cell
+            # before decrypt is reached (BACKLOG #5523 item 7).
+            patched.setattr(cipher, "encrypts", True, raising=False)
             if audit_raises:
                 record_audit = engine.store.record_audit
 
@@ -1179,3 +1182,50 @@ async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_nee
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
         assert r.json()["matched"] == 1
+
+
+async def test_a_sealed_criteria_cell_on_a_keyless_store_answers_423_not_malformed(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523 item 7: a keyless open of a store a key wrote handed the sealed criteria back
+    unchanged, so the recall answered 400 "malformed criteria", naming the wrong fault. A sealed
+    cell on a keyless store is now refused as a cell the store has no key to open: a 423, logged at
+    ERROR and audited, as a cell under a key the store does not hold is. Control: a plain JSON
+    cell, which a keyless store writes, recalls."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+        )
+        assert r.status_code == 200, r.text
+        pid = r.json()["id"]
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 200, r.text  # control: the keyless store's own cell recalls
+        sealed = make_cipher(generate_key(), write_v2=True).encrypt('{"content": "MRN999"}')
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?", (sealed, pid)
+        )
+        await engine.store._db.commit()
+        caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == (
+        f"preset {pid} is sealed, but this engine's store opened with no encryption key, so it "
+        "cannot be used; a store key that is not configured, or a value written outside the "
+        "store, can cause this"
+    )
+    [(level, text)] = [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
+    assert level == logging.ERROR
+    assert text.startswith(f"layered search refused preset {pid}: KeylessSealedCellError; ")
+    assert "[store] key" in text  # the remedy, in the log only
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 423, "cause": "KeylessSealedCellError"}
+    ]
+    # Not drift: the store writes no tag-failed row for it.
+    assert await engine.store.list_audit(action=PRESET_TAG_FAILED_ACTION) == []

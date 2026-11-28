@@ -549,6 +549,7 @@ from messagefoundry.store.base import (
 from messagefoundry.store.cell_tag import (
     BlankCellError,
     CellTagError,
+    KeylessSealedCellError,
     NonTextCellError,
     SealedBlankCellError,
 )
@@ -567,7 +568,11 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import MetadataTooDeepError, user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
+from messagefoundry.store.row_seal import (
+    SealFailureThrottle,
+    TransitSealUnavailableError,
+    probe_row_sealer_at_start,
+)
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -10585,22 +10590,10 @@ def create_app(
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
     # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
-    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
-    # each refusal, best effort. Touched on the event loop only.
-    _layered_refusals_logged: dict[tuple[str, str], float] = {}
-    _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
-    _LAYERED_REFUSAL_LOG_MAX = 4096
-
-    def _first_layered_refusal(preset_id: str, cause: str) -> bool:
-        key, now = (preset_id, cause), time.monotonic()
-        last = _layered_refusals_logged.pop(key, None)
-        if last is not None and now - last < _LAYERED_REFUSAL_LOG_INTERVAL_S:
-            _layered_refusals_logged[key] = last
-            return False
-        _layered_refusals_logged[key] = now
-        while len(_layered_refusals_logged) > _LAYERED_REFUSAL_LOG_MAX:
-            _layered_refusals_logged.pop(next(iter(_layered_refusals_logged)))
-        return True
+    # pair per hour, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. The shared throttle, not a copy of it (item 27). Touched on the
+    # event loop only.
+    _layered_refusal_log = SealFailureThrottle(interval=3600.0, track_max=4096)
 
     @app.get("/search/layered", response_model=MessageSearchResults)
     async def layered_search(
@@ -10667,7 +10660,7 @@ def create_app(
                 failed = f"defect {type(exc).__name__}"
             else:
                 return refusal
-            if _first_layered_refusal(preset_id, f"audit:{cause}:{failed}"):
+            if _layered_refusal_log.due((preset_id, f"audit:{cause}:{failed}")):
                 _log.error(
                     "layered search could not audit its refusal of preset %s (%s %s; %s)",
                     preset_id,
@@ -10718,7 +10711,7 @@ def create_app(
                 # Once per preset and reason per interval, as the other arms log: an outage fails
                 # every recall, and a changed reason is logged again (BACKLOG #5523).
                 cause = type(exc).__name__
-                if _first_layered_refusal(preset_id, f"{cause}:{exc}"):
+                if _layered_refusal_log.due((preset_id, f"{cause}:{exc}")):
                     _log.warning(
                         "layered search answered 503 on preset %s: %s", preset_id, str(exc)
                     )
@@ -10739,13 +10732,28 @@ def create_app(
                 # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
                 # above is a WARNING: it says nothing about the cell.
                 cause = type(exc).__name__
-                if _first_layered_refusal(preset_id, cause):
-                    _log.error("layered search refused preset %s: %s", preset_id, cause)
+                keyless = isinstance(exc, KeylessSealedCellError)
+                if _layered_refusal_log.due((preset_id, cause)):
+                    # A keyless open is most likely a store-wide setting: the log names the
+                    # store's key configuration, not one key source, since the cell may be a
+                    # Transit one or a plant (BACKLOG #5523 item 7).
+                    _log.error(
+                        "layered search refused preset %s: %s",
+                        preset_id,
+                        f"{cause}; the store opened with no encryption key, so configure the "
+                        "[store] key that sealed it, or treat the cell as written outside the store"
+                        if keyless
+                        else cause,
+                    )
                 refusal = HTTPException(
                     423,
-                    f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
-                    " a retired key that is not supplied, or a value written outside the store,"
-                    " can cause this",
+                    f"preset {preset_id} is sealed, but this engine's store opened with no"
+                    " encryption key, so it cannot be used; a store key that is not configured,"
+                    " or a value written outside the store, can cause this"
+                    if keyless
+                    else f"preset {preset_id} cannot be opened with the store's keys and cannot be"
+                    " used; a retired key that is not supplied, or a value written outside the"
+                    " store, can cause this",
                 )
             if refusal is not None:
                 # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
@@ -10766,7 +10774,7 @@ def create_app(
             if refused is not None or not isinstance(criteria, dict):
                 # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
                 # outside it. Logged, once per preset per interval, and audited each time.
-                if _first_layered_refusal(preset_id, "malformed"):
+                if _layered_refusal_log.due((preset_id, "malformed")):
                     _log.warning(
                         "layered search refused preset %s: its criteria are malformed", preset_id
                     )

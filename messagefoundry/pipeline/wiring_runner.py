@@ -9928,6 +9928,7 @@ class RegistryRunner:
         env_values: Mapping[str, Any] | None = None,
         *,
         fhir_lookup_anchors: FhirLookupAnchorPass | None = None,
+        require_running: bool = False,
     ) -> tuple[tuple[str, str], ...]:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
@@ -9977,17 +9978,31 @@ class RegistryRunner:
 
         On a running graph that :attr:`lease_lost` reads as lease-lost, it raises
         :class:`RunnerLeaseLostError` with no lane changed (BACKLOG #5906). The coordinator's
-        ``is_leader()`` is read twice: once this method holds the reload lock, which is after
-        ``Engine.reload_detail`` has loaded the config and run its preflights, and again just
-        before step 1. Each read is point in time: leadership lost after the second read is not
-        refused, and steps 1 to 3a then run on this node until ``Engine._stop_graph``, which waits
-        on the same lock, takes them down.
+        ``is_leader()`` is read twice here: once this method holds the reload lock, and again just
+        before step 1. The engine reads it first for an ungated reload (``Engine.reload_detail``)
+        and a DR activation's profile step, before their preflights; a released reload reaches
+        this lock after its preflights and the load. Each read is point in time: leadership lost
+        after the second read is not refused, and steps 1 to 3a then run on this node until
+        ``Engine._stop_graph``, which waits on the same lock, takes them down.
+
+        ``require_running`` refuses, with :class:`RunnerNotRunningError` and nothing changed, a
+        graph that is not running once this method holds the lock, rather than applying the graph
+        to a stopped runner and binding nothing. A DR activation passes it when its graph ran as
+        its profile step began, so a demotion that stopped the graph meanwhile is refused (BACKLOG
+        #5906). Every teardown holds the same lock, so the graph cannot stop between this read and
+        step 1; it can stop once this reload releases the lock.
         """
         async with self._reload_lock:
             # BACKLOG #5906: refused at once too, so a lease-lost node does not hold the lock its
             # own demotion teardown waits on through the build check and the anchor reads below.
             if self.lease_lost:
                 raise RunnerLeaseLostError.for_reload()
+            if require_running and not self._running:
+                raise RunnerNotRunningError(
+                    "",
+                    "this engine's graph is not running (stopped, or a demoted node), so this "
+                    "reload applies nothing",
+                )
             if new_registry is None:
                 new_registry = self.registry
             # ``env_values`` go live with the graph, under the same lock. A refused or rolled-back

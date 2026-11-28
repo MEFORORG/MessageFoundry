@@ -3039,19 +3039,33 @@ before the runner's second read, below, the reload itself refuses, and the appro
 marked failed and answers 422, as every refused release does. If it goes false after that second
 read, the release is not refused and runs on this node, as an inline reload would. A release on
 the leader, or on this node once its graph has stopped, is not refused for the lease. A dry run
-there is not refused for the lease: it swaps nothing and never asks for it. The runner reads the
-flag twice: once it holds the reload lock, which is after `Engine.reload_detail` has loaded the
-config and run its preflights, and again before the reload stops any listener. Each read is point
-in time, so what they guarantee is at least this: a reload is refused when the flag reads false
-at either read, and a flag that goes false after the second read is not refused. That reload then
+there is not refused for the lease: it swaps nothing and never asks for it. An inline reload
+reads the flag first in `Engine.reload_detail`, before its target check. When it reads false the
+target check still runs, so a directory outside the reload roots is still refused as denied, and
+the reload is then refused before the settings preflight and the config load. A flag that goes
+false during the target check is left to the runner's reads. A released reload skips that first read, so its refusal still follows its digest
+check. The runner then reads the flag twice: once it holds the reload lock, and again before the
+reload stops any listener. Each read is point in time, so what they guarantee is at least this: a
+reload is refused when the flag reads false at any read, and a flag that goes false after the
+runner's second read is not refused. That reload then
 binds listeners and resumes lanes on the node, and `Engine._stop_graph` takes them down only once
 the reload ends, since it waits on the same lock. A cluster convergence pass on such a node is
 refused the same way, before it loads the config, and retried each interval; the first pass of
 such a run logs at INFO with no traceback, the rest at DEBUG. A DR activation's reload would be
 refused too, and its `dr_activation_aborted` row names the lease. Only an embedder that skips the
-settings check reaches that, since the service settings refuse `[dr]` together with `[cluster]`;
-there the refusal comes at the activation's profile step, after its store recovery, its seed
-marker and any takeover hook have run.
+settings check reaches that, since the service settings refuse `[dr]` together with `[cluster]`.
+There the activation reads the lease after its archive confinement, again before its store
+recovery and again before any takeover hook, and aborts with kind `lease` (**503**) at the first
+read that finds the flag false or finds this node a cluster follower. The read before the hook
+comes after the store recovery and the seed marker, and its reason says so. A lease lost after
+the last of those reads, once any takeover hook has run, is refused at the profile step with kind
+`profile` in at least these cases: when the engine's read before the preflight finds it; when
+the runner's two reads of a reload find it, after the preflight has read the anchors and written
+their rows; and when the graph stopped during the step, as a demotion's teardown stops it, which
+the runner reads once its reload holds the lock every teardown also holds. At least this is still
+not refused: a lease lost after the runner's second read while the graph keeps running, whose
+reload binds and resumes lanes, so the activation is recorded active though the teardown then
+takes them down once the reload releases the lock.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
@@ -5088,7 +5102,12 @@ the composed layers writes no such row. A refusal row has `refused` in its detai
 from a search that ran. A NULL, empty or non-text criteria cell, and a sealed one that opens to an
 empty string, are refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
-`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity_drift` alert, as for a moved preset. A sealed criteria cell that a store opened with no
+key reads is refused too, as a cell the store's keys cannot open: a 423, with no store row or
+alert. The route tries to write its refusal row, and it is written only where the audit chain
+accepts it, for example on a store that was always keyless. On a store a key wrote and that is
+reopened with no key, the keyed audit chain refuses that row, so the only records are the
+route's rate-limited ERROR lines: the refusal and that it could not audit it. The store rate-limits its WARNING, alert and
 `integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
 refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
 engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator

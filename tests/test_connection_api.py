@@ -845,6 +845,35 @@ async def test_post_test_credential_audits_a_build_failure(
     assert json.loads(cred_rows[0]["detail"])["success"] is False
 
 
+async def test_post_test_credential_builds_its_connector_off_the_event_loop(
+    engine: Engine,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5905: the credential test builds its throwaway connector in a worker thread, as
+    the connection test does, so a credentialed build cannot stall the event loop. Red: the build
+    ran on the loop thread."""
+    import threading
+
+    from messagefoundry.pipeline import wiring_runner
+
+    built_on: list[int] = []
+
+    def recording_build(*_args: Any, **_kwargs: Any) -> Any:
+        built_on.append(threading.get_ident())
+        raise ValueError("stub build")  # normalised to a refused build, so nothing is dialled
+
+    monkeypatch.setattr(wiring_runner, "build_source", recording_build)
+    engine.add_registry(_credential_registry(str(tmp_path / "share")))
+
+    r = await client.post("/connections/IB_CRED/test-credential")
+
+    assert r.status_code == 200, r.text
+    assert r.json()["success"] is False and "stub build" in r.json()["detail"]
+    assert len(built_on) == 1 and built_on[0] != threading.get_ident()
+
+
 def test_build_test_connector_normalizes_every_build_failure(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

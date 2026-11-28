@@ -1136,14 +1136,21 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert row["kind"] == "profile"
 
 
+@pytest.mark.parametrize("lost", ["before_the_profile_step", "during_the_preflight"])
 async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
-    box: _Box, monkeypatch: pytest.MonkeyPatch
+    box: _Box, monkeypatch: pytest.MonkeyPatch, lost: str
 ) -> None:
     """Regression 2 of the hold on engine PR 3136: the runner refuses the profile's reload on such
     a node, and the abort row said the engine could not bind the feeds and handed on the reload
     refusal's own instruction. It now names the lease, says nothing bound, and the box stays
     passive. Reached only by an embedder that skips the settings check refusing [dr] with
-    [cluster], so the coordinator is swapped in by hand, and put back before teardown."""
+    [cluster], so the coordinator is swapped in by hand, and put back before teardown.
+
+    BACKLOG #5906: an activation reads the lease before its store and hook steps and aborts there
+    with kind "lease" (tests/test_runner_doors_not_running.py), so those reads are made to pass
+    here. A lease lost before the profile step is refused by the engine's own read, before the
+    preflight; one lost during the preflight is refused by the runner's, which this case keeps
+    covered."""
     engine = box.engine
     coord = engine.dr_coordinator
     assert coord is not None
@@ -1152,8 +1159,26 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
     assert rr is not None and rr.running
     not_leading = _LeaseCoordinator()
     not_leading.leader = False
-    monkeypatch.setattr(rr, "_coordinator", not_leading)
-    assert rr.lease_lost
+    monkeypatch.setattr(coord, "_not_leading", lambda: False)
+    preflight = engine._dr_preflight
+    preflights: list[object] = []
+    if lost == "before_the_profile_step":
+        monkeypatch.setattr(rr, "_coordinator", not_leading)
+        assert rr.lease_lost
+
+        async def recorded_preflight(*args: Any, **kwargs: Any) -> Any:
+            preflights.append(args)
+            return await preflight(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "_dr_preflight", recorded_preflight)
+    else:
+
+        async def losing_preflight(*args: Any, **kwargs: Any) -> Any:
+            preflights.append(args)
+            monkeypatch.setattr(rr, "_coordinator", not_leading)
+            return await preflight(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "_dr_preflight", losing_preflight)
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
     monkeypatch.undo()
@@ -1165,6 +1190,74 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
     (row,) = await _rows(engine.store, "dr_activation_aborted")
     assert row["kind"] == "profile" and "cluster lease" in str(row["reason"])
+    if lost == "before_the_profile_step":
+        # The engine's own read refused it, not the runner's: the preflight never ran.
+        assert preflights == []
+    else:
+        # The positive control: here the preflight ran, and the runner's read refused it.
+        assert len(preflights) == 1
+
+
+@pytest.mark.parametrize("leads", [False, True], ids=["demoted", "still_leading"])
+async def test_a_graph_stopped_during_the_preflight_is_refused(
+    box: _Box, monkeypatch: pytest.MonkeyPatch, leads: bool
+) -> None:
+    """BACKLOG #5906: a demotion whose Engine._stop_graph finishes during the profile step's
+    preflight left the runner stopped. Its reload then applied the graph to a stopped runner,
+    bound nothing, and the activation was recorded active. Red before the runner's
+    require_running read: no DrActivationError was raised. A graph stopped on a node that still
+    leads is refused too, with a reason that names the stopped graph rather than the lease, and
+    no longer says the engine could not bind the priority feeds, since nothing tried to bind."""
+    engine = box.engine
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None and rr.running
+    follower = _LeaseCoordinator()
+    follower.leader = False
+    # The coordinator's earlier reads pass: the demotion lands only during the preflight.
+    monkeypatch.setattr(coord, "_not_leading", lambda: False)
+    preflight = engine._dr_preflight
+
+    async def demoting_preflight(*args: Any, **kwargs: Any) -> Any:
+        out = await preflight(*args, **kwargs)
+        # The coordinator now reads this node as a follower, and _stop_graph stops the runner.
+        if not leads:
+            monkeypatch.setattr(engine, "_coordinator", follower)
+            monkeypatch.setattr(rr, "_coordinator", follower)
+        await rr.stop()
+        return out
+
+    monkeypatch.setattr(engine, "_dr_preflight", demoting_preflight)
+    if not leads:
+        park = rr.park_intake
+
+        async def regaining_park(*args: Any, **kwargs: Any) -> Any:
+            # The lease comes back while the rollback awaits: the abort still names the lease,
+            # the refusal's cause when it was raised.
+            follower.leader = True
+            return await park(*args, **kwargs)
+
+        monkeypatch.setattr(rr, "park_intake", regaining_park)
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+    monkeypatch.undo()
+    assert caught.value.kind == "profile"
+    text = str(caught.value)
+    if leads:
+        assert "cluster lease" not in text and "not running" in text
+        # Nothing tried to bind, so the reason must not say a bind failed (BACKLOG #5906).
+        assert "bound no listener" in text and "could not bind" not in text
+        # This node still leads, so the reason must not suggest a demotion.
+        assert "graph is not running, so the profile step bound no listener" in text
+        assert "demoted" not in text
+    else:
+        assert "no longer holds the cluster lease" in text and "bound no listener" in text
+    assert coord.active is False and engine.dr_active is False
+    assert not rr.running
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "profile" and ("cluster lease" in str(row["reason"])) is not leads
 
 
 async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(

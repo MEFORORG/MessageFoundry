@@ -181,6 +181,8 @@ class _RefusingRunner:
     """Stands in for the registry runner during an activation whose reload is refused."""
 
     registry = None
+    running = True
+    lease_lost = False
 
     def listening_inbounds(self) -> frozenset[str]:
         return frozenset()

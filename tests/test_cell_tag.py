@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import copy
 import logging
 import pathlib
 import sqlite3
@@ -31,6 +32,7 @@ from messagefoundry.store.cell_tag import (
     BlankCellError,
     CellTagError,
     CorruptCellError,
+    KeylessSealedCellError,
     NonTextCellError,
     UnmarkedCellError,
     dead_letter_on_cell_tag,
@@ -979,6 +981,33 @@ def test_a_blank_or_non_text_preset_criteria_cell_is_refused_at_the_store(
     if setter is not None:  # once per interval: two blank refusals of one row, one alert
         assert [t for t, reason in seen if "is blank" in reason] == ["search_presets"]
         assert [t for t, reason in seen if "not text" in reason] == ["search_presets"]
+
+
+def test_a_sealed_preset_criteria_cell_on_a_keyless_store_is_refused() -> None:
+    """BACKLOG #5523 item 7: the identity cipher hands a sealed cell back unchanged, so a keyless
+    store read a keyed store's criteria as their ciphertext. ``open_preset_criteria`` refuses it as
+    a plain CipherError, not a tag failure: it is a setting, not drift. Controls: a keyed store
+    opens its own sealed cell, and a keyless store opens its own plain one."""
+    keyed = make_cipher(generate_key(), write_v2=True)
+    keyless = make_cipher(None, write_v2=True)
+    aad = preset_criteria_aad(preset_id="pkeyless", owner_user_id="u1")
+    sealed = keyed.encrypt('{"channel_id": "ch2"}', aad=aad)
+    assert open_preset_criteria(keyed, sealed, preset_id="pkeyless", owner_user_id="u1") == (
+        '{"channel_id": "ch2"}'
+    )
+    with pytest.raises(KeylessSealedCellError) as refused:
+        open_preset_criteria(keyless, sealed, preset_id="pkeyless", owner_user_id="u1")
+    assert isinstance(refused.value, CipherError)
+    assert not isinstance(refused.value, CellTagError)
+    assert sealed not in str(refused.value)
+    copied = copy.copy(refused.value)  # rebuilt from its table and column, not its message
+    assert (copied.table, copied.column, str(copied)) == (
+        "search_presets",
+        "criteria",
+        str(refused.value),
+    )
+    plain = '{"channel_id": "ch2"}'
+    assert open_preset_criteria(keyless, plain, preset_id="pkeyless", owner_user_id="u1") == plain
 
 
 def test_a_failed_cell_is_reported_once_per_interval() -> None:

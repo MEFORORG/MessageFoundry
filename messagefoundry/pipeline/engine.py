@@ -80,6 +80,7 @@ from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import (
     DrCoordinator,
+    DrProfileGraphStopped,
     DrProfileNotLeading,
     warn_unset_pass_environment,
 )
@@ -117,6 +118,7 @@ from messagefoundry.pipeline.wiring_runner import (
     FhirLookupAnchorPass,
     RegistryRunner,
     RunnerLeaseLostError,
+    RunnerNotRunningError,
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
@@ -467,6 +469,14 @@ class ReloadStepFailure:
 
     step: str
     detail: str
+
+
+def _dr_profile_not_leading() -> DrProfileNotLeading:
+    """The DR profile step's lease refusal (BACKLOG #5906), in its own words: a follower's graph
+    has already stopped, and a DR activation is not a reload to retry on the leader."""
+    return DrProfileNotLeading(
+        "this node does not hold the cluster lease, so the DR profile step applied nothing"
+    )
 
 
 def _outbound_close_failure(close_failures: Sequence[tuple[str, str]]) -> ReloadStepFailure:
@@ -1273,8 +1283,21 @@ class Engine:
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
                 hop_posture=self._hop_posture,
+                not_leading=self._dr_not_leading,
             )
         return self._dr_coordinator
+
+    def _lease_lost(self) -> bool:
+        """Whether the runner reads this node as lease-lost (BACKLOG #5906), read at each call
+        since the engine's runner is set only once its graph is first added."""
+        rr = self._registry_runner
+        return rr is not None and rr.lease_lost
+
+    def _dr_not_leading(self) -> bool:
+        """Whether a DR activation must refuse here (BACKLOG #5906): the runner reads this node as
+        lease-lost, or it is a cluster follower, whose graph is down and whose store recovery
+        would re-pend the leader's in-flight rows. A single node always leads."""
+        return self._lease_lost() or not self._coordinator.is_leader()
 
     async def _dr_config_fingerprint(self) -> str | None:
         """The config digest a DR activation's seed marker records, or ``None`` when there is none.
@@ -1338,6 +1361,9 @@ class Engine:
         # What an operator had bound before this call, which a failed activation does not unbind.
         # It does not bind again one the attempt's own reload had parked.
         listening = rr.listening_inbounds() if rr is not None else frozenset()
+        # Whether the graph ran when the profile step began, so the reload refuses one that has
+        # stopped since, rather than binding nothing on a box recorded active (BACKLOG #5906).
+        was_running = rr is not None and rr.running
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
         # graph is what the operator last applied, through whatever approval that reload needed, so
         # an activation must not swap in bytes edited since then with no second person, nor the
@@ -1353,6 +1379,12 @@ class Engine:
         # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
         # DR decision is never a cluster-wide config bump.
         close_failures: tuple[tuple[str, str], ...] = ()
+        if self._dr_not_leading():
+            # BACKLOG #5906: before the preflight reads the anchors and writes their rows, as
+            # reload_detail refuses first. The coordinator's test, not the runner's alone: a node
+            # demoted during the takeover hook has a stopped runner, whose reload would answer
+            # with nothing bound. Nothing is changed yet, so nothing is rolled back.
+            raise _dr_profile_not_leading()
         try:
             lookups: FhirLookupAnchorPass | None = None
             if rr is not None:
@@ -1363,7 +1395,12 @@ class Engine:
                 # (vault BACKLOG #3094, #3582), unless a reload landed first and changed the graph.
                 # The reload's build check and executor build still load each lookup CA file,
                 # with no bound, as a lane's build loads its own.
-                close_failures = await rr.reload(fhir_lookup_anchors=lookups)
+                # require_running: a demotion whose Engine._stop_graph finishes during the
+                # preflight, or while the reload waits on its lock, leaves the graph stopped. The
+                # runner refuses that under its lock, before it changes anything (BACKLOG #5906).
+                close_failures = await rr.reload(
+                    fhir_lookup_anchors=lookups, require_running=was_running
+                )
         except BaseException as exc:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1371,6 +1408,9 @@ class Engine:
             # as not active. BaseException, not Exception (vault BACKLOG #2751): a cancelled reload
             # rolls its intake back to the previous graph (RegistryRunner.reload), so the latch has
             # to follow it there too.
+            # BACKLOG #5906: read before the awaits below, so a lease regained or lost while they
+            # run does not change which refusal the abort names.
+            not_leading = isinstance(exc, RunnerNotRunningError) and self._dr_not_leading()
             self._set_dr_active(was_active)
             standby = self._dr_standby_threshold()
             if rr is not None and standby is not None:
@@ -1396,10 +1436,16 @@ class Engine:
                         "DR activation failed, and closing the outbound sessions it had opened "
                         "failed too; POST /config/reload closes them"
                     )
-            if isinstance(exc, RunnerLeaseLostError):
+            if isinstance(exc, RunnerLeaseLostError) or not_leading:
                 # BACKLOG #5906: the DR coordinator's own type, so its abort row can name the
                 # lease without importing the runner.
-                raise DrProfileNotLeading(str(exc)) from exc
+                raise _dr_profile_not_leading() from exc
+            if isinstance(exc, RunnerNotRunningError):
+                # A graph stopped on a node that still leads: its own DR type, for the same
+                # reason, so the abort does not say a bind failed (BACKLOG #5906).
+                raise DrProfileGraphStopped(
+                    "this engine's graph is not running, so the DR profile step applied nothing"
+                ) from exc
             raise
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).
@@ -3077,11 +3123,9 @@ class Engine:
         shared row; read after the reload, a refresh could have moved the cache to a later bump."""
         initiator_digest = self._initiator_digest(version)
         try:
-            rr = self._registry_runner
-            if rr is not None and rr.lease_lost:
-                # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
-                # here, before the load runs the config modules and the preflights read the
-                # anchors, since the convergence runner retries it every interval.
+            if self._lease_lost():
+                # BACKLOG #5906: refused before reload_detail, which would refuse it too but only
+                # after its target check, since this pass is retried every interval.
                 raise RunnerLeaseLostError.for_reload()
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -3790,7 +3834,8 @@ class Engine:
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / a
         config directory or environment value file this reload could not read), or the runner's
         ``RunnerLeaseLostError`` (a cluster node that lost its lease while its graph runs, BACKLOG
-        #5906) — the caller maps these to HTTP errors.
+        #5906; an ungated non-dry-run reload refuses it right after the target check, before the
+        preflights and the load) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
@@ -3805,6 +3850,16 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
+        if not dry_run and approval is None and self._lease_lost():
+            # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
+            # here, before the settings preflight reads the anchors and the load runs the config
+            # modules, for the inline route; convergence refuses before it calls this method, and
+            # this read backs that one. The target check still runs first, so
+            # a directory outside the reload roots is still refused and audited as denied. A dry
+            # run swaps nothing, so it still runs. A released reload is left to the gate's
+            # before-claim check and the runner's, so its refusal still follows its digest check.
+            await self._existing_reload_target(config_dir)
+            raise RunnerLeaseLostError.for_reload()
         try:
             if not dry_run:
                 # First, so every reload route refuses a bad settings anchor at the point the
