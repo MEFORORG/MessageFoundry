@@ -9,8 +9,8 @@
   `from` import, a plain assignment or a constant `getattr` (`import shutil as sh`,
   `from os import write`, `opener = open`). Some readings it made before were false positives and
   are gone, at least: a read through a module opener called by its own name whose path held a
-  `w`, `a`, `x` or `+`, and a mode, in an opener's mode slot, whose only such letters come after a
-  `:` or `|`, such as a `tarfile` compression suffix (`"r:xz"`). It is still a filter with known
-  gaps, listed in the `_ambient_authority_hit` docstring in
-  [checks.py](../messagefoundry/checks.py), and it stays advisory unless
-  `--strict-handler-security` is set. (`BACKLOG #5382`)
+  `w`, `a`, `x` or `+`, and a string shaped like a `tarfile` mode whose only such letters come
+  after a `:` or `|`, such as a compression suffix (`"r:xz"`), in an opener's mode slot or in the
+  1st positional of an `.open`. It is still a filter with known gaps, listed in the
+  `_ambient_authority_hit` docstring in [checks.py](../messagefoundry/checks.py), and it stays
+  advisory unless `--strict-handler-security` is set. (`BACKLOG #5382`)

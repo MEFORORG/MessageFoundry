@@ -1156,9 +1156,9 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
     ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
     # On a receiver not known to be a path, a 1st-positional string is as likely a path or a URL as
-    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit. Each is flagged on the
-    # letters in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not
-    # detected.
+    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit unless the whole string is
+    # shaped like a tarfile mode. Each is flagged on the letters in its literal alone: the call
+    # itself (dbm creation, HTTP egress, a browser) is not detected.
     (
         "dbm_open_drive_path_letters_after_colon",
         'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
@@ -1172,7 +1172,7 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "webbrowser_url_letters_after_colon",
         'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
     ),
-    # A receiver that reads as a path keeps the unsplit 1st-positional reading too, whether through
+    # A receiver that reads as a path keeps that 1st-positional reading too, whether through
     # a class named Path from any module, a name bound to one, an unbound Path, or a '/' join. Each
     # is flagged on the letters in its literal alone, not on the body or data argument.
     (
@@ -1200,6 +1200,26 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     (
         "attribute_path_classmethod_drive_path_letters_after_colon",
         'import client\n\ndef f(msg):\n    client.Path.home().open("C:\\\\mefor\\\\cache", "c")\n',
+    ),
+    # A mode string is split at ':' or '|' only when the whole string is mode-shaped, as a tarfile
+    # mode is; a URL in the 2nd positional or the mode= keyword is read unsplit, on a rebound or
+    # imported open and on any receiver.
+    (
+        "rebound_open_url_in_mode_slot",
+        'from _helpers import open\n\ndef f(msg):\n    open("f", "https://example.org/a")\n',
+    ),
+    (
+        "imported_webbrowser_open_url_in_mode_slot",
+        'from webbrowser import open\n\ndef f(msg, u):\n    open(u, "https://example.org/a")\n',
+    ),
+    (
+        "path_named_import_mode_keyword_url",
+        "from _helpers import Path\n\ndef f(msg):\n"
+        '    Path("x").open(mode="https://example.org/a")\n',
+    ),
+    (
+        "receiver_open_mode_keyword_url",
+        'def f(msg, x, p):\n    x.open(p, mode="https://example.org/a")\n',
     ),
     # GzipFile with a fileobj and no mode takes the fileobj's mode, which may be a write.
     (
@@ -1258,6 +1278,7 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     ("gzip_open_read_path_with_a", 'import gzip\n\ndef f(msg):\n    gzip.open("/data/a.gz")\n'),
     ("tarfile_read_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r:xz")\n'),
     ("tarfile_read_stream_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r|xz")\n'),
+    ("receiver_open_mode_keyword_tarfile_read", 'def f(msg, x, p):\n    x.open(p, mode="r:gz")\n'),
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
     ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
