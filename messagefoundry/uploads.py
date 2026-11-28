@@ -3838,7 +3838,7 @@ class UploadStore:
                 # Checked before the body's outcome is weighed, because every reader refuses it
                 # before decrypting (_read_sidecar), so it is a skip over any body, a lost one too.
                 return self._refused_meta(fid, "it is plaintext too long to seal")
-        except (OSError, UnicodeDecodeError) as exc:
+        except OSError as exc:
             # Only an absent body is missing, and only when a fresh lstat says its final name is
             # gone (_known_absent): a share that cannot be reached raises a FileNotFoundError too
             # on Windows, with no winerror on a read, as does a Windows missing folder or drive
@@ -3846,23 +3846,32 @@ class UploadStore:
             # never a lost one a re-run would not count. On POSIX a missing folder above the name
             # reads as the name missing, so the body half is lost there and its pair counts as a
             # skip only because its sidecar is unreadable too (BACKLOG #5388).
-            missing = (
-                kind == "body"
-                and isinstance(exc, OSError)
-                and is_absent(exc)
-                and _known_absent(path)
-            )
-            if kind == "body" and (missing or isinstance(exc, UnicodeDecodeError)):
-                # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
-                # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
-                # counting one would fail every later run for good. The sidecar is still handled,
-                # as the unsealable kind when it is plaintext.
+            if kind == "body" and is_absent(exc) and _known_absent(path):
+                # BACKLOG #3181: the body is missing (or, in the arm below, not text), so no key
+                # reads it and no re-run changes that. It holds nothing under the OLD key, so it is
+                # not a skip; counting one would fail every later run for good. The sidecar is
+                # still handled, as the unsealable kind when it is plaintext.
                 _log.warning(
                     "uploaded file %s (body): missing or not text; no key can read it", fid
                 )
                 return _Half.LOST
             # An unreadable file. Counted and named, never silent: this file may still be under
             # the OLD key and the operator must not retire it yet.
+            _log.warning(
+                "uploaded file %s (%s): skipped, unreadable: %s", fid, kind, codec_safe_str(exc)
+            )
+            return _Half.SKIPPED
+        except UnicodeDecodeError as exc:
+            # Only a body reaches this arm today, since a sidecar that is not UTF-8 is refused
+            # above, and it is lost for the BACKLOG #3181 reason in the arm above. The arm is its
+            # own because is_absent reads an OSError's errno and a decode error has none; it also
+            # keeps the decode error from any call that might render it, which
+            # tests/test_unicode_error_log_paths.py refuses unless its _SAFE_CALLS names the call.
+            if kind == "body":
+                _log.warning(
+                    "uploaded file %s (body): missing or not text; no key can read it", fid
+                )
+                return _Half.LOST
             _log.warning(
                 "uploaded file %s (%s): skipped, unreadable: %s", fid, kind, codec_safe_str(exc)
             )
