@@ -1155,10 +1155,10 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ),
     ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
     ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
-    # On a receiver not known to be a path, a 1st-positional string is as likely a path or a URL as
-    # a mode, so it is read whole and a w, a, x or + after a ':' or '|' in it is still a hit, an
-    # exact tarfile mode ("r:xz") included. Each is flagged on the letters in its literal alone: the
-    # call itself (dbm creation, HTTP egress, a browser) is not detected.
+    # A 1st-positional string on an .open is read whole on every receiver, so a w, a, x or + after
+    # a ':' or '|' in it is still a hit, an exact tarfile mode ("r:xz") included; on a receiver not
+    # known to be a path it is as likely a path or a URL as a mode. Each is flagged on the letters
+    # in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not detected.
     (
         "dbm_open_drive_path_letters_after_colon",
         'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
@@ -1189,10 +1189,9 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "webbrowser_url_letters_after_colon",
         'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
     ),
-    # A receiver that reads as a path reads a 1st-positional string that is not an exact tarfile
-    # mode whole too, whether through a class named Path from any module, a name bound to one, an
-    # unbound Path, or a '/' join. Each is flagged on the letters in its literal alone, not on the
-    # body or data argument.
+    # A receiver that reads as a path reads its 1st-positional string whole too, whether through a
+    # class named Path from any module, a name bound to one, an unbound Path, or a '/' join. Each
+    # is flagged on the letters in its literal alone, not on the body or data argument.
     (
         "path_named_import_url_letters_after_colon",
         'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("https://example.org/a")\n',
@@ -1219,9 +1218,8 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "attribute_path_classmethod_drive_path_letters_after_colon",
         'import client\n\ndef f(msg):\n    client.Path.home().open("C:\\\\mefor\\\\cache", "c")\n',
     ),
-    # A mode string is split at ':' or '|' only when the whole string is an exact tarfile mode; a
-    # URL or any other string in the 2nd positional or the mode= keyword is read whole, on a
-    # rebound or imported open and on any receiver.
+    # Only a resolved tarfile.open mode is split; a URL or any other string in a mode slot the lint
+    # reads is read whole, on a rebound or imported open and on any receiver.
     (
         "rebound_open_url_in_mode_slot",
         'from _helpers import open\n\ndef f(msg):\n    open("f", "https://example.org/a")\n',
@@ -1242,6 +1240,89 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     (
         "receiver_open_mode_keyword_url",
         'def f(msg, x, p):\n    x.open(p, mode="https://example.org/a")\n',
+    ),
+    # Only the mode of a call resolved as tarfile.open or tarfile.TarFile.open is split, so a
+    # tarfile-mode string in any other mode slot the lint reads, or in an .open's 1st positional, is
+    # read whole and its "x" is a hit: on builtin open, on any receiver (paramiko's SFTP open
+    # creates a file on an "x"), on a pathlib or Path-named receiver's slot 0, and on a tarfile name
+    # the lint cannot tie to the module. The two Path receivers given a "w" are flagged on slot 0
+    # alone: their 2nd positional is not read, as on origin/main.
+    ("builtin_open_xz_mode_slot_one", 'def f(msg):\n    open("f", "r:xz")\n'),
+    ("builtin_open_xz_stream_mode_keyword", 'def f(msg, p):\n    open(p, mode="r|xz")\n'),
+    ("receiver_open_mode_keyword_xz", 'def f(msg, x, p):\n    x.open(p, mode="r:xz")\n'),
+    ("sftp_open_mode_keyword_xz", 'def f(msg, sftp, p):\n    sftp.open(p, mode="r:xz")\n'),
+    (
+        "pathlib_open_xz_mode",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("x").open("r:xz")\n',
+    ),
+    (
+        "path_named_import_open_xz_mode",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("r:xz")\n',
+    ),
+    ("div_join_open_xz_mode", 'def f(msg, a, b):\n    (a / b).open("r:xz", "w")\n'),
+    (
+        "zipfile_path_root_open_xz_mode",
+        'import zipfile\n\ndef f(msg, zf):\n    zipfile.Path(zf).root.open("r:xz", "w")\n',
+    ),
+    ("gzip_open_mode_keyword_xz", 'import gzip\n\ndef f(msg, p):\n    gzip.open(p, mode="r:xz")\n'),
+    (
+        "tarfile_parameter_mode_keyword_xz",
+        'def f(msg, tarfile, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_alias_mode_keyword_xz",
+        'import tarfile as tf\n\ndef f(msg, p):\n    tf.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_parameter_mode_keyword_xz",
+        'import tarfile\n\ndef f(msg, p, tarfile):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    # An opener patch on tarfile that the lint sees in the file (an attribute store, setattr, del,
+    # a vars() item), through tarfile or a name bound to a member of it, means a call spelled
+    # tarfile.open may not be tarfile's own, so its mode is read whole.
+    (
+        "tarfile_open_patched_mode_keyword_xz",
+        "import tarfile\n\ndef g(sftp):\n    tarfile.open = sftp.open\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_setattr_mode_keyword_xz",
+        'import tarfile\n\ndef g(c):\n    setattr(tarfile, "open", c)\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_vars_item_mode_keyword_xz",
+        'import tarfile\n\ndef g(c):\n    vars(tarfile)["open"] = c\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_deleted_mode_keyword_xz",
+        "import tarfile\n\ndef g():\n    del tarfile.open\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    # A patched module opener is not read as the module's own, so its 1st positional is read too.
+    (
+        "gzip_open_patched_slot_zero_write",
+        'import gzip\n\ndef g(fh):\n    gzip.open = fh.open\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    (
+        "tarfile_class_open_patched_slot_zero_write",
+        "import tarfile\n\ndef g(fh):\n    tarfile.TarFile.open = fh.open\n\ndef f(msg):\n"
+        '    tarfile.TarFile.open("w")\n',
+    ),
+    (
+        "tarfile_class_patched_by_name_mode_keyword_xz",
+        "import tarfile\nfrom tarfile import TarFile\n\ndef g(c):\n    TarFile.open = c\n\n"
+        'def f(msg, p):\n    tarfile.TarFile.open(p, mode="r:xz")\n',
+    ),
+    # tarfile.TarFile.open is read as a module opener, its mode in the 2nd positional.
+    (
+        "tarfile_class_open_write",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.TarFile.open(p, "w:xz")\n',
+    ),
+    (
+        "tarfile_class_open_getattr_write",
+        'import tarfile\n\ndef f(msg, p):\n    getattr(tarfile.TarFile, "open")(p, "w:xz")\n',
     ),
     # GzipFile with a fileobj and no mode takes the fileobj's mode, which may be a write.
     (
@@ -1304,6 +1385,33 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
         "tarfile_read_xz_mode_keyword",
         'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
     ),
+    (
+        "tarfile_read_xz_literal_path",
+        'import tarfile\n\ndef f(msg):\n    tarfile.open("/data/a.tar", "r:xz")\n',
+    ),
+    (
+        "tarfile_class_open_read_xz_mode_keyword",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.TarFile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_class_open_read_xz_literal_path",
+        'import tarfile\n\ndef f(msg):\n    tarfile.TarFile.open("/data/a.tar", "r:xz")\n',
+    ),
+    # A store that cannot replace an opener, or an opener store on another object, leaves the
+    # tarfile.open read split.
+    (
+        "tarfile_read_xz_after_extraction_filter",
+        "import tarfile\n\n"
+        "tarfile.TarFile.extraction_filter = staticmethod(tarfile.data_filter)\n\n"
+        'def f(msg, p):\n    tarfile.open(p, "r:xz")\n',
+    ),
+    (
+        "tarfile_read_xz_after_unrelated_open_store",
+        "import tarfile\n\ndef g(o, c):\n    o.open = c\n\n"
+        'def f(msg, p):\n    tarfile.open(p, "r:xz")\n',
+    ),
+    # Not split, since x.open is not resolved as tarfile.open: read whole, "r:gz" holds no w, a, x
+    # or +, so this pin passes with or without a split.
     ("receiver_open_mode_keyword_tarfile_read", 'def f(msg, x, p):\n    x.open(p, mode="r:gz")\n'),
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
