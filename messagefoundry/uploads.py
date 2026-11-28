@@ -348,29 +348,40 @@ def _root_fault(root: Path, listed: os.stat_result) -> str | None:
     lost share does. Or it answers as another file (``os.path.samestat``), as a share remounted, or
     a folder swapped in, under the root's name does (BACKLOG #8341 item 2). An answer proves nothing
     about the entries under it, and a file system that reports no stable identity, such as one that
-    answers every ``st_ino`` as 0, cannot show a swap. Text and not the exception, whose traceback
-    would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+    answers every ``st_ino`` as 0, cannot show a swap, and one that mints an identity on the
+    client, at least a CIFS mount with ``noserverino`` or a FUSE mount without stable inode numbers,
+    can stop a sound pass, which then removes nothing more. Text and not the exception, whose
+    traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
     try:
         now = root.stat()
     except OSError as exc:
-        return exc.strerror or type(exc).__name__
+        return f"stopped answering ({exc.strerror or type(exc).__name__})"
     if not os.path.samestat(now, listed):
-        return "it is no longer the folder the sweep listed"
+        return _ROOT_SWAPPED
     return None
+
+
+#: :func:`_root_fault`'s reason for a root that answers as another folder than the one listed.
+_ROOT_SWAPPED = "now answers as a different folder than the one the sweep listed"
 
 
 def _root_never_made(root: Path) -> bool:
     """Whether an uploads root whose ``stat`` or listing answered absence reads as one no save has
-    made yet: the nearest folder above it that answers is a folder. ``False`` when none answers, as
-    above a drive letter that is no longer mapped, when one answers as something else, or when one
-    fails for any other cause, so the sweep raises rather than reports a clean pass (BACKLOG #8341
-    item 4). A POSIX mount point whose share dropped still answers, so under one a lost share still
-    reads as a root never made."""
+    made yet: its name is not there, and the nearest folder above it that answers is a folder.
+    ``False`` when the root's own name is there, as a link, junction or mount point whose target is
+    lost is; when an ancestor's name is there but does not answer, as a dangling link; when none
+    answers, as above a drive letter that is no longer mapped; when one answers as something else;
+    or when one fails for any other cause. The sweep then raises rather than reports a clean pass
+    (BACKLOG #8341 item 4). At least these still read as a root never made: a root deleted after
+    its first save, and a root under a POSIX mount point whose share dropped, since that mount point
+    still answers."""
+    if os.path.lexists(root):
+        return False
     for parent in root.absolute().parents:
         try:
             info = parent.stat()
         except OSError as exc:
-            if is_absent(exc):
+            if is_absent(exc) and not os.path.lexists(parent):
                 continue
             return False
         return S_ISDIR(info.st_mode)
@@ -4323,7 +4334,9 @@ class UploadStore:
         ``stat`` or listing error :func:`~messagefoundry.path_reach.is_absent` reads as absence is
         an empty pass only when :func:`_root_never_made` reads the root as one no save has made yet,
         under a folder that answers (BACKLOG #8341 item 4); any other raises with nothing removed,
-        and :meth:`prune_expired` logs it, so a lost drive is never a clean pass. A body the listing
+        and :meth:`prune_expired` logs it, so at least a drive letter that is no longer mapped, and a
+        linked root whose target is lost, are not a clean pass; :func:`_root_never_made` names what
+        still is. A body the listing
         shows with no sidecar goes only once it is past the floor, :func:`_sidecar_is_absent`, asked
         right before the unlink, reports the sidecar not there, and the root still answers as the
         folder the sweep listed (:func:`_root_fault`, BACKLOG #8341 item 2).
@@ -4331,8 +4344,9 @@ class UploadStore:
         **That report is the file system's answer, not proof that no sidecar exists.**
         :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
         missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. The
-        root's identity check covers only a root that is now another folder, such as a share
-        remounted under its name. A stale cache, a hidden name, or a share that answers the same
+        root's identity check covers only a root that is another folder at the moment it is checked,
+        after the sidecar check, such as a share remounted under its name; one that flaps back
+        before that check passes it. A stale cache, a hidden name, or a share that answers the same
         identity can still send a body whose sidecar exists to the unlink, which writes no audit
         row, only the WARNING below. The check narrows the
         race with a sidecar landing after the listing and does not close it: one can land between
@@ -4402,10 +4416,14 @@ class UploadStore:
             why = _root_fault(root, listed)
             if why is None:
                 return False
+            # One memo key per cause, so a swap after a lost root inside the interval still logs.
+            cause = "swapped" if why == _ROOT_SWAPPED else "lost"
             _log.log(
-                logging.ERROR if self._link_logged.first("orphan sweep stopped") else logging.DEBUG,
-                "uploaded-logs orphan sweep stopped at %s: the uploads root stopped answering "
-                "(%s); no further file was removed and the next pass retries",
+                logging.ERROR
+                if self._link_logged.first(f"orphan sweep stopped {cause}")
+                else logging.DEBUG,
+                "uploaded-logs orphan sweep stopped at %s: the uploads root %s; no further file "
+                "was removed and the next pass retries",
                 name,
                 why,
             )

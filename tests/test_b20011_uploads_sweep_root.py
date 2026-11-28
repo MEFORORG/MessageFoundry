@@ -123,21 +123,22 @@ def test_a_root_under_a_file_is_not_a_root_never_made(
 
 def _swap_root_after_listing(
     monkeypatch: pytest.MonkeyPatch, store: UploadStore, other: Path, *, swapped: bool = True
-) -> None:
+) -> list[int]:
     """The root's first ``stat``, the sweep's pin, is real; with ``swapped``, every later one
-    answers as ``other``, as a share remounted under the root's name would."""
+    answers as ``other``, as a share remounted under the root's name would. Returns a list that
+    grows by one per ``stat`` of the root, so a test can tell stopping from skipping."""
     real = Path.stat
-    root_stats = 0
+    root_stats: list[int] = []
 
     def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        nonlocal root_stats
         if self == store._root:
-            root_stats += 1
-            if swapped and root_stats > 1:
+            root_stats.append(1)
+            if swapped and len(root_stats) > 1:
                 return real(other, follow_symlinks=follow_symlinks)
         return real(self, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(Path, "stat", _stat)
+    return root_stats
 
 
 async def _live_pair_whose_sidecar_reads_absent(
@@ -191,15 +192,17 @@ async def test_a_root_swapped_after_the_listing_keeps_the_body(
         assert removed == 0 and body.exists(), "a body was unlinked under a root that changed"
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1 and "orphan sweep stopped" in errors[0]
-        assert "no longer the folder the sweep listed" in errors[0]
+        assert "now answers as a different folder" in errors[0]
     else:
         assert removed == 1 and not body.exists()
 
 
+@pytest.mark.parametrize("swapped", [False, True], ids=["control", "root-swapped"])
 async def test_a_root_swapped_stops_before_the_next_orphan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swapped: bool
 ) -> None:
-    # Two orphans: the swap is seen at the first, and the second is never reached.
+    # Two orphans: the swap is seen at the first, and the second is never reached, so the root is
+    # stated twice (the pin and one check) rather than once per orphan, as a skip would make it.
     store = _store(tmp_path / "uploads")
     store._root.mkdir(mode=0o700, parents=True)
     bodies = []
@@ -210,6 +213,39 @@ async def test_a_root_swapped_stops_before_the_next_orphan(
         bodies.append(body)
     other = tmp_path / "another-folder"
     other.mkdir()
-    _swap_root_after_listing(monkeypatch, store, other)
-    assert store._sweep_orphans_sync(now=time.time()) == 0
-    assert all(body.exists() for body in bodies)
+    root_stats = _swap_root_after_listing(monkeypatch, store, other, swapped=swapped)
+    removed = store._sweep_orphans_sync(now=time.time())
+    if swapped:
+        assert removed == 0 and all(body.exists() for body in bodies)
+        assert len(root_stats) == 2, "the sweep went on past the swap"
+    else:
+        assert removed == 2 and not any(body.exists() for body in bodies)
+        assert len(root_stats) == 3
+
+
+def test_a_linked_root_whose_target_is_lost_is_not_a_root_never_made(tmp_path: Path) -> None:
+    # The root's name is there, as a link to a folder that is gone, as a junction or symlink to a
+    # lost volume is. On the first fix it read as never made and the pass was a silent 0.
+    target = tmp_path / "volume" / "uploads"
+    target.mkdir(parents=True)
+    root = tmp_path / "uploads"
+    try:
+        root.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
+    target.rmdir()
+    with pytest.raises(FileNotFoundError):
+        _store(root)._sweep_orphans_sync(now=time.time())
+
+
+def test_an_ancestor_that_is_a_dangling_link_is_not_a_root_never_made(tmp_path: Path) -> None:
+    target = tmp_path / "volume"
+    target.mkdir()
+    mount = tmp_path / "mount"
+    try:
+        mount.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
+    target.rmdir()
+    with pytest.raises(FileNotFoundError):
+        _store(mount / "uploads")._sweep_orphans_sync(now=time.time())

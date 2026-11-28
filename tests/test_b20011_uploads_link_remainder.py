@@ -73,3 +73,11 @@ def test_the_counted_control_bytes_are_built_once() -> None:
     )
     assert expected == sniff._DENSITY_CONTROLS
     assert b"\t" not in sniff._DENSITY_CONTROLS and b"\x01" in sniff._DENSITY_CONTROLS
+
+
+def test_the_text_check_counts_through_the_built_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The check reads the module's set, so emptied it counts nothing: a control-dense body passes.
+    dense = b"MSH|" + b"\x01" * 9000
+    assert sniff.nontext_upload_reason(dense) is not None
+    monkeypatch.setattr(sniff, "_DENSITY_CONTROLS", b"")
+    assert sniff.nontext_upload_reason(dense) is None
