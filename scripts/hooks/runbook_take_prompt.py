@@ -279,9 +279,8 @@ def read_book(path: Path) -> Book:
     # _XML_PARSER_ALLOWLIST and tests/test_csv_formula_consistency.py's 1.2.10 record, by owner
     # decision 2026-11-28. The input is the owner's own local runbook workbook, never engine data. It
     # is opened read_only (nothing is written back) and data_only (cached values, not formulas), from
-    # a dev hook under scripts/ that the wheel does not ship. load_workbook takes no keyword that
-    # defuses its XML: openpyxl uses defusedxml only where that is installed, and on the tools
-    # interpreter checked 2026-11-28 it is not, so the stdlib xml.etree parser reads the parts.
+    # a dev hook under scripts/ that the wheel does not ship. It is not fully defused on the tools
+    # interpreter; the allowlist entry states which parser reads which part.
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         q = wb["Batch queue"]

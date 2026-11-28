@@ -1764,9 +1764,12 @@ _XML_PARSER_ALLOWLIST = {
     "scripts/hooks/runbook_take_prompt.py": (
         "openpyxl load_workbook(read_only=True, data_only=True) over the owner's own local runbook "
         "workbook, in read_book() — a dev hook under scripts/ that the wheel does not ship, and a "
-        "surface no engine data reaches. NOT defused: openpyxl uses defusedxml only where it is "
-        "installed, and on the tools interpreter that runs the hook (checked 2026-11-28) it is not, "
-        "so the stdlib xml.etree parser reads the parts. Recorded by owner decision 2026-11-28; "
+        "surface no engine data reaches. NOT fully defused: openpyxl uses defusedxml only where it "
+        "is installed, and on the tools interpreter that runs the hook (openpyxl 3.1.5, checked "
+        "2026-11-28) it is not. There openpyxl reads workbook-level parts with lxml under "
+        "resolve_entities=False, but worksheet and shared-string parts with the stdlib "
+        "xml.etree iterparse, which expands an internal DTD entity (measured). load_workbook takes "
+        "no keyword that changes this. Recorded by owner decision 2026-11-28; "
         "tests/test_xml_parser_consistency.py records it as outside the corpus"
     ),
     "scripts/ci/tooling_receipt.py": (

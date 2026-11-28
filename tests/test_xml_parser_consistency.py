@@ -476,15 +476,15 @@ def test_xmlschema_still_disables_remote_schema_resolution() -> None:
 # 2026-11-28 recorded the runbook hook's workbook read in the ASVS 1.5.3 allowlist and here. The
 # corpus cannot drive it: openpyxl is in no extra, no lock file and no CI workflow (the reason
 # tests/test_csv_formula_consistency.py stubs it), and load_workbook takes a workbook package, not a
-# document string. It would not pass the refusal leg either: openpyxl defuses only where defusedxml
-# is installed, and on the hook's tools interpreter (checked 2026-11-28) it is not, so the stdlib
-# xml.etree parser reads the parts, and that parser expands this corpus's internal-DTD entity.
+# document string. It would not pass the refusal leg either: on the hook's tools interpreter part of
+# the workbook is read by a parser that expands an internal DTD entity. Which parser reads which part
+# is stated once, in that file's tests/test_security_static.py _XML_PARSER_ALLOWLIST entry.
 
 #: Repo-relative path -> why the hostile corpus above does not drive it.
 OUTSIDE_THE_CORPUS = {
     "scripts/hooks/runbook_take_prompt.py": (
         "openpyxl load_workbook(read_only=True, data_only=True) over the owner's own local runbook "
-        "workbook, in a dev hook under scripts/ that the wheel does not ship. Not defused (see "
+        "workbook, in a dev hook under scripts/ that the wheel does not ship. Not fully defused (see "
         "above), and openpyxl is installed in no environment this suite runs in"
     ),
 }
