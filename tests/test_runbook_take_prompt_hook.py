@@ -137,6 +137,10 @@ def test_key_readings() -> None:
     assert rt.key_targets("2026-11-27-notes") == (set(), set())
     assert rt.key_targets("batch-20011-pr-3385") == (set(), {20011})
     assert rt.key_targets("b472-PR3385-3765") == ({3765}, {472})
+    assert rt.key_targets("3765-b2") == ({3765}, set())
+    assert rt.key_targets("sub-b3-fix") == (set(), set())
+    assert rt.key_targets("batch-462-and-465") == (set(), {462, 465})
+    assert rt.key_targets("batches-462-465-470") == (set(), {462, 463, 464, 465, 470})
     assert rt.key_targets("1719-items-22-35") == ({1719}, set())
     assert rt.key_targets("batch-472-2026-11-27") == (set(), {472})
 
@@ -164,8 +168,35 @@ def test_only_the_current_text_before_the_history_names_a_holder() -> None:
     assert rt.pending_batches(["9012"], ours, NAMES) == []
 
 
+def test_a_cell_with_only_history_gets_force_take_because_take_compares_the_whole_cell() -> None:
+    book = _book({513: ("FREE", "FREE", "|| was Manager old-wt (oldsid12)")}, {9013: [(513, "")]})
+    (p,) = rt.pending_batches(["9013"], book, NAMES)
+    text = rt.message([p], "py", "rb.py", "w.xlsx", "M w (s)")
+    assert '--holder "M w (s)" --force-take' in text and "only history" in text
+
+
+def test_a_worktree_named_after_a_seat_does_not_match_every_seat_word() -> None:
+    names = rt.session_names("C:/wt/manager", "0123456789")
+    assert "manager" not in names
+    book = _book({514: ("FREE", "FREE", "Manager other-wt (ffff1234)")}, {9014: [(514, "")]})
+    (p,) = rt.pending_batches(["9014"], book, names)
+    assert not p.named_us
+
+
+def test_a_batch_past_taken_is_not_named() -> None:
+    book = _book({515: ("PR OPEN", "PR OPEN -- engine PR 1", "")}, {9015: [(515, "In progress")]})
+    assert rt.pending_batches(["9015"], book, NAMES) == []
+
+
+def test_an_unfound_read_batch_placeholder_is_flagged() -> None:
+    text = rt.message(
+        [rt.Pending(1, "", ())], "py", r"<account skills dir>\batch\read_batch.py", "w", "M w (s)"
+    )
+    assert "Replace <account skills dir>" in text
+
+
 def test_a_holder_cell_with_the_full_session_id_is_ours() -> None:
-    sid = "bb735675-ef99-4846-ae70-f3e56da8e810"
+    sid = "00000000-1111-2222-3333-444444444444"
     names = rt.session_names("C:/x/manager-wt", sid)
     book = _book({510: ("TAKEN", "T", f"Manager {sid}")}, {9010: [(510, "")]})
     assert rt.pending_batches(["9010"], book, names) == []
@@ -276,6 +307,11 @@ def test_run_warns_once_per_cooldown_and_caches_the_workbook_read(
     assert len(reads) == 1
     # A clock set back leaves a stamp in the future, which must not silence the warning.
     assert rt.main(_args(tmp_path, wt, claims, workbook, 10.0)) == 0
+    assert "--take 501" in capsys.readouterr().out
+    # After a compaction (--fresh) the cooldown does not hold the notice back.
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 11.0)) == 0
+    assert capsys.readouterr().out == ""
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 12.0, "--fresh")) == 0
     assert "--take 501" in capsys.readouterr().out
 
 

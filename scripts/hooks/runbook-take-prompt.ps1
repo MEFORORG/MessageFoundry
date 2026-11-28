@@ -62,6 +62,8 @@ try {
     # Only the two events whose output reaches the model without blocking; see the header.
     $event = [string]$session.Event
     if ($event -cnotin @('SessionStart', 'UserPromptSubmit')) { exit 0 }
+    # After a compaction the earlier notice may be gone from context, so the cooldown is skipped.
+    $fresh = $event -eq 'SessionStart' -and $session.Payload -and $session.Payload.PSObject.Properties['source'] -and [string]$session.Payload.source -eq 'compact'
 
     # The resolver's answer only; the header's WHICH WORKTREE says why there is no fallback.
     $root = $session.Root
@@ -112,6 +114,7 @@ try {
             '--workbook', $workbook, '--python', $py, '--read-batch', $readBatch)) {
         $psi.ArgumentList.Add([string]$a)
     }
+    if ($fresh) { $psi.ArgumentList.Add('--fresh') }
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardInput = $true

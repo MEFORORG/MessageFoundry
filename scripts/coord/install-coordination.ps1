@@ -167,7 +167,8 @@ $WIKI_MARKER = "mefor-wiki"
 # rule, re-checked rather than assumed:
 #   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat / mefor-wiki / mefor-runbook
 # No one of the seven contains another in either direction. Separate, so the prompt can be removed
-# (-Script runbook-take-prompt -Uninstall) without touching the other Stop rows.
+# (-Script runbook-take-prompt -Uninstall) without touching the other SessionStart and
+# UserPromptSubmit rows. It is on no Stop row, so -Only Stop does not reach it.
 $RUNBOOK_MARKER = "mefor-runbook"
 
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates

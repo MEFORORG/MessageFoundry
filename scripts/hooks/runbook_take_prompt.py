@@ -23,7 +23,8 @@ design (claim.ps1's header: the holder of a batch is not always the worktree a c
 WHO HOLDS A BATCH. Only the holder cell's CURRENT text counts, the part before any ``||`` history.
 It names this session when it carries the worktree name, the session id's first eight characters or
 the whole id, each as a whole token, and does not record a release ("released by ..."). A release
-never earns ``--force-take`` in the printed command.
+never earns ``--force-take`` in the printed command. A batch is named only while its State is
+empty, FREE or TAKEN (``TAKEABLE_STATES``): later, --take would move the dashboard backwards.
 
 COLUMN LAYOUT. Read by row-1 header, never by letter, as the batch skill's ``read_batch.py`` reads it:
 the Batch queue tab's ``Batch``, ``State``, ``Status`` and ``Manager / session``, and the Rows tab's
@@ -63,14 +64,22 @@ STATE_RETENTION_DAYS = 14
 # Seats that never take a batch: a Manager does. A Builder's claims sit under its Manager's hold,
 # and the Lander and Watchdog claim rows to land or watch them, not to build a batch.
 NEVER_TAKES = frozenset({"builder", "lander", "watchdog"})
+SEAT_WORDS = frozenset({"manager", "builder", "lander", "watchdog", "special"})
+# The States read_batch.py --take may write over without moving the dashboard backwards. A batch
+# at PR OPEN or later is past taking: --take would rewrite its State to TAKEN.
+TAKEABLE_STATES = ("", "FREE", "TAKEN")
 
 # Claim-key readings, built from read_batch.py's patterns but narrower, because here a false warning
-# costs more than a missed one. A key that mentions a batch names the batches it marks and every
-# batch inside a range it writes (batch-472, batches-462-465), and any other number in it as a row
-# (b472-3765-b), except a PR number (batch-20011-pr-3385) and a date. A key with no batch marker
-# names only its LEADING number, as a row (3765, 3765-b), and no row when it leads with a date.
-_MENTIONS_BATCH = re.compile(r"(?i)batch|(?<![a-z0-9])b[-_.]?\d")
-_BATCH_MARK = re.compile(r"(?i)(?:batch(?:es)?[-_. ]?|(?<![a-z0-9])b[-_.]?)(\d+)")
+# costs more than a missed one. PR numbers (pr-3385) and dates are read as nothing, anywhere.
+#   - The long form ("batch" anywhere) names batches only: every number in it and every number
+#     inside a range it writes, as read_batch.py's goal_batches holds them (batch-462-and-465,
+#     batches-462-465).
+#   - The short form names one batch and must START the key, and its other numbers are rows
+#     (b472-3765-b), so a part suffix such as 3765-b2 is not batch 2.
+#   - Any other key names only its LEADING number, as a row (3765, 3765-b), and no row when it
+#     leads with a date.
+_LONG_BATCH = re.compile(r"(?i)batch")
+_SHORT_BATCH = re.compile(r"(?i)^b[-_.]?(\d+)(?!\d)")
 _NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)")
 _RANGE = re.compile(r"(?<!\d)(\d{1,6})\s*[-–]\s*(\d{1,6})(?!\d)")
 _LEADING = re.compile(r"^(\d{1,6})(?!\d)")
@@ -133,15 +142,18 @@ def key_targets(key: str) -> tuple[set[int], set[int]]:
     runs = re.findall(r"\d+", key)
     if any(len(x) > 6 for x in runs):
         return set(), set()
-    if _MENTIONS_BATCH.search(key):
-        batches = {int(x) for x in _BATCH_MARK.findall(key)}
-        for a, b in _RANGE.findall(key):
+    rest = _PR.sub(" ", _DATE.sub(" ", key))
+    if _LONG_BATCH.search(key):
+        batches = {int(x) for x in _NUMBER.findall(rest)}
+        for a, b in _RANGE.findall(rest):
             lo, hi = int(a), int(b)
-            if lo in batches and lo < hi <= lo + RANGE_MAX:
+            if lo < hi <= lo + RANGE_MAX:
                 batches.update(range(lo, hi + 1))
-        rest = _PR.sub(" ", _DATE.sub(" ", key))
-        rows = {int(x) for x in _NUMBER.findall(rest)} - batches
-        return rows, batches
+        return set(), batches
+    short = _SHORT_BATCH.match(key)
+    if short:
+        n = int(short.group(1))
+        return {int(x) for x in _NUMBER.findall(rest[short.end() :])} - {n}, {n}
     if _DATE.match(key):
         return set(), set()
     m = _LEADING.match(key)
@@ -156,7 +168,11 @@ def session_names(worktree: str, session_id: str) -> tuple[str, ...]:
     """The names a holder cell may know this session by: its worktree and its session id's first
     eight characters, spelled as holder_text prints them, and the whole session id."""
     sid = safe_label(session_id)
-    return tuple(n for n in (safe_label(Path(worktree).name), sid[:8], sid) if n)
+    wt = safe_label(Path(worktree).name)
+    # A worktree named after a seat (manager, builder) would match every holder cell's seat word.
+    if wt.lower() in SEAT_WORDS:
+        wt = ""
+    return tuple(n for n in (wt, sid[:8], sid) if n)
 
 
 def names_us(holder: str, names: Iterable[str]) -> bool:
@@ -186,7 +202,8 @@ def holder_is_us(cell: str, names: Iterable[str]) -> bool:
 def _live(entry: QueueEntry) -> bool:
     if _FINISHED.match(entry.status.upper()):
         return False
-    return not entry.state.upper().startswith(_ENDED_STATES)
+    state = entry.state.upper()
+    return not state.startswith(_ENDED_STATES) and state.split(" ", 1)[0] in TAKEABLE_STATES
 
 
 def _ours(entry: QueueEntry, names: tuple[str, ...]) -> bool:
@@ -325,7 +342,7 @@ def our_claim_keys(
             if isinstance(wt, str) and wt.strip() and _wt_key(wt) == mine:
                 out.append(entry.name[: -len(".json")])
         except (OSError, ValueError):
-            continue
+            unreadable += 1
     return sorted(out), unreadable
 
 
@@ -374,7 +391,10 @@ def message(
                 "The cell names another holder, so --take refuses unless you add --force-take; "
                 "add it only once that holder has released the batch."
             )
-        elif p.state.upper().startswith("FREE") or not p.state:  # nothing before any ||
+        elif p.holder:
+            seen, force = "names no current holder, only history after ||", " --force-take"
+            advice = "--take compares the whole cell, so it refuses without --force-take here."
+        elif p.state.upper().startswith("FREE") or not p.state:
             seen = "reads FREE"
         else:
             seen = "has an empty Manager / session cell"
@@ -389,6 +409,8 @@ def message(
         )
         if advice:
             parts.append(advice)
+    if "<account skills dir>" in read_batch:
+        parts.append("Replace <account skills dir> with this account's skills directory first.")
     if "<seat>" in holder:
         parts.append("No seat is declared here: replace <seat> with this session's seat first.")
     parts.append(
@@ -504,7 +526,7 @@ def run(args: argparse.Namespace) -> str | None:
     for p in pending:
         last = warned.get(str(p.batch))
         # A stamp in the future (a clock set back) never silences a warning.
-        if isinstance(last, (int, float)) and 0 <= now - last < COOLDOWN_SECONDS:
+        if not args.fresh and isinstance(last, (int, float)) and 0 <= now - last < COOLDOWN_SECONDS:
             continue
         due.append(p)
         warned[str(p.batch)] = now
@@ -536,6 +558,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--claims-dir", help="read claims here instead of resolving the registry")
     ap.add_argument("--state-dir", help="keep the cache here instead of <coord>/runbook-take")
     ap.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    ap.add_argument(
+        "--fresh", action="store_true", help="ignore the cooldown (context was compacted)"
+    )
     try:
         args = ap.parse_args(argv)
         text = run(args)
