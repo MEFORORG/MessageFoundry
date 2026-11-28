@@ -1880,33 +1880,6 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
 #: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
 _MEMBER_EXTRA_WORDS = ("token",)
 
-# THE JDBC NO-USER MEMBER TAIL (BACKLOG #5386, added item 3). In
-# ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;`` the narrow pattern reads ``db`` as a
-# user and ``1433;user=svc;sslpassword=P`` as the password, so the member's key goes into the match
-# and ``ss_Sec9`` prints, since no later pass finds a key to hide it under. This pass runs just before
-# the narrow one, on both callers, and reads only that shape: a password span holding a ``;`` member
-# whose key holds a credential word, followed after its first "@" by a run that ends at a ";",
-# whitespace or the end of the text. A quote does not end it: tried, a differential fuzz found a
-# value ``origin/main`` hid printed in 56 of 600,000 line and surface pairs, at least on the store
-# error path after a camelCase label, as in
-# ``cfg accessToken=jdbc:sqlserver://svc:1433;sslpassword=P@Sec'q@p%40Kv9@h;...``. It rewrites the whole match, the run included, as the narrow
-# pass rewrites its own, so ``jdbc:sqlserver://db:<placeholder>@;`` is what is left. It never writes
-# the key back (the docstring above says why that was declined). The run takes only characters the
-# widened run takes (:data:`_DSN_RUN_CHAR`), so it holds no label a later pass reads, no "/" a DSN
-# needs, no quote and no separator; where it would end at anything else, nothing matches, and the
-# narrow pass reads the line as before. So the pass hides the run, and never text a later pass
-# reads. The cost: a DSN with a real user whose password holds such a member,
-# ``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``, has its host hidden too. What it leaves, at least: a
-# run that ends at a quote, a "/" or a separator prints, as it did before.
-_DSN_MEMBER_TAIL = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]++://[^\s:/@]++):"
-    r"(?=[^\s/@]*?;(?=[^\s/@;=]*+=)[^\s/@;=]*?(?:"
-    + _alternation(_CREDENTIAL_WORDS + _MEMBER_EXTRA_WORDS)
-    + r"))[^\s/@]++@(?:"
-    + _DSN_RUN_CHAR
-    + r")++(?=[;\s]|\Z)"
-)
-
 # A connection-string member whose KEY holds a credential word, with at most one qualifier after
 # it, its value taken to the next ";" (BACKLOG #5030). The generic dialect sends every ``odbc_params`` value plain, ``sslpassword``
 # among them, and such a value may hold a space, "," and "&". A plain password can still reach a
@@ -2328,6 +2301,45 @@ def _mask_member(m: re.Match[str]) -> str:
     cannot drift apart."""
     start, end = m.span(2)
     return f"{m.group(1)}={_mask_member_value(m.string, start, end)}"
+
+
+# THE JDBC NO-USER MEMBER TAIL (BACKLOG #5386, added item 3). In
+# ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;`` the narrow pattern reads ``db`` as a
+# user and ``1433;user=svc;sslpassword=P`` as the password, so the member's key goes into the match
+# and ``ss_Sec9`` prints, since no later pass finds a key to hide it under. This pass runs just
+# before the narrow one, on both callers, and reads only that shape: a password span holding a
+# ``;`` member whose key the member pass reads (:data:`_MEMBER_KEY_RUN`, so ``;passive=`` is no
+# key), followed after its first "@" by a run that ends at a ";", whitespace or the end of the
+# text. It rewrites the password as the narrow pass does and writes the run back MASKED, word by
+# word, by :func:`_mask_member_value`, as the member pass masks a value, for that pass's reason:
+# the same text is redacted again, and the PHI pass reads what is left. Deleted, the run took the
+# first word of a name, ``P@Jane Doe;``, and the bundle printed ``Doe`` where ``origin/main`` hid
+# both (code review). It never writes the key back (:func:`_dsn_password_repl` says why that was
+# declined). The run takes only characters the widened run takes (:data:`_DSN_RUN_CHAR`), so it
+# holds no label a later pass reads, no "/" a DSN needs, no quote and no separator; where it would
+# end at anything else, nothing matches, and the narrow pass reads the line as before. A quote does
+# not end it: tried, a differential fuzz found a value ``origin/main`` hid printed in 56 of 600,000
+# line and surface pairs, at least on the store error path after a camelCase label, as in
+# ``cfg accessToken=jdbc:sqlserver://svc:1433;sslpassword=P@Sec'q@p%40Kv9@h;...``. The cost: a DSN
+# with a real user whose password holds such a member, ``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``,
+# has its host masked too. What it leaves, at least: a run that ends at a quote, a "/" or a
+# separator prints, as it did before, and so does a tail after a key-material member, such as
+# ``;encryptionKey=P@ss_Sec9;``, on ``support.redact.redact_log_line``, whose key no word here
+# names.
+_DSN_MEMBER_TAIL = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]++://[^\s:/@]++):(?=[^\s/@]*?;"
+    + _MEMBER_KEY_RUN
+    + r"=)[^\s/@]++@(?P<dsn_member_tail>(?:"
+    + _DSN_RUN_CHAR
+    + r")++)(?=[;\s]|\Z)"
+)
+
+
+def _dsn_member_tail_repl(m: re.Match[str], placeholder: str) -> str:
+    """The replacement for a :data:`_DSN_MEMBER_TAIL` match: the narrow pass's rewrite, then the run
+    after the "@" with its words masked, one character for one. Both callers call this."""
+    start, end = m.span("dsn_member_tail")
+    return _dsn_password_repl(m, placeholder) + _mask_member_value(m.string, start, end)
 
 
 def _keep_label(m: re.Match[str], placeholder: str) -> str:
@@ -2994,6 +3006,7 @@ def _run(
         text = apply(_CREDENTIAL_KV, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _KEY_MATERIAL_HINT):
         text = apply(_KEY_MATERIAL, lambda m: _keep_label(m, placeholder), text, _BRACED)
+    member_words = _admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)
     if _admits(folded, _DSN_HINT):
 
         def dsn_repl(m: re.Match[str]) -> str:
@@ -3001,17 +3014,18 @@ def _run(
 
         # Before the narrow pass, which would take the member's key (see the pattern). Its ";",
         # "@" and key word are required, so the gate skips only lines it cannot match.
-        if (
-            ";" in text
-            and "@" in text
-            and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT))
-        ):
-            text = apply(_DSN_MEMBER_TAIL, dsn_repl, text, None)
+        if member_words and ";" in text and "@" in text:
+            text = apply(
+                _DSN_MEMBER_TAIL,
+                lambda m: _dsn_member_tail_repl(m, placeholder),
+                text,
+                "dsn_member_tail",
+            )
         text = apply(_DSN_PASSWORD, dsn_repl, text, None)
         if wide:
             text = apply(_WIDE_DSN_PASSWORD, dsn_repl, text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
-    if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
+    if ";" in text and member_words:
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
         text = apply(_CONNECTION_STRING_FIRST_MEMBER, _mask_member, text, 2)
     return text

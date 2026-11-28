@@ -129,6 +129,42 @@ def test_the_dsn_password_is_hidden_on_every_entry_point(
 #: Lines with no password the new readings may take, each printing whole on every entry point: a
 #: port after user@host, a user@host list with no password, a JDBC string with no "@", and a JDBC
 #: member that names no credential.
+#: Lines the JDBC member-tail pass reads, each with what the PHI surfaces must not print: the tail
+#: is the first word of a name, which the PHI pass must still read as one with the next word. A
+#: draft that deleted the tail printed ``Doe`` and ``JANE`` here (code review).
+_NAME_AFTER_TAIL = (
+    ("jdbc:sqlserver://db.invalid:1433;sslpassword=P@Jane Doe;", ("Jane", "Doe")),
+    ("jdbc:sqlserver://db.invalid:1433;sslpassword=P@DOE JANE 19800102;", ("DOE", "JANE")),
+)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS[1:], ids=_IDS[1:])
+@pytest.mark.parametrize(("line", "names"), _NAME_AFTER_TAIL)
+def test_a_name_after_a_member_tail_stays_hidden_on_the_phi_surfaces(
+    line: str, names: tuple[str, ...], call: Callable[[str], str]
+) -> None:
+    out = call(line)
+    for name in names:
+        assert name not in out, out
+
+
+#: A member whose key does not END in a credential word is no key the member pass reads, so the
+#: tail pass declines it and the host after the "@" stays as the narrow pass leaves it.
+_NOT_A_KEY = (
+    "jdbc:sqlserver://db.invalid:1433;passive=true;user=ops@corp.example;",
+    "jdbc:sqlserver://db.invalid:1433;passport=x;user=ops@corp.example;",
+)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+@pytest.mark.parametrize("line", _NOT_A_KEY)
+def test_a_member_whose_key_names_no_credential_keeps_the_host(
+    line: str, call: Callable[[str], str]
+) -> None:
+    out = call(line)
+    assert out.endswith("@corp.example;") and "ops" not in out, out
+
+
 _PRINTS_WHOLE = (
     "connect http://user@host:8080,admin@corp.example failed",
     "connect postgres://ops@corp.example@srv:5432/x failed",
@@ -158,3 +194,12 @@ def test_known_residual_a_member_tail_that_ends_at_a_quote_or_separator_prints(
     line: str, printed: str, call: Callable[[str], str]
 ) -> None:
     assert printed in call(line)
+
+
+def test_known_residual_a_key_material_member_tail_prints_on_the_bundle_reading() -> None:
+    """Pinned as printed: no word of the member pass names a key-material key, so the tail pass
+    declines it, and the bundle's own reading prints the tail, as ``origin/main`` does. The
+    write-time reading hides it through the camelCase key-material label."""
+    line = "jdbc:sqlserver://db.invalid:1433;encryptionKey=P@ss_Sec9;"
+    assert "ss_Sec9" in redact_log_line(line)
+    assert "ss_Sec9" not in scrub_credentials(line)

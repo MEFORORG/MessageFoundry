@@ -66,6 +66,7 @@ from messagefoundry.secretscrub import (
     _MEFOR_TAILS,
     _SHIPPED_TAILS,
     _braced_tail,
+    _dsn_member_tail_repl,
     _dsn_password_repl,
     _keep_key_marker,
     _mask_member,
@@ -725,7 +726,7 @@ def redact_log_line(line: str) -> str:
         body = read(_KEY_MATERIAL).sub(_keep_label, body)
         # secretscrub's JDBC member-tail pass, before the narrow copy takes the member's key.
         if ";" in body and "@" in body and "://" in body:
-            body = _DSN_MEMBER_TAIL.sub(_keep_dsn_user, body)
+            body = _DSN_MEMBER_TAIL.sub(_keep_dsn_member_tail, body)
         body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
         body = _redact_phi(body)  # shared engine PHI pass: HL7 segments/field runs + DOB + names
         # The second credential layer; see the comment above this function.
@@ -930,3 +931,8 @@ def _keep_dsn_user(m: re.Match[str]) -> str:
     """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``, by
     secretscrub's own replacement, so the two surfaces cannot drift apart."""
     return _dsn_password_repl(m, REDACTION_PLACEHOLDER)
+
+
+def _keep_dsn_member_tail(m: re.Match[str]) -> str:
+    """secretscrub's member-tail rewrite, with this module's placeholder."""
+    return _dsn_member_tail_repl(m, REDACTION_PLACEHOLDER)

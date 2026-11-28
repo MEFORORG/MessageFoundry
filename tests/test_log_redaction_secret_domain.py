@@ -1423,7 +1423,8 @@ def test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail() -> None
     )
     for out in (redact_log_line(line), scrub_credentials(line)):
         assert "ss_Sec9" not in out and "sslpassword" not in out, out
-        assert out.startswith("jdbc:sqlserver://db.invalid:") and out.endswith("@;"), out
+        # The tail is written back masked, one character for one, as a member value is.
+        assert out.startswith("jdbc:sqlserver://db.invalid:") and out.endswith("@xx_xxx0;"), out
 
 
 @pytest.mark.parametrize(
