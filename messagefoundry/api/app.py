@@ -567,7 +567,11 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import MetadataTooDeepError, user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
+from messagefoundry.store.row_seal import (
+    SealFailureThrottle,
+    TransitSealUnavailableError,
+    probe_row_sealer_at_start,
+)
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -10576,22 +10580,13 @@ def create_app(
         return SearchPresetDeleteResult(id=preset_id, deleted=True)
 
     # BACKLOG #5523: when the layered search last logged each (preset, cause) refusal. One record per
-    # pair per interval, as the store's tag-failure WARNING is; the route's audit row is written for
-    # each refusal, best effort. Touched on the event loop only.
-    _layered_refusals_logged: dict[tuple[str, str], float] = {}
-    _LAYERED_REFUSAL_LOG_INTERVAL_S = 3600.0
-    _LAYERED_REFUSAL_LOG_MAX = 4096
+    # pair per hour, as the store's tag-failure WARNING is; the route's audit row is written for
+    # each refusal, best effort. The shared throttle, not a copy of it (item 27). Touched on the
+    # event loop only.
+    _layered_refusal_log = SealFailureThrottle(interval=3600.0, track_max=4096)
 
     def _first_layered_refusal(preset_id: str, cause: str) -> bool:
-        key, now = (preset_id, cause), time.monotonic()
-        last = _layered_refusals_logged.pop(key, None)
-        if last is not None and now - last < _LAYERED_REFUSAL_LOG_INTERVAL_S:
-            _layered_refusals_logged[key] = last
-            return False
-        _layered_refusals_logged[key] = now
-        while len(_layered_refusals_logged) > _LAYERED_REFUSAL_LOG_MAX:
-            _layered_refusals_logged.pop(next(iter(_layered_refusals_logged)))
-        return True
+        return _layered_refusal_log.due((preset_id, cause))
 
     @app.get("/search/layered", response_model=MessageSearchResults)
     async def layered_search(

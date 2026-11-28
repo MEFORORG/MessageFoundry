@@ -52,7 +52,7 @@ import hmac
 import logging
 import math
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Hashable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -229,23 +229,32 @@ SEAL_FAILURE_TRACK_MAX: Final = 1024
 
 class SealFailureThrottle:
     """Decides when a row that failed its seal is reported again (BACKLOG #2592): at most once per
-    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per key, remembering at most
-    :data:`SEAL_FAILURE_TRACK_MAX` keys. One per reporter: the auth service and the approval gate
-    each hold one, so both follow one policy."""
+    ``interval`` seconds per key, remembering at most ``track_max`` keys, the oldest forgotten
+    first. The defaults are :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` and
+    :data:`SEAL_FAILURE_TRACK_MAX`. One per reporter: the auth service and the approval gate each
+    hold one, so both follow one policy. The layered search's refusal log holds one with its own
+    interval and bound (BACKLOG #5523 item 27)."""
 
-    __slots__ = ("_last",)
+    __slots__ = ("_interval", "_last", "_track_max")
 
-    def __init__(self) -> None:
-        self._last: dict[str, float] = {}
+    def __init__(
+        self,
+        *,
+        interval: float = SEAL_FAILURE_REPORT_INTERVAL_SECONDS,
+        track_max: int = SEAL_FAILURE_TRACK_MAX,
+    ) -> None:
+        self._interval = interval
+        self._track_max = track_max
+        self._last: dict[Hashable, float] = {}
 
-    def due(self, key: str) -> bool:
+    def due(self, key: Hashable) -> bool:
         """Whether ``key`` should be reported now; if so, records that it was."""
         now = time.monotonic()
         last = self._last.get(key)
-        if last is not None and now - last < SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+        if last is not None and now - last < self._interval:
             return False
         self._last.pop(key, None)
-        if len(self._last) >= SEAL_FAILURE_TRACK_MAX:
+        if len(self._last) >= self._track_max:
             self._last.pop(next(iter(self._last)))
         self._last[key] = now
         return True
