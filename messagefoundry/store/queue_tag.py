@@ -236,6 +236,7 @@ type QueueTagCause = Literal[
     "unknown",
     "corrupt",
     "blank",
+    "non-text",
     "ref",
     "ref-unsealed",
     "ref-not-delivered",
@@ -254,6 +255,8 @@ type QueueTagCause = Literal[
 #: - ``corrupt``: a cipher that names its keys refused a cell under a key it holds for a reason
 #:   other than a failed AEAD check (:class:`CorruptQueueCellError`).
 #: - ``blank``: the row holds a blank ``payload`` where a sealed cell must be.
+#: - ``non-text``: the row's ``payload`` is not text, a planted BLOB say, which the store never
+#:   writes (BACKLOG #5650).
 #: - ``ref``: on a keyed store, a store-once row's cell opened and the ``shared_body`` key it holds
 #:   differs from the row's ``body_ref`` column. Whether this one payload was sealed is not checked.
 #: - ``ref-unsealed``: as ``ref``, on a keyless store, where nothing is sealed.
@@ -265,6 +268,7 @@ QUEUE_TAG_CAUSES: Final[Mapping[QueueTagCause, str]] = MappingProxyType(
         "unknown": "was refused, and its cause was not determined,",
         "corrupt": "holds a payload that is corrupt",
         "blank": "holds no sealed payload",
+        "non-text": "holds a payload that is not text",
         "ref": "holds a reference that differs from its body_ref (the store is keyed)",
         "ref-unsealed": "holds a reference that differs from its body_ref (the store is keyless)",
         "ref-not-delivered": "is a store-once row, which this backend does not deliver,",
@@ -285,8 +289,8 @@ class QueueTagError(CipherError):
 
     Raised for at least a cell whose AEAD tag fails, a cell a cipher refused for a cause it did not
     name, a corrupt cell (:class:`CorruptQueueCellError`), a blank ``payload`` where a sealed cell
-    must be, a ``shared_body`` key that differs from the row's ``body_ref``, and a store-once row on
-    a backend that does not deliver one. A subclass of
+    must be, a ``payload`` that is not text, a ``shared_body`` key that differs from the row's
+    ``body_ref``, and a store-once row on a backend that does not deliver one. A subclass of
     :class:`CipherError`, so every claim path that already dead-letters an undecryptable row
     dead-letters this one the same way. Carries no row value. One :func:`open_queue_cell` raises
     for a cipher's refusal carries none of the cipher's text either: its message names the cipher
@@ -592,8 +596,9 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
 
     Raises :class:`QueueTagError`, which is drift, when the cell does not open under the row's
     tag (see :func:`_queue_cell_refusal`), when a keyed store's row (or any ``ref`` row) holds a
-    blank ``payload``, or when a ``ref`` row's opened key differs from its ``body_ref`` column. Any
-    other key or format problem raises the cipher's own class, and a key service that gave no
+    blank ``payload``, when any store's row holds a ``payload`` that is not text (BACKLOG
+    #5650), or when a ``ref`` row's opened key differs from its ``body_ref`` column. Any other
+    key or format problem raises the cipher's own class, and a key service that gave no
     verdict (:func:`is_transient_open_failure`) the cipher's own error. That includes at least a
     cell whose marker the cipher cannot read, which then gets no queue-tag audit row and no alert:
     docs/PHI.md section 1,
@@ -614,6 +619,12 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     :class:`UnmarkedCipherError`, whose text names a column and a remedy and no value."""
     payload = row["payload"]
     body_ref = row["body_ref"]
+    if not isinstance(payload, str):
+        # The store writes a payload as text only, keyed or keyless, into a NOT NULL column. A
+        # keyed cipher handed anything else would raise TypeError or AttributeError, which no
+        # CipherError containment catches, and a keyless one would return it unchanged (BACKLOG
+        # #5650).
+        raise QueueTagError("integrity: the queue row's payload is not text", cause="non-text")
     if payload == "" and (cipher.encrypts or body_ref is not None):
         # A keyed writer seals every body, an empty one included, and a ref row always holds its
         # reference. Blank is what retention leaves, so it is never a cell to deliver. A keyless

@@ -19209,44 +19209,49 @@ class MessageStore:
         no PHI until a message is opened + audited). ``allowed_channels`` restricts to a per-channel
         RBAC scope (None = all)."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
-        async with self._read() as db:
-            cur = await db.execute(
-                "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
-                " o.attempts, o.last_error, o.updated_at,"
-                " m.control_id, m.message_type, m.received_at, m.summary,"
-                " m.channel_id AS message_channel_id"
-                f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
-                " ORDER BY o.updated_at DESC, o.id DESC LIMIT ? OFFSET ?",
-                (*params, limit, offset),
-            )
-            # Mixed-table join: `last_error` is queue's (keyed by o.id, aliased outbox_id), `summary` is
-            # the joined messages row's (keyed by message_id and bound to the message's own channel,
-            # BACKLOG #2593) — each binds to its own cell (ASVS 11.3.3).
-            failures: list[CellTagError] = []
-            out: list[dict[str, Any]] = []
-            for r in await cur.fetchall():
-                d = dict(r)
-                # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-                d["last_error"] = await cipher_call(
-                    self._cipher,
-                    open_listed_cell,
-                    self._cipher,
-                    d["last_error"],
-                    cell_aad("queue", "last_error", r["outbox_id"]),
-                    table="queue",
+        failures: list[CellTagError] = []
+        out: list[dict[str, Any]] = []
+        try:
+            async with self._read() as db:
+                cur = await db.execute(
+                    "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
+                    " o.attempts, o.last_error, o.updated_at,"
+                    " m.control_id, m.message_type, m.received_at, m.summary,"
+                    " m.channel_id AS message_channel_id"
+                    f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
+                    " ORDER BY o.updated_at DESC, o.id DESC LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
                 )
-                await cipher_call(
-                    self._cipher,
-                    withhold_message_cells,
-                    self._cipher,
-                    d,
-                    ("summary",),
-                    message_id=r["message_id"],
-                    channel_id=d.pop("message_channel_id"),
-                    failures=failures,
-                )
-                out.append(d)
-        await report_cell_tag_failures(self, failures)
+                # Mixed-table join: `last_error` is queue's (keyed by o.id, aliased outbox_id),
+                # `summary` is the joined messages row's (keyed by message_id and bound to the
+                # message's own channel, BACKLOG #2593) — each binds to its own cell (ASVS 11.3.3).
+                for r in await cur.fetchall():
+                    d = dict(r)
+                    # BACKLOG #5970: only a last_error under a key the store does not hold is
+                    # withheld.
+                    d["last_error"] = await cipher_call(
+                        self._cipher,
+                        open_listed_cell,
+                        self._cipher,
+                        d["last_error"],
+                        cell_aad("queue", "last_error", r["outbox_id"]),
+                        table="queue",
+                    )
+                    await cipher_call(
+                        self._cipher,
+                        withhold_message_cells,
+                        self._cipher,
+                        d,
+                        ("summary",),
+                        message_id=r["message_id"],
+                        channel_id=d.pop("message_channel_id"),
+                        failures=failures,
+                    )
+                    out.append(d)
+        finally:
+            # A later row's refusal still audits the earlier rows' tag failures (BACKLOG #5650).
+            # Outside the read block: the audit write takes the writer lock.
+            await report_cell_tag_failures(self, failures)
         return out
 
     async def count_dead(
