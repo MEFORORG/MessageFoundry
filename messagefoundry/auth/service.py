@@ -4307,15 +4307,18 @@ def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
 @dataclass(frozen=True)
 class _UserLookup:
     """What one user read found (BACKLOG #2592): the account with its seal checked, or ``None``,
-    and whether any row was there at all. ``held`` without ``user`` is a row that fails its seal:
-    it is refused, and nothing may be created over it or beside it."""
+    and whether any row was there at all. ``held`` without ``user`` is a row that is refused, and
+    nothing may be created over it or beside it. Mostly that row fails its seal, but at least
+    :meth:`AuthService._settled_lookup` also answers it for a row whose one check raced a write,
+    with nothing established about its record (BACKLOG #5520)."""
 
     user: VerifiedUser | None
     held: bool
 
     @property
     def refused(self) -> bool:
-        """A row is there and fails its seal."""
+        """A row is there and is refused: it fails its seal, or, as the class says, it could not
+        be checked."""
         return self.held and self.user is None
 
 

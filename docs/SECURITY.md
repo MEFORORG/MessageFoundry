@@ -4640,8 +4640,8 @@ write races.
   names an account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
-recovery for any target whose record passes its integrity seal (a failing one is refused, 423, as
-its table row says), because passkeys mint **no recovery codes by design** (codes are phishable
+recovery for another user's account whose record passes its integrity seal (a failing one is
+refused 423, and the caller's own account 400, as its table row says), because passkeys mint **no recovery codes by design** (codes are phishable
 knowledge secrets that would undercut the phishing-resistant tier). A covered local account that has TOTP
 keeps it beside its passkeys, since it cannot remove it, so TOTP is its fallback. On any other
 account, enroll a second passkey or keep TOTP.

@@ -8,9 +8,9 @@ AD sign-in, the local sign-in's read by name and the directory rename refresh, a
 ``_load_user_by_federated_subject`` the federated sign-in. Each took one check and dropped whether
 it had established anything, so a check that raced a delete, rename or re-key read as a record
 that fails its seal (``refused``): the honest race refused the caller. They now read again while
-the check raced, up to ``_CHECKED_READ_PASSES`` checks, then refuse and report the row the last
-check read if it still holds the key, as ``_checked_by_id`` does for a row that raced every check;
-another row holding the key by then is checked once instead. Each test stands a raced or failed
+the check raced, up to ``_CHECKED_READ_PASSES`` checks, then refuse and report a row every check
+read if it still holds the key, as ``_checked_by_id`` does for a row that raced every check; any
+other row holding the key by then, one only some checks read included, is checked once instead. Each test stands a raced or failed
 check in for the contention by stubbing ``_verified``.
 Synthetic accounts only.
 """
@@ -219,6 +219,12 @@ def _other_row_at_final_read(
 
     async def swapped(*args: Any, **kw: Any) -> Any:
         reads[0] += 1
+        if reads[0] == after + 1 and key == "federated-subject":
+            # A real rebind, so the row served below holds the pair the lookup asked for.
+            await store.clear_user_federated_subject(
+                "u1", expected_issuer=_ISSUER, expected_subject=_SUBJECT
+            )
+            await store.set_user_federated_subject("u2", _ISSUER, _SUBJECT)
         if reads[0] > after:
             return await store.get_user("u2")
         return await original(*args, **kw)
