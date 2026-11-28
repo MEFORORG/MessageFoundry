@@ -1368,14 +1368,17 @@ def _os_open_may_write(call: ast.Call) -> bool:
 #: most names it returns. Bindings that extend each other (``a = b.x`` and ``b = a.y``) would grow
 #: without end, and ordinary code has them: a linked-list walk (``cur = nxt``, ``nxt = cur.next``)
 #: or one generic name bound in several functions reaches a bound on every call through it. So an
-#: expansion cut short is reported as truncated only when a name it left unread could still meet a
-#: name test of this rule (:meth:`_NameResolver.cut_may_hit`), and the call is then flagged rather
-#: than passed unread.
+#: expansion cut short is reported as truncated only when the bindings it follows reach a head or a
+#: part some name test of this rule reads (:meth:`_NameResolver.cut_may_hit`), and the call is then
+#: flagged rather than passed unread. That is coarser than whether an unread name is a hit: one
+#: binding to ``os.environ`` among them is enough to flag.
 _MAX_ALIAS_PARTS = 16
 _MAX_ALIAS_NAMES = 256
-#: The heads a resolved call name must start with to meet any name test of the ambient-authority
-#: rule (:func:`_ambient_name_hit`, :func:`_open_write_hit`); the one test that reads no head, a
-#: filesystem-write method, is :data:`_AMBIENT_FS_WRITE_ATTRS`. A new name test must keep this whole.
+#: The heads a resolved call name must start with to meet a name test of the ambient-authority rule
+#: that reads its head (:func:`_ambient_name_hit`, :func:`_open_write_hit`). The tests that read a
+#: part instead include at least a filesystem-write method (:data:`_AMBIENT_FS_WRITE_ATTRS`) and a
+#: ``pathlib`` class (:data:`_PATH_CLASSES`), which :meth:`_NameResolver.cut_may_hit` reads too. A
+#: new name test must be added to one of the three, or a cut expansion can pass it unread.
 _HIT_HEADS = frozenset(
     {"builtins", "importlib", "urllib", "http", "os"}
     | _AMBIENT_BARE_NAMES
@@ -1383,6 +1386,7 @@ _HIT_HEADS = frozenset(
     | _AMBIENT_ROOT_EXEMPTIONS.keys()
     | {name.partition(".")[0] for name in _MODULE_OPENERS | _AMBIENT_OS_PATHS}
 )
+_CUT_HIT_PARTS = _AMBIENT_FS_WRITE_ATTRS | _PATH_CLASSES
 
 
 def _non_import_binding(node: ast.AST) -> str | None:
@@ -1402,10 +1406,11 @@ def _non_import_binding(node: ast.AST) -> str | None:
             ast.TypeVar,
             ast.ParamSpec,
             ast.TypeVarTuple,
+            ast.ExceptHandler,
+            ast.MatchAs,
+            ast.MatchStar,
         ),
     ):
-        return node.name
-    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
         return node.name
     if isinstance(node, ast.MatchMapping):
         return node.rest
@@ -1422,7 +1427,8 @@ class _NameResolver:
     over-reports rather than let an alias in another function go unseen (ADR 0144: a filter, not a
     boundary). So a name it resolves is only *possibly* that binding, and the open-mode reading in
     :func:`_open_write_hit` keeps every reading a possible binding calls for. Relative and star
-    imports bind nothing here.
+    imports are not followed; they only make a name, or with ``*`` every name, not certainly the
+    module an ``import`` of it named (:meth:`is_unbound`).
 
     A binding from the bound name itself (``node = node.left``, ``out = out.write_text``) is applied
     at most once on the way to any name, so a tree walk that rebinds ``node`` several ways costs a
@@ -1432,13 +1438,19 @@ class _NameResolver:
         self._aliases: dict[str, set[str]] = {}
         self._self_suffixes: dict[str, set[str]] = {}
         self._cache: dict[str, tuple[frozenset[str], bool]] = {}
+        self._reach: dict[str, bool] = {}  # cut_may_hit's reading of the bindings, per head
         self._imported: set[str] = set()
         self._rebound: set[str] = set()
+        self._star_import = False
+        # ``lzma = None`` (the optional-import fallback) adds no reading: a constant has no .open.
+        constant_targets: set[int] = set()
         values: list[tuple[list[str], ast.expr]] = []
-        for node in ast.walk(tree):
+        for node in ast.walk(tree):  # breadth-first, so an Assign is seen before its targets
             rebound = _non_import_binding(node)
-            if rebound is not None:
+            if rebound is not None and id(node) not in constant_targets:
                 self._rebound.add(rebound)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                constant_targets.update(id(t) for t in node.targets if isinstance(t, ast.Name))
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.asname:
@@ -1446,10 +1458,12 @@ class _NameResolver:
                     else:
                         self._imported.add(alias.name.partition(".")[0])
             elif isinstance(node, ast.ImportFrom):
-                if node.module is None or node.level:
-                    continue
                 for alias in node.names:
-                    if alias.name != "*":
+                    if alias.name == "*":
+                        self._star_import = True
+                    elif node.module is None or node.level:
+                        self._rebound.add(alias.asname or alias.name)
+                    else:
                         self._bind(alias.asname or alias.name, f"{node.module}.{alias.name}")
             elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -1480,10 +1494,12 @@ class _NameResolver:
 
     def is_unbound(self, name: str) -> bool:
         """No binding but a plain ``import name`` names ``name``: none this resolver follows, no path
-        binding and no other (:func:`_non_import_binding`), so a parameter, loop target or ``except``
-        name spelt like an imported module is not read as that module."""
+        binding, no relative or star import, and no other (:func:`_non_import_binding`) except an
+        assignment of a constant, so a parameter, loop target or ``except`` name spelt like an
+        imported module is not read as that module."""
         return (
-            name not in self._aliases
+            not self._star_import
+            and name not in self._aliases
             and name not in self._self_suffixes
             and name not in self.path_names
             and name not in self._rebound
@@ -1529,25 +1545,29 @@ class _NameResolver:
         return result
 
     def cut_may_hit(self, dotted: str) -> bool:
-        """Whether some name :meth:`expand` could reach from ``dotted`` may meet a name test: a head
+        """Whether a name :meth:`expand` could reach from ``dotted`` may meet a name test: a head
         reachable through the bindings is in :data:`_HIT_HEADS`, or a part of ``dotted`` or of a
-        binding reachable from it is in :data:`_AMBIENT_FS_WRITE_ATTRS`. Every name an expansion
-        produces is a reachable head followed by such parts, so when neither holds, no name it left
-        unread can be a hit and a cut expansion loses nothing."""
-        heads = {dotted.partition(".")[0]}
-        parts = set(dotted.split("."))
-        stack = list(heads)
-        while stack:
-            head = stack.pop()
-            for target in self._aliases.get(head, ()):
-                parts.update(target.split("."))
-                target_head = target.partition(".")[0]
-                if target_head not in heads:
-                    heads.add(target_head)
-                    stack.append(target_head)
-            for suffix in self._self_suffixes.get(head, ()):
-                parts.update(suffix.split("."))
-        return not heads.isdisjoint(_HIT_HEADS) or not parts.isdisjoint(_AMBIENT_FS_WRITE_ATTRS)
+        binding reachable from it is a write method or a ``pathlib`` class (:data:`_CUT_HIT_PARTS`).
+        Every name an expansion produces is a reachable head followed by such parts, so when neither
+        holds, no name it left unread can meet a test those constants cover."""
+        head = dotted.partition(".")[0]
+        reach = self._reach.get(head)
+        if reach is None:
+            heads, parts = {head}, set()
+            stack = [head]
+            while stack:
+                current = stack.pop()
+                for target in self._aliases.get(current, ()):
+                    parts.update(target.split("."))
+                    target_head = target.partition(".")[0]
+                    if target_head not in heads:
+                        heads.add(target_head)
+                        stack.append(target_head)
+                for suffix in self._self_suffixes.get(current, ()):
+                    parts.update(suffix.split("."))
+            reach = not heads.isdisjoint(_HIT_HEADS) or not parts.isdisjoint(_CUT_HIT_PARTS)
+            self._reach[head] = reach
+        return reach or not _CUT_HIT_PARTS.isdisjoint(dotted.split("."))
 
     def call_names(self, func: ast.expr) -> tuple[frozenset[str], bool]:
         """Every dotted name a call's ``func`` may resolve to, or none when it is not a dotted chain

@@ -1117,6 +1117,14 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "imported_opener_rebound_by_call_result",
         'import codecs\n\ndef f(msg, make):\n    codecs = make()\n    codecs.open("w")\n',
     ),
+    (
+        "imported_opener_rebound_by_relative_import",
+        'import gzip\nfrom .compat import gzip\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_star_import",
+        'import gzip\nfrom _compat import *\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
     # A binding from the bound name itself is still followed, once.
     (
         "self_binding_on_import_alias",
@@ -1190,6 +1198,12 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
         "def a(msg, data):\n    resp = data.resp\n    return resp.get()\n\n"
         "def b(msg, resp):\n    data = resp.data\n    return data.get()\n",
     ),
+    # The optional-import fallback binds a constant, which has no .open: still the module.
+    (
+        "optional_import_fallback_to_none",
+        "try:\n    import lzma\nexcept ImportError:\n    lzma = None\n\ndef f(msg):\n"
+        '    lzma.open("/data/archive.xz")\n',
+    ),
     # Default and read modes of the other openers, by slot.
     ("receiver_open_read_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "r")\n'),
     ("zipfile_read_default", "import zipfile\n\ndef f(msg, p):\n    zipfile.ZipFile(p)\n"),
@@ -1247,6 +1261,34 @@ def test_a_truncated_alias_expansion_is_flagged(tmp_path: Path) -> None:
     lines += ["", "def f(msg):", "    w(3, msg.raw)"]
     result = _run(tmp_path, "\n".join(lines) + "\n")
     assert f"feed.py:{len(lines)} [ambient-authority]" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("name", "preamble", "last_binding", "call"),
+    [
+        # each reachable only past the bound, and each read by a different arm of cut_may_hit
+        ("write_method", "", "w = zz.write_text", "def f(msg, zz):\n    w(msg.raw)"),
+        (
+            "path_class",
+            "from pathlib import Path as zz",
+            "w = zz",
+            'def f(msg, m):\n    w("/q").open(m)',
+        ),
+        ("ambient_root", "import shutil as zz", "w = zz.copy", 'def f(msg):\n    w("/i", "/o")'),
+        ("opener_module", "import codecs as zz", "w = zz.open", 'def f(msg, m):\n    w("/i", m)'),
+    ],
+    ids=["write_method", "path_class", "ambient_root", "opener_module"],
+)
+def test_a_cut_expansion_that_reaches_a_hit_is_flagged(
+    tmp_path: Path, name: str, preamble: str, last_binding: str, call: str
+) -> None:
+    # 300 bindings that sort before the real one push it past the bound unread; the call is flagged
+    # because the bindings it follows reach a part or a head a name test reads.
+    lines = [preamble, *(f"w = a{i}" for i in range(300)), last_binding, "", *call.split("\n")]
+    result = _run(tmp_path, "\n".join(lines) + "\n")
+    assert f"feed.py:{len(lines)} [ambient-authority]" in result.detail, (
+        f"{name}: {result.detail!r}"
+    )
 
 
 @pytest.mark.timeout(30)
