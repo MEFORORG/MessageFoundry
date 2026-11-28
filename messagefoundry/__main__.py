@@ -13970,7 +13970,6 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
-        StoreAcquireTimeout,
         StoreNotFoundError,
         audit_chain_read_errors,
         build_store_cipher,
@@ -13991,6 +13990,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         cell_present,
         connect_readonly,
         server_cell_present,
+        server_row_filtered,
         server_walk_tables,
         store_tables,
     )
@@ -14085,11 +14085,18 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         # SQLite's, and a server statement runs under [store].command_timeout instead.
         label = _store_label(store)
         walk_errors = audit_chain_read_errors()
-        # A link or a store refusal, never a defect: a bug in the probe is raised, not read as a
-        # store that could not be read.
-        probe_errors: tuple[type[Exception], ...] = (*walk_errors, StoreAcquireTimeout)
+        # What the open's own handlers below read as could not start, and the key service's
+        # errors: a probe failing on any of them leaves the refusal's exit 2, never a FAIL.
+        probe_errors: tuple[type[Exception], ...] = (
+            *walk_errors,
+            RuntimeError,
+            ValueError,
+            CipherError,
+        )
 
-        async def keyed_behind_the_refusal(posture: HopPosture | None) -> CipherAudit | None:
+        async def keyed_behind_the_refusal(
+            posture: HopPosture | None, refusal: KeylessAuditChainRefused
+        ) -> CipherAudit | None:
             # A read-only walk under the identity cipher, on the probe handle, which writes
             # nothing and starts no chain (`open_cipher_walk_probe`): its audit when its
             # `keyed_surface` row or first sealed value found the key mismatch, with the cells
@@ -14109,11 +14116,12 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 )
             if found is None or found.key_mismatch is None:
                 return None
-            if store.encryption_key or store.encryption_key_file:
-                # The refusal's own sentence for this cause, which KEY_MISMATCH would drop.
-                found.key_mismatch += (
-                    ". A store key is configured, but [store].key_provider resolved no key in "
-                    "this environment"
+            if refusal.key_named:
+                # The refusal's own cause, first, so it stays the mismatch's and not a failure
+                # line's that `with_first_failure` may have added after it.
+                found.key_mismatch = (
+                    "A store key is configured, but [store].key_provider resolved no key in this "
+                    f"environment: {found.key_mismatch}"
                 )
             return found
 
@@ -14139,11 +14147,11 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # A keyless open of a keyed store refused by the open itself: the key, not the
                 # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
                 return False, CipherAudit(key_mismatch=safe_exc(exc)), None
-            except KeylessAuditChainRefused:
+            except KeylessAuditChainRefused as refusal:
                 # The #1916 guard refused, and stands. Only why is asked: a store holding keyed
                 # cells is the key's mistake, KEY_MISMATCH as SQLite says it, and a fresh one
                 # stays could not start (BACKLOG #1719 item 22).
-                keyed_audit = await keyed_behind_the_refusal(posture)
+                keyed_audit = await keyed_behind_the_refusal(posture, refusal)
                 if keyed_audit is None:
                     raise
                 return False, keyed_audit, None
@@ -14158,6 +14166,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 server_cipher = handle.cipher()
                 try:
                     columns = await source.cipher_walk_columns(server_walk_tables(cells))
+                    # A catalog read too, before any value: its failure is could not start.
+                    filtered = await server_row_filtered(source, cells, columns)
                 except walk_errors as exc:
                     raise _StoreUnreachable() from exc
                 if not any(server_cell_present(c, columns) for c in cells):
@@ -14173,6 +14183,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                         cells=cells,
                         chunk_rows=chunk_rows,
                         columns=columns,
+                        row_filtered=filtered,
                         into=found,
                     )
                 except walk_errors as exc:
@@ -14337,8 +14348,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "this login, through row-level security or because the catalog read of it was "
             "refused or incomplete, so values in them may not have been read: "
             f"{', '.join(audit.row_filtered)}. Run it as a role that reads every row: a "
-            "superuser, a role with BYPASSRLS, or the role that directly owns the table where "
-            "the table does not force row-level security"
+            "a role with BYPASSRLS, or the role that directly owns the table where the table "
+            "does not force row-level security; a superuser also does, but is not needed"
         )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
@@ -14356,6 +14367,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 "blob": audit.blob if counted else None,
                 "unmarked": audit.unmarked if counted else None,
                 "legacy": audit.legacy if counted else None,
+                # What the run could not cover, by name, so a script need not parse the reason.
+                "hidden": list(audit.hidden),
+                "row_filtered": list(audit.row_filtered),
                 "cells": [
                     {
                         "cell": t.name,

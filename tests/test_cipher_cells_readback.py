@@ -1465,7 +1465,7 @@ _SERVER_TOML = {
 
 class _FakeServerStore(_SqliteSource):
     """What ``open_store`` hands ``cipher-audit`` for a server backend, over a SQLite file: the
-    walk's four reads, the store's cipher, and a close that is counted."""
+    walk's five reads, the store's cipher, and a close that is counted."""
 
     def __init__(self, conn: sqlite3.Connection, cipher: Cipher) -> None:
         super().__init__(conn)

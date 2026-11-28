@@ -33,7 +33,15 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Callable,
+    Collection,
+    Generator,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1035,6 +1043,17 @@ async def read_server_cipher_cells(
                 break
 
 
+async def server_row_filtered(
+    source: CipherCellSource, cells: Iterable[CipherCell], columns: Mapping[str, frozenset[str]]
+) -> list[str]:
+    """The tables of a walk of ``cells`` that ``source`` says a row filter may hide rows in, of
+    those the catalog read ``columns`` shows, in the walk's order (BACKLOG #1719 item 35). A name
+    the source returns that the catalog did not show is never recorded."""
+    shown = [t for t in server_walk_tables(cells) if t in columns]
+    filtered = await source.cipher_walk_row_filtered(shown) if shown else frozenset()
+    return [t for t in shown if t in filtered]
+
+
 async def server_keyed_store_mismatch(
     source: CipherCellSource, cipher: Cipher, columns: Mapping[str, frozenset[str]]
 ) -> str | None:
@@ -1052,11 +1071,13 @@ async def audit_server_cipher_cells(
     cells: Iterable[CipherCell],
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     columns: Mapping[str, frozenset[str]] | None = None,
+    row_filtered: Collection[str] | None = None,
     into: CipherAudit | None = None,
 ) -> CipherAudit:
     """:func:`audit_cipher_cells` for a PostgreSQL or SQL Server store, through
     :func:`read_server_cipher_cells`, with the same precedence, the same stops and the same
-    ``into``."""
+    ``into``. ``row_filtered`` is :func:`server_row_filtered` for ``columns``, when the caller
+    already holds it."""
     wanted = tuple(cells)
     audit = _reset(into)
     if columns is None:
@@ -1069,10 +1090,11 @@ async def audit_server_cipher_cells(
     audit.hidden = audit.absent
     if not _keyed_surface_visible(columns):
         audit.hidden.append("keyed_surface")
-    shown = [t for t in server_walk_tables(wanted) if t in columns]
-    filtered = await source.cipher_walk_row_filtered(shown) if shown else frozenset()
-    # In the walk's own order, and only tables the catalog showed, so a name never comes from it.
-    audit.row_filtered = [t for t in shown if t in filtered]
+    audit.row_filtered = (
+        await server_row_filtered(source, wanted, columns)
+        if row_filtered is None
+        else list(row_filtered)
+    )
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit

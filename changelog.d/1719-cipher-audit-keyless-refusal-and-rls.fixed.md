@@ -9,9 +9,11 @@
   run whose audit log is not empty is not refused, and is unchanged. Before, a PostgreSQL table
   with row-level security on could hide rows from the audit login, and the walk could PASS over
   the rows it was shown. Now a run over such a table is never a PASS: it is NOT_COVERED, exit 3,
-  where no FAIL or KEY_MISMATCH leads, and every verdict names the table. The exceptions are a
-  login that is a superuser, has BYPASSRLS, or is itself the table's owner while the table does
-  not force row-level security; a member of the owning role is read as not the owner. A catalog
-  read that a grant or access rule refuses names every table; any other failure of that read
-  stops the audit as any failed read does. SQL Server security policies are not read
-  yet, so a SQL Server store's verdict is unchanged. (`BACKLOG #1719`)
+  where no FAIL or KEY_MISMATCH leads, and at least every verdict whose run read the catalog
+  names the table in its reason. The `--json` output gains a `row_filtered` list of those tables
+  and a `hidden` list of the cells the catalog did not show. The exceptions are a login that is
+  a superuser, has BYPASSRLS, or is itself the table's owner while the table does not force
+  row-level security; a member of the owning role is read as not the owner. A catalog read that
+  a grant or access rule refuses names every table; any other failure of that read is could not
+  start, exit 2, as a failed read of the column catalog is. SQL Server security policies are not
+  read yet, so a SQL Server store's verdict is unchanged. (`BACKLOG #1719`)

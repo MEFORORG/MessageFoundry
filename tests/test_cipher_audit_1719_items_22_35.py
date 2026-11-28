@@ -63,10 +63,11 @@ class _EmptyLogStore(_FakeServerStore):
 
 
 def _serve_an_empty_log(
-    monkeypatch: pytest.MonkeyPatch, db: Path, cipher: Cipher
+    monkeypatch: pytest.MonkeyPatch, db: Path, cipher: Cipher, *, key_named: bool = False
 ) -> list[_EmptyLogStore]:
     """``open_store`` hands back a handle over ``db`` and then runs the real guard on it with the
-    verdict the command passed, as the real ``open_store`` does for a keyless cipher."""
+    verdict the command passed, as the real ``open_store`` does for a keyless cipher;
+    ``key_named`` is the guard's own reading of whether the settings name a key."""
     opened: list[_EmptyLogStore] = []
 
     async def fake_open_store(settings: StoreSettings, **kw: Any) -> _EmptyLogStore:
@@ -75,7 +76,7 @@ def _serve_an_empty_log(
         refusal = kw["keyless_chain_refusal"]
         assert refusal is not None, "cipher-audit must pass the shared #1916 verdict"
         await store_base._refuse_to_start_a_keyless_chain(
-            cast(store_base.Store, handle), refusal, key_named=False
+            cast(store_base.Store, handle), refusal, key_named=key_named
         )
         return handle
 
@@ -194,6 +195,47 @@ def test_the_probe_s_key_mismatch_names_what_its_catalog_read_could_not_cover(
     rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
     assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
     assert "row-level security" in payload["reason"] and "messages" in payload["reason"], out
+
+
+def test_a_key_the_provider_did_not_resolve_keeps_the_refusal_s_cause(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Where the guard read the settings as naming a key, KEY_MISMATCH leads with that cause, and
+    where it did not, the sentence is absent."""
+    db, _settings = _copy(_template, tmp_path)
+    keyless = build_store_cipher(StoreSettings(path=str(db)))
+    cause = "A store key is configured, but [store].key_provider resolved no key"
+    for key_named in (True, False):
+        _serve_an_empty_log(monkeypatch, db, keyless, key_named=key_named)
+        _probe_from(monkeypatch, db)
+        rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+        assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+        assert payload["reason"].startswith(cause) is key_named, out
+
+
+def test_a_failed_row_security_read_is_could_not_start(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The row-security read is a catalog read before any value, so a lost link there is exit 2,
+    as one in the column catalog read is, never the FAIL a walk stopped part way earns."""
+    db, settings = _copy(_template, tmp_path)
+
+    class _Handle(_FakeServerStore):
+        async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+            raise ConnectionResetError("synthetic: lost")
+
+    async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    rc, out = _run_server_cli_raw(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 2, out
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
@@ -534,6 +576,7 @@ def test_cipher_audit_is_not_covered_under_row_level_security(
     assert rc == 3 and payload["status"] == "NOT_COVERED", out
     assert "row-level security" in payload["reason"], out
     assert next(iter(filtered)) in payload["reason"], out
+    assert payload["row_filtered"] == sorted(filtered) and payload["hidden"] == [], out
     assert payload["opened"] and payload["opened"] > 0
 
 

@@ -4807,6 +4807,7 @@ class KeylessAuditChainRefused(RuntimeError):
     def __init__(self, path: str, refused_by: str, *, key_named: bool = False) -> None:
         self.path = path
         self.refused_by = refused_by
+        self.key_named = key_named
         cause = (
             "A store key is configured, but [store].key_provider resolved no key in this "
             "environment, so the store opened keyless. "
@@ -4978,8 +4979,8 @@ def is_store_shape_error(exc: BaseException) -> bool:
 
 
 # --- the read-only cipher-cell walk the server stores share (BACKLOG #1719) --------------------
-# `cipher_cells.read_server_cipher_cells` reads a PostgreSQL or SQL Server store through four
-# methods, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
+# `cipher_cells.read_server_cipher_cells` and `audit_server_cipher_cells` read a PostgreSQL or SQL
+# Server store through the five methods of `cipher_cells.CipherCellSource`, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
 # own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
 # once. Every identifier a walk read is given is a declared constant from `cipher_cells`, and only
 # values are bound as parameters. A read may run more than one statement. Each statement takes its
