@@ -322,14 +322,15 @@ def _plain_refusal(info: os.stat_result) -> str | None:
 
 
 def _known_absent(path: Path) -> bool:
-    """Whether an ``lstat`` shows nothing at ``path``
-    (:func:`~messagefoundry.path_reach.is_absent`). ``False`` when something is there, and when
-    the ``lstat`` fails for any other reason, such as a share that cannot be reached, which is
-    logged (BACKLOG #5388)."""
+    """Whether an ``lstat`` shows the name ``path`` is not there
+    (:func:`~messagefoundry.path_reach.is_name_absent`, whose limits apply to a ``True``).
+    ``False`` when something is there, and when the ``lstat`` fails for any other reason, such as
+    a share that cannot be reached or, on Windows, a missing folder or drive above the name, which
+    is logged (BACKLOG #5388)."""
     try:
         os.lstat(path)
     except OSError as exc:
-        if is_absent(exc):
+        if is_name_absent(exc):
             return True
         _log.warning("uploaded-file part %s could not be checked: %s", path.name, exc)
     return False
@@ -529,7 +530,7 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
             os.set_blocking(handle.fileno(), True)
     except BaseException as exc:
         handle.close()
-        unreached = _unreachable_fault(exc)
+        unreached = _outage_fault(exc)
         if unreached is None:
             raise
     if unreached is not None:
@@ -654,6 +655,17 @@ def _unreachable_fault(exc: BaseException) -> str | None:
     if isinstance(exc, OSError) and is_unreachable(exc):
         return codec_safe_str(exc)
     return None
+
+
+def _outage_fault(exc: BaseException) -> str | None:
+    """:func:`_unreachable_fault`, for a check of a name that was just there: a
+    ``FileNotFoundError`` :func:`~messagefoundry.path_reach.is_name_absent` does not read as the
+    name missing, such as a Windows missing folder (3) or drive (15) above it, is an outage too,
+    so only a missing final name reads as gone (BACKLOG #5388)."""
+    fault = _unreachable_fault(exc)
+    if fault is None and isinstance(exc, FileNotFoundError) and not is_name_absent(exc):
+        return codec_safe_str(exc)
+    return fault
 
 
 def _read_fault(path: Path, exc: OSError) -> str | None:
@@ -3823,15 +3835,16 @@ class UploadStore:
                 # before decrypting (_read_sidecar), so it is a skip over any body, a lost one too.
                 return self._refused_meta(fid, "it is plaintext too long to seal")
         except (OSError, UnicodeDecodeError) as exc:
-            # Only an absent body is missing, and only when a fresh lstat agrees: a share that
-            # cannot be reached raises a FileNotFoundError too on Windows, with no winerror on a
-            # read, and that body may still be under the OLD key, so it is a skip below, never a
+            # Only an absent body is missing, and only when a fresh lstat says its final name is
+            # gone (_known_absent): a share that cannot be reached raises a FileNotFoundError too
+            # on Windows, with no winerror on a read, as does a missing folder or drive above the
+            # name, and that body may still be under the OLD key, so it is a skip below, never a
             # lost one a re-run would not count (BACKLOG #5388).
             missing = (
                 kind == "body"
                 and isinstance(exc, OSError)
                 and is_absent(exc)
-                and (getattr(exc, _RECHECKED, None) or _recheck(path, exc)) == "gone"
+                and _known_absent(path)
             )
             if kind == "body" and (missing or isinstance(exc, UnicodeDecodeError)):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
@@ -5285,12 +5298,13 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
         try:
             now = path.lstat()
         except OSError as exc:
-            # Only an absent file was removed. One whose share cannot be reached, whatever class
-            # it arrives as, raises _UnreachableError, so the caller skips it, never counts a body
-            # as lost, and never logs it as the uploads directory gone (BACKLOG #5388).
-            if is_absent(exc):
+            # Only a missing final name was removed. One whose share cannot be reached, whatever
+            # class it arrives as, or a Windows missing folder or drive above it, raises
+            # _UnreachableError, so the caller skips it, never counts a body as lost, and never
+            # logs it as the uploads directory gone (BACKLOG #5388).
+            if is_name_absent(exc):
                 raise _ChangedUnderReseal(gone=True) from exc
-            unreached = _unreachable_fault(exc)
+            unreached = _outage_fault(exc)
             if unreached is None:
                 raise
         if unreached is not None:

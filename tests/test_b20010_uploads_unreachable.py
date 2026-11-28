@@ -486,3 +486,137 @@ async def test_the_prune_logs_a_leftover_sidecar_it_could_not_clear(
     monkeypatch.undo()
     assert sidecar.exists()
     assert any("leftover sidecar" in r.getMessage() for r in caplog.records)
+
+
+# --- only a missing final name is gone (round-3 findings 1, 2, 3 and 6) ------------------------------
+
+
+def _name_missing(path: Path | None) -> OSError:
+    """ERROR_FILE_NOT_FOUND (2): the final name is not there, the one code ``is_name_absent``
+    reads as gone on Windows."""
+    text = "The system cannot find the file specified"
+    return _os_error(FileNotFoundError, errno.ENOENT, text, path, winerror=2)
+
+
+def _parent_missing(path: Path | None) -> OSError:
+    """ERROR_PATH_NOT_FOUND (3), a missing folder above the name, which CPython maps to ENOENT."""
+    text = "The system cannot find the path specified"
+    return _os_error(FileNotFoundError, errno.ENOENT, text, path, winerror=3)
+
+
+def _drive_missing(path: Path | None) -> OSError:
+    """ERROR_INVALID_DRIVE (15), as a mapped drive that dropped answers, mapped to ENOENT too."""
+    text = "The system cannot find the drive specified"
+    return _os_error(FileNotFoundError, errno.ENOENT, text, path, winerror=15)
+
+
+#: Errors ``is_absent`` reads as absence and ``is_name_absent`` does not: the name may be there.
+_NOT_NAME: dict[str, _Fault] = {"parent-missing": _parent_missing, "drive-missing": _drive_missing}
+
+
+def _every_lstat_fails(monkeypatch: pytest.MonkeyPatch, target: Path, fault: _Fault) -> None:
+    """``Path.lstat`` and ``os.lstat`` both raise ``fault`` for ``target``, as a dropped drive or
+    folder answers every check of a name under it."""
+    _lstat_fails(monkeypatch, target, fault)
+    real = os.lstat
+
+    def _lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if isinstance(path, str | os.PathLike) and Path(path) == target:
+            raise fault(target)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _lstat)
+
+
+@pytest.mark.parametrize("fault", list(_NOT_NAME))
+async def test_known_absent_reads_only_a_missing_name_as_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    # A missing folder or drive read as a pair removed, so a cancelled save's ERROR was withdrawn
+    # while its pair may still be stored on the drive that dropped.
+    _store, _fid, blob, _sidecar = await _saved(tmp_path)
+    _every_lstat_fails(monkeypatch, blob, _NOT_NAME[fault])
+    assert uploads._known_absent(blob) is False
+    monkeypatch.undo()
+    _every_lstat_fails(monkeypatch, blob, _name_missing)
+    assert uploads._known_absent(blob) is True  # control: a missing name is still gone
+
+
+@pytest.mark.parametrize("fault", list(_NOT_NAME))
+async def test_rotate_keys_replace_reads_a_missing_folder_as_an_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    # A missing folder or drive was the file removed, so a body there counted as lost.
+    _store, _fid, blob, _sidecar = await _saved(tmp_path)
+    seen = blob.lstat()
+    tmp = blob.with_name(blob.name + ".tmp")
+    tmp.write_text("synthetic", encoding="utf-8")
+    _lstat_fails(monkeypatch, blob, _NOT_NAME[fault])
+    with pytest.raises(uploads._UnreachableError):
+        uploads._replace_if_unchanged(tmp, blob, seen)
+    monkeypatch.undo()
+    _lstat_fails(monkeypatch, blob, _name_missing)
+    with pytest.raises(uploads._ChangedUnderReseal) as changed:  # control: a missing name
+        uploads._replace_if_unchanged(tmp, blob, seen)
+    assert changed.value.gone
+
+
+@pytest.mark.parametrize("fault", list(_NOT_NAME))
+async def test_rotate_key_skips_a_body_under_a_missing_folder_rather_than_count_it_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    # A lost body is not a skip, so a dropped drive could read as a pass that is done, and the
+    # operator retire the key the body is still under.
+    store, fid, blob, _sidecar = await _saved(tmp_path)
+    _every_lstat_fails(monkeypatch, blob, _NOT_NAME[fault])
+    half = store._reseal_half(cast(Any, None), fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.SKIPPED
+    monkeypatch.undo()
+    _every_lstat_fails(monkeypatch, blob, _name_missing)
+    # Control: a body whose name is missing is still a lost one.
+    half = store._reseal_half(cast(Any, None), fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.LOST
+
+
+def _after_the_open_fails(monkeypatch: pytest.MonkeyPatch, target: Path, fault: _Fault) -> None:
+    """The Windows check of ``target`` after its open raises ``fault``, on every platform."""
+    opened: list[Path] = []
+
+    def _recording_open(path: Any, flags: int, *args: Any) -> int:
+        opened.append(Path(path))
+        return os.open(path, flags, *args)
+
+    real = Path.lstat
+
+    def _lstat(self: Path) -> os.stat_result:
+        if self == target and target in opened:
+            raise fault(self)
+        return real(self)
+
+    monkeypatch.setattr(uploads, "_O_NOFOLLOW", 0)
+    monkeypatch.setattr(uploads, "os", _OsWith(_recording_open))
+    monkeypatch.setattr(Path, "lstat", _lstat)
+
+
+@pytest.mark.parametrize("fault", list(_NOT_NAME))
+@pytest.mark.parametrize("op", ["get_meta", "read_bytes"])
+async def test_a_missing_folder_at_the_check_after_the_open_answers_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op: str, fault: str
+) -> None:
+    # Round-3 finding 1: only winerror 53 and 67 were an outage there, so a missing folder or
+    # drive under a part that was just opened answered a missing upload.
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    _after_the_open_fails(monkeypatch, blob if op == "read_bytes" else sidecar, _NOT_NAME[fault])
+    with pytest.raises(UploadStorageUnreachableError):
+        await _call(store, op, fid)
+
+
+@pytest.mark.parametrize("op", ["get_meta", "read_bytes"])
+async def test_a_missing_name_at_the_check_after_the_open_is_still_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """Control: the name went after the open, so the answer is a missing upload."""
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    _after_the_open_fails(monkeypatch, blob if op == "read_bytes" else sidecar, _name_missing)
+    with pytest.raises(uploads.UploadNotFoundError):
+        await _call(store, op, fid)
