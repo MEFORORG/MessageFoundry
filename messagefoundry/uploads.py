@@ -14,8 +14,8 @@ This is a **leaf** module. From this package it imports the pure ``store.crypto`
 HL7 library, ``config.atomic_edit``'s cross-process lock primitives (``edit_lock``,
 ``lock_path_for`` and ``LOCK_FILE_NAME``, which :func:`_pair_lock` here builds on), its link test
 and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_reach`` and
-``redaction``; the import block is the list of record. It never imports the store instance, a transport, a
-connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
+``redaction``. The import block is the list of record. It never imports the store instance, a
+transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
 cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
 no store module is imported. All disk + crypto + split work runs **off the event loop**
@@ -369,7 +369,7 @@ _ROOT_SWAPPED = "now answers as a different folder than the one the sweep listed
 
 
 def _root_never_made(root: Path) -> bool:
-    """Whether an uploads root whose ``stat`` or listing answered absence reads as one no save has
+    """Whether an uploads root whose pinning ``stat`` answered absence reads as one no save has
     made yet: its name is not there, and the nearest folder above it that answers is a folder.
     ``False`` when the root's own name is there, as a link, junction or mount point whose target is
     lost is; when an ancestor's name is there but does not answer, as a dangling link; when none
@@ -4343,8 +4343,8 @@ class UploadStore:
         drive letter that is no longer mapped, and a linked root whose target is lost, are not a
         clean pass while they stay lost; :func:`_root_never_made` names what still is. Once the pin
         has succeeded, every listing error raises, absence included. A temp or body goes only
-        once it is past the floor and the root still answers as the folder the sweep listed,
-        checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a body the
+        once it is past the floor and the root still answers with the identity the pin read before
+        the listing, checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a body the
         listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just before
         that check, also reports the sidecar not there.
 

@@ -3,15 +3,13 @@
   now end the retention pass's orphan sweep with a logged error rather than a silent clean pass.
   A root deleted after its first save, and one under a POSIX mount point whose share dropped,
   still read as a folder no save has made yet. Once the root's own read has succeeded, a listing
-  that then answers absence is a logged error too. A temp leftover, or a body whose sidecar reads
-  as absent, is removed only if the uploads root, checked once right before that unlink, answers
-  with the identity it had when the sweep read it before its listing, so a share remounted under
-  it as another folder stops the sweep. A remount that answers with the same identity, that flaps
-  back before that check, or that lands after it and before the unlink can still have a temp or
-  body removed from the folder then under the root's name. On a file system that mints
-  identities on the client, at least a CIFS mount with `noserverino`, the check can stop sound
-  passes, so orphans can stay past retention. A body whose sidecar exists can still be removed,
-  with no audit row, in at least these cases: a stale client cache, a hidden name, a remount that
-  answers with the same identity or that flaps back before the check, a root swapped after the
-  check and before the unlink, and a sidecar that lands between its check and the unlink
-  (BACKLOG #6575).
+  that then answers absence is a logged error too. The sweep reads the root's identity before
+  its listing. Right before it removes a temp leftover, or a body whose sidecar reads as absent,
+  it checks that identity again. A share remounted under the root as another folder therefore
+  stops the sweep. The check does not catch a remount with the same identity, one that flaps
+  back before the check, or one that lands between the check and the removal. On a file system
+  that mints identities on the client, such as a CIFS mount with `noserverino`, the check can
+  stop sound passes, so orphans can stay past retention. A body whose sidecar exists can still be
+  removed, with no audit row. At least these cases do it: a stale client cache, a hidden name,
+  any of the remounts the check does not catch, and a sidecar that lands between its check and
+  the unlink (BACKLOG #6575).
