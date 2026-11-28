@@ -5,9 +5,10 @@ log now holds with its own interval and bound instead of a copy (BACKLOG #5523 i
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from messagefoundry.store import row_seal
 from messagefoundry.store.row_seal import (
     SEAL_FAILURE_REPORT_INTERVAL_SECONDS,
     SEAL_FAILURE_TRACK_MAX,
@@ -26,7 +27,7 @@ class _Clock:
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     c = _Clock()
-    monkeypatch.setattr(row_seal.time, "monotonic", c)
+    monkeypatch.setattr(time, "monotonic", c)
     return c
 
 
