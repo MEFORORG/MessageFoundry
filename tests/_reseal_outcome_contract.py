@@ -100,7 +100,28 @@ async def assert_reseal_outcome_contract(store: Any, raw: RawSql) -> None:
     await raw("UPDATE roles SET seal=? WHERE id=?", (MALFORMED_SEAL, unheld_role))
     await raw("UPDATE users SET authz_seal=? WHERE id=?", (MALFORMED_SEAL, user))
     await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (MALFORMED_SEAL, AD_ROLE_MAP))
+    open_approval = await store.create_pending_approval(
+        approval_id=f"reseal-{uuid4().hex}",
+        operation="messages.replay",
+        params="{}",
+        requester=user,
+        requester_user_id=user,
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    await raw("UPDATE pending_approvals SET seal=? WHERE id=?", (MALFORMED_SEAL, open_approval))
     await store.reencrypt_to_active()
     settled = store.reseal_outcome()
     assert (settled.unheld, settled.appeared) == (0, 0)
-    assert settled.refused - base.refused >= 4
+    # The forged role, the three re-planted seals and the open approval.
+    assert settled.refused - base.refused == 5
+
+    # A role seal naming the active key in another case: whichever way a backend's filters fold
+    # it, the role pass and the read-back must agree (SQL Server's role pass reads BIN2).
+    kid = store.row_sealer().key_id
+    await raw(
+        "UPDATE roles SET seal=? WHERE id=?",
+        (f"mfseal:v1:{kid.swapcase()}:{'0' * 64}", forged_role),
+    )
+    await store.reencrypt_to_active()
+    assert store.reseal_outcome().appeared == 0

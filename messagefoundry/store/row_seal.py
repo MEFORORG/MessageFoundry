@@ -1043,11 +1043,13 @@ class ResealOutcome:
     under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
     made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
     15). Those the passes refused never hold a rotation open: failing on a seal no key re-seals
-    would fail every later run too. ``appeared`` counts, at the read after the cell passes, the
+    would fail every later run too. ``appeared`` counts, at a read after the re-seal passes, the
     ``refused`` ones beyond what the passes themselves refused, pass by pass, plus any ``unheld``
     one, which a write made during the run leaves: such a seal may be sound and still under a
-    prior key, so the command stops before its audit roll (vault BACKLOG #5635). It compares
-    counts, not rows, so it can miss such a write; ``classify_unrotated`` says when."""
+    prior key, so the command stops before its audit roll (vault BACKLOG #5635). It is no check
+    that nothing else wrote to the store: it covers these four seal tables only, never a message
+    cell or an uploaded file, it compares counts rather than rows, and it misses at least a write
+    made after its last read and the cases ``classify_unrotated`` names."""
 
     unheld: int = 0
     refused: int = 0
@@ -1069,7 +1071,7 @@ _RESEAL_PASS_OF: Final[Mapping[str, str]] = MappingProxyType(
 
 
 def reseal_pass_refusals(
-    users: tuple[int, int], roles: tuple[int, int], approvals: tuple[int, int]
+    *, users: tuple[int, int], roles: tuple[int, int], approvals: tuple[int, int]
 ) -> Mapping[str, int]:
     """What each re-seal pass refused, from its ``(re-sealed, refused)``, for
     :func:`classify_unrotated` (vault BACKLOG #5635)."""
@@ -1094,9 +1096,10 @@ def classify_unrotated(
     pass checks every non-active seal it selects, re-seals each that holds and counts each that
     fails, and the read-back selects no seal its pass does not (``unrotated_seal_queries``), so a
     non-active seal over its count was written after the pass reached it. The count never counts
-    a seal a re-run with nothing else writing would meet again, but it can miss such a write: a
-    refused row that is then removed or repaired, or one a pass refused that the read does not
-    select, a closed request or a user seal under the active key, cancels one out."""
+    a seal a re-run with nothing else writing would meet again, but it can miss such a write: at
+    least a refused row that is then removed or repaired, and one a pass refused that the read
+    does not select, such as a closed request or a user seal under the active key, cancel one
+    out each."""
     if not isinstance(sealer, RowSealer):
         return ResealOutcome()
     unheld = refused = 0

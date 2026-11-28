@@ -31,13 +31,15 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.secret_rotation import ROTATION_RECORD_ID, dek_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealer, RowSealError
+from messagefoundry.store.row_seal import _RESEAL_PASS_OF, RowSealer, RowSealError
 from messagefoundry.store.store import (
     AD_MAPS,
     RESEALED_SEAL_COLUMNS,
     MessageStore,
     require_user_seal_for_write,
+    unrotated_seal_queries,
 )
+from messagefoundry.uploads import UploadStore
 from tests._reseal_outcome_contract import (
     MALFORMED_SEAL,
     UNHELD_KEY_ID,
@@ -309,14 +311,20 @@ async def _role_sealed_by_the_store(db: Path, key: str) -> tuple[str, str]:
 
 
 @pytest.mark.parametrize(
-    "after",
-    # Right after the re-seal passes, and during the cell passes, the bulk of a real run.
-    ["reseal_approval_records", "_reencrypt_state_to_active"],
+    ("owner", "after"),
+    # Right after the re-seal passes, during the cell passes, the bulk of a store pass, and during
+    # the uploads pass, which runs after the store pass returns.
+    [
+        (MessageStore, "reseal_approval_records"),
+        (MessageStore, "_reencrypt_state_to_active"),
+        (UploadStore, "reseal_to_active"),
+    ],
 )
 def test_a_seal_written_under_the_prior_key_during_the_run_holds_it_open(
     rig: tuple[Path, Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    owner: type,
     after: str,
 ) -> None:
     """The row's remaining shape: a writer running alongside, such as an engine still on the prior
@@ -327,15 +335,15 @@ def test_a_seal_written_under_the_prior_key_during_the_run_holds_it_open(
     db, uploads, key_a, key_b = rig
     role_id, prior_seal = asyncio.run(_role_sealed_by_the_store(db, key_a))
     assert prior_seal.startswith("mfseal:v1:")  # control: the store sealed it
-    original = getattr(MessageStore, after)
+    original = getattr(owner, after)
 
-    async def then_a_writer(self: MessageStore, *args: Any) -> Any:
+    async def then_a_writer(self: Any, *args: Any) -> Any:
         # After the role pass re-sealed the role under the new key, as the writer would.
         result = await original(self, *args)
         await _raw_for(db)("UPDATE roles SET seal=? WHERE id=?", (prior_seal, role_id))
         return result
 
-    monkeypatch.setattr(MessageStore, after, then_a_writer)
+    monkeypatch.setattr(owner, after, then_a_writer)
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
@@ -346,7 +354,7 @@ def test_a_seal_written_under_the_prior_key_during_the_run_holds_it_open(
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))  # still open
 
-    monkeypatch.setattr(MessageStore, after, original)
+    monkeypatch.setattr(owner, after, original)
     assert main(["rotate-key", "--db", str(db)]) == 0, capsys.readouterr()
     assert "OK:" in capsys.readouterr().out
     rows = asyncio.run(_rows(db, key_b))
@@ -372,5 +380,34 @@ def test_a_seal_no_pass_reaches_does_not_hold_every_run_open(
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0, capsys.readouterr()
     assert "OK:" in capsys.readouterr().out
-    where = {table: w for table, _column, w in RESEALED_SEAL_COLUMNS}["authority_set_seal"]
-    assert where == " AND name IN (" + ", ".join(f"'{n}'" for n in AD_MAPS) + ")"
+    query = dict(unrotated_seal_queries("?"))["authority_set_seal"]
+    assert query.endswith(" AND name IN (" + ", ".join(f"'{n}'" for n in AD_MAPS) + ")")
+    # Every table the read-back reads is held to a re-seal pass's refusals, so none raises.
+    assert set(_RESEAL_PASS_OF) == {table for table, _column, _where in RESEALED_SEAL_COLUMNS}
+
+
+def test_an_unheld_seal_written_during_the_cell_passes_stops_the_run_and_names_its_key(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A seal under a key the run does not hold, written after the check that raises for one, is
+    caught by the last read instead: the run stops before its roll and names the seal key id."""
+    db, uploads, key_a, key_b = rig
+    role_id, _ = asyncio.run(_role_sealed_by_the_store(db, key_a))
+    original = MessageStore._reencrypt_state_to_active
+
+    async def then_a_writer(self: Any, *args: Any) -> Any:
+        result = await original(self, *args)
+        await _raw_for(db)("UPDATE roles SET seal=? WHERE id=?", (UNHELD_SEAL, role_id))
+        return result
+
+    monkeypatch.setattr(MessageStore, "_reencrypt_state_to_active", then_a_writer)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "OK:" not in captured.out
+    assert "rotation aborted -- 1 user, role" in captured.err
+    assert f"seal key id(s) {UNHELD_KEY_ID} in roles" in captured.err
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp

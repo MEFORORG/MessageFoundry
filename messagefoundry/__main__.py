@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.security_notify import NoticeAuditSink, SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.custody_host import MintedCustody
+    from messagefoundry.store.row_seal import ResealOutcome
     from messagefoundry.store.store import UserRecord
 
 
@@ -13136,14 +13137,14 @@ class _UploadsRootLost(Exception):
 
 
 class _SealsAppeared(Exception):
-    """``rotate-key``'s store pass read more user, role, open approval or directory-map seals
-    under another key after its cell passes than its re-seal passes refused (vault BACKLOG
-    #5635, :attr:`ResealOutcome.appeared`). Raised before the uploads pass and the audit roll, so
-    the run stops short of both, as for :class:`_UploadsRootLost`."""
+    """``rotate-key`` read more user, role, open approval or directory-map seals under another key
+    than its re-seal passes refused (vault BACKLOG #5635, :attr:`ResealOutcome.appeared`), after
+    the store pass or right before the audit roll. Raised before the roll, so the run stops short
+    of it, as for :class:`_UploadsRootLost`."""
 
-    def __init__(self, count: int) -> None:
-        super().__init__(count)
-        self.count = count
+    def __init__(self, outcome: ResealOutcome) -> None:
+        super().__init__(outcome.appeared)
+        self.outcome = outcome
 
 
 def _uploads_root_refusal(uploads_dir: str) -> str | None:
@@ -13266,7 +13267,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
-    from messagefoundry.store.row_seal import ResealOutcome
     from messagefoundry.store.store import audit_roll_refused_for_good
     from messagefoundry.uploads import ResealResult, UploadStore
 
@@ -13434,7 +13434,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             if seals.appeared:
                 # One written during the run may be sound and under the prior key: stop before
                 # the one-way audit roll, so nothing is rolled, stamped or closed.
-                raise _SealsAppeared(seals.appeared)
+                raise _SealsAppeared(seals)
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
             # uploaded file under the retired key, so the operator's next step (dropping that key)
@@ -13456,6 +13456,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 # skip, and this is not one: the pass reached no upload at all. Nothing below runs,
                 # so the chain stays on the prior key, nothing is stamped and the record stays open.
                 raise _UploadsRootLost
+            # Vault BACKLOG #5635: read the seals again, so one written during the uploads pass
+            # also stops the run before the roll.
+            seals = await store.recheck_reseal_outcome()
+            if seals.appeared:
+                raise _SealsAppeared(seals)
             # BACKLOG #1904: the audit chain is the third surface the key covers. Its rows are never
             # re-MAC'd (the off-box tee and every recorded anchor hold those values); instead the chain
             # gets a range under the NEW key, whose first row commits to a digest of the old range, so
@@ -13574,16 +13579,25 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # Vault BACKLOG #5635. Exit 1, as above: the store pass has re-encrypted under the active
         # key. A seal its re-seal passes refused is not counted, so a re-run with nothing else
         # writing does not meet this again on its account.
+        found = exc.outcome
+        unheld = (
+            f" {found.unheld} of them name a seal key this run does not hold (seal key id(s) "
+            f"{', '.join(found.unheld_key_ids)} in {', '.join(found.unheld_tables)}): supply "
+            "that key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED for the re-run, or, where no key you "
+            "hold opens the record, recreate or remove it."
+            if found.unheld
+            else ""
+        )
         print(
-            f"error: rotation aborted -- {exc.count} user, role, open approval or directory-map "
-            "record(s) were found sealed under a key other than the active one after the store "
-            "pass, more than its re-seal passes refused, so something wrote to the store during "
-            "this run, such as an engine still running, and each may still be sealed under the "
-            "prior key. The run stopped before its uploads pass and its audit chain step, so no "
-            "uploaded file was re-sealed, the audit chain did not roll and the key's rotation "
-            "date was not stamped; a rotation record this run opened stays open. Stop every "
-            "engine using this store and re-run rotate-key BEFORE retiring any prior key "
-            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
+            f"error: rotation aborted -- {found.appeared} user, role, open approval or "
+            "directory-map record(s) were found sealed under a key other than the active one, "
+            "more than the store pass's re-seal passes refused, so something wrote to the store "
+            "during this run, such as an engine still running, and each may still be sealed "
+            "under a prior key." + unheld + " The run stopped before its audit chain step, so "
+            "the audit chain did not roll and the key's rotation date was not stamped; uploaded "
+            "files may not have been re-sealed, and a rotation record this run opened stays "
+            "open. Stop every engine using this store and re-run rotate-key BEFORE retiring any "
+            "prior key (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
             file=sys.stderr,
         )
         return 1

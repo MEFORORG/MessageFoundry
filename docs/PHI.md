@@ -820,7 +820,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    after the re-seal passes, which reads the tables it checks once, is atomic against a writer
    running alongside. A seal such a writer commits during the run may be missed, or counted with
    the refused records, rather than stopping the run, or it may stop the run after the re-seal
-   passes have committed under the active key, which you must then keep. So stop the engine
+   passes have committed under the active key, which you must then keep. Those tables are read
+   again after the cell passes and right before the audit roll: more seals under another key there
+   than the re-seal passes refused stops the run before the roll, exit 1, with nothing stamped and
+   the rotation record left open. That compares counts and covers those four tables only, never a
+   message cell or an uploaded file, so it is no check that nothing else wrote. So stop the engine
    before rotating, and before dropping the prior key.
    Supply that key and re-run, or remove a record no key you hold opens. A seal that fails under a
    key the run holds, or is malformed, does not stop it; the run notes it. When a start finds that the key in

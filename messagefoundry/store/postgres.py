@@ -2158,6 +2158,8 @@ class PostgresStore(ServerCipherWalk):
     backend = StoreBackend.POSTGRES
     # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
     _reseal_outcome: ResealOutcome = ResealOutcome()
+    # What each re-seal pass of the last reencrypt_to_active refused (vault BACKLOG #5635).
+    _refused_by_pass: Mapping[str, int] | None = None
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
@@ -4174,6 +4176,7 @@ class PostgresStore(ServerCipherWalk):
         ones. A value no configured key can decrypt raises before any UPDATE (PHI is never dropped).
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
         self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
+        self._refused_by_pass = None
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -4214,12 +4217,10 @@ class PostgresStore(ServerCipherWalk):
         report_role_reseal(*roles)
         approvals = await self.reseal_approval_records()
         report_approval_reseal(*approvals)
+        self._refused_by_pass = reseal_pass_refusals(users=users, roles=roles, approvals=approvals)
         # Vault BACKLOG #5635: what the passes left under another key, read again at the end;
         # store.py's twin says why.
-        refused_by_pass = reseal_pass_refusals(users, roles, approvals)
-        self._reseal_outcome = classify_unrotated(
-            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
-        )
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
         if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
             raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
@@ -4336,9 +4337,7 @@ class PostgresStore(ServerCipherWalk):
         ended = await self._execute("DELETE FROM sessions")
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
-        self._reseal_outcome = classify_unrotated(
-            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
-        )
+        await self.recheck_reseal_outcome()
         return total
 
     async def _reencrypt_composite(
@@ -10854,6 +10853,15 @@ class PostgresStore(ServerCipherWalk):
         order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
         2)."""
         await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
+
+    async def recheck_reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.recheck_reseal_outcome`` states the contract (vault
+        BACKLOG #5635)."""
+        if self._refused_by_pass is not None:
+            self._reseal_outcome = classify_unrotated(
+                self._row_sealer, await self._unrotated_seals(), pass_refused=self._refused_by_pass
+            )
+        return self._reseal_outcome
 
     def reseal_outcome(self) -> ResealOutcome:
         """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""

@@ -1786,6 +1786,11 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
+    async def recheck_reseal_outcome(self) -> ResealOutcome:
+        """Read the re-sealed tables again, as :meth:`reseal_outcome` then returns them; store.py's
+        ``MessageStore.recheck_reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        ...
+
     def reseal_outcome(self) -> ResealOutcome:
         """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
         one: the user, role, approval and directory-map seals its re-seal passes did not move

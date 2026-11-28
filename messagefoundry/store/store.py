@@ -5730,9 +5730,8 @@ RESEALED_SEAL_COLUMNS: Final = (
     ("users", "authz_seal", ""),
     ("roles", "seal", ""),
     ("pending_approvals", "seal", " AND status IN ('pending', 'executing', 'interrupted')"),
-    # Only the maps the role pass re-seals (AD_MAPS, below), so a stray row it never reaches is not
-    # read as a seal written during the run (vault BACKLOG #5635).
-    ("authority_set_seal", "seal", " AND name IN ('ad_group_role_map', 'ad_group_scope_map')"),
+    # Narrowed to the maps the role pass re-seals (AD_MAPS) by unrotated_seal_queries.
+    ("authority_set_seal", "seal", ""),
 )
 
 
@@ -5776,11 +5775,15 @@ def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tupl
     pass does not also select: ``classify_unrotated`` counts a refused seal beyond its pass's own
     refusals as written during the run, so a wider filter here would fail every rotation on a
     seal no pass reaches (vault BACKLOG #5635). A narrower one only lets such a write go unseen."""
+    # Only the maps the role pass re-seals, so a stray row it never reaches is not read as a seal
+    # written during the run (vault BACKLOG #5635). The names are code constants.
+    maps = " AND name IN (" + ", ".join(f"'{name}'" for name in AD_MAPS) + ")"
     return tuple(
         (
             table,
             f"SELECT {column} AS seal FROM {table} WHERE {column} <> ''"
-            f" AND {column}{collate} NOT LIKE {placeholder}{where}",
+            f" AND {column}{collate} NOT LIKE {placeholder}{where}"
+            + (maps if table == "authority_set_seal" else ""),
         )
         for table, column, where in RESEALED_SEAL_COLUMNS
     )
@@ -12555,6 +12558,8 @@ class MessageStore:
     backend = StoreBackend.SQLITE
     # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
     _reseal_outcome: ResealOutcome = ResealOutcome()
+    # What each re-seal pass of the last reencrypt_to_active refused (vault BACKLOG #5635).
+    _refused_by_pass: Mapping[str, int] | None = None
 
     def __init__(
         self,
@@ -13724,6 +13729,7 @@ class MessageStore:
         number of values rewritten."""
         cipher = self._cipher
         self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
+        self._refused_by_pass = None
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
             # and the comment named only the harmless one. IdentityCipher means NO key is
@@ -13767,13 +13773,11 @@ class MessageStore:
         report_role_reseal(*roles)
         approvals = await self.reseal_approval_records()
         report_approval_reseal(*approvals)
+        self._refused_by_pass = reseal_pass_refusals(users=users, roles=roles, approvals=approvals)
         # Vault BACKLOG #5635: what the passes left under another key, for the command to read,
         # with what each pass refused, so a seal written during the run is told apart. Read again
         # at the end, below, for a seal written during the cell passes.
-        refused_by_pass = reseal_pass_refusals(users, roles, approvals)
-        self._reseal_outcome = classify_unrotated(
-            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
-        )
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
         if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
             raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
@@ -13863,9 +13867,7 @@ class MessageStore:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         if ended:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
-        self._reseal_outcome = classify_unrotated(
-            self._row_sealer, await self._unrotated_seals(), pass_refused=refused_by_pass
-        )
+        await self.recheck_reseal_outcome()
         return total
 
     def _rotation_scan(self, column: str) -> str:
@@ -21223,6 +21225,18 @@ class MessageStore:
     def reseal_outcome(self) -> ResealOutcome:
         """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
         one (vault BACKLOG #5635); empty before one has run."""
+        return self._reseal_outcome
+
+    async def recheck_reseal_outcome(self) -> ResealOutcome:
+        """Read the re-sealed tables again against what the last :meth:`reencrypt_to_active`'s
+        re-seal passes refused, record it as :meth:`reseal_outcome` and return it (vault BACKLOG
+        #5635). ``reencrypt_to_active`` runs it last, and ``rotate-key`` again right before its
+        audit roll, so a seal a writer running alongside makes after the store pass counts in
+        ``appeared``. Before any run, or after one that stopped, it returns the last outcome."""
+        if self._refused_by_pass is not None:
+            self._reseal_outcome = classify_unrotated(
+                self._row_sealer, await self._unrotated_seals(), pass_refused=self._refused_by_pass
+            )
         return self._reseal_outcome
 
     async def _unrotated_seals(self) -> list[tuple[str, object]]:
