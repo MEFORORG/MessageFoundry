@@ -1928,17 +1928,21 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
     the end of its last word that a caller's text glued after it could complete
     (:func:`_glue_head_start`), which is kept as it stood (BACKLOG #5925 closing step 1:
     ``</family Kim`` masks to ``</family Xxm``, since ``m`` opens ``MSH`` and ``mfb``). That end
-    starts at the first index :func:`_glue_head_start` finds; the passes it models read only the
-    characters it keeps; at least one pass, the connection-string member key reader in
-    ``secretscrub``, also reads a key's characters before them, and :data:`_MEMBER_KEY_HEADS` keeps
-    those. Two reads also rest on the mask's shape, not on what it keeps: the member reader takes
-    the masked letters before a kept head as word characters, and the credential filters'
-    camelCase start needs the masked letter before a kept capital to be lower-case. Both hold
-    because :data:`_SHAPE` masks a letter to a letter of its case. A line break before the end is
-    read as the text's end, since an answer is stripped before a caller glues to it (``</family
-    Li`` then a line break masks ``Li``). ``None`` keeps the rest as it stood where those rules
-    refuse it for another reason: :func:`_rest_words` refuses it, its last word holds a digit, or
-    the mask would leave nothing changed or a last word some pass reads literally."""
+    starts at the first index :func:`_glue_head_start` finds, and the characters it keeps are the
+    ones the passes it models need as they stood: the passes that read a word with no boundary
+    before it (:data:`_UNBOUNDED_HEADS`), the credential filters' label-word starts
+    (:func:`_camel_head_at`) and the connection-string member key reader in ``secretscrub``
+    (:data:`_MEMBER_KEY_HEADS`). Some reads also rest on the masked characters' shape, not on what
+    is kept, at least these: the member reader takes the masked letters before a kept head as part
+    of its key, and the credential filters' camelCase start needs the masked letter before a kept
+    capital to be lower-case. Both hold because :data:`_SHAPE` masks a letter to a letter of its
+    case. A line break before the end is read as the text's end: where an answer keeps its closing
+    line break, as :func:`redact` does, glued text follows the break and cannot complete the word,
+    and where an answer is stripped, as :func:`safe_text` strips it, the word ends the text and
+    these rules read it there. (``</family Li`` then a line break masks ``Li``). ``None`` keeps the
+    rest as it stood where those rules refuse it for another reason: :func:`_rest_words` refuses it,
+    its last word holds a digit, or the mask would leave nothing changed or a last word some pass
+    reads literally."""
     if _rest_words(rest, camel=True) is None:
         return None
     last = list(_GLUED_WORD.finditer(rest))[-1]  # a rest _rest_words accepts holds a word
