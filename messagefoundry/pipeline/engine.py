@@ -1357,9 +1357,11 @@ class Engine:
         # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
         # DR decision is never a cluster-wide config bump.
         close_failures: tuple[tuple[str, str], ...] = ()
-        if self._lease_lost():
+        if self._dr_not_leading():
             # BACKLOG #5906: before the preflight reads the anchors and writes their rows, as
-            # reload_detail refuses first. Nothing is changed yet, so nothing is rolled back.
+            # reload_detail refuses first. The coordinator's test, not the runner's alone: a node
+            # demoted during the takeover hook has a stopped runner, whose reload would answer
+            # with nothing bound. Nothing is changed yet, so nothing is rolled back.
             raise DrProfileNotLeading(str(RunnerLeaseLostError.for_reload()))
         try:
             lookups: FhirLookupAnchorPass | None = None

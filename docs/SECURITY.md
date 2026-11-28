@@ -3040,9 +3040,10 @@ marked failed and answers 422, as every refused release does. If it goes false a
 read, the release is not refused and runs on this node, as an inline reload would. A release on
 the leader, or on this node once its graph has stopped, is not refused for the lease. A dry run
 there is not refused for the lease: it swaps nothing and never asks for it. An inline reload
-reads the flag first in `Engine.reload_detail`, right after its target check, so a directory
-outside the reload roots is still refused as denied, and before the settings preflight and the
-config load. A released reload skips that first read, so its refusal still follows its digest
+reads the flag first in `Engine.reload_detail`, before its target check. When it reads false the
+target check still runs, so a directory outside the reload roots is still refused as denied, and
+the reload is then refused before the settings preflight and the config load. A flag that goes
+false during the target check is left to the runner's reads. A released reload skips that first read, so its refusal still follows its digest
 check. The runner then reads the flag twice: once it holds the reload lock, and again before the
 reload stops any listener. Each read is point in time, so what they guarantee is at least this: a
 reload is refused when the flag reads false at any read, and a flag that goes false after the
@@ -3056,8 +3057,10 @@ settings check reaches that, since the service settings refuse `[dr]` together w
 There the activation reads the lease after its archive confinement, again before its store
 recovery and again before any takeover hook, and aborts with kind `lease` (**503**) at the first
 read that finds the flag false or finds this node a cluster follower. A lease lost after the last
-of those reads is refused at the profile step, before its preflight but after the store recovery,
-the seed marker and any takeover hook have run.
+of those reads, after the store recovery, the seed marker and any takeover hook have run, is
+refused at the profile step with kind `profile`: before its preflight when the engine's read
+there finds it, or by the runner's read once the preflight has read the anchors and written their
+rows.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer

@@ -1136,14 +1136,21 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert row["kind"] == "profile"
 
 
+@pytest.mark.parametrize("lost", ["before_the_profile_step", "during_the_preflight"])
 async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
-    box: _Box, monkeypatch: pytest.MonkeyPatch
+    box: _Box, monkeypatch: pytest.MonkeyPatch, lost: str
 ) -> None:
     """Regression 2 of the hold on engine PR 3136: the runner refuses the profile's reload on such
     a node, and the abort row said the engine could not bind the feeds and handed on the reload
     refusal's own instruction. It now names the lease, says nothing bound, and the box stays
     passive. Reached only by an embedder that skips the settings check refusing [dr] with
-    [cluster], so the coordinator is swapped in by hand, and put back before teardown."""
+    [cluster], so the coordinator is swapped in by hand, and put back before teardown.
+
+    BACKLOG #5906: an activation reads the lease before its store and hook steps and aborts there
+    with kind "lease" (tests/test_runner_doors_not_running.py), so those reads are made to pass
+    here. A lease lost before the profile step is refused by the engine's own read, before the
+    preflight; one lost during the preflight is refused by the runner's, which this case keeps
+    covered."""
     engine = box.engine
     coord = engine.dr_coordinator
     assert coord is not None
@@ -1152,12 +1159,18 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
     assert rr is not None and rr.running
     not_leading = _LeaseCoordinator()
     not_leading.leader = False
-    monkeypatch.setattr(rr, "_coordinator", not_leading)
-    assert rr.lease_lost
-    # BACKLOG #5906: an activation now reads the lease before its store and hook steps and aborts
-    # there with kind "lease" (tests/test_runner_doors_not_running.py). This case is a lease lost
-    # after the last of those reads, which only the profile step sees, so they are made to pass.
     monkeypatch.setattr(coord, "_not_leading", lambda: False)
+    if lost == "before_the_profile_step":
+        monkeypatch.setattr(rr, "_coordinator", not_leading)
+        assert rr.lease_lost
+    else:
+        preflight = engine._dr_preflight
+
+        async def losing_preflight(*args: Any, **kwargs: Any) -> Any:
+            monkeypatch.setattr(rr, "_coordinator", not_leading)
+            return await preflight(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "_dr_preflight", losing_preflight)
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
     monkeypatch.undo()

@@ -157,16 +157,17 @@ _RUN_ON_THE_LEASE_HOLDER: Final = "run the activation on the node that holds the
 
 
 class DrProfileNotLeading(RuntimeError):
-    """The ``activate_profile`` callback's reload was refused because this cluster node's
-    coordinator no longer reads it as leader, before the reload changed any lane (BACKLOG #5906).
-    The engine raises it from the runner's own refusal, so this module does not import the
-    runner."""
+    """The ``activate_profile`` callback refused because this cluster node does not hold the
+    lease, before it changed any lane (BACKLOG #5906). The engine raises it from its own read
+    before the preflight, or from the runner's refusal of the reload, so this module does not
+    import the runner. Its abort keeps kind ``profile``, the step that refused."""
 
 
 class DrActivationError(RuntimeError):
     """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
     ``profile``/``state``/``lease``/``audit``/``error``, the last for an error no abort path
-    caught; ``lease`` for a cluster node that lost its lease, BACKLOG #5906) so the
+    caught; ``lease`` for a cluster node that does not hold the lease, read before the store and
+    hook steps, BACKLOG #5906) so the
     caller (the API endpoint) can map it to an HTTP error and the operator sees the failing phase.
     ``audit`` is the one kind that is not an abort: the box's
     posture already changed and the audit row recording that could not be written, so the call
@@ -624,9 +625,10 @@ class DrCoordinator:
         # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
         # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
         # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
-        progress.step = "store"
-        # Read again: the seed checks above can take a while (BACKLOG #5906).
+        # Read again: the seed checks above can take a while (BACKLOG #5906). Before the step is
+        # marked, so an interrupted abort row does not name a step that never began.
         await self._refuse_if_not_leading(actor, now)
+        progress.step = "store"
         try:
             await self._store.reset_stale_inflight(
                 owned=self._owned_lanes() if self._owned_lanes is not None else None
@@ -643,8 +645,8 @@ class DrCoordinator:
         # (3) Acquire-VIP-or-abort (ADR 0048). The optional takeover_hook is belt-and-braces for a
         # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
         # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
-        progress.step = "vip"
         await self._refuse_if_not_leading(actor, now)
+        progress.step = "vip"
         # _run_vip_hook marks the attempt once the hook's process starts, so the abort a failed or
         # killed hook writes says it ran.
         await self._run_vip_hook(
