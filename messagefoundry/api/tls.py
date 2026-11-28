@@ -353,8 +353,8 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     old certificate names, with or without a trailing dot, and the default ``[api].host``, which
     the CLI, the IDE and the harness dial by default. :func:`_make_generated` drops one that is the
     bind's own SAN entry (:func:`_san_key`), so a ``localhost.`` bind keeps ``localhost``, which
-    Python's ``ssl`` verifies as a different name (#8291 item 1). A bind :attr:`ApiSettings.is_loopback`
-    lists gets all three from :func:`_generated_sans` anyway, so this matters for a wildcard bind
+    Python's ``ssl`` verifies as a different name (#8291 item 1). A bind
+    :attr:`ApiSettings.is_loopback` lists gets all three from :func:`_generated_sans` anyway, so this matters for a wildcard bind
     and for another spelling, such as ``LOCALHOST`` or ``[::1]``: a re-mint for a move from
     ``::`` to ``0.0.0.0`` keeps the ``::1`` the old certificate named, and a renewal at ``::`` of a
     pair minted for ``::1`` keeps its ``127.0.0.1`` and ``localhost``. A renewal keeps

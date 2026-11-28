@@ -1993,9 +1993,10 @@ def san_names(pem: bytes, name: str) -> bool:
     with its trailing dot, because Python's hostname verification keeps it, which the tray, the CLI
     and the harness use: a client dialling ``localhost.`` refuses a certificate naming only
     ``localhost``, and the reverse (measured with ``ssl`` and ``httpx``; another TLS stack may
-    ignore the dot, and then this answer is only stricter than it needs). ``False`` when the certificate has no readable SAN; ``True`` when ``name`` cannot
-    be classified at all, so a caller deciding whether to replace the certificate never replaces it
-    over a name the mint would refuse too. Raises ``ValueError`` when ``pem`` is not a parseable
+    ignore the dot, and then this answer is only stricter than it needs). ``False`` when the
+    certificate has no readable SAN; ``True`` when ``name`` cannot be classified at all, so a
+    caller deciding whether to replace the certificate never replaces it over a name the mint
+    would refuse too. Raises ``ValueError`` when ``pem`` is not a parseable
     certificate. Reads only the public certificate.
     """
     cert = x509.load_pem_x509_certificate(pem)

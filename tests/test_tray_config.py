@@ -741,18 +741,27 @@ def test_a_wildcard_bind_is_probed_on_loopback_and_stays_monitor_only(app_parame
     assert cfg.monitor_only is True
 
 
-#: Spellings of a wildcard that Windows will not bind (BACKLOG #5936 item 2). One list, so the
-#: premise test and the test that relies on it cover the same hosts.
-_WINDOWS_UNBINDABLE_WILDCARDS = ["::ffff:0.0.0.0", "0"]
-
-
-@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
-def test_a_wildcard_spelling_windows_cannot_bind_stays_monitor_only(host: str) -> None:
-    """BACKLOG #5936 item 2. ``::ffff:0.0.0.0`` and ``0`` spell a wildcard on some stacks, but
-    neither binds on Windows, the tray's only platform (the test below), so the engine never runs
-    on one and a tray reading it as down is right. Both must still withhold service control."""
+@pytest.mark.parametrize(
+    ("host", "unspecified"),
+    [
+        # Read as the IPv6 wildcard, so it is held monitor-only as a wildcard is.
+        ("::ffff:0.0.0.0", True),
+        # Not an address to the tray, so a remote name, held monitor-only as a remote engine is.
+        ("0", False),
+    ],
+)
+def test_a_wildcard_spelling_windows_cannot_bind_stays_monitor_only(
+    host: str, unspecified: bool
+) -> None:
+    """BACKLOG #5936 item 2. ``::ffff:0.0.0.0`` and ``0`` spell a wildcard on some stacks. On
+    Windows, the tray's only platform, the first does not bind (the test below), so a tray reading
+    it as down is right. The second is not settled: the listener's lookup sends ``0`` to the
+    resolver, which on the box measured found nothing, while a numeric parse reads it as
+    ``0.0.0.0``, so whether an engine listens there depends on the resolver. Both must withhold
+    service control, each by its own path, whatever the probe shows."""
     cfg = compose_config(None, ServiceRegistryInfo(app_parameters=f"serve --host {host}"))
     assert cfg.monitor_only is True
+    assert cfg.bind_unspecified is unspecified
 
 
 def _listen_once(host: str) -> None:
@@ -768,14 +777,14 @@ def _listen_once(host: str) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
-@pytest.mark.parametrize("host", _WINDOWS_UNBINDABLE_WILDCARDS)
-def test_windows_refuses_a_listener_on_those_wildcard_spellings(host: str) -> None:
-    """The premise of the test above, measured where the tray runs: ``loop.create_server`` refuses
-    both hosts. If this starts passing a bind, the tray's handling of the spelling is a live
-    question again. The control is the test below: the same helper binds loopback, so a refusal
-    here is about the spelling, not a box or runner that refuses every listener."""
+def test_windows_refuses_a_listener_on_the_mapped_wildcard() -> None:
+    """A premise of the test above, measured where the tray runs: ``loop.create_server`` refuses
+    ``::ffff:0.0.0.0``, a numeric host, so no name lookup is involved. If this starts passing a
+    bind, the tray's handling of the spelling is a live question again. The control is
+    :func:`test_the_listener_helper_binds_loopback`: the same helper binds loopback, so the
+    refusal is about the spelling, not a box or runner that refuses every listener."""
     with pytest.raises(OSError):
-        _listen_once(host)
+        _listen_once("::ffff:0.0.0.0")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
