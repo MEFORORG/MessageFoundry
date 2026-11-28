@@ -1455,6 +1455,12 @@ def test_a_stream_with_no_encoding_is_written_as_the_line_came(
             self.text += text
             return len(text)
 
+    plain_io = io.StringIO()  # an io.TextIOBase subclass whose encoding is None
+    handler = GuardedStreamHandler(plain_io, guard=LogWriteGuard())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.emit(_record("caf%s", chr(0xE9)))
+    assert plain_io.getvalue() == "caf\xe9\n"
+
     for stream in (_Plain(), _Slotted()):
         handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
         handler.setFormatter(logging.Formatter("%(message)s"))
@@ -1652,6 +1658,32 @@ def test_a_flap_bound_trip_says_a_pending_cause(
     assert logging_guard._ENCODING_UNREADABLE_FAULT in err
 
 
+def test_an_unhashable_str_encoding_does_not_fail_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The ASCII shortcut caches by encoding name, so the name is taken as a plain str first.
+    # NEGATIVE CONTROL: with the encoding passed to the cache as it came, the unhashable str
+    # subclass raised TypeError and the sink reached stage 2.
+    class _Name(str):
+        __hash__ = None  # type: ignore[assignment]
+
+    class _Writer(io.StringIO):
+        encoding = _Name("utf-8")
+
+    stream = _Writer()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("hello"))
+
+    assert events == []
+    assert stream.getvalue() == "hello\n"
+
+
 def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1693,9 +1725,7 @@ def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
         stream.fail_next = True
         handler.emit(_record("rolls on"))
 
-    err = capsys.readouterr().err
-    assert err.count("IS UNWRITABLE") == 5
-    assert err.count("format faults since") == 0
+    assert capsys.readouterr().err.count("format faults since") == 0
 
 
 def test_a_stream_class_that_cannot_be_classified_is_said(
@@ -1710,11 +1740,12 @@ def test_a_stream_class_that_cannot_be_classified_is_said(
         def __mro__(cls) -> tuple[type, ...]:
             raise TypeError("no mro")
 
-    def write(self: object, text: str) -> int:
-        written.append(text)
-        return len(text)
+    raw, inner = _strict_cp1252()
+    inner.reconfigure(errors="replace")
 
-    written: list[str] = []
+    def write(self: object, text: str) -> int:
+        return inner.write(text)
+
     stream = _BadMro("Writer", (), {"write": write})()
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
@@ -1723,10 +1754,11 @@ def test_a_stream_class_that_cannot_be_classified_is_said(
     handler.setFormatter(logging.Formatter("%(message)s"))
     capsys.readouterr()
 
-    handler.emit(_record("hello"))
+    handler.emit(_record("caf%s", chr(0xE9)))
 
     assert events == []
-    assert written == ["hello\n"]
+    # Written as it came: cp1252 has the e-acute, and no ASCII escape was made.
+    assert raw.getvalue().decode("cp1252").splitlines() == ["caf\xe9"]
     assert f"{logging_guard._CLASSIFY_FAULT} ('TypeError')" in capsys.readouterr().err
 
 

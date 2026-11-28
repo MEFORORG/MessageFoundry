@@ -1139,8 +1139,8 @@ class _GuardedSinkMixin(_SinkBase):
         ``force``. Faults counted inside that interval wait for the next call after it: the next
         fault, the next guard write (:meth:`_write_line` ends in this call, and the stdout sink
         writes every record through it), the next ``flush`` (a file sink record ends in one),
-        a stage-2 failure (:meth:`_say_faults`, which forces it when the sink first goes into
-        stage 2), or ``close``, which forces it. Called under the handler's lock. Never raises."""
+        a stage-2 failure (:meth:`_say_faults`, which forces it each time the sink goes into
+        stage 2 from another state), or ``close``, which forces it. Called under the handler's lock. Never raises."""
         # ``getattr``: logging can flush or close a handler whose constructor raised before
         # ``_init_guard`` ran.
         faults: dict[str, int] | None = getattr(self, "_format_faults", None)
@@ -1278,7 +1278,10 @@ class _GuardedSinkMixin(_SinkBase):
                 except Exception as classify_exc:
                     # An exotic class: read as "no encoding", never a failed write, but said.
                     read_failed = False
-                    self._note_format_fault(f"{_CLASSIFY_FAULT} ({_type_name(classify_exc)})")
+                    unreadable = _type_name(classify_exc)
+                    self._note_format_fault(
+                        f"{_CLASSIFY_FAULT} ({unreadable}); its lines are written as they came"
+                    )
             if not read_failed:
                 encoding = None
             else:
@@ -1288,6 +1291,9 @@ class _GuardedSinkMixin(_SinkBase):
                     f"{_ENCODING_UNREADABLE_FAULT} ({unreadable}); lines to it are escaped for "
                     "ASCII"
                 )
+        if isinstance(encoding, str):
+            # A plain str: a subclass may be unhashable, and the shortcut's cache hashes it.
+            encoding = str.__str__(encoding)
         written = line
         if isinstance(encoding, str) and not (line.isascii() and _encodes_ascii(encoding)):
             try:
@@ -1304,6 +1310,7 @@ class _GuardedSinkMixin(_SinkBase):
             self._write_raw(ascii_only)
             written = ascii_only
         # An unreadable encoding is what made the escape, so it is not also counted as one.
+        # ``unreadable`` also marks a classify failure, whose own entry counts the line.
         if unreadable is None and written != line:
             self._note_format_fault(_ESCAPED_FAULT)
         # After the count, so an escape made now is said with any whose interval has passed.

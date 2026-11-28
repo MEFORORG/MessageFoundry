@@ -488,17 +488,19 @@ writes, a file sink record the strict UTF-8 stream refused, the stand-in notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
 least these. A stream whose `encoding` reads as a string is escaped for that codec. A stream whose
 `encoding` is missing, or reads as anything but a string, is written as the line came; on a
-replacing stream such a line can carry `?` with nothing said. That covers a stream with no
+replacing stream such a line can carry `?` with nothing said, except where classifying
+failed, below. That covers a stream with no
 `encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
 `__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose target has none or is
 gone. A read that raises `AttributeError` counts as missing, unless a class on the stream's MRO
-defines `encoding` as something other than a member descriptor. A member descriptor is an empty
+defines `encoding` as something other than a member descriptor. A member descriptor is a
 `__slots__` member or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything
 else, or raises `AttributeError` from such a definition, is unreadable. An unreadable stream is
 written with everything outside ASCII escaped. Each line to it is counted on the stderr
 format-fault line described below, naming the exception's type, whether or not the write lands. If
 classifying the stream's class fails, the stream is read as having no `encoding`, and that failure
-is counted on the same line. When the sink first reaches stage 2, that line is said at once, inside
+is counted on the same line. Each time the sink goes into stage 2 from another state, that line is
+said at once, inside
 the report interval too. Later records keep the rated line, a sink that goes on rolling past the
 flap bound included. A stream that refuses even the ASCII line, as cp864 refuses `%`, fails the
 write, and the two stages decide. A stream whose `encoding` names
