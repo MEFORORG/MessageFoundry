@@ -67,11 +67,6 @@ def _main() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(redaction, "_end_tag_rest", _main_end_tag_rest)
         patch.setattr(redaction, "_masked_only", _never_masked_only)
-        # Main copied an end tag naming no open element as it stood (BACKLOG #5925 item 13).
-        if hasattr(redaction, "_stray_end_tag_name"):
-            patch.setattr(
-                redaction, "_stray_end_tag_name", lambda text, tag, mask, **_: tag.group()
-            )
         yield
 
 
@@ -443,8 +438,9 @@ _STARTS = (
     "<family> ", '<identifier><system value="urn:x">', "<identifier><value>",
 )  # fmt: skip
 _CONTENT = ("Smith", "Smith Doe", "", "1980", "Doe\n", "A^B^C", "(0010,1000) Doe")
-#: The last two are prefixed local names no element takes, so the stray end-tag mask (item 13) is
-#: exercised here; the end-of-text shape glued text completes is pinned below, not reached here.
+#: The last two are prefixed local names no element takes, so their rests are read after a stray
+#: end tag. The fuzz does not judge the names: they are not planted values. The name kept as main
+#: kept it (item 13) is pinned by ``test_a_value_written_as_an_end_tags_name_is_kept_as_main_kept_it``.
 _ENDS = (
     "</family", "</given", "</other", "</ns:family", "</name", "</system", "</value", "</x:ZqxM",
     "</ns:zqxP",
@@ -739,223 +735,176 @@ def test_the_mask_is_a_fixed_point() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "want"),
+    ("text", "name"),
     [
-        ("<family>Smith</family:Zqxdoe>", "<family>[redacted]</family:Xxxxxx>"),
-        ("<family>Smith</family:Zqxdoe></family>", "<family>[redacted]</family:Xxxxxx></family>"),
-        ("<given>Smith</ns:Zqxdoe 4455>", "<given>[redacted]</ns:Xxxxxx 0000>"),
+        ("<family>Smith</family:Zqxdoe>", "</family:Zqxdoe>"),
+        ("<family>Smith</family:Zqxdoe></family>", "</family:Zqxdoe>"),
+        ("<family>Smith</family:ZqxM ", "</family:ZqxM"),
+        ("<family>Smith</ns:ZqMSH ", "</ns:ZqMSH"),
+        ("<family>Smith</ns:zqxdoe", "</ns:zqxdoe"),
+        ("<family>Smith</Zqxdoe>", "</Zqxdoe>"),
+        ("<identifier><system>x</b:Zqxdoe></system></identifier>", "</b:Zqxdoe>"),
+        ("<family>Smith</ns:Zqxdoe></family><ns:Xxxxxx>", "</ns:Zqxdoe>"),
     ],
 )
-def test_an_end_tag_naming_no_open_element_has_its_name_masked(text: str, want: str) -> None:
-    """BACKLOG #5925 item 13: inside a leaf element, an end tag that closes nothing is text of the
-    element, and ``</family:Zqxdoe>`` read as a qualified name printed its local part."""
+def test_a_value_written_as_an_end_tags_name_is_kept_as_main_kept_it(text: str, name: str) -> None:
+    """BACKLOG #5925 item 13, a named residual: an end tag naming no open element keeps its name,
+    so ``</family:Zqxdoe>`` prints ``Zqxdoe``. Masking the local part in place was tried and
+    dropped: a masked name can spell an element that text a caller puts before the answer opens,
+    and a later call then reads the tag as closing it (the joins below)."""
     with _main():
         main = redact(text)
-    assert "Zqxdoe" in main  # the premise: main printed it
-    assert redact(text) == want
-    assert _is_main_masked(want, main)
-    assert redact(want) == want
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<family>Smith</ns:userPwd",  # ending the text: a camel credential label
-        "<family>Smith</family:ZqMSH>",  # a word read with no boundary
-        "<family>Smith</family:userPwd>",  # a camel credential label
-        "<identifier><system>x</b:Zqxdoe></system></identifier>",  # not a leaf frame
-        "<family>Smith</Zqxdoe>",  # no prefix: an unprefixed name can be another pass's markup
-        "<family>Smith</ns:name>",  # a vocabulary local name: a later call reads it
-    ],
-)
-def test_an_end_tag_name_the_rules_refuse_stays_as_main_left_it(text: str) -> None:
-    with _main():
-        main = redact(text)
+        main_safe = safe_text(text)
+    assert name in main  # the premise: main kept the name
     assert redact(text) == main
-
-
-@pytest.mark.parametrize(
-    ("text", "want"),
-    [
-        ("<family>Smith</family:ZqxM ", "<family>[redacted]</family:XxxM"),
-        ("<family>Smith</x:zqxP\n", "<family>[redacted]</x:xxxP"),
-        ("<given>Jo</y:Zqnon\t", "<given>[redacted]</y:Xxnon"),
-        ("<family>Smith</family:Zqxdoe ", "<family>[redacted]</family:Xxxxxx"),
-        ("<family>Smith</family:Zqxdoe", "<family>[redacted]</family:Xxxxxx"),  # round 2
-        ("<family>Smith</ns:ZqMSH ", "<family>[redacted]</ns:XxMSH"),  # round 2
-    ],
-)
-def test_a_stray_end_tag_name_ending_the_text_keeps_its_glue_head(text: str, want: str) -> None:
-    """Code review of the item-13 mask: where only whitespace follows the name to the text's end,
-    the stripped answer ends on the name, so it keeps the end a caller's glued text could complete,
-    as an end tag's rest that ends the text keeps it."""
-    assert safe_text(text) == want
-    assert safe_text(want) == want
-
-
-@pytest.mark.parametrize(
-    ("a", "raw", "value"),
-    [
-        ("<family>Smith</family:ZqxM ", "SH*^~\\&*A*B\rPID*1**DOEX$JANEX", "DOEX"),
-        ("<family>Smith</x:zqxP\n", "assword: s3cr3tvalue99", "s3cr3tvalue99"),
-        ("<family>Smith</y:Zqnon ", "numeric port: 'hunterpw@host'", "hunterpw"),
-    ],
-)
-def test_text_glued_after_a_stray_end_tag_name_still_completes_its_word(
-    a: str, raw: str, value: str
-) -> None:
-    """Code review of the item-13 mask: masking the whole name lost the head of the word glued text
-    completes, and a value main's answer hid printed (measured on the head before this repair)."""
-
-    def joined() -> str:
-        return secretscrub.scrub_credentials(redact(safe_text(a) + raw))
-
-    with _main():
-        assert value not in joined()  # the premise: main's answer hid it
-    assert value not in joined()
-    # THE POSITIVE CONTROL: the name masked whole, as before this repair, and the value prints.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "_glue_head_start", len)
-        assert value in joined()
-
-
-def test_a_stray_end_tag_name_the_window_cut_leaves_last_is_masked() -> None:
-    """Code review round 2: a bounded head is stripped before it is redacted, so a stray name the
-    cut left last ends the head with the note after it, and is masked whole, as an end tag's rest
-    is there. It printed whole on every bounded route, as on main."""
-    tag = "<family>Smith</ns:zqxdoe"
-    text = "w " * ((65536 - len(tag) - 1) // 2) + tag + " " + "q " * 5000
-    head, note = redaction.safe_text_bound(text)
-    assert note and head.rstrip().endswith(tag)  # the premise: the cut leaves the name last
-    with _main():
-        assert "zqxdoe" in safe_text(text, limit=10**6)  # the premise: main printed it
-    out = safe_text(text, limit=10**6)
-    assert "</ns:xxxxxx [redaction bound:" in out
-    assert "zqxdoe" not in out
-
-
-@pytest.mark.parametrize(
-    ("local", "masked"), [("ZqMSH", "XxXXX"), ("Zqnonnumeric", "Xxxxxxxxxxxx")]
-)
-def test_a_stray_end_tag_name_behind_a_bound_note_hides_a_boundary_free_word(
-    local: str, masked: str
-) -> None:
-    """PR 3387 finding 2: behind a bound note, a name ending in a word some pass reads with no
-    boundary before it was kept whole, while with no note it masked but for its glue head. Only
-    whitespace and the note follow the name there, so the whole-word rule is not applied, as for an
-    end tag's rest behind the note (:func:`redaction._end_tag_rest`)."""
-    _, note = redaction.safe_text_bound("w " * 40_000)
-    assert note  # the premise: a real bound note
-    text = "<family>Smith</ns:" + local + note
-    with _main():
-        assert local in redact(text)  # the premise: main printed it
-    out = redact(text)
-    assert out == "<family>[redacted]</ns:" + masked + note
-    assert redact(out) == out
+    assert safe_text(text) == main_safe
 
 
 _BOUND_NOTE = redaction.safe_text_bound("w " * 40_000)[1]
 
-#: ``(the first call, answer's text, text a caller glues after the answer)``: the answer's stray
-#: end tag masked to the name of an element a start tag in the text opens, or to the head of one
-#: (PR 3387 finding 1). A later call read the masked tag as closing that element, so the glued
-#: ``zqxdoe`` was read outside the leaf and printed, where main's answer kept the tag as it stood
-#: and the value inside the leaf.
-_QNAME_COLLISIONS = {
-    # the join the review found: `Q` masks to `X`, an open element's name
+#: ``id: (the call each fragment goes through, the fragments, text a caller glues after them)``.
+#: Each fragment is redacted on its own and the answers are joined, then the glued text is added.
+#: Pins for the kept name: the answer's stray end tag stands in a leaf element. The dropped mask
+#: wrote a name that some text opens an element of; a later call read the tag as closing it, and
+#: the glued ``zqxdoe`` printed outside the leaf, where main's answer kept the tag as it stood and
+#: the value inside the leaf (PR 3387). The comments name what the mask wrote.
+_QNAME_COLLISIONS: dict[str, tuple[Callable[[str], str], tuple[str, ...], str]] = {
+    # `Q` masked to `X` spelled an open element's name
     "open-element": (
         safe_text,
-        "<identifier><ns:A><ns:X><value>123</ns:Q>",
+        ("<identifier><ns:A><ns:X><value>123</ns:Q>",),
         "zqxdoe</value></ns:X></ns:A></identifier>",
     ),
     "open-element-redact": (
         redact,
-        "<identifier><ns:A><ns:X><value>123</ns:Q>",
+        ("<identifier><ns:A><ns:X><value>123</ns:Q>",),
         "zqxdoe</value></ns:X></ns:A></identifier>",
     ),
-    # the whole-name mask, the tag not ending the text
     "not-at-end": (
         safe_text,
-        "<identifier><ns:A><ns:X><value>123</ns:Q>tail",
+        ("<identifier><ns:A><ns:X><value>123</ns:Q>tail",),
         "zqxdoe</value></ns:X></ns:A></identifier>",
     ),
-    # the glue-head mask at the text's end: `Kim` masks to `Xxm`
+    # `Kim` masked to `Xxm`, its glue head kept
     "glue-head": (
         safe_text,
-        "<identifier><ns:A><ns:Xxm><value>123</ns:Kim",
+        ("<identifier><ns:A><ns:Xxm><value>123</ns:Kim",),
         ">zqxdoe</value></ns:Xxm></ns:A></identifier>",
     ),
-    # the name ending the text, where glued name characters complete the mask: `Abc` masks to
-    # `Xxx`, and `x>` makes it `</ns:Xxxx>` (code review of this repair)
+    # `Abc` masked to `Xxx`, and glued `x>` made it `</ns:Xxxx>`
     "glued-completion": (
         safe_text,
-        "<identifier><ns:A><ns:Xxxx><value>123</ns:Abc",
+        ("<identifier><ns:A><ns:Xxxx><value>123</ns:Abc",),
         "x>zqxdoe</value></ns:Xxxx></ns:A></identifier>",
     ),
-    # the name ending the text behind a bound note: the note is the end tag's rest, and a glued
-    # `>` ends the tag
     "behind-a-bound-note": (
         redact,
-        "<identifier><ns:A><ns:X><value>123</ns:Q" + _BOUND_NOTE,
+        ("<identifier><ns:A><ns:X><value>123</ns:Q" + _BOUND_NOTE,),
         ">zqxdoe</value></ns:X></ns:A></identifier>",
     ),
-    # an element no walk had open at the tag: `<identifier> ` reads as prose until the glued text
-    # closes it, so the names the walk has open do not refuse this mask
+    # `<identifier> ` reads as prose until the glued text closes it
     "opened-outside-the-walk": (
         safe_text,
-        "<identifier> <ns:A><ns:X><telecom><value>123</ns:Q>",
+        ("<identifier> <ns:A><ns:X><telecom><value>123</ns:Q>",),
         "zqxdoe</value></telecom></ns:X></ns:A></identifier>",
+    ),
+    # the walk reads a start tag inside a comment, and the masked tag closed it
+    "comment-borne": (
+        safe_text,
+        ("<identifier><ns:A><!-- <ns:X> --><value>123</ns:Q>",),
+        "zqxdoe</value></ns:X></ns:A></identifier>",
+    ),
+    # the walk reads a start tag inside an attribute value too, since a value stops at `<`
+    "attribute-borne": (
+        safe_text,
+        ('<identifier><ns:A><ns:B note="<ns:X>"><value>123</ns:Q>',),
+        "zqxdoe</value></ns:X></ns:B></ns:A></identifier>",
+    ),
+    # an earlier redacted fragment opened the element the mask spelled
+    "prepend": (
+        safe_text,
+        ("<identifier><ns:A><ns:X>", "<family>Smith</ns:Q>"),
+        "zqxdoe</family></ns:X></ns:A></identifier>",
+    ),
+    "prepend-redact": (
+        redact,
+        ("<identifier><ns:A><ns:X>", "<family>Smith</ns:Q>"),
+        "zqxdoe</family></ns:X></ns:A></identifier>",
+    ),
+    # a kept end tag closed the earlier fragment's `<b>`, so the masked tag stood in an element
+    # that is not a leaf: a rule refusing a masked-looking tag only in a leaf misses this
+    "prepend-past-the-leaf": (
+        safe_text,
+        ("<identifier><ns:A><ns:X><telecom><b>", "<family>Smith</b>x</ns:Q>"),
+        "zqxdoe</family></telecom></ns:X></ns:A></identifier>",
     ),
 }
 
 
 @pytest.mark.parametrize(
-    ("first", "a", "glued"), list(_QNAME_COLLISIONS.values()), ids=list(_QNAME_COLLISIONS)
+    ("first", "parts", "glued"), list(_QNAME_COLLISIONS.values()), ids=list(_QNAME_COLLISIONS)
 )
-def test_a_stray_end_tag_mask_never_spells_a_start_tags_name(
-    first: Callable[[str], str], a: str, glued: str
+def test_text_glued_after_a_stray_end_tag_stays_hidden(
+    first: Callable[[str], str], parts: tuple[str, ...], glued: str
 ) -> None:
+    """PR 3387: each case printed ``zqxdoe`` while the name mask had no collision refusal, and the
+    three prepend cases still did once it refused a collision only in its own text."""
     assert _BOUND_NOTE  # the premise: a real bound note
+
+    def joined() -> str:
+        return redact("".join(first(part) for part in parts) + glued)
+
     with _main():
-        assert "zqxdoe" not in redact(first(a) + glued)  # the premise: main's answer hid it
-    assert "zqxdoe" not in redact(first(a) + glued)
-    assert first(first(a)) == first(a)
+        assert "zqxdoe" not in joined()  # the premise: main's answer hid it
+    assert "zqxdoe" not in joined()
+    for part in parts:
+        assert first(first(part)) == first(part)
 
 
-class _NoNames:
-    """A start-tag name set that holds nothing: the mask without its collision refusal."""
-
-    def __init__(self, text: str) -> None:
-        pass
-
-    def opened_before(self, qname: str, pos: int) -> bool:
-        return False
-
-    def any_starting_with(self, head: str) -> bool:
-        return False
+#: ``id: (the stray tag as the last fragment's answer has it, the mask PR 3387's name mask wrote
+#: there before it refused a collision)``, where it was not ``</ns:Q`` masked to ``</ns:X``.
+_MASKED_AS = {"glue-head": ("</ns:Kim", "</ns:Xxm"), "glued-completion": ("</ns:Abc", "</ns:Xxx")}
 
 
 @pytest.mark.parametrize(
-    ("first", "a", "glued"), list(_QNAME_COLLISIONS.values()), ids=list(_QNAME_COLLISIONS)
+    ("case", "first", "parts", "glued"),
+    [(case, *spec) for case, spec in _QNAME_COLLISIONS.items()],
+    ids=list(_QNAME_COLLISIONS),
 )
-def test_the_collision_refusal_is_what_hides_the_glued_value(
-    first: Callable[[str], str], a: str, glued: str
+def test_a_stray_end_tag_name_masked_in_place_prints_the_glued_value(
+    case: str, first: Callable[[str], str], parts: tuple[str, ...], glued: str
 ) -> None:
-    """THE POSITIVE CONTROL: with the refusal off, the mask spells the element's name again and the
-    glued value prints, so the test above fails for the reason it names."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "_StartTagNames", _NoNames)
-        assert "zqxdoe" in redact(first(a) + glued)
+    """THE POSITIVE CONTROL: with the last fragment's stray tag masked in place, as the dropped
+    mask wrote it before it refused a collision, the glued value prints, so the test above fails
+    for the reason it names. Its last form refused all but the three prepend cases."""
+    stray, masked = _MASKED_AS.get(case, ("</ns:Q", "</ns:X"))
+    answers = [first(part) for part in parts]
+    assert answers[-1].count(stray) == 1, answers[-1]  # the premise: the answer kept the name
+    answers[-1] = answers[-1].replace(stray, masked)
+    assert "zqxdoe" in redact("".join(answers) + glued)
+
+
+_WINDOW_CUT_TAG = "<family>Smith</ns:zqxdoe"
+_WINDOW_CUT = "w " * ((65536 - len(_WINDOW_CUT_TAG) - 1) // 2) + _WINDOW_CUT_TAG + " " + "q " * 5000
 
 
 @pytest.mark.parametrize(
-    "text",
-    [
-        "<family>Smith</ns:Zqxdoe></family><ns:Xxxxxx>",  # opened after the tag
-        "<family>Smith</ns:Zqxdoe ></family><ns:Xxxxxx>",
-    ],
+    ("text", "name"),
+    [(_WINDOW_CUT, "</ns:zqxdoe"), ("<family>Smith</ns:ZqMSH" + _BOUND_NOTE, "</ns:ZqMSH")],
+    ids=["the-window-cut-leaves-it-last", "behind-a-bound-note"],
 )
-def test_a_start_tag_after_the_stray_tag_does_not_refuse_its_mask(text: str) -> None:
-    """Code review of this repair: an end tag cannot close an element that opens after it in any
-    reading, so a start tag spelling the mask after it leaves the mask in place."""
-    assert "Zqxdoe" not in redact(text)
+def test_a_stray_end_tag_name_on_a_bounded_route_is_kept_as_main_kept_it(
+    text: str, name: str
+) -> None:
+    """The residual above holds where a bound note follows the name too: the 64 KiB cut leaving
+    it last, and a note already in the text."""
+    head, note = redaction.safe_text_bound(_WINDOW_CUT)
+    assert note and head.rstrip().endswith(_WINDOW_CUT_TAG)  # the premise: the cut leaves it last
+    assert _BOUND_NOTE  # the premise: a real bound note
+    assert text == _WINDOW_CUT or text.endswith(_BOUND_NOTE)
+    with _main():
+        main = safe_text(text, limit=10**6)
+        main_redact = redact(text)
+    assert name in main and name in main_redact  # the premise: main kept the name
+    assert safe_text(text, limit=10**6) == main
+    assert redact(text) == main_redact
