@@ -18,7 +18,7 @@ and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_re
 transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph.
 The cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
-no store module is imported. All disk + crypto + split work runs **off the event loop**
+no store module beyond the two pure ones above is imported. All disk + crypto + split work runs **off the event loop**
 (``asyncio.to_thread``).
 
 **PHI.** An uploaded file is real HL7 PHI at rest. Bodies are never logged at INFO+; every access is
@@ -4343,8 +4343,11 @@ class UploadStore:
         and that check, which a root that flaps back as a folder in that gap passes too. Any other
         pin error raises with nothing removed, and :meth:`prune_expired` logs it, so at least a
         drive letter that is no longer mapped, and a linked root whose target is lost, are not a
-        clean pass while they stay lost; :func:`_root_never_made` names what still is. Once the pin
-        has succeeded, every listing error raises, absence included. A temp or body goes only
+        clean pass while they stay lost. At least these still are: the roots
+        :func:`_root_never_made` names, and a lost root whose pin still answers, such as a root that
+        is itself a POSIX mount point whose share dropped, whose empty listing is a pass that
+        removes nothing and logs nothing. Once the pin has succeeded, every listing error raises,
+        absence included. A temp or body goes only
         once it is past the floor and the root still answers with the identity the pin read before
         the listing, checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a
         body the listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just

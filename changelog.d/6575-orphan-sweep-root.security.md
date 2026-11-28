@@ -7,5 +7,5 @@
   remounted under the root as another folder stops the sweep with a logged error. Some lost roots
   still read as a clean pass, at least a root deleted after its first save, one under a POSIX
   mount point whose share dropped, and one that is itself a mount point whose share dropped. The
-  limits of the root check are stated once, in the docstring of `UploadStore._sweep_orphans_sync`
-  in `messagefoundry/uploads.py` (BACKLOG #6575).
+  root check's other limits are stated in the docstring of `UploadStore._sweep_orphans_sync` in
+  `messagefoundry/uploads.py` (BACKLOG #6575).
