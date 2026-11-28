@@ -38,6 +38,7 @@ bootstrap-admin.txt
 *.pem
 *.pem.replaced
 *.pem.prior
+*.pem.renewing
 *.pfx
 secrets/
 

@@ -71,6 +71,10 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     "secrets/": ("secrets/**", "**/secrets/**"),
     "*.key": ("*.key",),
     "*.pem": ("*.pem",),
+    # The generated TLS pair's kept, prior and staged siblings beside the store (BACKLOG #5973).
+    "*.pem.replaced": ("*.pem.replaced",),
+    "*.pem.prior": ("*.pem.prior",),
+    "*.pem.renewing": ("*.pem.renewing",),
     "*.pfx": ("*.pfx",),
     "*.db": ("*.db",),
     "*.db-wal": ("*.db-wal",),

@@ -25,7 +25,12 @@ _PROBES = [
     "api-generated-key.pem.replaced",
     "api-generated-cert.pem.replaced",
     "api-generated-cert.pem.prior",
+    "api-generated-key.pem.renewing",
+    "api-generated-cert.pem.renewing",
 ]
+
+#: A name no ignore line matches, so the probe above can answer non-zero here.
+_CONTROL = "api-generated-key.pem.unignored-control"
 
 
 @pytest.mark.parametrize("probe", _PROBES)
@@ -37,3 +42,15 @@ def test_a_generated_pair_sibling_at_the_repo_root_is_ignored(probe: str) -> Non
         check=False,
     )
     assert result.returncode == 0, f"{probe} at the repo root is not ignored by .gitignore"
+
+
+def test_a_name_no_ignore_line_matches_is_not_ignored() -> None:
+    """The control: the same probe answers 1 for a sibling no rule matches, so a pass above is the
+    rules' doing, not a probe that always answers 0."""
+    result = subprocess.run(  # nosec B603 B607 -- fixed git argv, no shell
+        ["git", "check-ignore", "-q", "--no-index", _CONTROL],
+        cwd=_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stderr
