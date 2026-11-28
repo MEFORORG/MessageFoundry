@@ -1091,7 +1091,7 @@ def test_a_posix_mount_refusal_names_no_role_its_caller_does_not_hold() -> None:
     )
 
 
-@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "fuse", "fuse.fuse-overlayfs"])
+@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "fuse.fuse-overlayfs"])
 def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
     """A sandbox whose ``/`` is a 9p or virtiofs share would otherwise refuse every key file; a
     delegated mount below ``/`` on the same path is still refused. A network root is the next
@@ -1102,7 +1102,11 @@ def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "fstype", ["nfs", "nfs4", "cifs", "smb3", "ceph", "glusterfs", "gfs2", "ocfs2", "drvfs"]
+    "fstype",
+    [
+        *("nfs", "nfs4", "cifs", "smb3", "ceph", "glusterfs", "gfs2", "ocfs2", "drvfs"),
+        *("fuse", "fuse.sshfs", "fuse.s3fs"),
+    ],
 )
 def test_a_posix_root_mount_of_a_type_no_sandbox_gives_is_refused(fstype: str) -> None:
     """Vault BACKLOG #5636 step 4: the ``/`` exemption, meant for a sandbox's 9p or virtiofs root,
@@ -1184,6 +1188,61 @@ def test_a_posix_mount_table_answering_none_judges_no_type() -> None:
         mounts_fn=lambda: None,
     )
     assert problem is None
+
+
+def test_a_posix_walk_through_an_automount_point_and_back_is_not_unchecked() -> None:
+    """A path that passes an automount point only to climb back out with ``..`` does not end on it,
+    so that point decides nothing; the same key named without the detour passes too."""
+    tree = {**_KEY_TREE, "/private/auto": _ROOT_DIR}
+    table = [("/", "ext4"), ("/private/auto", "autofs")]
+    assert _posix_link("/private/auto/../tmp/keys/k.key", tree, {}, table) is None
+    assert _posix_link("/private/tmp/keys/k.key", tree, {}, table) is None
+
+
+def test_a_posix_walk_run_again_keeps_the_first_walks_finding() -> None:
+    """Where the two tables differ, the path is walked again, and a finding the first walk made is
+    kept: here a folder a group may write, holding a link, is unmounted between the two reads, so
+    the second walk reads the clean folder beneath it."""
+    state = {"mounted": True}
+    tree = {**_KEY_TREE, "/srv": _ROOT_DIR, "/srv/m/link": (0, stat.S_IFLNK | 0o777)}
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part == "/srv/m":
+            return PosixStat(0, stat.S_IFDIR | (0o775 if state["mounted"] else 0o755))
+        return PosixStat(*tree[part]) if part in tree else PosixStat(*_key_tree_entry(part))
+
+    reads = [[("/", "ext4"), ("/srv/m", "ext4")], [("/", "ext4")]]
+
+    def mounts_fn() -> list[tuple[str, str]]:
+        state["mounted"] = len(reads) == 2  # unmounted between the walk and the second read
+        return reads.pop(0)
+
+    problem = restricted_file._posix_link_problem(
+        "/srv/m/link/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn={"/srv/m/link": "/private/tmp/keys"}.__getitem__,
+        mounts_fn=mounts_fn,
+    )
+    assert problem is not None and "a folder holding or above a junction or link" in problem
+
+
+@pytest.mark.parametrize("unread_first", [True, False])
+def test_a_posix_mount_table_read_only_once_of_twice_is_unchecked(unread_first: bool) -> None:
+    """Where one of the two reads of the table fails, the walk could not be checked against both,
+    so a path that is otherwise clean is answered as not fully checked."""
+    reads = [None, [("/", "ext4")]] if unread_first else [[("/", "ext4")], None]
+    problem = restricted_file._posix_link_problem(
+        "/private/tmp/keys/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lambda part: PosixStat(*_key_tree_entry(part)),
+        readlink_fn=lambda _part: "",
+        mounts_fn=lambda: reads.pop(0),
+    )
+    assert isinstance(problem, restricted_file.UncheckedProblem)
+    assert problem == restricted_file.MOUNT_TABLE_UNREAD
 
 
 def test_a_posix_link_finding_is_answered_before_an_unchecked_mount_table() -> None:
