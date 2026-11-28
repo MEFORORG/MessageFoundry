@@ -126,7 +126,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.base import sealed_read_errors, store_connect_errors
 from messagefoundry.store.crypto import Cipher
-from messagefoundry.store.row_seal import probe_row_sealer_at_start, shutdown_transit_pools
+from messagefoundry.store.row_seal import TransitPoolLease, probe_row_sealer_at_start
 from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
@@ -653,6 +653,8 @@ class Engine:
         owned_settings: Sequence[object] = (),
     ) -> None:
         self.store = store
+        # This engine's hold on the process-wide Transit pools, released by stop (BACKLOG #3929).
+        self._transit_pool_lease = TransitPoolLease()
         # Settings models this engine is not otherwise handed ([auth], [security], [tls], ...), read
         # only for the directories they name, which the `.processed` archive sweep must never reach
         # (BACKLOG #1188, engine_owned_dirs).
@@ -4546,20 +4548,18 @@ class Engine:
             else:
                 log.exception("the store close failed after an engine stop step failed")
         try:
-            # After the store close, so no store call is still handing work to them (BACKLOG #3929).
-            # The wait is bounded; a bulk walk still running past it keeps its thread, and the
-            # process exit waits for it.
-            drained = await shutdown_transit_pools(
-                budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0)
-            )
-            if not drained:
+            # After the store close (BACKLOG #3929). The pools are shut only when this engine held
+            # the last lease. The wait is bounded, and skipped on a stop already cancelled; a call
+            # still running past it keeps its thread, and the process exit waits for it.
+            drain = 0.0 if cancelled else budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0)
+            if not await self._transit_pool_lease.release(drain):
                 log.warning(
                     "Transit calls were still running when the engine stopped; the process exit "
-                    "waits for them, and for any queued behind them, to finish"
+                    "waits for them to finish"
                 )
         except asyncio.CancelledError:
             cancelled = True
-        except Exception:  # noqa: BLE001 - logged; the stop's own result must not be lost to it
+        except RuntimeError:  # a join thread that could not start; logged, the stop goes on
             log.exception("the Transit call pools did not shut down cleanly")
         cancelled = cancelled or (me is not None and me.cancelling() > baseline)
         if failure is not None and not isinstance(failure, Exception):

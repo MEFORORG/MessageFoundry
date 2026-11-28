@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import contextlib
 import contextvars
 import functools
 import hashlib
@@ -567,7 +566,7 @@ _UNVERIFIABLE: Final = "unverifiable"
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
 TRANSIT_SEAL_WORKERS: Final = 8
-#: The name every thread of the seal pool's name starts with.
+#: The prefix every seal pool thread's name starts with.
 TRANSIT_SEAL_THREAD_PREFIX: Final = "mefor-transit-seal"
 #: The bulk pool's size when ``[store].transit_bulk_workers`` is not set (BACKLOG #3929). A
 #: judgement, not a measurement: small, so concurrent bulk walks cannot hold many Vault round trips
@@ -575,7 +574,7 @@ TRANSIT_SEAL_THREAD_PREFIX: Final = "mefor-transit-seal"
 TRANSIT_BULK_WORKERS_DEFAULT: Final = 2
 #: The largest bulk pool size the setting accepts.
 TRANSIT_BULK_WORKERS_MAX: Final = 64
-#: The name every thread of the bulk pool's name starts with.
+#: The prefix every bulk pool thread's name starts with.
 TRANSIT_BULK_THREAD_PREFIX: Final = "mefor-transit-bulk"
 
 
@@ -659,8 +658,10 @@ def _join_in_own_thread(pool: ThreadPoolExecutor) -> asyncio.Event:
 
     def join() -> None:
         pool.shutdown(wait=True)
-        with contextlib.suppress(RuntimeError):  # the loop closed first: nobody waits any more
+        try:
             loop.call_soon_threadsafe(ended.set)
+        except RuntimeError as exc:  # the loop closed first, so nobody waits for this any more
+            log.info("a Transit pool ended after its event loop closed: %s", exc)
 
     threading.Thread(target=join, name="mefor-transit-pool-join", daemon=True).start()
     return ended
@@ -670,16 +671,19 @@ async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     """Shut down the seal pool and the bulk pool; each is built again on its next use. Returns
     whether every call they held finished within ``timeout`` seconds (None waits for them all).
 
-    Neither pool takes a new call once detached here, and each still runs the calls it already
-    holds, queued ones included. A bulk call can make many round trips, each bounded only by the
-    Vault client's own timeout, so the wait for them is bounded here, never the calls: one still
-    running past ``timeout`` keeps its thread, and interpreter exit waits for it. The wait runs in
-    a thread of its own per pool, so the event loop keeps serving. A call handed to a pool while the detach runs
-    can be refused, which reads as an outage
-    (:class:`~messagefoundry.store.crypto.CipherUnavailableError`); a later one gets a new pool."""
+    Neither pool takes a new call once detached here. A call queued and not yet started is
+    cancelled, so it never runs after its store closed, and its caller gets
+    :class:`asyncio.CancelledError`. A call already running finishes: a bulk call can make many
+    round trips, each bounded only by the Vault client's own timeout, so the wait for them is
+    bounded here, never the calls. One still running past ``timeout`` keeps its thread, and
+    interpreter exit waits for it. The wait runs in a thread of its own per pool, so the event
+    loop keeps serving. A call handed to a pool while the detach runs can be refused, which reads
+    as an outage (:class:`~messagefoundry.store.crypto.CipherUnavailableError`); a later one gets a
+    new pool. A process with more than one user of the pools releases them through
+    :class:`TransitPoolLease` instead, so the last user's release is the one that shuts them."""
     pools = [pool for pool in (_SEAL_POOL.detach(), _BULK_POOL.detach()) if pool is not None]
     for pool in pools:
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=False, cancel_futures=True)
     if not pools:
         return True
     # Drained at once, so the wait is for the slower pool, not for the sum of both.
@@ -691,6 +695,35 @@ async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     except TimeoutError:
         return False
     return True
+
+
+_leases_lock: Final = threading.Lock()
+_leases = 0
+
+
+class TransitPoolLease:
+    """One user's hold on the process-wide Transit pools, such as an engine and its store
+    (BACKLOG #3929). The pools are shut down only when the last lease is released, so one user's
+    stop never detaches pools another user's calls still run on."""
+
+    def __init__(self) -> None:
+        global _leases
+        with _leases_lock:
+            _leases += 1
+        self._held = True
+
+    async def release(self, timeout: float | None = None) -> bool:
+        """Release this lease, once; later calls do nothing. Where it was the last, shut the
+        pools down as :func:`shutdown_transit_pools` does and return what it returns; else True,
+        since nothing was waited for."""
+        global _leases
+        with _leases_lock:
+            if not self._held:
+                return True
+            self._held = False
+            _leases -= 1
+            last = _leases == 0
+        return await shutdown_transit_pools(timeout) if last else True
 
 
 async def _in_pool[**P, T](

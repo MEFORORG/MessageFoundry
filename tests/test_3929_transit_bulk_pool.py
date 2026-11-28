@@ -312,17 +312,22 @@ async def test_a_bounded_shutdown_leaves_a_running_walk_to_finish() -> None:
     assert await shutdown_transit_pools(0.05) is True  # nothing left to wait for
 
 
+async def _engine(path: Path) -> Any:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    return await Engine.create(path, egress_settings=EgressSettings(deny_by_default=False))
+
+
 async def test_the_engine_stop_shuts_the_pools_down_after_the_store_closes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline import engine as engine_module
-    from messagefoundry.pipeline.engine import Engine
 
+    # Engines another test left unstopped hold leases of their own; this one must be the last.
+    monkeypatch.setattr(row_seal, "_leases", 0)
     order: list[str] = []
-    eng = await Engine.create(
-        tmp_path / "s.db", egress_settings=EgressSettings(deny_by_default=False)
-    )
+    eng = await _engine(tmp_path / "s.db")
     real_close = eng.store.close
 
     async def close() -> None:
@@ -334,7 +339,7 @@ async def test_the_engine_stop_shuts_the_pools_down_after_the_store_closes(
         return False
 
     monkeypatch.setattr(eng.store, "close", close)
-    monkeypatch.setattr(engine_module, "shutdown_transit_pools", shutdown)
+    monkeypatch.setattr(row_seal, "shutdown_transit_pools", shutdown)
     try:
         await eng.stop()
     finally:
@@ -344,3 +349,70 @@ async def test_the_engine_stop_shuts_the_pools_down_after_the_store_closes(
         "store closed",
         f"pools shut down within {engine_module._TRANSIT_POOL_DRAIN_SECONDS}",
     ]
+    await eng.stop()  # a second stop releases nothing more
+    assert row_seal._leases == 0
+
+
+async def test_one_engine_stop_leaves_the_pools_another_engine_still_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two engines in one process share the seal pool. One stopping must not detach it: before
+    the leases, it did, the other engine's next calls built a second pool, and more Transit calls
+    than ``TRANSIT_SEAL_WORKERS`` ran at once."""
+    monkeypatch.setattr(row_seal, "_leases", 0, raising=False)
+    first = await _engine(tmp_path / "a.db")
+    second = await _engine(tmp_path / "b.db")
+    gate = _Gate()
+    cipher = _HeldTransitCipher(gate)
+    held = [
+        asyncio.create_task(row_seal.cipher_call(cipher, gate.hold))
+        for _ in range(TRANSIT_SEAL_WORKERS)
+    ]
+    later: list[asyncio.Task[None]] = []
+    try:
+        await gate.until_running(TRANSIT_SEAL_WORKERS)
+        pool = row_seal._transit_pool()
+        await first.stop()
+        assert row_seal._transit_pool() is pool, "the stop detached a pool still in use"
+        later = [asyncio.create_task(row_seal.cipher_call(cipher, gate.hold)) for _ in range(4)]
+        await asyncio.sleep(0.3)  # time for a second pool, were there one, to start them
+        assert gate.running == TRANSIT_SEAL_WORKERS
+    finally:
+        gate.release.set()
+        await asyncio.gather(*held, *later)
+        await second.stop()
+    assert gate.peak == TRANSIT_SEAL_WORKERS
+
+
+async def test_a_lease_shuts_the_pools_only_when_the_last_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    one, two = row_seal.TransitPoolLease(), row_seal.TransitPoolLease()
+    pool = row_seal._transit_bulk_pool()
+    assert await one.release(1.0) is True
+    assert await one.release(1.0) is True  # released once only
+    assert row_seal._transit_bulk_pool() is pool
+    assert await two.release(1.0) is True
+    with pytest.raises(RuntimeError):
+        pool.submit(int)  # the last release shut it
+    assert row_seal._leases == 0
+
+
+async def test_a_queued_call_is_cancelled_at_shutdown_and_never_runs() -> None:
+    configure_transit_bulk_workers(1)
+    gate = _Gate()
+    cipher = _HeldTransitCipher(gate)
+    ran: list[str] = []
+    running = asyncio.create_task(cipher_bulk_call(cipher, gate.hold))
+    await gate.until_running(1)
+    queued = asyncio.create_task(cipher_bulk_call(cipher, ran.append, "queued"))
+    await asyncio.sleep(0.05)
+    try:
+        assert await shutdown_transit_pools(0.05) is False  # the running call is still held
+    finally:
+        gate.release.set()
+    await running
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    assert ran == []

@@ -9,7 +9,8 @@
   `[store].transit_bulk_workers` (`MEFOR_STORE_TRANSIT_BULK_WORKERS`), default `2`, from `1` to
   `64`; any other value is refused when the settings load. The default is a judgement, not a
   measurement. Past that bound a bulk walk waits behind the others, with no deadline, so at most
-  that many run at once where up to 8 could before. The engine stop now shuts both pools down
-  after the store closes, waiting off the event loop up to 2 seconds, within its stop budget, for
-  calls still running, then leaving them to finish. Nothing changes under `aesgcm`. See
+  that many run at once where up to 8 could before. When the last engine in the process
+  stops, it now shuts both pools down after its store closes: queued calls are cancelled, and it
+  waits off the event loop up to 2 seconds, or what is left of its stop budget, for calls still
+  running, then leaves them to finish. Nothing changes under `aesgcm`. See
   [CONFIGURATION.md](../docs/CONFIGURATION.md). (`BACKLOG #3929`)
