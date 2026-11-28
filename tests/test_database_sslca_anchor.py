@@ -43,6 +43,7 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.store import MessageStore
 from messagefoundry.transports import database
 from messagefoundry.transports.database import _build_odbc_dsn, generic_odbc_param
+from tests._encrypted_pem_probe import PRIVATE_KEY_LABELS
 from tests.test_foreign_tls_ca_encryption_header import _certificate, _headered
 from tests.test_trust_anchors import _block, _path_ok
 
@@ -290,14 +291,16 @@ async def test_a_swapped_sslca_with_an_encryption_header_is_refused_at_the_next_
     assert rows[1]["previous"] == before
 
 
+@pytest.mark.parametrize("label", PRIVATE_KEY_LABELS)
 async def test_a_swapped_sslca_with_a_private_key_is_refused_at_the_next_check(
-    store: MessageStore, tmp_path: Path, judged: None
+    store: MessageStore, tmp_path: Path, judged: None, label: str
 ) -> None:
+    """BACKLOG #3745, once for each label its step 2 names: a key block swapped into a checked
+    ``sslca`` refuses the lane's next check."""
     ca = _ca(tmp_path)
     settings = _settings(ca)
     check = ta.make_lane_anchor_check(store, enforcing=True)
     await check("outbound", _OUT, settings)
-    label = "PRIVATE" + " KEY"  # split, so a secret scanner does not read a real key
     ca.write_bytes(
         _block(b"db-ca") + f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n".encode()
     )

@@ -19,6 +19,7 @@ import pytest
 from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, PRIVATE_KEY_SCOPE
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
+from tests._encrypted_pem_probe import PRIVATE_KEY_LABELS
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 # requests and urllib3 come with the [vault] extra, and strict_requests imports both. So they are
@@ -153,12 +154,13 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
 
 
 @pytest.mark.parametrize("proxied", [True, False], ids=["through an https proxy", "direct"])
-@pytest.mark.parametrize("label", ["PRIVATE" + " KEY", "ENCRYPTED PRIVATE" + " KEY"])
+@pytest.mark.parametrize("label", PRIVATE_KEY_LABELS)
 def test_ca_text_with_a_private_key_is_refused_before_any_tls_load(
     proxied: bool, label: str
 ) -> None:
-    """BACKLOG #3745. Red with the private-key check removed from ``_refuse_encrypted_ca_text``:
-    the key block has no encryption header, so nothing else refuses it. The key block's own body
+    """BACKLOG #3745, once for each label its step 2 names. Red with the private-key check removed
+    from ``_refuse_encrypted_ca_text``: the key block has no encryption header, so nothing else
+    refuses it. The key block's own body
     is a marker too, so a refusal that echoed the key is red (vault BACKLOG #4569 finding 6)."""
     text = _PLAIN + f"-----BEGIN {label}-----\nSYNTHETICKEYBODYMARKER\n-----END {label}-----\n"
     made, factory = _contexts(_NoTlsLoad)
