@@ -721,6 +721,46 @@ def test_closing_step_4_an_entry_the_probe_cannot_read_takes_the_full_walk(
     assert database._capath_entry_clear(r"C:\capath\a.0", "a.0") is False
 
 
+@pytest.mark.parametrize("name", ["NUL", "com1.0", "Aux .pem"])
+def test_pr2815_item_15_a_device_named_entry_takes_the_full_walk(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """PR 2815 item 15. The one-lstat shortcut read the walk's name rules from its own copy, so
+    the device-name rule the walk gained (vault BACKLOG #5515) did not reach it: the probe read
+    ``NUL`` as the device, a plain file, and cleared an entry the walk refuses once the folder
+    is reached through a link. It now reads the walk's own rules (``walk_name_cause``). Red under
+    origin/main's copy: the shortcut cleared it with no full walk."""
+    walked: list[str] = []
+    monkeypatch.setattr(database, "_win_probe", lambda _p: (FILE, None))
+
+    def verdict(path: str) -> bool | None:
+        walked.append(path)
+        return None
+
+    monkeypatch.setattr(database, "_path_verdict", verdict)
+    assert database._capath_entry_clear(rf"C:\capath\{name}", name) is False
+    assert walked == [rf"C:\capath\{name}"]
+
+
+@pytest.mark.parametrize("folder", [r"C:\certs\NUL", r"C:\certs\nul\\", r"C:\certs\com1.d"])
+def test_an_sslcapath_folder_named_like_a_device_is_refused_unlisted(
+    monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """The folder's own walk read its last name as the device, since that is where the walk ends,
+    but the driver passes through the folder to ``<hash>.0``. Measured on Windows 10.0.26300 (the
+    #5515 review): a junction named ``NUL`` walked clear, and only a listing failure refused it.
+    Red under origin/main: the folder was listed, and its entries cleared it."""
+    listed: list[str] = []
+
+    def scandir(path: str) -> Any:
+        listed.append(path)
+        raise AssertionError("a device-named folder must not be listed")
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    assert database._capath_folder_clear(folder) is False
+    assert listed == []
+
+
 def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -622,6 +622,38 @@ def test_the_dos_device_names_are_cpythons() -> None:
     assert ntpath._reserved_names == ap._DOS_DEVICE_NAMES  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("path", [r"C:\keys\NUL", r"C:\keys\com1.d", r"NUL"])
+def test_a_last_name_the_open_passes_through_is_judged_as_a_folder(path: str) -> None:
+    """Vault BACKLOG #5197, on the #5515 rule. A caller that walks the folder holding a file, or a
+    folder whose entries a driver opens, says the open passes through the last name
+    (``last_is_folder``), and the walk refuses a device name there. Its control is the same path
+    as a file the open reads, which the walk still walks. Red under: each caller copying the rule
+    for its own last name, which the ODBC ``sslcapath`` folder walk had not."""
+    _chain, cause = windows_chain(path, "C:\\cwd", _probe(), last_is_folder=True)
+    assert cause is not None and cause.kind == _DEVICE_NAME_KIND
+    _chain, cause = windows_chain(path, "C:\\cwd", _probe())
+    assert cause is None
+
+
+def test_a_share_folder_named_like_a_device_is_still_a_share() -> None:
+    """Win32 applies no device-name rule to a share path, and the walk stops at the share before
+    any name, so a key folder ``\\\\host\\share\\NUL`` reads as a share, not a device name."""
+    _chain, cause = windows_chain(
+        r"\\files.test\share\NUL", "C:\\cwd", _probe(), last_is_folder=True
+    )
+    assert cause is not None and cause.kind == ap.SHARE_CAUSE
+
+
+def test_walk_name_cause_is_the_walks_name_rule() -> None:
+    """The one copy of the walk's name rules, which the ODBC entry shortcut reads too."""
+    assert ap.walk_name_cause("ca.pem", r"C:\x\ca.pem", device=True) is None
+    assert ap.walk_name_cause("ca.pem:s", r"C:\x\ca.pem:s", device=False) is not None
+    assert ap.walk_name_cause("ca.pem.", r"C:\x\ca.pem.", device=False) is not None
+    assert ap.walk_name_cause("NUL", r"C:\x\NUL", device=False) is None
+    cause = ap.walk_name_cause("NUL", r"C:\x\NUL", device=True)
+    assert cause is not None and cause.kind == _DEVICE_NAME_KIND
+
+
 @pytest.mark.parametrize("target", [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem"])
 def test_a_link_to_a_prefixed_dos_device_name_is_not_walked(target: str) -> None:
     """A prefixed link target holding a device name is refused as the device path it is."""

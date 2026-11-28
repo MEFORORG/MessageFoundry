@@ -54,6 +54,7 @@ import contextlib
 import errno
 import json
 import logging
+import ntpath
 import os
 import re
 import sys
@@ -75,6 +76,7 @@ from messagefoundry.auth.anchor_path import (
     WinProbe,
     _win_probe,
     query_drive_target,
+    walk_name_cause,
     windows_chain,
 )
 from messagefoundry.auth.trust_anchors import (
@@ -1306,7 +1308,15 @@ def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
 def _capath_folder_clear(folder: str) -> bool:
     """Whether no entry of ``folder`` leads off the host or is a path the walk cannot clear, for
     :func:`_capath_entries_leave_host`. A reason it is not is logged as the walk logs one
-    (:func:`_not_cleared`)."""
+    (:func:`_not_cleared`).
+
+    A folder whose own last name is a DOS device name is refused unlisted: the folder's walk read
+    that name as the device, the caller's own last name, where the driver passes through it to an
+    entry (``anchor_path.walk_name_cause``; vault BACKLOG #5515, #5197)."""
+    name_cause = walk_name_cause(ntpath.basename(ntpath.normpath(folder)), folder, device=True)
+    if name_cause is not None:
+        _not_cleared(name_cause.kind, name_cause)
+        return False
     try:
         # Not found and not a folder are tolerated at the open only. Raised while the folder is
         # listed, they leave part of it unjudged, so they refuse below as any listing error does.
@@ -1353,9 +1363,11 @@ def _capath_entry_clear(path: str, name: str) -> bool:
     is clear. An entry the probe reads as a plain file or folder is: the walk of its full path
     would pass the folder's own chain, then end at this probe with no cause. Anything else takes
     that full walk (:func:`_path_verdict`): a link, an entry the probe cannot read, and a name the
-    walk ends on (a stream, or a trailing space or dot). So one ``lstat`` judges a plain entry,
-    not a walk from the volume root, and no entry the walk would refuse is cleared."""
-    if ":" not in name and not name.endswith((" ", ".")):
+    walk may end on, by the walk's own name rules (``anchor_path.walk_name_cause``: a stream, a
+    trailing space or dot, or a DOS device name, which the walk refuses after a link). So one
+    ``lstat`` judges a plain entry, not a walk from the volume root, and no entry the walk would
+    refuse is cleared."""
+    if walk_name_cause(name, path, device=True) is None:
         try:
             kind, _target = _win_probe(path)
         except OSError as exc:

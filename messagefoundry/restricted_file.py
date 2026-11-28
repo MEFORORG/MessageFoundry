@@ -63,7 +63,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from messagefoundry.auth.anchor_path import (
-    _DEVICE_NAME,
     _DEVICE_PATH,
     _GRANTING_ACE_TYPES,
     _SHARED_SERVICE_SIDS,
@@ -81,7 +80,6 @@ from messagefoundry.auth.anchor_path import (
     WinSecurity,
     WinTrust,
     _drive_relative,
-    _is_dos_device_name,
     _strip_win_prefix,
     _win_probe,
     describe_sid,
@@ -863,10 +861,9 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     # not refused by the walk. The device-prefix guard above still refuses one, since it reads every
     # name (an over-refusal for the last name, which only the open reads).
     walked = full if full.parent == full else full.parent
-    if walked != full and _is_dos_device_name(walked.name):
-        # The walk reads its own last name by its Win32 text, which opens the device, where the
-        # open passes through a folder of that name (vault BACKLOG #5515).
-        return _windows_cause_problem(WalkCause.plain(_DEVICE_NAME))
+    # The open passes through the walk's last name as a folder, so a DOS device name there, which
+    # the walk would read as the device, is refused (vault BACKLOG #5515).
+    through = walked != full
     substituted: list[str] = []
     remote: list[str] = []
 
@@ -891,7 +888,12 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
         return None
 
     chain, cause = windows_chain(
-        str(walked), os.getcwd, _win_probe, volume_cause=volume_cause, drive_target=drive_target
+        str(walked),
+        os.getcwd,
+        _win_probe,
+        volume_cause=volume_cause,
+        drive_target=drive_target,
+        last_is_folder=through,
     )
     if remote:  # the volume cause above ends the walk, so this is the cause it answered
         cause = WalkCause.plain(SHARE_CAUSE)
@@ -909,7 +911,11 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
             # Before drive types were read, a mapped drive was walked as a local volume and the
             # junctions and links met on it were judged by the link rule. That walk is kept.
             local_chain, local_cause = windows_chain(
-                str(walked), os.getcwd, _win_probe, drive_target=host.drive_target
+                str(walked),
+                os.getcwd,
+                _win_probe,
+                drive_target=host.drive_target,
+                last_is_folder=through,
             )
             problem = _windows_cause_problem(local_cause)
             if problem is None:
