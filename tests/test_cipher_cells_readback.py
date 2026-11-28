@@ -1723,43 +1723,39 @@ def test_the_server_audit_itself_records_what_the_catalog_hid(
     assert audit.key_mismatch is not None and source.limits == {}
 
 
-def test_a_server_audit_stopped_part_way_keeps_what_the_catalog_hid(
+def test_a_server_audit_stopped_by_an_outage_keeps_what_the_catalog_hid(
     tmp_path: Path,
     _template: tuple[Path, StoreSettings],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A key-service outage part way raises, and the audit filled in place still holds the hidden
-    cell, since it is recorded before any value is read."""
+    """A key-service outage at the walk's first decrypt raises, and the audit filled in place
+    still holds the hidden cell, since it is recorded before any value is read. Control: with
+    nothing hidden, the same stop leaves the list empty."""
     db, _settings = _copy(_template, tmp_path)
 
     class _Down:
         encrypts = True
+        calls = 0
 
         def is_encrypted(self, stored: str) -> bool:
             return stored.startswith(MARKER_PREFIX)
 
         def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            self.calls += 1
             try:
                 raise ConnectionRefusedError("synthetic outage")
             except OSError as exc:
                 raise CipherError("Transit decrypt failed") from exc
 
-    _hide_from_catalog(monkeypatch, "search_presets")
-    found = CipherAudit()
-    conn = connect_readonly(db, busy_timeout=5.0)
-    try:
+    for hide, expected in ((False, []), (True, ["search_presets.criteria"])):
+        if hide:
+            _hide_from_catalog(monkeypatch, "search_presets")
+        down, found = _Down(), CipherAudit()
         with pytest.raises(CipherError):
-            asyncio.run(
-                audit_server_cipher_cells(
-                    cast(CipherCellSource, _SqliteSource(conn)),
-                    cast(Cipher, _Down()),
-                    cells=POSTGRES_CIPHER_CELLS,
-                    into=found,
-                )
-            )
-    finally:
-        conn.close()
-    assert found.hidden == ["search_presets.criteria"], found.hidden
+            _server_audit(db, cast(Cipher, down), into=found)
+        # The walk reached a value: the stop came from the decrypt, not the catalog read.
+        assert down.calls == 1 and found.tallies, (down.calls, found)
+        assert found.hidden == expected, found.hidden
 
 
 def test_a_server_walk_that_loses_its_connection_still_names_a_hidden_cell(
@@ -1832,6 +1828,20 @@ def test_a_reused_audit_whose_catalog_read_fails_keeps_no_earlier_finding(
     monkeypatch.setattr(_SqliteSource, "cipher_walk_columns", lost)
     with pytest.raises(ConnectionResetError):
         _server_audit(db, cipher, into=audit)
+    assert audit.hidden == [] and audit.tallies == [], audit
+    # The SQLite twin resets the same way when its own catalog read fails.
+    monkeypatch.undo()
+    _hide_from_catalog(monkeypatch, "search_presets")
+    audit, _source = _server_audit(db, cipher)
+    assert audit.hidden and audit.tallies
+    junk = tmp_path / "not-a-store.db"
+    junk.write_bytes(b"SYNTH not a database " * 64)
+    conn = connect_readonly(junk, busy_timeout=5.0)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            audit_cipher_cells(conn, cipher, into=audit)
+    finally:
+        conn.close()
     assert audit.hidden == [] and audit.tallies == [], audit
 
 

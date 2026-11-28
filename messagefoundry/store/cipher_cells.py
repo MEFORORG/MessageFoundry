@@ -562,7 +562,7 @@ class _Opening:
 
     def read(
         self,
-        sealed: bool,
+        sealed: bool | int,
         stored: object,
         key: list[object],
         where: tuple[object, ...],
@@ -570,7 +570,8 @@ class _Opening:
     ) -> bool:
         """Classify one row's value, by the one rule :func:`read_cipher_cells` and
         :func:`_read_server_chunk` share, and queue it when it is to be opened. ``sealed`` is the
-        backend's own sealed test of the value. True when the queue met an outage (:meth:`add`)."""
+        backend's own sealed test of the value, read for its truth (SQLite's is an integer).
+        True when the queue met an outage (:meth:`add`)."""
         if not sealed:
             self.note(CellReading(self.spec, unsealed_kind, where))
         elif not isinstance(stored, str):
@@ -695,12 +696,13 @@ class CipherAudit:
     tallies: list[CellTally] = field(default_factory=list)
     key_mismatch: str | None = None
     #: What a server store's catalog read did not show, so the walk read none of it: each cell
-    #: asked for as ``table.column`` (any one of the columns it needs), then ``keyed_surface``.
-    #: Without that table a keyed surface reads as never sealed, and a keyless walk of a keyed
-    #: store sees no key mismatch. Names from the inventory, never the catalog. At least a missing
-    #: grant, or a schema behind this build, hides one. A store with any is not audited whole, so
-    #: no verdict over it may PASS (BACKLOG #1719 item 9). Always empty after a SQLite walk, whose
-    #: missing cells an older store predates (``present``).
+    #: asked for as ``table.column``, listed when its column or any AAD, order or locator column
+    #: it needs is hidden, then ``keyed_surface``. Without that table a keyed surface reads as
+    #: never sealed, and a keyless walk of a keyed store whose sealed values are all purged or
+    #: BLOBs sees no key mismatch. Names from the inventory, never the catalog. At least a
+    #: missing grant, or a schema behind this build, hides one. A store with any is not audited
+    #: whole, so no verdict over it may PASS (BACKLOG #1719 item 9). Always empty after a SQLite
+    #: walk, whose missing cells an older store predates (``present``).
     hidden: list[str] = field(default_factory=list)
 
     @property
@@ -825,10 +827,12 @@ def audit_cipher_cells(
     failure's, so it does not depend on which value the walk meets first. What stops the walk is
     :meth:`_Tallier.add`'s to say. :func:`_tally_into` says what ``into`` is for."""
     wanted = tuple(cells)
+    # Reset first, so a catalog read that raises leaves no earlier walk's findings in `into`.
+    audit = _tally_into(into, [])
     tables = store_tables(conn)
-    audit = _tally_into(
-        into, [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
-    )
+    audit.tallies[:] = [
+        CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted
+    ]
     audit.key_mismatch = keyed_store_mismatch(conn, cipher, tables)
     if audit.key_mismatch is not None:
         return audit
