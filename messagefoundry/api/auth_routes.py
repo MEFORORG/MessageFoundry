@@ -2010,7 +2010,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # auth/webauthn.py). An actor check inside it would narrow the one path that exists when a
         # user has lost every factor. This route is the only caller today, so the distinction is
         # about WHICH CASE is refused, not about which function holds the line: cross-user recovery
-        # still reaches the service untouched, and only self-targeting is refused here.
+        # still reaches the service, and the only actor check here is the self-target refusal.
+        # The checked read below refuses no actor: it refuses a target whose record fails its
+        # seal (423), which the service's own loader already refused as "no such user".
         #
         # SELF-TARGETING IS NEVER RECOVERY, which is what makes the refusal safe. Reaching this
         # route at all requires passing `require_step_up_action(... ADMIN_RESET_MFA ...)`, which is

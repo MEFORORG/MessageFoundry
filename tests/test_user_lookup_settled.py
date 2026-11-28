@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5520 items 4 and 12: a lookup by username or by directory id that races a write is
-read again rather than refused.
+"""BACKLOG #5520 items 4 and 12: a lookup by a key other than the id that is refused is read
+again rather than refused on one check.
 
-``_lookup_by_username`` and ``_lookup_by_directory_object_id`` back provision-admin and the AD
-sign-in. Each took one check and dropped whether it had established anything, so a check that
-raced a delete, rename or re-key read as a record that fails its seal (``refused``): the honest
-race refused the caller. They now read again while the check raced, up to
-``_CHECKED_READ_PASSES`` reads, as ``_lookup_user_settled`` does for the id. Each test stands a
-raced check in for the contention by making ``_verified`` settle nothing on its first calls.
-Synthetic accounts only.
+``_lookup_by_username`` and ``_lookup_by_directory_object_id`` back at least provision-admin, the
+AD sign-in, the local sign-in's read by name and the directory rename refresh, and
+``_load_user_by_federated_subject`` the federated sign-in. Each took one check and dropped whether
+it had established anything, so a check that raced a delete, rename or re-key read as a record
+that fails its seal (``refused``): the honest race refused the caller. They now read again while
+refused, up to ``_CHECKED_READ_PASSES`` reads, as ``_lookup_user_settled`` does for the id. Each
+test stands a raced or failed check in for the contention by stubbing ``_verified``. Synthetic
+accounts only.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
@@ -25,8 +26,18 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
 _OBJECT_ID = "6f1c2a4e-0000-4000-8000-000000000001"
-#: The keys :func:`_lookups` reads by, one parametrized case each.
-_KEYS = ("username", "directory-object-id")
+_ISSUER = "https://idp.example.test"
+_SUBJECT = "sub-0001"
+_PASSES = service_module._CHECKED_READ_PASSES
+#: The store reader behind each key, counted to prove a raced check reads the store again.
+_READERS = {
+    "username": "get_user_by_username",
+    "directory-object-id": "get_user_by_directory_object_id",
+    "federated-subject": "get_user_by_federated_subject",
+}
+_KEYS = tuple(_READERS)
+#: The keys whose lookup reports ``held``; the federated loader returns the account alone.
+_HELD_KEYS = ("username", "directory-object-id")
 
 
 @pytest.fixture
@@ -38,9 +49,13 @@ async def store() -> AsyncIterator[MessageStore]:
         await s.close()
 
 
-def _race_first(service: AuthService, monkeypatch: pytest.MonkeyPatch, races: int) -> list[int]:
-    """Make ``service._verified`` answer its first ``races`` calls on a row as a check that raced a
-    write (nothing settled), and run the real check after that. Returns the call counter."""
+def _stub_verified(
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Callable[[int], _SealCheck | None],
+) -> list[int]:
+    """Make ``service._verified`` answer its n-th call on a row with ``answer(n)``, or run the real
+    check where that is ``None``. Returns the call counter."""
     real = service._verified
     calls = [0]
 
@@ -48,12 +63,34 @@ def _race_first(service: AuthService, monkeypatch: pytest.MonkeyPatch, races: in
         if user is None:
             return await real(user)
         calls[0] += 1
-        if calls[0] <= races:
-            return _SealCheck()
-        return await real(user)
+        stubbed = answer(calls[0])
+        return await real(user) if stubbed is None else stubbed
 
     monkeypatch.setattr(service, "_verified", verified)
     return calls
+
+
+def _race_first(service: AuthService, monkeypatch: pytest.MonkeyPatch, races: int) -> list[int]:
+    """The first ``races`` checks race a write (nothing settled); the real check after that."""
+    return _stub_verified(service, monkeypatch, lambda n: _SealCheck() if n <= races else None)
+
+
+def _wrap_reader(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str, *, gone_after: int | None = None
+) -> list[int]:
+    """Count the store reads behind ``key``; past ``gone_after`` reads, the row reads as gone."""
+    name = _READERS[key]
+    original = getattr(store, name)
+    reads = [0]
+
+    async def counted(*args: Any, **kw: Any) -> Any:
+        reads[0] += 1
+        if gone_after is not None and reads[0] > gone_after:
+            return None
+        return await original(*args, **kw)
+
+    monkeypatch.setattr(store, name, counted)
+    return reads
 
 
 async def _account(store: MessageStore) -> None:
@@ -65,13 +102,18 @@ async def _account(store: MessageStore) -> None:
         directory_object_id=_OBJECT_ID,
         audits=(),
     )
+    await store.set_user_federated_subject("u1", _ISSUER, _SUBJECT)
 
 
-def _lookups(service: AuthService) -> dict[str, Callable[[], Awaitable[_UserLookup]]]:
-    return {
-        "username": lambda: service._lookup_by_username("jdoe"),
-        "directory-object-id": lambda: service._lookup_by_directory_object_id(_OBJECT_ID),
-    }
+async def _lookup(service: AuthService, key: str) -> _UserLookup:
+    """The lookup by ``key``. The federated loader returns the account alone, so its ``held`` here
+    is whether it returned one; only the tests over ``_HELD_KEYS`` ask ``held`` of a refusal."""
+    if key == "username":
+        return await service._lookup_by_username("jdoe")
+    if key == "directory-object-id":
+        return await service._lookup_by_directory_object_id(_OBJECT_ID)
+    user = await service._load_user_by_federated_subject(_ISSUER, _SUBJECT)
+    return _UserLookup(user, user is not None)
 
 
 @pytest.mark.parametrize("key", _KEYS)
@@ -79,51 +121,74 @@ async def test_a_raced_check_is_read_again_not_refused(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
     """RED when: the lookup takes one check and reads a raced one as refused. Two raced checks
-    are contention, not a failing seal."""
+    are contention, not a failing seal, and each is answered by a new read of the store."""
     await _account(store)
     service = AuthService(store, AuthSettings())
-    _race_first(service, monkeypatch, races=service_module._CHECKED_READ_PASSES - 1)
-    found = await _lookups(service)[key]()
+    _race_first(service, monkeypatch, races=_PASSES - 1)
+    reads = _wrap_reader(store, monkeypatch, key)
+    found = await _lookup(service, key)
     assert found.user is not None and found.user.id == "u1"
     assert found.held and not found.refused
+    assert reads[0] == _PASSES
 
 
-@pytest.mark.parametrize("key", _KEYS)
+@pytest.mark.parametrize("key", _HELD_KEYS)
 async def test_a_check_that_races_every_pass_fails_closed(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Control: a row whose every check raced is still refused, never read as passing or gone, so
-    a writer that keeps racing the read cannot buy the account a pass."""
+    """Control: a row still there after every check raced is refused, never read as passing or
+    gone, so a writer that keeps racing the read cannot buy the account a pass."""
     await _account(store)
     service = AuthService(store, AuthSettings())
-    calls = _race_first(service, monkeypatch, races=service_module._CHECKED_READ_PASSES)
-    found = await _lookups(service)[key]()
+    calls = _race_first(service, monkeypatch, races=_PASSES)
+    found = await _lookup(service, key)
     assert found.refused
-    assert calls[0] == service_module._CHECKED_READ_PASSES
+    assert calls[0] == _PASSES
 
 
-@pytest.mark.parametrize("key", _KEYS)
-async def test_a_failing_record_is_refused_on_its_first_check(
+@pytest.mark.parametrize("key", _HELD_KEYS)
+async def test_a_row_gone_after_every_pass_raced_is_not_held(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Control: a check that established a failing record is refused at once, not read again."""
+    """Where the last check raced and the row is then gone from the key, it reads as gone, not as
+    a refused holder of a name nobody holds."""
     await _account(store)
     service = AuthService(store, AuthSettings())
-    calls = [0]
+    _race_first(service, monkeypatch, races=_PASSES)
+    _wrap_reader(store, monkeypatch, key, gone_after=_PASSES)
+    found = await _lookup(service, key)
+    assert found.user is None and not found.held
 
-    async def failing(user: Any) -> _SealCheck:
-        calls[0] += 1
-        return _SealCheck(failed=user is not None)
 
-    monkeypatch.setattr(service, "_verified", failing)
-    found = await _lookups(service)[key]()
+@pytest.mark.parametrize("key", _HELD_KEYS)
+async def test_a_failing_check_is_read_again(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Two honest role writes committing across one check's reads fail it, so a failed check is
+    read again, as the id's settled read does; one that then passes is served."""
+    await _account(store)
+    service = AuthService(store, AuthSettings())
+    _stub_verified(service, monkeypatch, lambda n: _SealCheck(failed=True) if n == 1 else None)
+    found = await _lookup(service, key)
+    assert found.user is not None and not found.refused
+
+
+@pytest.mark.parametrize("key", _HELD_KEYS)
+async def test_a_record_failing_every_check_is_refused(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Control: a record that fails on every read is refused after ``_CHECKED_READ_PASSES``."""
+    await _account(store)
+    service = AuthService(store, AuthSettings())
+    calls = _stub_verified(service, monkeypatch, lambda n: _SealCheck(failed=True))
+    found = await _lookup(service, key)
     assert found.refused
-    assert calls[0] == 1
+    assert calls[0] == _PASSES
 
 
 @pytest.mark.parametrize("key", _KEYS)
 async def test_an_account_gone_is_not_held(store: MessageStore, key: str) -> None:
     """Control: no row reads as gone, not as a record that fails its seal."""
     service = AuthService(store, AuthSettings())
-    found = await _lookups(service)[key]()
+    found = await _lookup(service, key)
     assert found.user is None and not found.held

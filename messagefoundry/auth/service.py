@@ -4341,14 +4341,14 @@ class _SealCheck:
         return self.user is not None or self.failed
 
 
-#: How many times a checked read of an account by id checks it while each check races a write that
-#: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
+#: How many times a checked read of an account, by id or by another key, checks it while each check
+#: races a write that deletes, renames, rebinds or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
 #: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
 #: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
 #: check too, and ``AuthService._settled_lookup``, the lookups by a key other than the id, which
-#: reads again only on a raced check (BACKLOG #5520 items 4 and 12). What happens once every pass
-#: has raced is each reader's to say: the two settled reads answer refused and report only what
-#: each ``_verified`` check reported, while
+#: does the same (BACKLOG #5520 items 4 and 12). What happens once every pass has raced is each
+#: reader's to say: the two settled reads answer refused and report only what each ``_verified``
+#: check reported, while
 #: :meth:`AuthService._checked_by_id` reports a seal failure.
 _CHECKED_READ_PASSES: Final = 3
 
@@ -11635,8 +11635,8 @@ class AuthService:
             # BACKLOG #3069 note T3), with no verified id to name. NOT CLOSED HERE: the reconciler's
             # own ``held`` read still reads a seal-failed holder as None, so the pre-check is
             # skipped and the write's guard catches it instead; and ``refused`` also reads true for
-            # a holder deleted or re-keyed between the re-read's own row and role reads, a narrow
-            # window that still files this refusal.
+            # a holder whose every check raced a write, up to ``_CHECKED_READ_PASSES`` reads
+            # (``_settled_lookup``), a narrow window that still files this refusal.
             #
             # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
             # one rename for this pass rather than raising: a raise would end the pass before the
@@ -14223,21 +14223,26 @@ class AuthService:
     async def _settled_lookup(
         self, read: Callable[[], Awaitable[UserRecord | None]]
     ) -> _UserLookup:
-        """One lookup by a key other than the id, read again while its check raced a write
-        (BACKLOG #5520 items 4 and 12), up to :data:`_CHECKED_READ_PASSES` reads in all.
+        """One lookup by a key other than the id, read again while it is refused (BACKLOG #5520
+        items 4 and 12), up to :data:`_CHECKED_READ_PASSES` reads in all, as
+        :meth:`_lookup_user_settled` reads the id.
 
         A check that raced a delete, a rename, a rebind or a re-key settles nothing and is not
-        reported (:meth:`_verified`), so it is not read as a record that fails its seal: the next
-        read decides, and one that finds no row is gone. A record :meth:`_verified` established
-        fails is refused at once. A row still there after every check raced is refused, which
-        fails closed, and, as :meth:`_lookup_user_settled` does, reports only what each check
-        reported."""
+        reported (:meth:`_verified`), and two honest role writes committing across one check's
+        reads can fail it, so neither is taken as the answer while a read is left: the next read
+        decides, and one that finds no row by the key is gone. Refused on every read is refused,
+        which fails closed, and reports only what each check reported. Where the last check
+        raced rather than failed, the key is read once more, so a row deleted or moved off the
+        key by then reads as gone rather than as a refused holder."""
+        check = _SealCheck()
         for _pass in range(_CHECKED_READ_PASSES):
             raw = await read_user_or_unreadable(read())
             check = await self._verified(raw)
-            if raw is None or check.settled:
+            if raw is None or check.user is not None:
                 return _UserLookup(check.user, raw is not None)
-        return _UserLookup(None, True)
+        if check.failed:
+            return _UserLookup(None, True)
+        return _UserLookup(None, await read_user_or_unreadable(read()) is not None)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
