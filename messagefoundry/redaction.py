@@ -1506,7 +1506,8 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     key's value; the stray-closer walk sees nothing wrong, since every closer has an opener. So
     such a value makes :func:`_scrub_json_value` raise :class:`_MismatchedJsonCloser`, and the text
     becomes the placeholder. It is read only where the enclosing frame would keep the value: none
-    is open, or an object that is searched. ``nested`` says the walk has a frame open around this
+    is open, or the enclosing frame is an INHERIT frame (kept, with the structures under it still
+    searched), an object or an array or call alike. ``nested`` says the walk has a frame open around this
     one, where a line break is whitespace. The walk starts at the key, so a frame opened before the
     key does not count, and a line break after the key's own container ends the value even inside
     such a frame: pretty-printed ``{\n "given": [x]\n Doe}}`` is a residual.
@@ -1517,12 +1518,18 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     trusted. Only one, so a run of notes costs one step per closer rather than a rescan of the
     run, and a second note reads as a value.
 
-    **Not a value here:** a comma, a closer, a line end at the walk's top level, the end of the
-    text, and anything after a container that is exactly the placeholder ``[redacted]``. A scrub
-    writes that placeholder for a bare token inside a container, and a field-run pass for a run,
-    so ``{"value": x y}`` reads as ``{"value": [redacted] [redacted]}`` on a second pass, which
-    must not then be blanked (the fixed point :func:`safe_text` relies on). A run a field-run pass
-    turns into the placeholder before this walk reads it is covered by :func:`_runs_on_as_received`.
+    **Not a value here**, at least: a comma, a closer, a line end at the walk's top level, the end
+    of the text, and anything after a container that is exactly the placeholder ``[redacted]``. The
+    code below is the definition. A scrub writes that placeholder for a bare token inside a
+    container, and a field-run pass for a run, so ``{"value": x y}`` reads as
+    ``{"value": [redacted] [redacted]}`` on a second pass, which must not then be blanked (the
+    fixed point :func:`safe_text` relies on).
+
+    :func:`_runs_on_as_received` covers a BRACKETED run only: as received, ``"given": [a|b|c] x``
+    holds a container, so the walk there reads the ``x`` after it. An UNBRACKETED run is not
+    covered: as received, ``"given": a|b|c x`` holds a scalar, which this walk does not read past,
+    and after the field-run pass it reads ``"given": [redacted] x``, which the placeholder exempts.
+    So ``x`` is kept, a residual.
 
     **Only a container's end is read, by choice.** A token after a scalar (``"family": "Doe"
     failed``) is far more often prose after a diagnostic's value than a stray closer, and blanking

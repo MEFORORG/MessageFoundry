@@ -102,6 +102,10 @@ MISSED = [
     f'"family": "Doe" {SECRET}',
     # The placeholder written by the text itself, which a second pass must be able to read.
     f'"given": [redacted] {SECRET}',
+    # An UNBRACKETED field run, then the token. As received the value is a scalar, which the
+    # run-on rule does not read past, and the field-run pass then writes the placeholder, which
+    # it exempts, so `_runs_on_as_received` does not cover it (as on origin/main 4ad697da713).
+    f'"given": a|b|c {SECRET}',
 ]
 
 
@@ -156,7 +160,9 @@ def test_a_kept_text_is_legible_and_a_fixed_point(text: str) -> None:
     assert safe_text(once) == once
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED")
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED"
+)
 @pytest.mark.parametrize("text", MISSED)
 def test_a_documented_miss_still_keeps_the_value(text: str) -> None:
     assert SECRET not in redact(text)
@@ -310,7 +316,8 @@ def _token_structure(text: str) -> str:
     return "".join(out)
 
 
-def _redaction_suite_strings() -> list[str]:
+@functools.cache
+def _redaction_suite_strings() -> tuple[str, ...]:
     """Every string literal in the redaction suites, the inputs and the expected outputs alike."""
     names = re.compile(r"redact|5814|5815|safe_exc|clamp|audit_offbox|quarantine")
     found: set[str] = set()
@@ -322,10 +329,10 @@ def _redaction_suite_strings() -> list[str]:
                 for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             )
-    return sorted(found)
+    return tuple(sorted(found))
 
 
-def _fuzz(count: int) -> list[str]:
+def _fuzz(count: int) -> tuple[str, ...]:
     """Seeded texts drawn from what either walk reads: brackets, both quotes, a backslash, line
     breaks and other whitespace, string prefixes, characters neither treats as structure, PHI keys
     and filler."""
@@ -334,15 +341,28 @@ def _fuzz(count: int) -> list[str]:
     parts += ["\x1c", "\x1f", "\x85", "\u2028", "\u2029", "\u3000", ",", ":", "x", "b'", 'B"']
     parts += ['rb"', "`", "<", ">", '"""']
     parts += ['"family": ', "'given': ", '"name":', '"0010ABCD": ']
-    return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
+    return tuple("".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count))
 
 
-@functools.cache
-def _corpus() -> list[str]:
-    """This file's cases and the suites' literals with their ``redact`` results, then the fuzz."""
+_STRUCTURE_FUZZ = 30_000
+#: How much of the structure fuzz the differential reads (see its docstring).
+_DIFFERENTIAL_SHARE = 4_000
+
+
+def _cases() -> list[str]:
+    """This file's cases and the suites' literals, then their ``redact`` results.
+
+    Not cached: the results come from whatever ``redact`` is live, so a cache filled while a test
+    had the rules patched off would hand that test's answers to every later test. The pure part,
+    the literals, is cached in :func:`_redaction_suite_strings`."""
     texts = [*STRAY, *RUN_ON, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
     texts += _redaction_suite_strings()
-    return texts + [redact(text) for text in texts] + _fuzz(30_000)
+    return texts + [redact(text) for text in texts]
+
+
+def _corpus() -> list[str]:
+    """:func:`_cases`, then the structure fuzz."""
+    return [*_cases(), *_fuzz(_STRUCTURE_FUZZ)]
 
 
 def test_the_structure_walk_matches_the_token_walk() -> None:
@@ -437,8 +457,15 @@ def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.Mo
     4ad697da713's scrubber only while ``_rules_off`` names every rule this branch added; the
     build's own run against origin/main's module, kept out of the suite because it needs git, is
     recorded in its commit message. Every rule here only turns a text into the placeholder, so
-    this is the check that a later change keeps it that way."""
-    texts = [*_corpus()[:4_000], *LEAK_PROBES, *RUN_ON, *KEPT, *_differential_fuzz(4_000)]
+    this is the check that a later change keeps it that way.
+
+    It reads every :func:`_cases` text but only the head of the structure fuzz, for time: most of
+    that fuzz holds a PHI key, and scoring all of it through every scrubber twice costs a large
+    share of the per-test timeout (measured 2026-11-27). That fuzz aims at the walk's brackets,
+    which :func:`test_the_structure_walk_matches_the_token_walk` reads whole, and
+    :func:`_differential_fuzz` is this test's own fuzz."""
+    head = _fuzz(_STRUCTURE_FUZZ)[:_DIFFERENTIAL_SHARE]
+    texts = [*_cases(), *head, *LEAK_PROBES, *RUN_ON, *KEPT, *_differential_fuzz(4_000)]
     # Neither rule reads a text with no PHI key, so only those can differ.
     texts = [text for text in texts if _JSON_PHI_KEY.search(text)]
     leaks, changed = _words_main_hid(texts, _answers(texts), _main_answers(texts, monkeypatch))
