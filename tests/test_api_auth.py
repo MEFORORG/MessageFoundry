@@ -3121,8 +3121,9 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
     `user_id == identity.user_id` twenty-five lines above; reset-MFA, the sharper of the two, did not.
 
     WHY REFUSING SELF-TARGETING DOES NOT COST A RECOVERY PATH, which is the thing to get right:
-    `AuthService.admin_reset_mfa` stays unguarded and is still the always-available recovery for a
-    locked-out passkey user (ADR 0068 section 2). Cross-user reset is untouched -- the assertion
+    `AuthService.admin_reset_mfa` stays unguarded by any actor check and is still the recovery for
+    a locked-out passkey user (ADR 0068 section 2) whose record passes its seal (a failing one
+    answers 423, BACKLOG #5520). Cross-user reset of an intact account still works -- the assertion
     below pins that. And self-targeting was never recovery: reaching this route requires passing
     `require_step_up_action(... ADMIN_RESET_MFA ...)`, which is itself MFA-gated, so an operator who
     has genuinely lost every factor cannot call it at all.
@@ -3179,7 +3180,7 @@ async def test_admin_reset_mfa_refuses_to_target_the_caller(engine: Engine) -> N
         h = _auth(tok)
         other = await c.post(f"/users/{target}/reset-mfa", headers=h)
         assert other.status_code == 200, (
-            "cross-user admin MFA reset broke. That is the always-available recovery for a "
+            "cross-user admin MFA reset broke. That is the recovery for a "
             "locked-out passkey user (ADR 0068 section 2) and the self-exclusion must not touch it."
         )
 

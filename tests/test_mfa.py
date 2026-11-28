@@ -954,7 +954,8 @@ async def test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard(
 ) -> None:
     """The guard above must not cost the escape hatch, and this is what proves it did not.
 
-    admin_reset_mfa is "the always-available recovery for a locked-out passkey user" — a DIFFERENT
+    admin_reset_mfa is "the recovery for a locked-out passkey user whose record passes its seal"
+    — a DIFFERENT
     method from disable_mfa, deliberately unguarded. Under exactly the conditions that make the
     self-service path refuse (MFA required, TOTP the only factor), the admin path must still clear.
     """
