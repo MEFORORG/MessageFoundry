@@ -466,7 +466,8 @@ def open_message_cell(
 def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
     """Open a whole ``messages`` row's cells in place, each under the tag its row's id and channel
     build (ASVS 11.3.3, BACKLOG #2593), so a cell that fails that tag refuses the whole read. Every
-    backend's ``get_message`` runs it through ``asyncio.to_thread`` (BACKLOG #5981)."""
+    backend's ``get_message`` runs it off the loop through ``row_seal.cipher_offload`` (BACKLOG
+    #5981, #3929)."""
     for column in MESSAGE_TAG_CELLS:
         record[column] = open_message_cell(
             cipher,

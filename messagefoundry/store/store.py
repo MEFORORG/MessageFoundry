@@ -225,6 +225,7 @@ from messagefoundry.store.row_seal import (
     SealPager,
     TransitSealUnavailableError,
     cipher_call,
+    cipher_offload,
     classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
@@ -14896,7 +14897,7 @@ class MessageStore:
         await reserve_invocations_ahead(
             self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
         )
-        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        sealed = await cipher_offload(self._cipher, _seal, ref, plaintext_chunks)
         del plaintext_chunks
         now = time.time()
         async with _writer_guard(self._db, self._lock):
@@ -18977,7 +18978,7 @@ class MessageStore:
             return None
         record = dict(row)
         # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
-        await asyncio.to_thread(open_message_record, self._cipher, record)
+        await cipher_offload(self._cipher, open_message_record, self._cipher, record)
         return record
 
     async def message_channel_id(self, message_id: str) -> str | None:

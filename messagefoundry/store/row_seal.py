@@ -557,19 +557,22 @@ _UNVERIFIABLE: Final = "unverifiable"
 #: asyncio's default executor, so a slow Vault cannot fill the default executor with seal checks.
 #: The row sealer's own calls use it, through ``_in_transit_pool``, and so do the store cipher
 #: calls routed through :func:`cipher_call` under a cipher that blocks on I/O (BACKLOG #3929): a
-#: seal check can queue behind cell encrypts and decrypts. Other store paths still hand Transit
-#: calls to the default executor through ``asyncio.to_thread``. The
+#: seal check can queue behind cell encrypts and decrypts, and behind a whole batch routed through
+#: :func:`cipher_offload`. A store path that hands a Transit call to ``asyncio.to_thread`` itself
+#: still uses the default executor. The
 #: queue past the bound has no deadline, so a check waits for a free thread for as long as the
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
 TRANSIT_SEAL_WORKERS: Final = 8
+#: The name every Transit pool thread's name starts with.
+TRANSIT_THREAD_PREFIX: Final = "mefor-transit-seal"
 
 
 @functools.cache
 def _transit_pool() -> ThreadPoolExecutor:
     # Built on first use, so a process that never seals through Transit builds no pool.
     return ThreadPoolExecutor(
-        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix="mefor-transit-seal"
+        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix=TRANSIT_THREAD_PREFIX
     )
 
 
@@ -608,6 +611,24 @@ async def cipher_call[**P, T](
     if cipher_blocks_on_io(cipher):
         return await _in_transit_pool(call, *args, **kwargs)
     return call(*args, **kwargs)
+
+
+async def cipher_offload[**P, T](
+    cipher: object, call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """``call(*args, **kwargs)`` off the event loop under every cipher: on the Transit pool when
+    ``cipher`` blocks on I/O, else on asyncio's default executor (:func:`asyncio.to_thread`).
+
+    For a whole batch of cipher calls that is CPU work in proportion to its size even under an
+    in-process cipher, so :func:`cipher_call`'s inline run would hold the loop: at least a
+    message's cells, an attachment's seal and a state-cache reload (BACKLOG #3929). Under Transit
+    the batch holds one of the pool's :data:`TRANSIT_SEAL_WORKERS` threads for all its round
+    trips, so other Transit calls can queue behind it, as behind a :func:`cipher_call` batch. The
+    content search's scan does not come here: one search can make thousands of serial round trips,
+    and a few concurrent searches would then hold the whole pool."""
+    if cipher_blocks_on_io(cipher):
+        return await _in_transit_pool(call, *args, **kwargs)
+    return await asyncio.to_thread(call, *args, **kwargs)
 
 
 def _batch_cost(plaintext: str, aad: bytes | None) -> int:

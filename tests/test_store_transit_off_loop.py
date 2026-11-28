@@ -196,8 +196,8 @@ async def test_an_in_process_cipher_runs_inline_on_the_loop(
         )
         message = await store.get_message(mid)
         assert message is not None and message["raw"] == _RAW
-        # The write's encrypts run inline. The read's decrypt is not checked: get_message already
-        # hands its record to asyncio.to_thread under every cipher.
+        # The write's encrypts run inline. The read's decrypt is not checked: get_message hands its
+        # record off the loop under every cipher, to the default executor for this one (#3929).
         assert encrypt_threads, "the write made no cipher call, so this test measured nothing"
         assert set(encrypt_threads) == {threading.get_ident()}
         assert threads, "the read made no cipher call"

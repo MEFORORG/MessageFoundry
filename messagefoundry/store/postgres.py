@@ -219,6 +219,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     SealPager,
     cipher_call,
+    cipher_offload,
     classify_unrotated,
     row_sealer_for_cipher,
     seal_chunks,
@@ -8241,7 +8242,7 @@ class PostgresStore(ServerCipherWalk):
         await reserve_invocations_ahead(
             self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
         )
-        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        sealed = await cipher_offload(self._cipher, _seal, ref, plaintext_chunks)
         del plaintext_chunks
         now = time.time()
         # READ COMMITTED pinned, so the ON CONFLICT below waits out a concurrent put and inserts
@@ -9329,7 +9330,7 @@ class PostgresStore(ServerCipherWalk):
             return None
         d = dict(record)
         # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
-        await asyncio.to_thread(open_message_record, self._cipher, d)
+        await cipher_offload(self._cipher, open_message_record, self._cipher, d)
         return d
 
     async def message_channel_id(self, message_id: str) -> str | None:

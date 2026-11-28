@@ -215,6 +215,7 @@ from messagefoundry.store.row_seal import (
     RowSealError,
     SealPager,
     cipher_call,
+    cipher_offload,
     classify_unrotated,
     row_sealer_for_cipher,
     seal_chunks,
@@ -10669,7 +10670,7 @@ class SqlServerStore(ServerCipherWalk):
         live by then, and a whole-table decrypt on the loop could stall it into a fence. It fails closed
         like the open-time warm: a row it cannot decrypt raises, and the cache in place is kept."""
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
-        self._state_cache = await asyncio.to_thread(self._decode_state_rows, rows)
+        self._state_cache = await cipher_offload(self._cipher, self._decode_state_rows, rows)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -13404,7 +13405,7 @@ class SqlServerStore(ServerCipherWalk):
         await reserve_invocations_ahead(
             self._cipher, self.add_cipher_invocations, len(plaintext_chunks)
         )
-        sealed = await asyncio.to_thread(_seal, ref, plaintext_chunks)
+        sealed = await cipher_offload(self._cipher, _seal, ref, plaintext_chunks)
         del plaintext_chunks
         now = time.time()
         async with self._acquire() as conn:
@@ -14591,7 +14592,7 @@ class SqlServerStore(ServerCipherWalk):
         if record is not None:
             # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault
             # call.
-            await asyncio.to_thread(open_message_record, self._cipher, record)
+            await cipher_offload(self._cipher, open_message_record, self._cipher, record)
         return record
 
     async def message_channel_id(self, message_id: str) -> str | None:
