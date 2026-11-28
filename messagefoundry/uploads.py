@@ -5298,10 +5298,11 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
         try:
             now = path.lstat()
         except OSError as exc:
-            # Only a missing final name was removed. One whose share cannot be reached, whatever
-            # class it arrives as, or a Windows missing folder or drive above it, raises
-            # _UnreachableError, so the caller skips it, never counts a body as lost, and never
-            # logs it as the uploads directory gone (BACKLOG #5388).
+            # On Windows only a missing final name was removed; on POSIX a missing folder above it
+            # reads as the name missing too. One whose share cannot be reached, whatever class it
+            # arrives as, or a Windows missing folder or drive above it, raises _UnreachableError,
+            # so the caller skips it, never counts a body as lost, and never logs it as the uploads
+            # directory gone (BACKLOG #5388).
             if is_name_absent(exc):
                 raise _ChangedUnderReseal(gone=True) from exc
             unreached = _outage_fault(exc)
