@@ -1733,10 +1733,12 @@ def test_a_keyed_surface_seen_without_a_column_it_needs_is_hidden(
     as the whole table is, and the walk never reads it: on a server store that read would fail on
     the column the login cannot see. Control: shown whole, the keyless walk reads it and stops on
     the key mismatch it records."""
-    db, _settings = _copy(_template, tmp_path)
+    db, settings = _copy(_template, tmp_path)
     keyless = build_store_cipher(StoreSettings(path=str(db)))
-    audit, _source = _server_audit(db, keyless)
-    assert audit.hidden == [] and "resolved no key" in (audit.key_mismatch or ""), audit
+    audit, source = _server_audit(db, keyless)
+    # From the keyed_surface read, before any chunk: the walk's own keyless line says otherwise.
+    assert audit.hidden == [] and "is recorded as keyed" in (audit.key_mismatch or ""), audit
+    assert source.limits == {}, source.limits
 
     async def unreadable(self: _SqliteSource) -> tuple[str, str] | None:
         raise AssertionError("read keyed_surface, which the catalog showed only in part")
@@ -1746,6 +1748,30 @@ def test_a_keyed_surface_seen_without_a_column_it_needs_is_hidden(
         m.setattr(_SqliteSource, "cipher_walk_keyed_surface", unreadable)
         audit, _source = _server_audit(db, keyless)
     assert audit.hidden == ["keyed_surface"], audit.hidden
+
+    # A keyed walk asks the surface-sealed test not to read keyed_surface either.
+    asked: list[bool] = []
+    real_sealed = _SqliteSource.cipher_walk_surface_sealed
+
+    async def spy(self: _SqliteSource, table: str, column: str, *, keyed: bool) -> bool:
+        asked.append(keyed)
+        return await real_sealed(self, table, column, keyed=keyed)
+
+    keyed_cipher = build_store_cipher(settings)
+    with monkeypatch.context() as m:
+        m.setattr(_SqliteSource, "cipher_walk_surface_sealed", spy)
+        _server_audit(db, keyed_cipher)
+        assert asked and all(asked), asked
+        asked.clear()
+        _hide_from_catalog(m, "keyed_surface", "surface_column")
+        audit, _source = _server_audit(db, keyed_cipher)
+    assert asked and not any(asked), asked
+    assert audit.hidden == ["keyed_surface"], audit.hidden
+    # Control: a keyed_surface column the walk does not read, hidden, leaves the table visible.
+    with monkeypatch.context() as m:
+        _hide_from_catalog(m, "keyed_surface", "keyed_at")
+        audit, _source = _server_audit(db, keyed_cipher)
+    assert audit.hidden == [], audit.hidden
 
 
 def test_a_keyless_audit_of_a_purged_keyed_store_with_keyed_surface_hidden_is_not_covered(
@@ -1762,13 +1788,10 @@ def test_a_keyless_audit_of_a_purged_keyed_store_with_keyed_surface_hidden_is_no
     conn = sqlite3.connect(db)
     try:
         for cell in SQLITE_CIPHER_CELLS:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (cell.table,)
-            ).fetchone():
-                conn.execute(
-                    f"UPDATE {cell.table} SET {cell.column} = '' WHERE {cell.column} LIKE ?",
-                    (f"{MARKER_PREFIX}%",),
-                )
+            conn.execute(
+                f"UPDATE {cell.table} SET {cell.column} = '' WHERE {cell.column} LIKE ?",
+                (f"{MARKER_PREFIX}%",),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1817,6 +1840,8 @@ def test_a_server_audit_stopped_by_an_outage_keeps_what_the_catalog_hid(
         # The walk reached one decrypt and stopped there: the outage was raised, never tallied as
         # a damaged value, and no later value was sent.
         assert down.calls == 1 and found.failed == 0 and found.opened == 0, (down.calls, found)
+        # Filled in place: one tally per cell asked for, which a fresh audit does not hold.
+        assert len(found.tallies) == len(POSTGRES_CIPHER_CELLS), found.tallies
         assert found.hidden == expected, found.hidden
 
 

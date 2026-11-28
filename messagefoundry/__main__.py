@@ -14280,8 +14280,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         reason += (
             f"; {len(audit.hidden)} expected cipher table(s) or cell(s) are not visible in the "
             f"catalog of {_store_label(store)} and were not read: {', '.join(audit.hidden)}. At "
-            "least a missing grant on the table, or a schema behind this build, hides one: grant "
-            "the login read on it, or let the service's open migrate the store, and run again"
+            "least a missing grant on the table or one of its columns, or a schema behind this "
+            "build, hides one: grant the login read on it, or let the service's open migrate the store, and run again"
         )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted

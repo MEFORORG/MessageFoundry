@@ -537,16 +537,14 @@ def _failed(
 
 class _Opening:
     """One chunk's rows of one cell, each reading kept at its row's place. :meth:`read` classifies
-    every row the walk fetched, sealed or not, and queues a sealed text value to be opened under a
+    each row the walk hands it, sealed or not, and queues a sealed text value to be opened under a
     key. Each value is opened with its cell's AAD and then put through its cell's
     ``check``; the plaintext goes no further. A marker in another case fails without a decrypt:
     the cipher would otherwise hand it to its unmarked-value rule and, under
     ``allow_unmarked_ciphertext``, return it with no tag checked. :func:`_open_queued` opens the
     queue and :func:`_opened` ends the chunk."""
 
-    def __init__(
-        self, spec: CipherCell, cipher: Cipher, unsealed_kind: ReadingKind = "unmarked"
-    ) -> None:
+    def __init__(self, spec: CipherCell, cipher: Cipher, unsealed_kind: ReadingKind) -> None:
         self.spec, self.cipher = spec, cipher
         #: How :meth:`read` names a value the sealed test does not select (see :class:`CellReading`).
         self.unsealed_kind: ReadingKind = unsealed_kind
@@ -574,8 +572,9 @@ class _Opening:
     ) -> bool:
         """Classify one row's value, by the one rule :func:`read_cipher_cells` and
         :func:`_read_server_chunk` share, and queue it when it is to be opened. ``sealed`` is the
-        walk's own reading of whether the value is sealed: SQLite's sealed test, selected in SQL
-        as an integer, or the server walk's, made in Python on the fetched value. Read for its
+        walk's own reading of whether the value is sealed: on SQLite a column the SELECT
+        computes (the sealed test as an integer, or the literal 1 where that test is the WHERE
+        clause), on a server store a test made in Python on the fetched value. Read for its
         truth. True when the queue met an outage (:meth:`add`)."""
         if not sealed:
             self.note(CellReading(self.spec, self.unsealed_kind, where))
@@ -890,9 +889,10 @@ _KEYED_SURFACE_COLUMNS = frozenset({"surface_table", "surface_column"})
 
 
 def _keyed_surface_visible(columns: Mapping[str, frozenset[str]]) -> bool:
-    """Whether the catalog read shows ``keyed_surface`` with every column the walk reads of it; a
-    table shown in part is read as hidden, so no statement asks for a column the login cannot
-    see."""
+    """Whether the catalog read shows ``keyed_surface`` with every column the walk reads of it. A
+    table shown in part is read as hidden, so the walk asks for no column the catalog read did not
+    show. A column the catalog shows can still refuse a SELECT, at least where the catalog lists
+    a column for a privilege other than SELECT."""
     return columns.get("keyed_surface", frozenset()) >= _KEYED_SURFACE_COLUMNS
 
 
@@ -940,8 +940,7 @@ def _read_server_chunk(
         sealed = not text or _is_sealed_text(stored)
         if not sealed and not unmarked:
             continue  # not sealed, and this walk does not count unmarked values
-        # The AAD columns only for a value `read` may open.
-        key = [row[index[c]] for c in spec.aad_columns] if text and sealed else []
+        key = [row[index[c]] for c in spec.aad_columns]
         if opening.read(sealed, stored, key, where):
             break
     # After an outage the walk ends, so the position returned with it is never read.
