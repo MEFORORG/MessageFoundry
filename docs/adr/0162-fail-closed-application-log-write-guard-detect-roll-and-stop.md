@@ -486,7 +486,9 @@ case; a replacing stream never raises, so on serve's default stdout that escape 
 line carried `?`. The escape holds for every line the guard writes: the stdout sink's record
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
-least these. A stream with no `encoding` is written as the line came. One whose `encoding` names
+least these. A stream with no `encoding` is written as the line came. One whose `encoding`
+cannot be read, because reading it raises, is written with everything outside ASCII escaped,
+and that is said on the same stderr line. One whose `encoding` names
 a codec other than the one it uses is written escaped for the named codec, so it escapes more
 than it needs to where the named codec is the narrower, and too little where it is the
 wider, leaving the rest to the ASCII fallback below. Either

@@ -830,6 +830,13 @@ def _encodes_ascii(encoding: str) -> bool:
     return _encodable(_ALL_ASCII, encoding) == _ALL_ASCII
 
 
+#: The stderr format-fault line's entry for a stream whose ``encoding`` could not be read, so the
+#: line was escaped for ASCII (BACKLOG #5813).
+_ENCODING_UNREADABLE_FAULT = (
+    "the sink's stream encoding could not be read; the line was written with everything outside "
+    "ASCII escaped"
+)
+
 #: The stderr format-fault line's entry for a line the sink's stream could not encode, written
 #: escaped (BACKLOG #5813). The record formatted; it is counted on that line all the same.
 _ESCAPED_FAULT = (
@@ -1194,12 +1201,17 @@ class _GuardedSinkMixin(_SinkBase):
         ``UnicodeEncodeError``, as a stream with no
         ``encoding`` or one that does not name the encoder it uses can, the line is written again
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
-        propagates. A write whose line was escaped is counted for the stderr format-fault line.
+        propagates. A stream whose ``encoding`` cannot be read is escaped for ASCII, and that is
+        counted too. A write whose line was escaped is counted for the stderr format-fault line.
         Called under the handler's lock, which that count needs."""
         try:
             encoding = getattr(self.stream, "encoding", None)
-        except Exception:  # a proxy whose property raises: read as no encoding, not a failed write
-            encoding = None
+        except Exception:
+            # A proxy whose ``encoding`` property raises. Not a failed write, and not "no
+            # encoding" either: on a replacing stream that would write ``?`` unseen. So the line is
+            # escaped for ASCII, which every text stream takes, and the fault is said.
+            encoding = "ascii"
+            self._note_format_fault(_ENCODING_UNREADABLE_FAULT)
         written = line
         if isinstance(encoding, str) and not (line.isascii() and _encodes_ascii(encoding)):
             try:
@@ -1221,11 +1233,15 @@ class _GuardedSinkMixin(_SinkBase):
         self._report_format_faults()
 
     def _write_raw(self, line: str) -> None:
-        # StreamHandler.flush, as StreamHandler.emit ends: it skips a stream with no flush rather
-        # than failing a write that landed. Not self.flush(), which would say the format faults
-        # before _write_line counts this line's escape.
-        self.stream.write(line)
-        logging.StreamHandler.flush(self)
+        # Flush as StreamHandler.flush does, skipping a stream with no flush rather than failing a
+        # write that landed, but without its truthiness test on the stream (a stream's __bool__ is
+        # not a liveness test) or its lock (the caller holds it, and it can be None). Not
+        # self.flush(), which would say the format faults before _write_line counts this escape.
+        stream = self.stream
+        stream.write(line)
+        flush = getattr(stream, "flush", None)
+        if flush is not None:
+            flush()
 
 
 class GuardedStreamHandler(_GuardedSinkMixin, logging.StreamHandler[TextIO]):
