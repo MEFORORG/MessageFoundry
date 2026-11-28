@@ -366,18 +366,25 @@ class NonTextCellError(CellTagError):
 
 
 class KeylessSealedCellError(CipherError):
-    """A keyless store read a sealed (``mfenc:``) preset criteria cell, which a keyed store wrote
-    and this one has no key to open (BACKLOG #5523 item 7). The identity cipher hands such a cell
-    back unchanged, so without this refusal the layered search read the ciphertext as malformed
-    criteria. A plain :class:`CipherError`, so the route answers it as a cell the store's keys
-    cannot open."""
+    """A keyless store read a sealed (``mfenc:``) preset criteria cell (BACKLOG #5523 item 7): a
+    keyed store wrote it, or it was written outside the store. The identity cipher hands such a
+    cell back unchanged, so without this refusal the layered search read the ciphertext as
+    malformed criteria. A per-cell :class:`CipherError`, not the open-time
+    :class:`~messagefoundry.store.crypto.StoreKeylessError`, so every ``except CipherError`` that
+    contains a cell refusal contains it; the layered search gives it its own 423 text and log line.
+    """
 
     def __init__(self, table: str, column: str) -> None:
         self.table = table
+        self.column = column
         super().__init__(
-            f"a {table}.{column} cell is sealed under a store key, but this store opened with no "
-            "key configured"
+            f"a {table}.{column} cell is sealed, but this store opened with no key configured"
         )
+
+    def __reduce__(self) -> tuple[type[KeylessSealedCellError], tuple[str, str]]:
+        # args holds the message, not the constructor's arguments, so copy and pickle rebuild it
+        # from these.
+        return (type(self), (self.table, self.column))
 
 
 class NonTextListedCellError(CipherError):

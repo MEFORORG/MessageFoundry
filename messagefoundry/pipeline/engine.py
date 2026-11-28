@@ -1429,11 +1429,11 @@ class Engine:
                     )
             if isinstance(exc, RunnerLeaseLostError) or not_leading:
                 # BACKLOG #5906: the DR coordinator's own type, so its abort row can name the
-                # lease without importing the runner. A graph stopped on a node that still leads
-                # keeps the runner's own refusal.
+                # lease without importing the runner.
                 raise _dr_profile_not_leading() from exc
             if isinstance(exc, RunnerNotRunningError):
-                # Nothing tried to bind, so the abort must not say a bind failed (BACKLOG #5906).
+                # A graph stopped on a node that still leads: its own DR type, for the same
+                # reason, so the abort does not say a bind failed (BACKLOG #5906).
                 raise DrProfileGraphStopped(
                     "this engine's graph is not running, so the DR profile step applied nothing"
                 ) from exc

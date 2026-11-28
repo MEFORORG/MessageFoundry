@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import copy
 import logging
 import pathlib
 import sqlite3
@@ -999,6 +1000,12 @@ def test_a_sealed_preset_criteria_cell_on_a_keyless_store_is_refused() -> None:
     assert isinstance(refused.value, CipherError)
     assert not isinstance(refused.value, CellTagError)
     assert sealed not in str(refused.value)
+    copied = copy.copy(refused.value)  # rebuilt from its table and column, not its message
+    assert (copied.table, copied.column, str(copied)) == (
+        "search_presets",
+        "criteria",
+        str(refused.value),
+    )
     plain = '{"channel_id": "ch2"}'
     assert open_preset_criteria(keyless, plain, preset_id="pkeyless", owner_user_id="u1") == plain
 

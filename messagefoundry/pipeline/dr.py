@@ -709,8 +709,9 @@ class DrCoordinator:
                 )
             elif isinstance(exc, DrProfileGraphStopped):
                 reason = (
-                    "DR run-profile activation refused: this engine's graph is not running, so "
-                    "the profile step bound no listener and the box stays passive"
+                    "DR run-profile activation refused: this engine's graph is not running "
+                    "(stopped, or a demoted node), so the profile step bound no listener and the "
+                    "box stays passive"
                 )
             else:
                 reason = (

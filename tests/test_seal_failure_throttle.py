@@ -5,7 +5,6 @@ log now holds with its own interval and bound instead of a copy (BACKLOG #5523 i
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 import pytest
@@ -26,14 +25,12 @@ class _Clock:
 
 
 @pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
-    c = _Clock()
-    monkeypatch.setattr(time, "monotonic", c)
-    return c
+def clock() -> _Clock:
+    return _Clock()
 
 
 def test_a_key_is_due_once_per_its_interval(clock: _Clock) -> None:
-    throttle = SealFailureThrottle(interval=3600.0, track_max=4)
+    throttle = SealFailureThrottle(interval=3600.0, track_max=4, clock=clock)
     assert throttle.due(("p1", "malformed"))
     clock.now += 3599.0
     assert not throttle.due(("p1", "malformed"))
@@ -42,23 +39,26 @@ def test_a_key_is_due_once_per_its_interval(clock: _Clock) -> None:
     assert throttle.due(("p1", "malformed"))
 
 
-def test_the_key_asked_about_least_recently_is_forgotten_past_the_bound(clock: _Clock) -> None:
-    throttle = SealFailureThrottle(interval=3600.0, track_max=2)
+def test_the_oldest_reported_key_is_forgotten_past_the_bound(clock: _Clock) -> None:
+    throttle = SealFailureThrottle(interval=3600.0, track_max=2, clock=clock)
     assert throttle.due("a") and throttle.due("b")
-    assert not throttle.due("a")  # suppressed, and now the most recently asked about
-    assert throttle.due("c")  # so "b" is forgotten to make room, not "a"
-    assert not throttle.due("a")  # still suppressed inside its interval
-    assert throttle.due("b")
+    assert not throttle.due("a")  # suppressed; a suppressed call does not refresh it
+    assert throttle.due("c")  # so "a", the oldest reported, is forgotten to make room
+    assert throttle.due("a")
+    assert not throttle.due("c")  # still remembered
 
 
-@pytest.mark.parametrize("kwargs", [{"track_max": 0}, {"track_max": -1}, {"interval": -1.0}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"track_max": 0}, {"track_max": -1}, {"interval": -1.0}, {"interval": float("nan")}],
+)
 def test_a_bound_that_cannot_hold_a_key_is_refused(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         SealFailureThrottle(**kwargs)
 
 
 def test_the_defaults_are_the_seal_reporters_policy(clock: _Clock) -> None:
-    throttle = SealFailureThrottle()
+    throttle = SealFailureThrottle(clock=clock)
     assert throttle.due("row")
     clock.now += SEAL_FAILURE_REPORT_INTERVAL_SECONDS - 1.0
     assert not throttle.due("row")

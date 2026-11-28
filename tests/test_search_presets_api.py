@@ -1217,12 +1217,13 @@ async def test_a_sealed_criteria_cell_on_a_keyless_store_answers_423_not_malform
     assert r.status_code == 423, r.text
     assert r.json()["detail"] == (
         f"preset {pid} is sealed, but this engine's store opened with no encryption key, so it "
-        "cannot be used"
+        "cannot be used; a store key that is not configured, or a value written outside the "
+        "store, can cause this"
     )
     [(level, text)] = [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
     assert level == logging.ERROR
     assert text.startswith(f"layered search refused preset {pid}: KeylessSealedCellError; ")
-    assert "MEFOR_STORE_ENCRYPTION_KEY" in text  # the remedy, in the log only
+    assert "[store] key" in text  # the remedy, in the log only
     assert await _refusal_audits(engine) == [
         {"presets": 1, "refused": pid, "status": 423, "cause": "KeylessSealedCellError"}
     ]

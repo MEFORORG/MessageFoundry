@@ -10725,20 +10725,22 @@ def create_app(
                 cause = type(exc).__name__
                 keyless = isinstance(exc, KeylessSealedCellError)
                 if _layered_refusal_log.due((preset_id, cause)):
-                    # A keyless open is a store-wide setting, not a fault of this cell: the log
-                    # names the remedy, as StoreKeylessError does (BACKLOG #5523 item 7).
+                    # A keyless open is most likely a store-wide setting: the log names the
+                    # store's key configuration, not one key source, since the cell may be a
+                    # Transit one or a plant (BACKLOG #5523 item 7).
                     _log.error(
                         "layered search refused preset %s: %s",
                         preset_id,
-                        f"{cause}; the store opened with no encryption key, so set "
-                        "MEFOR_STORE_ENCRYPTION_KEY to the key that wrote it"
+                        f"{cause}; the store opened with no encryption key, so configure the "
+                        "[store] key that sealed it, or treat the cell as written outside the store"
                         if keyless
                         else cause,
                     )
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} is sealed, but this engine's store opened with no"
-                    " encryption key, so it cannot be used"
+                    " encryption key, so it cannot be used; a store key that is not configured,"
+                    " or a value written outside the store, can cause this"
                     if keyless
                     else f"preset {preset_id} cannot be opened with the store's keys and cannot be"
                     " used; a retired key that is not supplied, or a value written outside the"

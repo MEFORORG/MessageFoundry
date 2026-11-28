@@ -1206,8 +1206,8 @@ async def test_a_graph_stopped_during_the_preflight_is_refused(
     preflight left the runner stopped. Its reload then applied the graph to a stopped runner,
     bound nothing, and the activation was recorded active. Red before the runner's
     require_running read: no DrActivationError was raised. A graph stopped on a node that still
-    leads is refused too, with the runner's own reason rather than the lease, and its reason no
-    longer says the engine could not bind the priority feeds, since nothing tried to bind."""
+    leads is refused too, with a reason that names the stopped graph rather than the lease, and
+    no longer says the engine could not bind the priority feeds, since nothing tried to bind."""
     engine = box.engine
     coord = engine.dr_coordinator
     assert coord is not None
