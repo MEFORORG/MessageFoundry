@@ -54,13 +54,19 @@ def _lose_the_drive(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     absence)."""
     lost = {root.absolute(), *root.absolute().parents}
     real = Path.stat
+    real_lexists = os.path.lexists
 
     def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
         if self.absolute() in lost:
             raise FileNotFoundError(errno.ENOENT, "The system cannot find the path specified")
         return real(self, follow_symlinks=follow_symlinks)
 
+    def _lexists(path: Any) -> bool:
+        # No name is there either, so the walk runs off the anchor, as above a lost drive.
+        return False if Path(path).absolute() in lost else real_lexists(path)
+
     monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setattr(os.path, "lexists", _lexists)
 
 
 def test_a_lost_drive_raises_rather_than_reading_as_a_clean_sweep(

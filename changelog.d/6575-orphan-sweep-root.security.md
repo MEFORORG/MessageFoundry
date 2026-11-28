@@ -4,6 +4,8 @@
   A root deleted after its first save, and one under a POSIX mount point whose share dropped,
   still read as a folder no save has made yet. A body whose sidecar reads as absent is removed
   only while the uploads root still answers as the folder the sweep listed, so a share remounted
-  under it as another folder stops the sweep. A stale client cache, a hidden name, a remount that
-  answers with the same identity, or one that flaps back before the check, can still let a body
-  whose sidecar exists be removed (BACKLOG #6575).
+  under it as another folder stops the sweep. A body whose sidecar exists can still be removed,
+  with no audit row, in at least these cases: a stale client cache, a hidden name, a remount that
+  answers with the same identity or that flaps back before the check, a root swapped after the
+  check and before the unlink, and a sidecar that lands between its check and the unlink
+  (BACKLOG #6575).

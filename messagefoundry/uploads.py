@@ -4359,7 +4359,8 @@ class UploadStore:
         stamped it can differ by file system and is not asserted here.
 
         A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
-        too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
+        too, or, before a body's unlink, answers as another folder (:func:`_root_fault`), the pass
+        stops and returns what it removed, logged at ERROR with that reason.
         :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
         interval is as long, so a lasting fault can log on every scheduled pass.
 
@@ -4404,8 +4405,10 @@ class UploadStore:
             listed = root.stat()
             entries = list(root.iterdir())
         except OSError as exc:
-            if is_absent(exc) and _root_never_made(root):
-                return 0  # no save has made the root yet
+            # A save may make the root between the failed read and the walk, so a root that is now
+            # a folder is an empty pass too, and the next one lists it.
+            if is_absent(exc) and (_root_never_made(root) or root.is_dir()):
+                return 0  # no save had made the root yet
             raise
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
         names = {entry.name for entry in entries}
@@ -4452,12 +4455,14 @@ class UploadStore:
                     continue  # inside the floor; being past it does not prove it abandoned
                 # The listing is a snapshot and a share can return a short one with no error, so
                 # ask again, last, before the unlink.
-                if sidecar is not None and not _sidecar_is_absent(sidecar):
-                    continue
-                # An absent answer is about a name in whatever folder answers for the root now,
-                # so a body goes only while that is the folder listed (BACKLOG #8341 item 2).
-                if sidecar is not None and _root_lost(name):
-                    break
+                if sidecar is not None:
+                    if not _sidecar_is_absent(sidecar):
+                        continue
+                    # An absent answer is about a name in whatever folder answers for the root
+                    # now, so a body goes only while that is the folder listed (BACKLOG #8341
+                    # item 2).
+                    if _root_lost(name):
+                        break
                 entry.unlink()
             except OSError as exc:
                 if _root_lost(name):
