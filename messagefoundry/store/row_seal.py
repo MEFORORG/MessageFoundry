@@ -52,7 +52,7 @@ import hmac
 import logging
 import math
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -1041,25 +1041,47 @@ class ResealOutcome:
     malformed. The read-back does not verify them, so ``refused`` holds at least a seal that fails
     under a key the run holds, which no key re-seals, and a sound seal a writer running alongside
     made under a retired key the run holds after its pass (vault BACKLOG #5635 items 14 and
-    15). They never hold a rotation open: failing on a seal no
-    key re-seals would fail every later run too."""
+    15). Those the passes refused never hold a rotation open: failing on a seal no key re-seals
+    would fail every later run too. ``appeared`` counts the ``refused`` ones beyond what the passes
+    themselves refused, pass by pass, which only a write made during the run can leave: such a
+    seal may be sound and still under a prior key, so the command does not report the rotation
+    complete (vault BACKLOG #5635)."""
 
     unheld: int = 0
     refused: int = 0
+    appeared: int = 0
     unheld_tables: tuple[str, ...] = ()
     unheld_key_ids: tuple[str, ...] = ()
 
 
+#: The re-seal pass that refuses a table's seals, where it is not the table's own name: the role
+#: pass also re-seals both directory maps.
+_RESEAL_PASS_OF: Final = {"authority_set_seal": "roles"}
+
+
 def classify_unrotated(
-    sealer: AnyRowSealer | None, seals: Iterable[tuple[str, object]]
+    sealer: AnyRowSealer | None,
+    seals: Iterable[tuple[str, object]],
+    *,
+    pass_refused: Mapping[str, int] | None = None,
 ) -> ResealOutcome:
     """The :class:`ResealOutcome` for ``seals``, each ``(table, stored seal)`` a re-seal pass's
     table held after it ran. A blank seal or one under the active key is not counted. Under a
     Transit sealer, or no sealer, nothing is: ``rotate-key`` refuses vault_transit before it opens
-    the store."""
+    the store.
+
+    ``pass_refused`` is what each re-seal pass refused, keyed ``users``, ``roles`` and
+    ``pending_approvals``. Given it, the refused seals of a pass's tables beyond that pass's own
+    count are counted ``appeared``. A pass checks every non-active seal it selects, re-seals each
+    that holds and counts each that fails, so after it a non-active seal over its count was
+    written after the pass reached it, by a writer running alongside. The approval and user
+    passes can also refuse a row this read does not select, a closed request or a seal under the
+    active key, so the count can miss such a write but never counts a seal a re-run with nothing
+    else writing would meet again."""
     if not isinstance(sealer, RowSealer):
         return ResealOutcome()
     unheld = refused = 0
+    per_pass: dict[str, int] = {}
     tables: set[str] = set()
     key_ids: set[str] = set()
     for table, stored in seals:
@@ -1071,9 +1093,17 @@ def classify_unrotated(
             key_ids.add(str(stored)[len(SEAL_PREFIX) :].partition(":")[0])
         else:
             refused += 1
+            group = _RESEAL_PASS_OF.get(table, table)
+            per_pass[group] = per_pass.get(group, 0) + 1
+    appeared = (
+        sum(max(0, n - pass_refused.get(group, 0)) for group, n in per_pass.items())
+        if pass_refused is not None
+        else 0
+    )
     return ResealOutcome(
         unheld=unheld,
         refused=refused,
+        appeared=appeared,
         unheld_tables=tuple(sorted(tables)),
         unheld_key_ids=tuple(sorted(key_ids)),
     )

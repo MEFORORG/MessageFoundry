@@ -10859,11 +10859,18 @@ class SqlServerStore(ServerCipherWalk):
         if preflight.unheld:
             self._reseal_outcome = preflight
             raise unheld_seal_refusal(preflight, before_writes=True)
-        report_user_reseal(*await self.reseal_user_records())
-        report_role_reseal(*await self.reseal_role_records())
-        report_approval_reseal(*await self.reseal_approval_records())
+        users = await self.reseal_user_records()
+        report_user_reseal(*users)
+        roles = await self.reseal_role_records()
+        report_role_reseal(*roles)
+        approvals = await self.reseal_approval_records()
+        report_approval_reseal(*approvals)
         # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
-        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        self._reseal_outcome = classify_unrotated(
+            self._row_sealer,
+            await self._unrotated_seals(),
+            pass_refused={"users": users[1], "roles": roles[1], "pending_approvals": approvals[1]},
+        )
         if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
             raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
@@ -17810,8 +17817,11 @@ class SqlServerStore(ServerCipherWalk):
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
+        # The binary collation the read after the passes uses, so a seal that read selects is one
+        # this pass selected and either re-sealed or counted (vault BACKLOG #5635).
         rows = await self._fetchall(
-            "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+            "SELECT id FROM roles WHERE seal <> ''"
+            " AND seal COLLATE Latin1_General_100_BIN2 NOT LIKE ? ORDER BY id",
             (f"{SEAL_PREFIX}{sealer.key_id}:%",),
         )
         resealed = refused = 0

@@ -13459,7 +13459,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if isinstance(store, SecretRotationMetaStore) and rolled[0] and not uploads.incomplete:
+            # A seal written during the run may be sound and under the prior key (#5635), so it
+            # holds the rotation open as a skipped upload does.
+            if (
+                isinstance(store, SecretRotationMetaStore)
+                and rolled[0]
+                and not uploads.incomplete
+                and not seals.appeared
+            ):
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -13563,8 +13570,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     )
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
     # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
-    # uploaded file may still be under that key (BACKLOG #3181).
-    complete = rolled_ok and not uploads.incomplete
+    # uploaded file may still be under that key (BACKLOG #3181), or while a record sealed during the
+    # run may be (vault BACKLOG #5635).
+    complete = rolled_ok and not uploads.incomplete and not seals.appeared
     print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
@@ -13665,6 +13673,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "sound and still under the prior key: stop every engine using this store and re-run "
             "before dropping that key. A re-run may count such a record again; do not remove an "
             "account on this count alone."
+        )
+    if seals.appeared:
+        # Vault BACKLOG #5635: more of them than the re-seal passes refused, so these were written
+        # after their pass reached them. Such a seal may be sound and under the prior key, so
+        # this run fails and stamps nothing; a re-run with nothing else writing settles it.
+        print(
+            f"error: {seals.appeared} of those record(s) were written during this run, after the "
+            "re-seal passes reached them, so each may still be sealed under the prior key. This "
+            "run did not stamp the key's rotation date, and the rotation stays open. Stop every "
+            "engine using this store and re-run rotate-key BEFORE retiring any prior key "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED).",
+            file=sys.stderr,
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under

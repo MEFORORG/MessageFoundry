@@ -277,3 +277,66 @@ async def test_the_reseal_outcome_contract_holds_on_sqlite(tmp_path: Path) -> No
         await assert_reseal_outcome_contract(store, _raw_for(path))
     finally:
         await store.close()
+
+
+async def _role_sealed_by_the_store(db: Path, key: str) -> tuple[str, str]:
+    """A custom role the store writes and seals under ``key``, and that seal."""
+    store = await _open(db, key)
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        role_id = (
+            await service.create_custom_role(
+                display_name="r-alongside",
+                description=None,
+                permissions=["messages:replay"],
+                actor="t",
+            )
+        ).id
+    finally:
+        await store.close()
+    conn = sqlite3.connect(db)
+    try:
+        (seal,) = conn.execute("SELECT seal FROM roles WHERE id=?", (role_id,)).fetchone()
+    finally:
+        conn.close()
+    return role_id, str(seal)
+
+
+def test_a_seal_written_under_the_prior_key_during_the_run_holds_it_open(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The row's remaining shape: a writer running alongside, such as an engine still on the prior
+    key, seals a record under that key after its pass re-sealed it. The run counted it refused,
+    printed OK and exited 0, and dropping the key then stranded the record. More refused seals than
+    the passes refused now fail the run, stamp nothing and leave the rotation record open. The
+    re-run with nothing else writing is the control: it completes."""
+    db, uploads, key_a, key_b = rig
+    role_id, prior_seal = asyncio.run(_role_sealed_by_the_store(db, key_a))
+    assert prior_seal.startswith("mfseal:v1:")  # control: the store sealed it
+    original = MessageStore.reseal_approval_records
+
+    async def then_a_writer(self: MessageStore) -> tuple[int, int]:
+        # After the role pass re-sealed the role under the new key, as the writer would.
+        result = await original(self)
+        await _raw_for(db)("UPDATE roles SET seal=? WHERE id=?", (prior_seal, role_id))
+        return result
+
+    monkeypatch.setattr(MessageStore, "reseal_approval_records", then_a_writer)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "OK:" not in captured.out and "PARTIAL:" in captured.out
+    assert "error: 1 of those record(s) were written during this run" in captured.err
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))  # still open
+
+    monkeypatch.setattr(MessageStore, "reseal_approval_records", original)
+    assert main(["rotate-key", "--db", str(db)]) == 0, capsys.readouterr()
+    assert "OK:" in capsys.readouterr().out
+    rows = asyncio.run(_rows(db, key_b))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert rows[ROTATION_RECORD_ID].fingerprint == ""
