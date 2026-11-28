@@ -8,8 +8,10 @@ Windows error such as ``ERROR_NETNAME_DELETED`` (64) under ``EINVAL``, and a Win
 ``FileNotFoundError`` carrying ``ERROR_BAD_NETPATH`` (53). Each step of a part's read, the first
 ``lstat``, the Windows check after the open and the read itself, classes all three as unreachable,
 so a by-id read answers ``UploadStorageUnreachableError`` rather than a server error or a missing
-file. Every site that reads a ``FileNotFoundError`` as absence reads it through ``is_absent``, so
-an outage is never a removal, a lost body or a pair already gone.
+file. At least the sites tested here read a ``FileNotFoundError`` as absence only through
+``is_absent``, and the ones a removal or a ``rotate-key`` lost body rests on that the last section
+names only through ``is_name_absent``. Other sites still read a Windows missing folder or drive as
+absence; the changelog fragment names them.
 
 Synthetic values only. The faults are raised by patching the one call that meets them, since a
 real outage cannot be made on a test runner.
@@ -133,23 +135,7 @@ async def test_an_outage_at_the_check_after_the_open_answers_unreachable(
     # 8401eaff finding 2: Windows checks the name again once it is open, and an error there was
     # raised as it was: a server error, or for a FileNotFoundError a missing upload.
     store, fid, blob, sidecar = await _saved(tmp_path)
-    target = blob if op == "read_bytes" else sidecar
-    opened: list[Path] = []
-
-    def _recording_open(path: Any, flags: int, *args: Any) -> int:
-        opened.append(Path(path))
-        return os.open(path, flags, *args)
-
-    real = Path.lstat
-
-    def _lstat(self: Path) -> os.stat_result:
-        if self == target and target in opened:
-            raise _ALL[fault](self)
-        return real(self)
-
-    monkeypatch.setattr(uploads, "_O_NOFOLLOW", 0)  # the Windows path, on every platform
-    monkeypatch.setattr(uploads, "os", _OsWith(_recording_open))
-    monkeypatch.setattr(Path, "lstat", _lstat)
+    _after_the_open_fails(monkeypatch, blob if op == "read_bytes" else sidecar, _ALL[fault])
     with pytest.raises(UploadStorageUnreachableError):
         await _call(store, op, fid)
 
@@ -505,7 +491,9 @@ def _parent_missing(path: Path | None) -> OSError:
 
 
 def _drive_missing(path: Path | None) -> OSError:
-    """ERROR_INVALID_DRIVE (15), as a mapped drive that dropped answers, mapped to ENOENT too."""
+    """ERROR_INVALID_DRIVE (15), which CPython maps to ENOENT too. Which file calls answer it is not
+    measured: on one Windows 11 box a path on an unmapped drive letter answered 3, as
+    :func:`_parent_missing` does."""
     text = "The system cannot find the drive specified"
     return _os_error(FileNotFoundError, errno.ENOENT, text, path, winerror=15)
 
@@ -575,6 +563,45 @@ async def test_rotate_key_skips_a_body_under_a_missing_folder_rather_than_count_
     _every_lstat_fails(monkeypatch, blob, _name_missing)
     # Control: a body whose name is missing is still a lost one.
     half = store._reseal_half(cast(Any, None), fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.LOST
+
+
+class _OsOpenAndLstatFail:
+    """The ``os`` the uploads module reads: the open of ``target`` says it is absent, with no
+    winerror as a Windows open gives, and its own ``lstat`` of ``target`` meets ``fault``."""
+
+    def __init__(self, target: Path, fault: _Fault) -> None:
+        self._target = target
+        self._fault = fault
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(os, name)
+
+    def open(self, path: Any, flags: int, *args: Any) -> int:
+        if Path(path) == self._target:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        return os.open(path, flags, *args)
+
+    def lstat(self, path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path) == self._target:
+            raise self._fault(self._target)
+        return os.lstat(path, *args, **kwargs)
+
+
+@pytest.mark.parametrize("fault", list(_NOT_NAME))
+async def test_rotate_key_skips_a_body_whose_failed_open_meets_a_missing_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    # The re-check after a failed open read a missing folder or drive as the body gone, and the
+    # half reused that verdict, so it was LOST while the body may still be under the OLD key.
+    store, fid, blob, _sidecar = await _saved(tmp_path, keyed=True)
+    cipher = cast(Any, store._cipher)
+    monkeypatch.setattr(uploads, "os", _OsOpenAndLstatFail(blob, _NOT_NAME[fault]))
+    half = store._reseal_half(cipher, fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.SKIPPED
+    monkeypatch.setattr(uploads, "os", _OsOpenAndLstatFail(blob, _name_missing))
+    # Control: a re-check that says the name is missing is still a lost body.
+    half = store._reseal_half(cipher, fid, blob, "body", gate=cast(Any, None))
     assert half is uploads._Half.LOST
 
 

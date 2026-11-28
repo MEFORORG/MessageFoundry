@@ -326,11 +326,11 @@ def _known_absent(path: Path) -> bool:
     (:func:`~messagefoundry.path_reach.is_name_absent`, whose limits apply to a ``True``).
     ``False`` when something is there, and when the ``lstat`` fails for any other reason, such as
     a share that cannot be reached or, on Windows, a missing folder or drive above the name, which
-    is logged (BACKLOG #5388)."""
+    is logged (BACKLOG #5388). A ``ValueError``, as for a name with a NUL, is such a failure too."""
     try:
         os.lstat(path)
-    except OSError as exc:
-        if is_name_absent(exc):
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, OSError) and is_name_absent(exc):
             return True
         _log.warning("uploaded-file part %s could not be checked: %s", path.name, exc)
     return False
