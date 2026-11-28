@@ -14274,8 +14274,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         if audit.absent and not server:
             reason += f"; {unread}, so not read: {', '.join(audit.absent)}"
     if audit.hidden:
-        # On every verdict, so a key or a lost connection fixed first does not hide a grant gap
-        # until a second run.
+        # On every verdict whose run read the catalog, so a key or a lost connection fixed first
+        # does not hide a grant gap until a second run. An open the store refused as keyless
+        # read no catalog, so that KEY_MISMATCH names none.
         reason += (
             f"; {len(audit.hidden)} expected cipher table(s) or cell(s) are not visible in the "
             f"catalog of {_store_label(store)} and were not read: {', '.join(audit.hidden)}. At "
