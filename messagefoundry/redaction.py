@@ -1526,10 +1526,13 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     fixed point :func:`safe_text` relies on).
 
     :func:`_runs_on_as_received` covers a BRACKETED run only: as received, ``"given": [a|b|c] x``
-    holds a container, so the walk there reads the ``x`` after it. An UNBRACKETED run is not
-    covered: as received, ``"given": a|b|c x`` holds a scalar, which this walk does not read past,
-    and after the field-run pass it reads ``"given": [redacted] x``, which the placeholder exempts.
-    So ``x`` is kept, a residual.
+    holds a container, so this check reads the ``x`` after it and the walk raises. An UNBRACKETED
+    run is not covered. As received, ``"given": a|b|c x`` holds a scalar: the scrub there takes
+    ``x`` with the bare run and hides it, but it raises nothing, and :func:`_runs_on_as_received`
+    keeps only whether it raised, not its output. The field-run pass then writes
+    ``"given": [redacted] x``, the placeholder exempts it here, and inside an object the policy
+    after that container is the enclosing frame's, so ``x`` is kept, top-level or nested alike: a
+    residual, which the ``MISSED`` list pins.
 
     **Only a container's end is read, by choice.** A token after a scalar (``"family": "Doe"
     failed``) is far more often prose after a diagnostic's value than a stray closer, and blanking

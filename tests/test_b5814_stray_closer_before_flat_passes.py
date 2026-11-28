@@ -102,10 +102,12 @@ MISSED = [
     f'"family": "Doe" {SECRET}',
     # The placeholder written by the text itself, which a second pass must be able to read.
     f'"given": [redacted] {SECRET}',
-    # An UNBRACKETED field run, then the token. As received the value is a scalar, which the
-    # run-on rule does not read past, and the field-run pass then writes the placeholder, which
-    # it exempts, so `_runs_on_as_received` does not cover it (as on origin/main 4ad697da713).
+    # An UNBRACKETED field run, then the token, top-level, in an object and nested (kept on
+    # origin/main 4ad697da713 too). Why: the `_json_value_runs_on` docstring.
     f'"given": a|b|c {SECRET}',
+    f'{{"given": a|b|c {SECRET}}}',
+    f'{{"family": DOE^JANE^Q {SECRET}}}',
+    f'{{"identifier": {{"value": a|b|c {SECRET}}}}}',
 ]
 
 
@@ -332,7 +334,7 @@ def _redaction_suite_strings() -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
-def _fuzz(count: int) -> tuple[str, ...]:
+def _fuzz(count: int) -> list[str]:
     """Seeded texts drawn from what either walk reads: brackets, both quotes, a backslash, line
     breaks and other whitespace, string prefixes, characters neither treats as structure, PHI keys
     and filler."""
@@ -341,7 +343,7 @@ def _fuzz(count: int) -> tuple[str, ...]:
     parts += ["\x1c", "\x1f", "\x85", "\u2028", "\u2029", "\u3000", ",", ":", "x", "b'", 'B"']
     parts += ['rb"', "`", "<", ">", '"""']
     parts += ['"family": ', "'given': ", '"name":', '"0010ABCD": ']
-    return tuple("".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count))
+    return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
 
 
 _STRUCTURE_FUZZ = 30_000
@@ -464,8 +466,9 @@ def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.Mo
     share of the per-test timeout (measured 2026-11-27). That fuzz aims at the walk's brackets,
     which :func:`test_the_structure_walk_matches_the_token_walk` reads whole, and
     :func:`_differential_fuzz` is this test's own fuzz."""
-    head = _fuzz(_STRUCTURE_FUZZ)[:_DIFFERENTIAL_SHARE]
-    texts = [*_cases(), *head, *LEAK_PROBES, *RUN_ON, *KEPT, *_differential_fuzz(4_000)]
+    # Seeded and drawn in order, so this is the head of the structure fuzz.
+    head = _fuzz(_DIFFERENTIAL_SHARE)
+    texts = [*_cases(), *head, *LEAK_PROBES, *KEPT, *_differential_fuzz(4_000)]
     # Neither rule reads a text with no PHI key, so only those can differ.
     texts = [text for text in texts if _JSON_PHI_KEY.search(text)]
     leaks, changed = _words_main_hid(texts, _answers(texts), _main_answers(texts, monkeypatch))
