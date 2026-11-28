@@ -3102,8 +3102,9 @@ def _run(
     (:func:`_without_new_dsn_readings` says why).
     The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is,
     the tail after a user's placeholder (:data:`_DSN_TAIL`) included, and the reading before
-    applies the whole pattern, the two readings batch 20010 added among it; the traced shipped
-    reading applies it less those two, as above. So a line the union returns its reading before for, whole, on either branch
+    applies the whole pattern, the two readings batch 20010 added among it, where
+    ``new_dsn_readings`` is True, and the pattern less those two where it is False; the traced
+    shipped reading applies it less those two either way, as above. So a line the union returns its reading before for, whole, on either branch
     above, still takes the tail. Its run does not cross a camelCase label only the shipped
     reading reads, because every segment of the widened match stops at a label word
     (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
@@ -3533,9 +3534,10 @@ def _union(
     would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
     they are by default; :func:`_scrub_credentials` passes the reading without the tails. The
     traced shipped reading also leaves out the two readings batch 20010 added to the widened DSN
-    pass (:func:`_without_new_dsn_readings`); the shortcut, which applies ``sub``, does not.
-    ``new_dsn_readings`` reaches every :func:`_run` here, the probes and the reading before
-    included."""
+    pass (:func:`_without_new_dsn_readings`); the shortcut, which applies ``sub``, leaves them out
+    only when ``new_dsn_readings`` is False. ``new_dsn_readings`` reaches every :func:`_run`
+    here, the probes and the reading before included, and with it False no run here applies the
+    member-tail pass (:data:`_DSN_MEMBER_TAIL`) or those two readings."""
     before = _Trace(len(text), _pre_camel)
     shipped_read = _same if read is None else read
     # Without the two widened DSN readings batch 20010 added; the function says why.

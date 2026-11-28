@@ -7,6 +7,10 @@
 
   What still prints includes at least the residuals stated in the comments on `_WIDE_DSN_PASSWORD`
   and `_DSN_MEMBER_TAIL` in `messagefoundry/secretscrub.py`; that list is not complete.
-  A `messagefoundry verify` report does not take these readings, so it still prints each value
-  above, as it did before this change; the comment above `_WIDE_DSN_PASSWORD` says why.
+  Text that `messagefoundry.verify_leaf.safe_detail_text` scrubs, including at least the text
+  `safe_exc_detail` and `safe_exc_text` pass it, does not take this change: each value above
+  still prints there, as it did before. That text includes at least the details of a
+  `messagefoundry verify` report and the acceptance harness's probe rows that quote an
+  exception (`scrubbed_exc` in `harness/acceptance/probes.py`); the docstring of
+  `scrub_credentials_without_tails` in `messagefoundry/secretscrub.py` says why.
   (`BACKLOG #5386`)
