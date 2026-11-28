@@ -1811,8 +1811,8 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     4455``), and the end of a last word that glued text could complete, which stays while the
     words before it are masked (``</family zqxP`` masks to ``</family xxxP``, and ``shared``
     stays whole); an end tag naming no open element whose name :func:`_stray_end_tag_name` keeps,
-    at least an unprefixed one and one that ends the text (``</family:Zqxdoe`` with nothing
-    after it; with its ``>``, the local part is masked); and the text of an element that only a
+    at least an unprefixed one (``</Zqxdoe>``; with a prefix, as in ``</family:Zqxdoe>``, the
+    local part is masked); and the text of an element that only a
     malformed end tag closes and whose text opens with whitespace (``<family> Smith</family
     Kim``), which is read as prose.
 
@@ -1945,35 +1945,42 @@ def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool, *, noted: boo
     the name carries a prefix and its local part names no element a pass reads
     (:data:`_XML_STRUCTURE_NAMES`): masking ``</name`` itself let a later call read the element
     differently, and a value after it printed (measured by the composed-join differential). And
-    only where whitespace or the tag's ``>`` follows the name, and where :func:`_rest_words` and
-    :func:`_ends_in_unbounded_word` allow it as they allow a rest the tag's ``>`` ends. Where only
-    whitespace follows the name to the text's end and no bound note follows (``noted`` False), the
-    stripped answer ends on the name and a caller's text can be glued to it, so the name keeps its
-    glue head (:func:`_mask_keeping_glue_head`: ``</family:ZqxM `` masks to ``</family:XxxM``), or
-    is kept whole where that mask refuses it. Otherwise, or with ``mask`` False, the tag is kept as
-    it stood, at least an unprefixed ``</Zqxdoe>`` and a ``</family:Zqxdoe`` that ends the text.
-    The prefix is never masked (``</Zqxdoe:x>`` prints ``Zqxdoe``), and only a leaf frame's stray
-    tag is read, so one inside an element whose text is read as one value prints its local part
-    (``<telecom>555</ns:Zqx4455>``)."""
+    only where whitespace, the tag's ``>`` or the text's end follows the name.
+
+    **Where the name ends the text** (nothing or only whitespace after it) **and no bound note
+    follows** (``noted`` False), the stripped answer ends on the name and a caller's text can be
+    glued to it, so the name keeps its glue head, as an end tag's rest ending the text keeps it
+    (:func:`_mask_keeping_glue_head`: ``</family:ZqxM `` masks to ``</family:XxxM``, ``</ns:ZqMSH``
+    to ``</ns:XxMSH``), and is kept whole where that mask refuses it. **Everywhere else**, the
+    end of a bounded head included, where the head's whitespace is dropped and the note follows
+    (``noted`` True), the local name is masked whole where :func:`_rest_words` and
+    :func:`_ends_in_unbounded_word` allow it as they allow a rest the tag's ``>`` ends, and kept
+    as it stood where they refuse it.
+
+    With ``mask`` False the tag is kept as it stood, and so, at least, is an unprefixed
+    ``</Zqxdoe>``. The prefix is never masked (``</Zqxdoe:x>`` prints ``Zqxdoe``), and only a leaf
+    frame's stray tag is read, so one inside an element whose text is read as one value prints its
+    local part (``<telecom>555</ns:Zqx4455>``)."""
     whole = tag.group()
     local = tag.group(3)
+    at_end = _TRAILING_SPACE.match(text, tag.end()) is not None
     if (
         not mask
         or local == tag.group(2)  # no prefix: an unprefixed name can be another pass's markup
         or local in _XML_STRUCTURE_NAMES
         or len(local) > _GLUED_VALUE_MAX
-        or text[tag.end() : tag.end() + 1] not in (">", " ", "\t", "\r", "\n")
+        or not (at_end or text[tag.end() : tag.end() + 1] in (">", " ", "\t", "\r", "\n"))
     ):
         return whole
     rest = " " + local
-    if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
-        return whole
     head = whole[: len(whole) - len(local)]
-    if not noted and _TRAILING_SPACE.match(text, tag.end()) is not None:
-        # Only whitespace runs to the text's end, so the stripped answer ends on the name and a
-        # caller's text can be glued to it: keep the glue head, as an end tag's rest keeps it.
+    if at_end and not noted:
+        # The stripped answer ends on the name and a caller's text can be glued to it: keep the
+        # glue head, as an end tag's rest ending the text keeps it.
         masked = _mask_keeping_glue_head(rest)
         return whole if masked is None else head + masked[1:]
+    if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
+        return whole
     return head + local.translate(_SHAPE)
 
 
@@ -3074,8 +3081,9 @@ def safe_text_bound(text: str) -> tuple[str, str]:
     audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
     :func:`safe_text` cut it again and append a second bound note. ``safe_text(head) + note`` is
     not ``safe_text(text)``: :func:`safe_text` on the head alone sees no note after it, so a value
-    the cut left last is judged as ending the text (BACKLOG #5925). :func:`redact_bounded_head`
-    gives the head's answer as :func:`safe_text` gives it."""
+    the cut left last is judged as ending the text (BACKLOG #5925). ``safe_text(head,
+    follows=note) + note`` tells it, as the off-box audit tee does, and
+    :func:`redact_bounded_head` gives the head's answer as :func:`safe_text` gives it."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 

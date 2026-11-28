@@ -760,7 +760,7 @@ def test_an_end_tag_naming_no_open_element_has_its_name_masked(text: str, want: 
 @pytest.mark.parametrize(
     "text",
     [
-        "<family>Smith</family:Zqxdoe",  # nothing after the name: glued text could complete it
+        "<family>Smith</ns:userPwd",  # ending the text: a camel credential label
         "<family>Smith</family:ZqMSH>",  # a word read with no boundary
         "<family>Smith</family:userPwd>",  # a camel credential label
         "<identifier><system>x</b:Zqxdoe></system></identifier>",  # not a leaf frame
@@ -781,6 +781,8 @@ def test_an_end_tag_name_the_rules_refuse_stays_as_main_left_it(text: str) -> No
         ("<family>Smith</x:zqxP\n", "<family>[redacted]</x:xxxP"),
         ("<given>Jo</y:Zqnon\t", "<given>[redacted]</y:Xxnon"),
         ("<family>Smith</family:Zqxdoe ", "<family>[redacted]</family:Xxxxxx"),
+        ("<family>Smith</family:Zqxdoe", "<family>[redacted]</family:Xxxxxx"),  # round 2
+        ("<family>Smith</ns:ZqMSH ", "<family>[redacted]</ns:XxMSH"),  # round 2
     ],
 )
 def test_a_stray_end_tag_name_ending_the_text_keeps_its_glue_head(text: str, want: str) -> None:
@@ -815,3 +817,18 @@ def test_text_glued_after_a_stray_end_tag_name_still_completes_its_word(
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(redaction, "_glue_head_start", len)
         assert value in joined()
+
+
+def test_a_stray_end_tag_name_the_window_cut_leaves_last_is_masked() -> None:
+    """Code review round 2: a bounded head is stripped before it is redacted, so a stray name the
+    cut left last ends the head with the note after it, and is masked whole, as an end tag's rest
+    is there. It printed whole on every bounded route, as on main."""
+    tag = "<family>Smith</ns:zqxdoe"
+    text = "w " * ((65536 - len(tag) - 1) // 2) + tag + " " + "q " * 5000
+    head, note = redaction.safe_text_bound(text)
+    assert note and head.rstrip().endswith(tag)  # the premise: the cut leaves the name last
+    with _main():
+        assert "zqxdoe" in safe_text(text, limit=10**6)  # the premise: main printed it
+    out = safe_text(text, limit=10**6)
+    assert "</ns:xxxxxx [redaction bound:" in out
+    assert "zqxdoe" not in out
