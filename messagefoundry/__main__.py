@@ -1205,8 +1205,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "connection, an unreadable row or the key service), 2 could not start, 3 NOT_COVERED (a "
         "PostgreSQL or SQL Server store whose catalog does not show this login a table or column "
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
-        "read, or a PostgreSQL table whose row-level security may hide rows from this login), 4 "
-        "KEY_MISMATCH. Run it with the service's own key: a shell "
+        "read; at least also a PostgreSQL table whose row-level security may hide rows from this "
+        "login, or whose row-security catalog read failed, so its rows may not all have been "
+        "read), 4 KEY_MISMATCH. With --json, row_filtered lists those tables, and is null where "
+        "no row filter was read (SQLite, SQL Server). Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
         "'vault_transit' values go to Transit in batches of up to 128 values and 524,288 "
         "characters of them, and a value past that bound alone (BACKLOG #1719, #6706)",
@@ -13955,11 +13957,15 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     A server store's schema is the build's, so every cell of the inventory asked for must be
     visible in its catalog read. One that is not, a table or a column, was not read, at least
     because the login lacks a grant on it: that is NOT_COVERED, never a PASS over the rest. So is
-    a PostgreSQL table whose row-level security may hide rows from the login, which is read, and
-    may not be read whole (BACKLOG #1719 item 35).
+    at least a PostgreSQL table whose row-level security may hide rows from the login, or one
+    whose row-security catalog read failed; it is read, and may not be read whole (BACKLOG #1719
+    item 35). ``--json`` names those tables in ``row_filtered``: a list where the row filter was
+    read, empty when none applies, and ``null`` where no row filter was read, at least on SQLite,
+    on SQL Server, whose security policies are not read, and on an open refused before any
+    catalog read. ``hidden`` lists the cells the catalog did not show.
 
-    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (a server store whose catalog hides an
-    expected cell, or whose row-level security may hide rows), 4 KEY_MISMATCH (a sealed value and
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (at least a server store whose catalog
+    hides an expected cell, or whose rows a row filter may hide), 4 KEY_MISMATCH (a sealed value and
     no key resolved, the usual cause being a shell without the service's key). A FAIL or
     KEY_MISMATCH the visible cells earn leads 3. A keyless open of a server store whose audit log
     is empty is refused as one that would start a keyless audit chain; where a read-only probe
@@ -13969,7 +13975,6 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
-        KEY_NAMED_UNRESOLVED,
         KeylessAuditChainRefused,
         StoreNotFoundError,
         audit_chain_read_errors,
@@ -14111,13 +14116,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 )
             if found is None or found.key_mismatch is None:
                 return None
-            # The refusal's own cause first, so it stays the mismatch's and not a failure line's
-            # that `with_first_failure` may have added after it; then what the refusal saw.
-            cause = f"{KEY_NAMED_UNRESOLVED}: " if refusal.key_named else ""
-            found.key_mismatch = (
-                f"{cause}{found.key_mismatch}. The store's audit log also reads as empty to this "
-                "login, though a keyed store's holds at least its genesis row: the log may have "
-                "been emptied, or its rows hidden from this login"
+            found.key_mismatch = _keyed_refusal_mismatch(
+                found.key_mismatch, key_named=refusal.key_named
             )
             return found
 
@@ -14338,12 +14338,22 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "least a missing grant on the table or one of its columns, or a schema behind this "
             "build, hides one: grant the login read on it, or let the service's open migrate the store, and run again"
         )
-    if audit.row_filtered:
-        # Beside the hidden cells, on every verdict whose run read the catalog, for the same reason.
+    if audit.row_filtered and audit.row_filter == "failed":
+        # Beside the hidden cells, on every verdict whose run read the catalog, for the same
+        # reason. The read failed, so no role flag was learned: BYPASSRLS is not the fix.
+        reason += (
+            f"; the row-security catalog read of {_store_label(store)} failed, so every one of "
+            f"its {len(audit.row_filtered)} visible table(s) may hide rows from this login, and "
+            f"values in them may not have been read: {', '.join(audit.row_filtered)}. Grant the "
+            "login read on pg_catalog.pg_class and pg_catalog.pg_roles, check the link to the "
+            "store, and run again"
+        )
+    elif audit.row_filtered:
+        # Named by the row-security rule, on every verdict whose run read the catalog.
         reason += (
             f"; {len(audit.row_filtered)} table(s) of {_store_label(store)} may hide rows from "
-            "this login, through row-level security or because the catalog read of it was "
-            "refused or incomplete, so values in them may not have been read: "
+            "this login, through row-level security, or are not ordinary tables, or were not in "
+            "the catalog read, so values in them may not have been read: "
             f"{', '.join(audit.row_filtered)}. Run it as a role that reads every row: "
             "a role with BYPASSRLS, or the role that directly owns the table where the table "
             "does not force row-level security; a superuser also does, but is not needed"
@@ -14366,7 +14376,10 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 "legacy": audit.legacy if counted else None,
                 # What the run could not cover, by name, so a script need not parse the reason.
                 "hidden": list(audit.hidden),
-                "row_filtered": list(audit.row_filtered),
+                # null where no row filter was read, so an empty list always means "read, none".
+                "row_filtered": (
+                    None if audit.row_filter == "unread" else list(audit.row_filtered)
+                ),
                 "cells": [
                     {
                         "cell": t.name,
@@ -16025,6 +16038,23 @@ def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
         # Setting a cause, by `raise ... from` or by assignment, also suppresses the context.
         link = None if link.__suppress_context__ else link.__context__
     return False
+
+
+def _keyed_refusal_mismatch(mismatch: str, *, key_named: bool) -> str:
+    """``cipher-audit``'s KEY_MISMATCH line behind the keyless-chain refusal (BACKLOG #1719 item
+    22): the refusal's configured-key cause first where it named one, then ``mismatch``'s own
+    line with what the refusal saw, an empty audit log, attached to it, and then any failure
+    line :func:`~messagefoundry.store.cipher_cells.with_first_failure` added after it."""
+    from messagefoundry.store.base import KEY_NAMED_UNRESOLVED
+    from messagefoundry.store.cipher_cells import FIRST_FAILURE_SEPARATOR
+
+    head, sep, tail = mismatch.partition(FIRST_FAILURE_SEPARATOR)
+    cause = f"{KEY_NAMED_UNRESOLVED}: " if key_named else ""
+    return (
+        f"{cause}{head}. The store's audit log also reads as empty to this login, though a keyed "
+        "store's holds at least its genesis row: the log may have been emptied, or its rows "
+        f"hidden from this login{sep}{tail}"
+    )
 
 
 def _emit_store_open_error(

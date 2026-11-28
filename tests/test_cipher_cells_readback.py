@@ -1202,7 +1202,7 @@ class _SqliteSource:
                 found[table] = names
         return found
 
-    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
         return frozenset(t for t in tables if t in self.row_filtered)
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:

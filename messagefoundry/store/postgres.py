@@ -119,7 +119,6 @@ from messagefoundry.store.base import (
     check_walk_identifiers,
     driver_sqlstate,
     seed_filter_clause,
-    store_call_errors,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -4106,42 +4105,33 @@ class PostgresStore(ServerCipherWalk):
     async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
         """Those of ``tables`` whose rows row-level security may hide from this login (BACKLOG
         #1719 item 35): :func:`row_security_hides_rows` over ``pg_class`` and ``pg_roles``, read in
-        the schema :meth:`cipher_walk_columns` reads. A table with no row there, or a flag read as
-        NULL, is named, and a read refused as insufficient_privilege (42501) names every table:
-        a doubt reads as not audited whole, never as covered.
+        the schema :meth:`cipher_walk_columns` reads. A table with no row there, a relation that
+        is not an ordinary or partitioned table (a view or a foreign table can filter rows that
+        no row-security flag shows), or a flag read as NULL, is named: a doubt reads as not
+        audited whole, never as covered.
 
         A member of the owning role is read as not the owner, though PostgreSQL exempts one that
-        inherits the role's privileges: that errs toward naming the table. Any other failure, a
-        lost connection, a statement timeout or another class-42 error among them, is raised."""
+        inherits the role's privileges: that errs toward naming the table. A failed read is
+        raised, for ``cipher_cells.server_row_filtered`` to judge."""
         names = list(dict.fromkeys(tables))
         if not names:
             return frozenset()
-        try:
-            rows = await self._fetchall(
-                "SELECT t.name AS table_name, c.relrowsecurity, c.relforcerowsecurity,"
-                " (c.relowner = r.oid) AS owned, r.rolsuper, r.rolbypassrls"
-                " FROM unnest($1::text[]) AS t(name)"
-                " LEFT JOIN pg_catalog.pg_class c ON c.relname::text = t.name"
-                " AND c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
-                " WHERE n.nspname = current_schema())"
-                " LEFT JOIN pg_catalog.pg_roles r ON r.rolname = current_user",
-                names,
-            )
-        except store_call_errors() as exc:
-            if driver_sqlstate(exc) != "42501":
-                # Not a refused grant: a link, a timeout, a syntax or catalog fault. The caller,
-                # `cipher_cells.server_row_filtered`, reads it as a doubt too, and logs it.
-                raise
-            # insufficient_privilege refused the catalog read: a doubt over every table.
-            log.warning(
-                "cipher-audit: the row-level security catalog read was refused (%s, SQLSTATE %s)",
-                type(exc).__name__,
-                driver_sqlstate(exc),
-            )
-            return frozenset(names)
-        # pg_class is unique on name and schema, so each table has at most one row.
+        rows = await self._fetchall(
+            "SELECT t.name AS table_name, c.relkind::text AS relkind, c.relrowsecurity,"
+            " c.relforcerowsecurity,"
+            " (c.relowner = r.oid) AS owned, r.rolsuper, r.rolbypassrls"
+            " FROM unnest($1::text[]) AS t(name)"
+            " LEFT JOIN pg_catalog.pg_class c ON c.relname::text = t.name"
+            " AND c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
+            " WHERE n.nspname = current_schema())"
+            " LEFT JOIN pg_catalog.pg_roles r ON r.rolname = current_user",
+            names,
+        )
+        # pg_class is unique on name and schema, so each table has at most one row. Only an
+        # ordinary ('r') or partitioned ('p') table is read by its flags.
         hides = {
-            str(r["table_name"]): row_security_hides_rows(
+            str(r["table_name"]): str(r["relkind"]) not in ("r", "p")
+            or row_security_hides_rows(
                 enabled=r["relrowsecurity"],
                 forced=r["relforcerowsecurity"],
                 owned=r["owned"],

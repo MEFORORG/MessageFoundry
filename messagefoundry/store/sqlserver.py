@@ -4975,12 +4975,12 @@ class SqlServerStore(ServerCipherWalk):
             found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
         return {t: frozenset(c) for t, c in found.items()}
 
-    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
-        """None of ``tables``: this backend's row filter, a SQL Server security policy, is not read
-        yet, so a walk under one is not reported as not audited whole. Its PostgreSQL twin reads
-        row-level security (BACKLOG #1719 item 35); reading security policies here is a follow-up,
-        unfiled."""
-        return frozenset()
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+        """``None``: this backend's row filter, a SQL Server security policy, is not read yet, so
+        a walk under one is not reported as not audited whole, and ``cipher-audit --json`` prints
+        ``row_filtered`` as null. Its PostgreSQL twin reads row-level security (BACKLOG #1719
+        item 35); reading security policies here is a follow-up, unfiled."""
+        return None
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""

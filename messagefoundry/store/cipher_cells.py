@@ -37,7 +37,6 @@ import sqlite3
 from collections.abc import (
     AsyncGenerator,
     Callable,
-    Collection,
     Generator,
     Iterable,
     Mapping,
@@ -73,6 +72,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "COMPOSITE_CIPHER_CELLS",
     "DEFAULT_CHUNK_ROWS",
+    "FIRST_FAILURE_SEPARATOR",
     "POSITION",
     "POSTGRES_CIPHER_CELLS",
     "SQLITE_CIPHER_CELLS",
@@ -92,6 +92,8 @@ __all__ = [
     "read_server_cipher_cells",
     "server_cell_present",
     "server_keyed_store_mismatch",
+    "RowFilterRead",
+    "RowFilterReading",
     "server_row_filtered",
     "server_walk_tables",
     "store_tables",
@@ -728,6 +730,11 @@ class CipherAudit:
     #: audited whole either, and no verdict over it may PASS (BACKLOG #1719 item 35). Always empty
     #: after a SQLite walk.
     row_filtered: list[str] = field(default_factory=list)
+    #: How :attr:`row_filtered` was learned: ``read``, from the backend's row-filter read;
+    #: ``failed``, every shown table named because that read failed; ``unread``, no row filter
+    #: was read at all (SQLite, SQL Server, or a run that read no catalog), so an empty
+    #: :attr:`row_filtered` says nothing.
+    row_filter: RowFilterRead = "unread"
 
     @property
     def opened(self) -> int:
@@ -759,10 +766,14 @@ class CipherAudit:
         return bool(self.hidden or self.row_filtered)
 
 
+#: What :func:`with_first_failure` puts between a key-mismatch line and the failure before it.
+FIRST_FAILURE_SEPARATOR = "; also found before it: "
+
+
 def with_first_failure(mismatch: str, first: str | None) -> str:
     """A key-mismatch line that keeps a failure the walk met before it: the mismatch decides the
     verdict, and the failure, which no key will clear, must not wait for a second run to show."""
-    return mismatch if first is None else f"{mismatch}; also found before it: {first}"
+    return mismatch if first is None else f"{mismatch}{FIRST_FAILURE_SEPARATOR}{first}"
 
 
 def _keyed_mismatch_line(table: object, column: object, source: str) -> str:
@@ -800,6 +811,7 @@ def _reset(into: CipherAudit | None) -> CipherAudit:
     into.key_mismatch = None
     into.hidden = []
     into.row_filtered = []
+    into.row_filter = "unread"
     return into
 
 
@@ -885,12 +897,12 @@ class CipherCellSource(Protocol):
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
 
-    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
         """Those of ``tables`` whose rows a server row filter may hide from this login, each one
-        the catalog read shows. Where a backend reads its row filter, any doubt, a refused read of
-        the catalog included, names the table: a table named here is read as not audited whole,
-        so the safe answer is to name it. SQL Server does not read its security policies yet, so
-        it names none (BACKLOG #1719 item 35)."""
+        the catalog read shows, or ``None`` where the backend reads no row filter: SQL Server does
+        not read its security policies yet (BACKLOG #1719 item 35). Any doubt names the table: a
+        table named here is read as not audited whole, so the safe answer is to name it. A read
+        that fails raises; :func:`server_row_filtered` says what then."""
         ...
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None: ...
@@ -1047,33 +1059,55 @@ async def read_server_cipher_cells(
                 break
 
 
+#: How a walk learned its row-filtered tables: see :attr:`CipherAudit.row_filter`.
+RowFilterRead = Literal["read", "failed", "unread"]
+
+
+@dataclass(frozen=True, slots=True)
+class RowFilterReading:
+    """What :func:`server_row_filtered` learned: the tables, and how."""
+
+    tables: tuple[str, ...]
+    state: RowFilterRead
+
+
 async def server_row_filtered(
     source: CipherCellSource, cells: Iterable[CipherCell], columns: Mapping[str, frozenset[str]]
-) -> list[str]:
+) -> RowFilterReading:
     """The tables of a walk of ``cells`` that ``source`` says a row filter may hide rows in, of
     those the catalog read ``columns`` shows, in the walk's order (BACKLOG #1719 item 35). A name
-    the source returns that the catalog did not show is never recorded.
+    the source returns that the catalog did not show is never recorded. ``unread`` where the
+    catalog shows no table, or the backend reads no row filter.
 
-    A read that fails names every shown table, logged by class: a read nobody finished is a
-    doubt, and a doubt reads as not audited whole, never as covered. So the walk goes on, and a
-    run it can finish is NOT_COVERED rather than stopped, and a keyless probe still reads its key
-    mismatch after it. A defect is raised."""
-    from messagefoundry.store.base import driver_sqlstate, store_call_errors
+    A read that fails on the store's I/O, a driver error or a lost link
+    (:func:`~messagefoundry.store.base.store_open_errors`), names every shown table, ``failed``,
+    logged by class: a read nobody finished is a doubt, and a doubt reads as not audited whole,
+    never as covered. So the walk goes on, a run it can finish is NOT_COVERED rather than
+    stopped, and a keyless probe still reads its key mismatch after it. Anything else, at least
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` and a ``RuntimeError``,
+    ``ValueError`` or ``TypeError`` a bug raises, is raised."""
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
+    from messagefoundry.store.base import driver_sqlstate, store_open_errors
 
     shown = [t for t in server_walk_tables(cells) if t in columns]
     if not shown:
-        return []
+        return RowFilterReading((), "unread")
+    io_errors = store_open_errors()
     try:
         filtered = await source.cipher_walk_row_filtered(shown)
-    except store_call_errors() as exc:
+    except AUDIT_WRITE_DEFECTS:
+        raise
+    except io_errors as exc:
         log.warning(
             "cipher-audit: the row-filter read failed (%s, SQLSTATE %s); every table is read "
             "as row-filtered",
             type(exc).__name__,
             driver_sqlstate(exc),
         )
-        return shown
-    return [t for t in shown if t in filtered]
+        return RowFilterReading(tuple(shown), "failed")
+    if filtered is None:
+        return RowFilterReading((), "unread")
+    return RowFilterReading(tuple(t for t in shown if t in filtered), "read")
 
 
 async def server_keyed_store_mismatch(
@@ -1093,7 +1127,7 @@ async def audit_server_cipher_cells(
     cells: Iterable[CipherCell],
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
     columns: Mapping[str, frozenset[str]] | None = None,
-    row_filtered: Collection[str] | None = None,
+    row_filtered: RowFilterReading | None = None,
     into: CipherAudit | None = None,
 ) -> CipherAudit:
     """:func:`audit_cipher_cells` for a PostgreSQL or SQL Server store, through
@@ -1112,11 +1146,11 @@ async def audit_server_cipher_cells(
     audit.hidden = audit.absent
     if not _keyed_surface_visible(columns):
         audit.hidden.append("keyed_surface")
-    audit.row_filtered = (
-        await server_row_filtered(source, wanted, columns)
-        if row_filtered is None
-        else list(row_filtered)
+    rows_read = (
+        await server_row_filtered(source, wanted, columns) if row_filtered is None else row_filtered
     )
+    audit.row_filtered = list(rows_read.tables)
+    audit.row_filter = rows_read.state
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit

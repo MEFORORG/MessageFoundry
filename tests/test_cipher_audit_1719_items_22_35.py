@@ -34,6 +34,8 @@ from messagefoundry.store.cipher_cells import (
     CipherCellSource,
     audit_server_cipher_cells,
     connect_readonly,
+    server_row_filtered,
+    server_walk_tables,
 )
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.postgres import PostgresStore, row_security_hides_rows
@@ -554,6 +556,7 @@ def _pg_reading(rows: list[dict[str, Any]] | Exception) -> PostgresStore:
 
 def _row(name: str, **flags: object) -> dict[str, Any]:
     base: dict[str, object] = {
+        "relkind": "r",
         "relrowsecurity": False,
         "relforcerowsecurity": False,
         "owned": True,
@@ -587,43 +590,142 @@ def test_a_table_the_catalog_read_did_not_return_is_named() -> None:
     assert got == {"state"}
 
 
-def test_another_class_42_error_is_raised() -> None:
-    """Only insufficient_privilege is a refusal this read answers itself; a syntax or catalog
-    fault is raised, for the caller to log as what it is."""
-    store = _pg_reading(_SYNTAX_ERROR)
-    with pytest.raises(_Syntax):
-        asyncio.run(store.cipher_walk_row_filtered(["messages"]))
-
-
-def test_a_refused_catalog_read_names_every_table() -> None:
-    store = _pg_reading(_Refused("synthetic: permission denied"))
-    assert asyncio.run(store.cipher_walk_row_filtered(["messages", "state"])) == {
-        "messages",
-        "state",
-    }
-
-
 class _TimedOut(sqlite3.DatabaseError):
     """A server driver's statement timeout."""
 
     sqlstate = "57014"
 
 
-@pytest.mark.parametrize("error", [_Lost("synthetic: lost"), _TimedOut("synthetic: timeout")])
-def test_a_failure_that_is_not_a_refusal_is_raised_for_the_walk_to_report(
+@pytest.mark.parametrize(
+    "error",
+    [
+        _Refused("synthetic: permission denied"),
+        _SYNTAX_ERROR,
+        _Lost("synthetic: lost"),
+        _TimedOut("synthetic: timeout"),
+    ],
+    ids=["refused", "syntax", "lost", "timeout"],
+)
+def test_the_postgres_read_raises_every_failure_for_its_caller_to_judge(
     error: Exception,
 ) -> None:
-    """A lost link or a timeout is not a reading of row security, so it is raised, as every other
-    walk read raises it, rather than named as row-level security."""
+    """The backend read answers no failure itself, a refused grant included, so the one judge is
+    ``server_row_filtered``, which can say the read failed rather than that row security
+    applies."""
     store = _pg_reading(error)
     with pytest.raises(type(error)):
         asyncio.run(store.cipher_walk_row_filtered(["messages"]))
 
 
-def test_sql_server_names_no_table_yet() -> None:
-    """Out of scope for item 35: SQL Server security policies are not read, so nothing changes."""
+@pytest.mark.parametrize("relkind", ["v", "m", "f", None])
+def test_a_relation_that_is_not_an_ordinary_table_is_named(relkind: str | None) -> None:
+    """A view, a materialized view or a foreign table under a cipher table's name can filter rows
+    no row-security flag shows, and a missing relkind is a doubt: each is named, though its
+    flags read as exempt. An ordinary or partitioned table is read by its flags."""
+    store = _pg_reading(
+        [
+            _row("messages", relkind=relkind),
+            _row("state", relkind="r"),
+            _row("queue", relkind="p"),
+        ]
+    )
+    got = asyncio.run(store.cipher_walk_row_filtered(["messages", "state", "queue"]))
+    assert got == {"messages"}
+
+
+def test_sql_server_reads_no_row_filter() -> None:
+    """Out of scope for item 35: SQL Server security policies are not read, and it says so with
+    None rather than an empty set a reader would take for "read, none"."""
     store = SqlServerStore.__new__(SqlServerStore)
-    assert asyncio.run(store.cipher_walk_row_filtered(["messages"])) == frozenset()
+    assert asyncio.run(store.cipher_walk_row_filtered(["messages"])) is None
+
+
+class _RaisingSource(_SqliteSource):
+    def __init__(self, conn: sqlite3.Connection, error: Exception) -> None:
+        super().__init__(conn)
+        self.error = error
+
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+        raise self.error
+
+
+def _row_filter_of(
+    db: Path, source_error: Exception | None = None, answer: frozenset[str] | None = frozenset()
+) -> Any:
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        source: _SqliteSource
+        if source_error is not None:
+            source = _RaisingSource(conn, source_error)
+        else:
+
+            class _Answering(_SqliteSource):
+                async def cipher_walk_row_filtered(
+                    self, tables: Sequence[str]
+                ) -> frozenset[str] | None:
+                    return answer
+
+            source = _Answering(conn)
+        columns = asyncio.run(source.cipher_walk_columns(server_walk_tables(POSTGRES_CIPHER_CELLS)))
+        return asyncio.run(
+            server_row_filtered(cast(CipherCellSource, source), POSTGRES_CIPHER_CELLS, columns)
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("synthetic: defect"),
+        ValueError("synthetic: defect"),
+        TypeError("synthetic: defect"),
+        NotImplementedError("synthetic: defect"),
+        RecursionError("synthetic: defect"),
+    ],
+    ids=["runtime", "value", "type", "not-implemented", "recursion"],
+)
+def test_a_defect_in_the_row_filter_read_is_raised(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    error: Exception,
+) -> None:
+    """A bug is raised, never read as a failed read that names every table."""
+    db, _settings = _copy(_template, tmp_path)
+    with pytest.raises(type(error)):
+        _row_filter_of(db, source_error=error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _Refused("synthetic: permission denied"),
+        _Lost("synthetic: lost"),
+        ConnectionResetError("synthetic: reset"),
+    ],
+    ids=["refused", "lost", "reset"],
+)
+def test_a_store_failure_of_the_row_filter_read_names_every_table(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    error: Exception,
+) -> None:
+    db, _settings = _copy(_template, tmp_path)
+    reading = _row_filter_of(db, source_error=error)
+    assert reading.state == "failed"
+    assert "messages" in reading.tables and "keyed_surface" in reading.tables
+
+
+def test_the_row_filter_reading_says_how_it_was_learned(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+) -> None:
+    db, _settings = _copy(_template, tmp_path)
+    assert _row_filter_of(db, answer=None).state == "unread"
+    empty = _row_filter_of(db, answer=frozenset())
+    assert empty.state == "read" and empty.tables == ()
+    named = _row_filter_of(db, answer=frozenset({"messages"}))
+    assert named.state == "read" and named.tables == ("messages",)
 
 
 class _RlsSource(_SqliteSource):
@@ -718,3 +820,96 @@ def test_a_key_mismatch_still_names_row_level_security(
     rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
     assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
     assert "row-level security" in payload["reason"], out
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [(None, None), (frozenset(), [])],
+    ids=["not-read", "read-empty"],
+)
+def test_json_row_filtered_is_null_where_no_row_filter_was_read(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer: frozenset[str] | None,
+    expected: list[str] | None,
+) -> None:
+    """``null`` where the backend reads no row filter, ``[]`` only where it read one and found
+    none, so an empty list always means read."""
+    db, settings = _copy(_template, tmp_path)
+
+    class _Handle(_FakeServerStore):
+        async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+            return answer
+
+    async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "sqlserver")
+    assert rc == 0 and payload["status"] == "PASS", out
+    assert payload["row_filtered"] == expected, out
+
+
+def test_json_row_filtered_is_null_on_sqlite(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json
+
+    from messagefoundry.__main__ import main
+
+    db, settings = _copy(_template, tmp_path)
+    cfg = tmp_path / "service.toml"
+    key = settings.encryption_key
+    assert key is not None
+    cfg.write_text(
+        f'[store]\npath = "{db.as_posix()}"\nencryption_key = "{key}"\n', encoding="utf-8"
+    )
+    rc = main(["cipher-audit", "--service-config", str(cfg), "--json"])
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 0, payload
+    assert payload["row_filtered"] is None
+
+
+def test_a_failed_row_filter_read_names_the_read_not_bypassrls(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Tables named because the read failed point at the read, a grant on pg_class and
+    pg_roles; BYPASSRLS, which cannot fix a refused catalog read, is not suggested."""
+    db, settings = _copy(_template, tmp_path)
+
+    class _Handle(_FakeServerStore):
+        async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+            raise _Refused("synthetic: permission denied")
+
+    async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 3 and payload["status"] == "NOT_COVERED", out
+    assert "catalog read" in payload["reason"] and "failed" in payload["reason"], out
+    assert "pg_catalog.pg_class" in payload["reason"], out
+    assert "BYPASSRLS" not in payload["reason"], out
+
+
+def test_the_empty_log_note_stays_on_the_mismatch_line() -> None:
+    """Where a failure line follows the mismatch, the empty-log note goes on the mismatch, before
+    it, and the configured-key cause leads."""
+    from messagefoundry.__main__ import _keyed_refusal_mismatch
+    from messagefoundry.store.cipher_cells import with_first_failure
+
+    line = with_first_failure("X is recorded as keyed", "messages.raw id=3 is a BLOB")
+    got = _keyed_refusal_mismatch(line, key_named=True)
+    head, _sep, tail = got.partition("; also found before it: ")
+    assert head.startswith(store_base.KEY_NAMED_UNRESOLVED)
+    assert "audit log also reads as empty" in head
+    assert tail == "messages.raw id=3 is a BLOB"
+    plain = _keyed_refusal_mismatch("X is recorded as keyed", key_named=False)
+    assert plain.startswith("X is recorded as keyed. The store's audit log also reads as empty")
