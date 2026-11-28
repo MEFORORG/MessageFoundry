@@ -13946,7 +13946,14 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # OSError or sqlite3.Error from either is reported as a FAIL too (BACKLOG #1719).
     try:
         result = run_guarded(
-            run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
+            run_restore_verify(
+                args.archive,
+                store_settings=settings.store,
+                full=args.full,
+                # BACKLOG #5818: without it a keyed site that set [backup].allow_unencrypted would
+                # see its plaintext archive refused, with a remedy naming the setting it had set.
+                allow_unencrypted=settings.backup.allow_unencrypted,
+            )
         )
     except _key_unresolved() as exc:
         # The keyring is resolved before the archive is read, so this is "could not start", not a
