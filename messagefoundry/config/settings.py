@@ -922,6 +922,13 @@ class StoreSettings(_Section):
     # secret.
     vault_revocation_attested: bool = False
     vault_revocation_attested_reason: str | None = None
+    # Threads in the Transit BULK pool (BACKLOG #3929). Under `vault_transit`, a call that makes many
+    # round trips in one go (an audit chain walk, a reference cache decode, SQL Server's state cache
+    # load, an at-open seal batch) runs there, apart from the row seal pool the auth path's seal
+    # checks use, so a walk cannot queue them. Read each time the Transit cipher is built; ignored
+    # under `aesgcm`. The bounds are store/row_seal.py's TRANSIT_BULK_WORKERS_DEFAULT and _MAX, and
+    # the default is a judgement, not a measurement. Not a secret.
+    transit_bulk_workers: int = Field(default=2, ge=1, le=64)
 
     # --- Offline uploaded-logs (BACKLOG #125/#126, ADR 0134) ----------------
     # Directory holding operator-uploaded diagnostic message files (browsed offline, decoupled from any

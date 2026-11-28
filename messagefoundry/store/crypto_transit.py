@@ -104,7 +104,7 @@ from messagefoundry.store.keyprovider_vault import (
     transit_key_name_setting,
     vault_failure_text,
 )
-from messagefoundry.store.row_seal import transit_mac_version
+from messagefoundry.store.row_seal import configure_transit_bulk_workers, transit_mac_version
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -617,7 +617,8 @@ class TransitCipher(_UnmarkedPolicy):
 
     encrypts = True
     #: Every call is a Transit HTTP round trip, so :func:`~messagefoundry.store.row_seal.cipher_call`
-    #: runs it on the row-seal Transit pool rather than inline (BACKLOG #3929).
+    #: runs it on the row-seal Transit pool rather than inline, and ``cipher_bulk_call`` on the
+    #: Transit bulk pool (BACKLOG #3929).
     blocks_on_io = True
     #: This cipher cannot name the keys it holds, and its UnauthenticatedCipherError is Vault's
     #: AEAD refusal of the value itself, never a key it lacks, so
@@ -1617,6 +1618,9 @@ def build_transit_cipher(
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
+    # The bulk pool is process-wide, so this sizes it for every Transit store in the process; the
+    # last build's value wins for the next pool built (BACKLOG #3929).
+    configure_transit_bulk_workers(settings.transit_bulk_workers)
     return TransitCipher(
         client,
         key_name,

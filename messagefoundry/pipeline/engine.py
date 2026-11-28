@@ -126,7 +126,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.base import sealed_read_errors, store_connect_errors
 from messagefoundry.store.crypto import Cipher
-from messagefoundry.store.row_seal import probe_row_sealer_at_start
+from messagefoundry.store.row_seal import TransitPoolLease, probe_row_sealer_at_start
 from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
@@ -195,13 +195,18 @@ _STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
 _STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
+#: How long stop waits, after the store closes, for Transit calls still running on the seal and
+#: bulk pools (BACKLOG #3929). Under a stop budget it gets what is left, at least the floor. A call
+#: still running then is left to finish, so the stop does not wait out a whole bulk walk.
+_TRANSIT_POOL_DRAIN_SECONDS = 2.0
 
 
 class _StopBudget:
     """What each of :meth:`Engine.stop`'s budgeted waits may spend (BACKLOG #3191).
 
     The budgeted waits are the retention runner's stop (BACKLOG #6526), the CRL reload runner's
-    stop, the remote-debug refusal watch's stop and the alert-state drain. With no budget each
+    stop, the remote-debug refusal watch's stop, the alert-state drain and, after the store closes,
+    the Transit pools' drain (BACKLOG #3929). With no budget each
     keeps its fixed bound. Under one, a wait gets the shorter of its fixed bound and what is left
     of the budget once the time kept for the steps after it is taken out, and never less than
     :data:`_STOP_WAIT_FLOOR_SECONDS` unless its fixed bound is less. So a wait is shortened only
@@ -1022,6 +1027,10 @@ class Engine:
         # vault BACKLOG #3109: the shared version whose stored initiator's digest was last logged
         # as unreadable, so a version the runner retries every tick logs it once.
         self._initiator_digest_warned: int | None = None
+        # This engine's hold on the process-wide Transit pools (BACKLOG #3929), released once the
+        # stop reaches the store's close. Taken last, so a constructor that raises leaks none.
+        self._store_close_reached = False
+        self._transit_pool_lease = TransitPoolLease()
 
     def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
         """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
@@ -4374,10 +4383,47 @@ class Engine:
 
         A tight budget can cut those waits to :data:`_STOP_WAIT_FLOOR_SECONDS` and lose the work
         they wait for (the owner ruled on 2026-11-22 that the budget wins).
-        docs/SERVICE.md, *Start / stop / status*, says what each cut loses."""
+        docs/SERVICE.md, *Start / stop / status*, says what each cut loses.
+
+        Last, once the store's close has run or raised, this engine's lease on the Transit pools
+        is released, once (BACKLOG #3929). A stop that raises before it reaches the close keeps the
+        lease, since the store and the graph may still be using the pools; a later stop that
+        reaches the close releases it. It waits for the pools' running calls only when the steps
+        ended or raised an ordinary error; a cancel, KeyboardInterrupt or SystemExit gets no
+        wait."""
+        budget = _StopBudget(budget_seconds)
+        waits = False
+        try:
+            await self._stop_steps(budget)
+            waits = True
+        except Exception:
+            waits = True
+            raise
+        finally:
+            if self._store_close_reached:
+                drain = budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0) if waits else 0.0
+                await self.release_transit_pools(drain)
+
+    async def release_transit_pools(self, timeout: float) -> None:
+        """Release this engine's lease on the Transit pools, once; later calls do nothing. Where it
+        was the last lease, the pools are shut down and their running calls waited for up to
+        ``timeout`` seconds, after which they are left to finish (BACKLOG #3929). The failed-start
+        unwind, which never stops the engine, calls this too."""
+        try:
+            drained = await self._transit_pool_lease.release(timeout)
+        except RuntimeError:  # a join thread that could not start; logged, the stop goes on
+            log.exception("the Transit call pools did not shut down cleanly")
+            return
+        if not drained and timeout > 0:
+            log.warning(
+                "Transit calls were still running when the engine stopped; the process exit "
+                "waits for them to finish"
+            )
+
+    async def _stop_steps(self, budget: _StopBudget) -> None:
+        """:meth:`stop`'s steps, up to and including the store's close."""
         log.info("engine stopping")
         self._stopping = True
-        budget = _StopBudget(budget_seconds)
         # Kept back, at each budgeted wait, for the waits after it and the store's close: each
         # later budgeted wait its share, the watch's cancel wait its floor, and the config-write
         # drain the bound it will use, or nothing when the gate is closed and no write runs.
@@ -4533,6 +4579,7 @@ class Engine:
             cancelled = True
         except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised
             failure = exc
+        self._store_close_reached = True  # stop() releases the Transit pool lease from here on
         try:
             await self.store.close()
         except Exception as exc:

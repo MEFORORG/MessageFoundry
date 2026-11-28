@@ -43,9 +43,13 @@ _KEY = "mefor-store"
 #: check is then the one check that sees a later call wait on the loop. So BACKLOG #5757 item 4's
 #: cut to one sleep per test is not taken.
 _BLOCK = 0.3
-#: Every Transit pool thread's name starts with this, which ``row_seal._transit_pool`` passes as a
-#: literal; there is no constant to import.
-_POOL_PREFIX = "mefor-transit-seal"
+#: Every seal pool thread's name starts with this. A pool thread is named ``<prefix>_<n>``.
+_POOL_PREFIX = row_seal.TRANSIT_SEAL_THREAD_PREFIX
+#: The thread name prefixes of the two Transit pools, each with the ``_`` the pool adds: the seal
+#: pool's and the bulk pool's (BACKLOG #3929). No other thread passes the pool check.
+_SEAL_THREADS = f"{row_seal.TRANSIT_SEAL_THREAD_PREFIX}_"
+_BULK_THREADS = f"{row_seal.TRANSIT_BULK_THREAD_PREFIX}_"
+_POOL_THREADS = (_SEAL_THREADS, _BULK_THREADS)
 #: Synthetic rows only, never PHI. Every test uses one row per key, two in all, so a per-row path
 #: makes a second call, which the stall check also covers because every call blocks.
 _KEYS = ("k1", "k2")
@@ -55,9 +59,9 @@ _BACKENDS = [PostgresStore, SqlServerStore]
 
 class _RecordingTransit(_FakeTransit):
     """A fake Transit that records the thread and its name for each call, and blocks each once
-    armed. Its own copy rather than the SQLite test's, which imports a name BACKLOG #3929 added, so
-    this file still imports on the tree before that fix and its failing run there can be shown
-    again."""
+    armed. Its own copy rather than the SQLite test's. The file now reads the two pools' thread
+    name prefixes from ``row_seal``, so it no longer imports on a tree without the bulk pool
+    (BACKLOG #3929)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -171,11 +175,16 @@ def _fake_sql_server_db(
 
 
 async def _measure(
-    transit: _RecordingTransit, call: Callable[[], Awaitable[Any]], *, pool: bool = True
+    transit: _RecordingTransit,
+    call: Callable[[], Awaitable[Any]],
+    *,
+    pool: bool = True,
+    on: tuple[str, ...] = _POOL_THREADS,
 ) -> Any:
     """Run ``call`` with every Transit call blocking, and check that it made a Transit call,
     that none ran on the loop's thread, that the loop kept ticking meanwhile, and, unless ``pool``
-    is False, that every one ran on a Transit pool thread."""
+    is False, that every one ran on a thread whose name starts with one of ``on``: by default
+    either Transit pool's, and :data:`_BULK_THREADS` alone for a bulk walk."""
     loop_thread = threading.get_ident()
     transit.threads.clear()
     transit.names.clear()
@@ -205,7 +214,7 @@ async def _measure(
     # The ticker's last pass always records a gap, after ``done`` is set, so gaps is never empty.
     assert max(gaps) < _BLOCK, f"the loop stalled for {max(gaps):.3f}s"
     if pool:
-        off_pool = [n for n in transit.names if not n.startswith(_POOL_PREFIX)]
+        off_pool = [n for n in transit.names if not n.startswith(on)]
         assert not off_pool, f"a Transit call ran off the Transit pool: {off_pool}"
     return result
 
@@ -253,6 +262,51 @@ async def test_the_pool_check_fires_on_the_default_executor() -> None:
         await _measure(transit, default_executor)
 
 
+async def test_the_pool_check_fires_on_a_thread_that_is_no_transit_pool() -> None:
+    """Negative control for the pool check's names: a thread off the loop whose name is neither
+    pool's prefix fails it, so the check does not accept any thread."""
+    transit, cipher = _transit()
+    sealed = cipher.encrypt('"x"', aad=cell_aad("t", "c", "1"))
+
+    async def elsewhere() -> str:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mefor-transit") as other:
+            hop = asyncio.get_running_loop().run_in_executor(
+                other, lambda: cipher.decrypt(sealed, aad=cell_aad("t", "c", "1"))
+            )
+            return await hop
+
+    with pytest.raises(AssertionError, match="off the Transit pool"):
+        await _measure(transit, elsewhere)
+
+
+async def test_a_bulk_walk_check_fires_on_the_seal_pool() -> None:
+    """Negative control for the bulk walks' pins: a call on the seal pool fails a check that asks
+    for the bulk pool, so those pins tell the two pools apart."""
+    transit, cipher = _transit()
+    sealed = cipher.encrypt('"x"', aad=cell_aad("t", "c", "1"))
+
+    async def on_the_seal_pool() -> str:
+        return await row_seal.cipher_call(
+            cipher, cipher.decrypt, sealed, aad=cell_aad("t", "c", "1")
+        )
+
+    with pytest.raises(AssertionError, match="off the Transit pool"):
+        await _measure(transit, on_the_seal_pool, on=(_BULK_THREADS,))
+
+
+async def test_a_bulk_call_runs_on_the_bulk_pool() -> None:
+    """The bulk pool's own pin: ``cipher_bulk_call`` passes a bulk-only check."""
+    transit, cipher = _transit()
+    sealed = cipher.encrypt('"x"', aad=cell_aad("t", "c", "1"))
+
+    async def bulk() -> str:
+        return await row_seal.cipher_bulk_call(
+            cipher, cipher.decrypt, sealed, aad=cell_aad("t", "c", "1")
+        )
+
+    assert await _measure(transit, bulk, on=(_BULK_THREADS,)) == '"x"'
+
+
 def _reference_rows(cipher: Any) -> list[dict[str, Any]]:
     return [
         {
@@ -274,7 +328,8 @@ async def test_the_reference_read_decrypts_off_the_loop(cls: type[Any]) -> None:
     store = _bare_store(cls, cipher)
 
     _serve_rows(store, rows)
-    await _measure(transit, store._load_reference_cache)
+    # One bulk walk over the rows (BACKLOG #3929), so on the bulk pool alone.
+    await _measure(transit, store._load_reference_cache, on=(_BULK_THREADS,))
     assert dict(store._reference_cache["codes"]) == {key: f"value-{key}" for key in _KEYS}
     assert store._reference_versions == {"codes": "v1"}
 
@@ -303,7 +358,12 @@ async def test_the_state_cache_load_decrypts_off_the_loop(cls: type[Any]) -> Non
         return [{"namespace": "ns", "version": 1}] if "state_version" in sql else rows
 
     store._fetchall = fetchall
-    await _measure(transit, store._load_state_cache)
+    # SQL Server's load is one bulk walk (BACKLOG #3929); Postgres's opens each row on the seal pool.
+    await _measure(
+        transit,
+        store._load_state_cache,
+        on=(_BULK_THREADS,) if cls is SqlServerStore else (_SEAL_THREADS,),
+    )
     assert dict(store._state_cache) == {("ns", key): {"n": key} for key in _KEYS}
     if cls is PostgresStore:
         assert store._state_versions == {"ns": 1}
@@ -378,7 +438,8 @@ async def test_a_reference_converge_decrypts_off_the_loop(cls: type[Any]) -> Non
     store = _bare_store(cls, cipher)
 
     _serve_rows(store, rows)
-    assert await _measure(transit, store.converge_reference_cache) == ["codes"]
+    converged = await _measure(transit, store.converge_reference_cache, on=(_BULK_THREADS,))
+    assert converged == ["codes"]
     assert dict(store._reference_cache["codes"]) == {key: f"value-{key}" for key in _KEYS}
 
 

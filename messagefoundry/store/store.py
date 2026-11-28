@@ -224,6 +224,7 @@ from messagefoundry.store.row_seal import (
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    cipher_bulk_call,
     cipher_call,
     classify_unrotated,
     require_seal_for_write,
@@ -8890,7 +8891,7 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     # different chain from the one the verify passed. The no-op below verifies too: its OK is read
     # as "the rotation is done", so it must not stand over a chain audit-verify fails (#1945).
     rows = await host._audit_rows()
-    ok, msg = await cipher_call(
+    ok, msg = await cipher_bulk_call(
         host._audit_mac_fn,
         verify_audit_rows,
         rows,
@@ -20979,7 +20980,7 @@ class MessageStore:
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return await cipher_call(
+        return await cipher_bulk_call(
             self._audit_mac_fn,
             verify_audit_rows,
             await self._audit_rows(),

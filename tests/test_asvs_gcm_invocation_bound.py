@@ -799,7 +799,8 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
     """
     from messagefoundry.pipeline import engine as engine_mod
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(engine_mod.Engine.stop)))
+    # Engine.stop runs its steps in _stop_steps, then releases the Transit pools (BACKLOG #3929).
+    tree = ast.parse(textwrap.dedent(inspect.getsource(engine_mod.Engine._stop_steps)))
 
     def first_line(attr: str) -> int:
         lines = [

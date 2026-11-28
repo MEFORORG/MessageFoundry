@@ -1930,7 +1930,9 @@ def _managed_teardown_steps(
     return steps
 
 
-async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None) -> None:
+async def _unwind_failed_start(
+    store: Store, notifier: NotifierAlertSink | None, engine: Engine | None = None
+) -> None:
     """Close what the managed lifespan opened before its startup failed, ahead of engine.start()
     (BACKLOG #5907). The engine never started, so it is not stopped: the store is closed directly.
     The security signals are not removed here: their install is the guarded span's last statement,
@@ -1960,7 +1962,10 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). A send still
     running at the cut is named by transport in NotifierAlertSink._cut_sends's WARNING. The cut
     does not end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring
-    say which run on."""
+    say which run on.
+
+    Last, on every way out, an engine built before the failure releases its lease on the Transit
+    pools, with no wait for their running calls (BACKLOG #3929)."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
@@ -2010,7 +2015,11 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
         )
     # Never cut: a store left open keeps aiosqlite's non-daemon worker alive (#1257).
     steps.append(_TeardownStep("the store's close", 0.0, lambda _b: store.close(), bounded=False))
-    await _run_teardown(steps, budget)
+    try:
+        await _run_teardown(steps, budget)
+    finally:
+        if engine is not None:
+            await engine.release_transit_pools(0.0)
 
 
 @asynccontextmanager
@@ -13690,6 +13699,8 @@ def create_managed_app(
         # teardown's try below, so a raise or cancel anywhere in it closes the notifier and the
         # store; left open, aiosqlite's non-daemon worker holds the process at exit (#1257). The
         # engine has not started anywhere in this span, so the unwind never calls engine.stop().
+        # Bound before the span, so the unwind can release the engine's Transit pool lease.
+        unwind_engine: Engine | None = None
         try:
             # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
             # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
@@ -13819,7 +13830,7 @@ def create_managed_app(
             # #145: thread the alert notifier so a leadership transition (HA failover / election) pages via
             # leadership_acquired/lost. None → the coordinator's default LoggingAlertSink logs the transition.
             coordinator = build_coordinator(store, cluster_settings, alert_sink=notifier)
-            engine = Engine(
+            engine = unwind_engine = Engine(
                 store,
                 poll_interval=poll_interval,
                 max_correlation_depth=max_correlation_depth,
@@ -14142,7 +14153,7 @@ def create_managed_app(
                 engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
             )
         except BaseException:
-            await _unwind_failed_start(store, notifier)
+            await _unwind_failed_start(store, notifier, unwind_engine)
             raise
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise

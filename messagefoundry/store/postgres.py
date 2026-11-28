@@ -218,6 +218,7 @@ from messagefoundry.store.row_seal import (
     RevokedRowSealError,
     RowSealError,
     SealPager,
+    cipher_bulk_call,
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
@@ -3623,7 +3624,7 @@ class PostgresStore(ServerCipherWalk):
         active-version list) LEFT JOIN ``reference`` so a set synced to ZERO rows is still a present
         empty ``{}``. Returns ``({name: {key: value}}, {name: version})``, each set sealed (BACKLOG
         #1174)."""
-        return await cipher_call(
+        return await cipher_bulk_call(
             self._cipher, self._decode_reference_rows, await self._reference_rows()
         )
 
@@ -3640,7 +3641,7 @@ class PostgresStore(ServerCipherWalk):
         self, rows: Sequence[Mapping[str, Any]]
     ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
         """The decrypt half of :meth:`_read_active_reference_snapshots`. Synchronous, so the
-        whole read decrypts in one :func:`cipher_call` (BACKLOG #3929)."""
+        whole read decrypts in one :func:`cipher_bulk_call` (BACKLOG #3929)."""
         cache: dict[str, MutableMapping[str, Any]] = {}
         versions: dict[str, str] = {}
         for r in rows:
@@ -3676,7 +3677,7 @@ class PostgresStore(ServerCipherWalk):
         # next converge to compare again.
         held = dict(self._reference_versions)
         rows = await self._reference_rows()
-        cache, versions = await cipher_call(self._cipher, self._decode_reference_rows, rows)
+        cache, versions = await cipher_bulk_call(self._cipher, self._decode_reference_rows, rows)
         refreshed: list[str] = []
         for name, version in versions.items():
             current = self._reference_versions.get(name)
@@ -10758,7 +10759,7 @@ class PostgresStore(ServerCipherWalk):
         :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return await cipher_call(
+        return await cipher_bulk_call(
             self._audit_mac_fn,
             verify_audit_rows,
             await self._audit_rows(),
