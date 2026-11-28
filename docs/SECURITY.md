@@ -5103,8 +5103,11 @@ from a search that ran. A NULL, empty or non-text criteria cell, and a sealed on
 empty string, are refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
 `integrity_drift` alert, as for a moved preset. A sealed criteria cell that a store opened with no
-key reads is refused too, as a cell the store's keys cannot open: a 423 with the route's refusal
-row and its ERROR, and no store row or alert. The store rate-limits its WARNING, alert and
+key reads is refused too, as a cell the store's keys cannot open: a 423, with no store row or
+alert. The route tries to write its refusal row, and it is written only where the audit chain
+accepts it, for example on a store that was always keyless. On a store a key wrote and that is
+reopened with no key, the keyed audit chain refuses that row, so the only records are the
+route's rate-limited ERROR lines: the refusal and that it could not audit it. The store rate-limits its WARNING, alert and
 `integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
 refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
 engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator
