@@ -208,7 +208,7 @@ providerSuite("connections custom editor answers the form's fields request (BACK
   // is needed after it. The page sends an id with each request, and a request without one gets no
   // reply (fieldsReply, BACKLOG #8243 item 18).
   const ask = (token: string): Promise<void> =>
-    handler!({ command: "fields", seq: 1, transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+    handler!({ command: "fields", seq: 1, page: "0123456789abcdef", transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
 
   test("a transport change is answered with the new transport's field groups", async () => {
     await ask(await open());

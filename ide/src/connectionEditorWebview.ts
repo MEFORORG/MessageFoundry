@@ -355,6 +355,15 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // latest request sent, as JSON.
     let FIELDS_SEQ = 0;
     let FIELDS_ANSWERED = 0;
+    // This page load's nonce, sent with every request and echoed with every answer. VS Code rebuilds
+    // a hidden panel from the same html and token, and the new page restarts its ids, so an answer
+    // meant for the page before it can carry a live id: only the nonce tells the two apart. From
+    // crypto.getRandomValues, so two loads cannot share it by construction of a seed.
+    const FIELDS_PAGE = (() => {
+      const words = new Uint32Array(2);
+      crypto.getRandomValues(words);
+      return Array.from(words, (w) => w.toString(16).padStart(8, '0')).join('');
+    })();
     let ASKED_SETTINGS = null;
     // The transport and direction the drawn fields were built for, set once the load has drawn,
     // so a request the host could not answer puts the pickers back where the fields are.
@@ -401,6 +410,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       vscode.postMessage({
         command: 'fields',
         seq: FIELDS_SEQ,
+        page: FIELDS_PAGE,
         transport: $('transport').value,
         direction: $('direction').value,
         settings: settings,
@@ -738,35 +748,39 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }
-    // A "fields" reply echoes its request's id (seq) and the transport and direction its groups were
-    // built for (fieldsReply in connectionEditor.ts). An "error" answering a fields request the host
-    // could not rebuild carries that request's id too; other errors carry none.
+    // A "fields" reply echoes its request's page nonce and id (page, seq) and the transport and
+    // direction its groups were built for (fieldsReply in connectionEditor.ts). An "error" answering
+    // a fields request the host could not rebuild carries that request's page and id too; other
+    // errors carry neither.
     const DIRECTIONS = ['inbound', 'outbound'];
     const SHAPES = {
-      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt),
-      fields: (d) => mfInt(d.seq) && mfStr(d.transport) && mfOneOf(d.direction, DIRECTIONS) &&
+      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt) && mfOpt(d.page, mfStr),
+      fields: (d) => mfInt(d.seq) && mfStr(d.page) && mfStr(d.transport) && mfOneOf(d.direction, DIRECTIONS) &&
         mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
         mfOpt(g.description, mfStr) && mfArrOf(g.fields, mfFieldDescriptor)),
     };
+    // Whether an answer is to this page load's request in flight: its nonce and its latest id. An
+    // older request's answer no longer matters, an earlier page instance's is not this page's, and
+    // one naming no request in flight (the page never sends id 0) is not an answer at all.
+    function answersInFlight(d) { return fieldsPending() && d.page === FIELDS_PAGE && d.seq === FIELDS_SEQ; }
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
       if (!d || !mfShapeOk(d, 'command', SHAPES, 'connection editor')) { return; }
       if (d.command === 'error') {
-        if (d.seq === undefined) { errorEl.textContent = d.message; errorEl.style.display = ''; }
-        // An error naming a request is that request's answer. Only the latest unanswered request's
-        // counts: an older one's failure no longer matters, and one naming no request in flight
-        // (the page never sends id 0) is not an answer at all.
-        else if (fieldsPending() && d.seq === FIELDS_SEQ) fieldsFailed(d.message);
+        if (d.seq === undefined && d.page === undefined) { errorEl.textContent = d.message; errorEl.style.display = ''; }
+        // An error naming a request is that request's answer, taken only for the request in flight.
+        else if (answersInFlight(d)) fieldsFailed(d.message);
       }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
-        // Only the reply to the latest unanswered request is drawn: a reply to an older one would
-        // drop or change a setting the latest request carries, or bring back one it left out. The
-        // echoed transport and direction must be the pickers' too: a page VS Code rebuilt from the
-        // same html restarts its ids, so a reply meant for the page before it can carry a live id.
-        if (!fieldsPending() || d.seq !== FIELDS_SEQ) return;
+        // Only the reply to this page's request in flight is drawn: a reply to an older one would
+        // drop or change a setting the latest request carries, or bring back one it left out, and
+        // one meant for an earlier page instance was built from that instance's settings.
+        if (!answersInFlight(d)) return;
+        // Every picker change sends a new request, so this page's answer names the pickers'
+        // transport and direction; a reply that does not was mislabelled by its host.
         if (d.transport !== $('transport').value || d.direction !== $('direction').value) return;
         // The form changed since the latest request (a setting removed, kept again, emptied,
         // retyped or switched between a literal and env()): drawing its reply would undo that, so

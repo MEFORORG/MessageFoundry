@@ -31,7 +31,29 @@ const webview = {
   },
 };
 const disposable = (): { dispose(): void } => ({ dispose: (): void => {} });
-const panelStub = { webview, onDidDispose: disposable, onDidChangeViewState: disposable, dispose: (): void => {} };
+// A disposed panel's webview getter throws, as VS Code's does ("Webview is disposed").
+let panelDisposed = false;
+let disposeListeners: (() => void)[] = [];
+const panelStub = {
+  get webview(): typeof webview {
+    if (panelDisposed) {
+      throw new Error("Webview is disposed");
+    }
+    return webview;
+  },
+  onDidDispose: (cb: () => void): { dispose(): void } => {
+    disposeListeners.push(cb);
+    return { dispose: (): void => {} };
+  },
+  onDidChangeViewState: disposable,
+  dispose: (): void => {},
+};
+function disposePanel(): void {
+  panelDisposed = true;
+  for (const cb of disposeListeners) {
+    cb();
+  }
+}
 const vscodeStub = {
   workspace: {
     get workspaceFolders(): { uri: { fsPath: string } }[] | undefined {
@@ -96,9 +118,15 @@ const SCHEMA = {
 
 // When set, `connection schema` fails, as it does when the engine cannot describe itself.
 let schemaFails = false;
+// When set, `connection schema` waits for this promise, so a test can act while a rebuild is in
+// flight.
+let schemaGate: Promise<void> | undefined;
 
 async function fakeRunJson(args: string[]): Promise<unknown> {
   if (args[0] === "connection" && args[1] === "schema") {
+    if (schemaGate) {
+      await schemaGate;
+    }
     if (schemaFails) {
       throw new Error("synthetic schema failure");
     }
@@ -177,6 +205,9 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
     posts = [];
     webview.html = "";
     schemaFails = false;
+    schemaGate = undefined;
+    panelDisposed = false;
+    disposeListeners = [];
     schemaModule.resetConnectionSchemaCache();
   });
 
@@ -228,28 +259,35 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
     ["the command-opened editor", openCommandEditor],
   ];
 
+  // The page's per-load nonce, which the hosts echo with the id.
+  const PAGE = "0123456789abcdef";
+  const ask = (token: string, extra: Record<string, unknown>): Promise<void> =>
+    handler!({ command: "fields", page: PAGE, transport: "file", direction: "inbound", settings: {}, __mfChannel: token, ...extra });
+
   for (const [name, open] of hosts) {
-    test(`${name}: the fields reply echoes the request's id, transport and direction`, async () => {
+    test(`${name}: the fields reply echoes the request's page, id, transport and direction`, async () => {
       const token = await open();
-      await handler!({ command: "fields", seq: 7, transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+      await ask(token, { seq: 7 });
       const reply = posts.find((p) => p.command === "fields");
       assert.ok(reply, `no fields reply was posted; posts: ${JSON.stringify(posts)}`);
       assert.strictEqual(reply.seq, 7, "the reply does not name the request it answers");
+      assert.strictEqual(reply.page, PAGE, "the reply does not name the page that asked");
       assert.strictEqual(reply.transport, "file");
       assert.strictEqual(reply.direction, "inbound");
       assert.match(JSON.stringify(reply.groups), /"directory"/, "the reply carries the file transport's fields");
     });
 
-    test(`${name}: a request the engine cannot answer gets an error naming its id`, async () => {
+    test(`${name}: a request the engine cannot answer gets an error naming its page and id`, async () => {
       const token = await open();
       posts = [];
       schemaFails = true;
       schemaModule.resetConnectionSchemaCache();
-      await handler!({ command: "fields", seq: 4, transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+      await ask(token, { seq: 4 });
       assert.ok(!posts.some((p) => p.command === "fields"), "a fields reply was posted with no fields");
       const error = posts.find((p) => p.command === "error");
       assert.ok(error, `the failed request got no answer; posts: ${JSON.stringify(posts)}`);
       assert.strictEqual(error.seq, 4, "the error does not name the request it answers");
+      assert.strictEqual(error.page, PAGE, "the error does not name the page that asked");
       assert.match(String(error.message), /file transport: synthetic schema failure/, "the error does not say why");
     });
 
@@ -257,21 +295,39 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
       const token = await open();
       posts = [];
       // Caught here, so a handler that rejects fails on the missing answer, not on the rejection.
-      await handler!({ command: "fields", seq: 9, transport: "broken", direction: "inbound", settings: {}, __mfChannel: token })
-        .catch(() => undefined);
+      await ask(token, { seq: 9, transport: "broken" }).catch(() => undefined);
       const error = posts.find((p) => p.command === "error");
       assert.ok(error, `the throwing build got no answer; posts: ${JSON.stringify(posts)}`);
       assert.strictEqual(error.seq, 9);
       assert.match(String(error.message), /broken transport: /);
     });
 
-    test(`${name}: a request with no valid id gets no reply, since the page would discard it`, async () => {
+    test(`${name}: a request with no valid id or page gets no reply, since the page would discard it`, async () => {
       const token = await open();
       posts = [];
-      for (const seq of [undefined, "1", 1.5]) {
-        await handler!({ command: "fields", seq, transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+      for (const extra of [{}, { seq: "1" }, { seq: 1.5 }, { seq: 1, page: undefined }, { seq: 1, page: 5 }, { seq: 1, page: "" }, { seq: 1, page: "x".repeat(65) }]) {
+        await ask(token, extra);
       }
-      assert.deepStrictEqual(posts, [], "a request with no valid id was answered");
+      assert.deepStrictEqual(posts, [], "a request with no valid id or page was answered");
+    });
+
+    test(`${name}: a panel closed while its rebuild is in flight drops the reply without throwing`, async () => {
+      const token = await open();
+      posts = [];
+      schemaModule.resetConnectionSchemaCache();
+      let release!: () => void;
+      schemaGate = new Promise<void>((r) => (release = r));
+      try {
+        const pending = ask(token, { seq: 3 });
+        disposePanel();
+        release();
+        let rejected: unknown;
+        await pending.catch((e: unknown) => (rejected = e));
+        assert.strictEqual(rejected, undefined, `the handler rejected after the panel closed: ${String(rejected)}`);
+        assert.deepStrictEqual(posts, [], "a reply was posted to a closed panel");
+      } finally {
+        schemaGate = undefined;
+      }
     });
   }
 });

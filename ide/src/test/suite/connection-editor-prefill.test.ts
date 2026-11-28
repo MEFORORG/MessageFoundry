@@ -187,13 +187,14 @@ function load(opts: {
     window,
     posted,
     deliver(data): void {
-      // A "fields" reply echoes the id, transport and direction of the request it answers, as both
-      // hosts do (fieldsReply in connectionEditor.ts); one given none answers the latest request.
+      // A "fields" reply echoes the page nonce, id, transport and direction of the request it
+      // answers, as both hosts do (fieldsReply in connectionEditor.ts); one given none answers the
+      // latest request.
       let message = data;
       if (data.command === "fields" && data.seq === undefined) {
         const asked = posted.filter((m) => m.command === "fields");
-        const last = asked[asked.length - 1] ?? { seq: 0, transport: "mllp", direction: "outbound" };
-        message = { seq: last.seq, transport: last.transport, direction: last.direction, ...data };
+        const last = asked[asked.length - 1] ?? { seq: 0, page: "", transport: "mllp", direction: "outbound" };
+        message = { seq: last.seq, page: last.page, transport: last.transport, direction: last.direction, ...data };
       }
       window.dispatchEvent(
         new window.MessageEvent("message", {

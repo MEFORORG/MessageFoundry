@@ -246,6 +246,11 @@ NON_PYTHON_INVENTORY: dict[str, frozenset[str]] = {
     # capability, so its entropy SOURCE is the security property; the file's own header explains why
     # ``node:crypto`` and not ``crypto.getRandomValues`` (extension-host code, not webview code).
     "ide/src/cspNonce.ts": frozenset({"randomBytes"}),
+    # BACKLOG #5565 / #8243 item 18. A per-load page nonce in the connection editor webview: 8 bytes
+    # of crypto.getRandomValues as hex, sent with every fields request so a page VS Code rebuilt from
+    # the same html cannot take an earlier instance's answer as its own. It is not a capability;
+    # a CSPRNG is used because Math.random is banned by this gate.
+    "ide/src/connectionEditorWebview.ts": frozenset({"getRandomValues"}),
 }
 
 # Top-level stdlib modules that mean "crypto happens here".

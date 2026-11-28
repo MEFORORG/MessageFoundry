@@ -157,8 +157,9 @@ def test_gate_is_clean_on_the_real_tree() -> None:
 # built on disk rather than mocked, because the property under test is what the WALK reaches.
 
 #: The real anchor, reproduced in miniature. Fixtures carry it by default so the arm's stale
-#: direction (which fires when the inventory's one row is unbacked) does not drown the assertion
-#: under test. The tests that want that direction ask for it explicitly.
+#: direction (which fires when an inventory row is unbacked) does not drown the assertion under
+#: test. The tests that want that direction ask for it explicitly. Every other shipped row gets a
+#: stub drawing exactly its documented sources (_ROW_STUB_MARK), for the same reason.
 _ANCHOR_REL = "ide/src/cspNonce.ts"
 _ANCHOR_SRC = (
     'import { randomBytes } from "node:crypto";\n'
@@ -173,6 +174,9 @@ _ANCHOR_SRC = (
 #: these fixtures silently red.
 _PLACEHOLDER_SRC = "// inert fixture placeholder: no randomness draw\nexport const x = 1;\n"
 
+#: The first line of a stub standing in for a shipped inventory row other than the anchor.
+_ROW_STUB_MARK = "// fixture stub for a shipped inventory row"
+
 
 def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True) -> Path:
     """Write ``files`` (repo-relative path -> text) into a throwaway repo root and return it.
@@ -183,6 +187,10 @@ def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True)
     written = dict(files)
     if with_anchor:
         written.setdefault(_ANCHOR_REL, _ANCHOR_SRC)
+        for rel, tokens in _gate().NON_PYTHON_INVENTORY.items():
+            if rel != _ANCHOR_REL:
+                draws = "".join(f"{token}(x);\n" for token in sorted(tokens))
+                written.setdefault(rel, f"{_ROW_STUB_MARK}\n{draws}")
     touched = {rel.split("/", 1)[0] for rel in written}
     for root in _gate().NON_PYTHON_WALK_ROOTS:
         if root not in touched:
@@ -195,9 +203,16 @@ def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True)
 
 
 def _placeholders_in(repo: Path) -> int:
-    """How many inert placeholders :func:`_ts_repo` seeded, so a ``scanned`` expectation stays
-    derivable rather than a transcribed constant that drifts when a root is added."""
-    return len(list(repo.rglob("_placeholder.js")))
+    """How many inert placeholders and inventory-row stubs :func:`_ts_repo` seeded, so a
+    ``scanned`` expectation stays derivable rather than a transcribed constant that drifts when a
+    root or a row is added."""
+    stubs = sum(
+        1
+        for rel in _gate().NON_PYTHON_INVENTORY
+        if (repo / rel).is_file()
+        and (repo / rel).read_text(encoding="utf-8").startswith(_ROW_STUB_MARK)
+    )
+    return len(list(repo.rglob("_placeholder.js"))) + stubs
 
 
 @pytest.mark.parametrize(

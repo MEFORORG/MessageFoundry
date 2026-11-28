@@ -138,6 +138,9 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
     // The picker selection: a name, `null` for an EXPLICIT "＋ New connection" (must render the blank
     // form even when the file has entries), undefined for "no preference yet" (→ first connection).
     let desired: string | null | undefined;
+    // Set on close: a rebuild still in flight then has no page to answer, and reading a disposed
+    // panel's webview throws.
+    let disposed = false;
     // The connection the currently-shown form was rendered from (null → the blank "new" form) — the
     // save-time merge source AND the name an in-place save is allowed to replace (#234).
     let renderedName: string | null = null;
@@ -223,6 +226,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         direction?: string;
         settings?: Record<string, unknown>;
         seq?: unknown;
+        page?: unknown;
       }) => {
         const ws = workspaceDir();
         if (!ws) {
@@ -241,10 +245,17 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // #5565), and without an answer it kept the previous transport's fields.
           // A select or an external edit can re-render the panel before or while this runs; the
           // reply is then for a page that no longer exists, and is dropped (postToSameRender).
-          // The reply echoes the request's id, so the page draws only its latest request's answer.
+          // The reply echoes the request's page and id, so the page draws only its latest request's
+          // answer.
           const asked = requestToken(m);
-          const reply = await fieldsReply(ws, { transport: m.transport, direction: m.direction, settings: m.settings, seq: m.seq });
-          if (reply) {
+          const reply = await fieldsReply(ws, {
+            transport: m.transport,
+            direction: m.direction,
+            settings: m.settings,
+            seq: m.seq,
+            page: m.page,
+          });
+          if (reply && !disposed) {
             void postToSameRender(panel.webview, asked, reply);
           }
         } else if (m?.command === "save" && m.conn) {
@@ -347,6 +358,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
       void render(); // a genuine external edit — refresh the form/list
     });
     panel.onDidDispose(() => {
+      disposed = true;
       sub.dispose();
       if (guardTimer) {
         clearTimeout(guardTimer);

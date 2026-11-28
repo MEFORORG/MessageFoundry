@@ -198,6 +198,7 @@ function replyTo(p: Page, request: Payload): void {
   p.deliver({
     command: "fields",
     seq: request.seq,
+    page: request.page,
     transport: request.transport,
     direction: request.direction,
     groups: buildForm(SCHEMA, request.transport, request.direction, request.settings),
@@ -492,7 +493,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     const p = load();
     pick(p, "file");
     const [asked] = fieldsRequests(p);
-    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: asked.seq });
+    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: asked.seq, page: asked.page });
     assert.strictEqual(p.window.document.getElementById("transport").value, "mllp", "the picker still names file");
     assert.match(String(p.window.document.getElementById("error").textContent), /file transport\. The transport and direction are back/);
     const conn = savedConn(p);
@@ -506,7 +507,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     pick(p, "file");
     assert.strictEqual(saveClicks(p), 0);
     // A reply the page discards as malformed is no answer: Save still waits.
-    p.deliver({ command: "fields", seq: fieldsRequests(p)[0].seq, transport: "file", direction: "outbound", groups: 5 });
+    p.deliver({ command: "fields", seq: fieldsRequests(p)[0].seq, page: fieldsRequests(p)[0].page, transport: "file", direction: "outbound", groups: 5 });
     assert.strictEqual(saveClicks(p), 0);
     const waits = timers.filter((t) => t.ms > 0);
     assert.strictEqual(waits.length, 1, "the request set no wait");
@@ -539,7 +540,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     pick(p, "file");
     const [asked] = fieldsRequests(p);
     // A reply meant for an earlier page instance, which restarted its ids at the same number.
-    p.deliver({ command: "fields", seq: asked.seq, transport: "mllp", direction: "outbound", groups: buildForm(SCHEMA, "mllp", "outbound", {}) });
+    p.deliver({ command: "fields", seq: asked.seq, page: asked.page, transport: "mllp", direction: "outbound", groups: buildForm(SCHEMA, "mllp", "outbound", {}) });
     assert.strictEqual(saveClicks(p), 0, "the mismatched reply was taken as the answer");
     replyTo(p, asked);
     assert.ok(control(p, "path"), "the matching reply was not drawn");
@@ -547,10 +548,59 @@ suite("connection editor: only the reply to the latest fields request is drawn (
 
   test("a reply or an error naming no request in flight is ignored", () => {
     const p = load();
-    p.deliver({ command: "fields", seq: 0, transport: "mllp", direction: "outbound", groups: [] });
-    assert.ok(control(p, "port"), "an unsolicited reply was drawn");
-    p.deliver({ command: "error", message: "synthetic", seq: 0 });
-    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "an unsolicited error was shown");
+    pick(p, "file");
+    answerLatest(p);
+    const [answered] = fieldsRequests(p);
+    // This page's own nonce, for its id 0, never sent, and for its id 1, already answered.
+    for (const seq of [0, answered.seq]) {
+      p.deliver({ command: "fields", seq, page: answered.page, transport: "file", direction: "outbound", groups: [] });
+      assert.ok(control(p, "path"), `an unsolicited reply was drawn: id ${seq}`);
+      p.deliver({ command: "error", message: "synthetic", seq, page: answered.page });
+      assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", `an unsolicited error was shown: id ${seq}`);
+    }
+  });
+
+  // VS Code rebuilds a hidden panel from the same html and token, so a new page instance restarts
+  // its ids; a reply or error meant for the instance before it can carry a live id. Its per-load
+  // nonce is what tells the two apart.
+  const EARLIER_PAGE = "0000000000000000";
+
+  test("each request names this page with a per-load nonce, the same for every request", () => {
+    const p = load();
+    pick(p, "file");
+    pick(p, "mllp");
+    const pages = fieldsRequests(p).map((r) => r.page);
+    assert.ok(typeof pages[0] === "string" && /^[0-9a-f]{16}$/.test(pages[0]), `no nonce: ${String(pages[0])}`);
+    assert.strictEqual(pages[1], pages[0], "the nonce changed between requests of one page");
+    const q = load();
+    pick(q, "file");
+    assert.notStrictEqual(fieldsRequests(q)[0].page, pages[0], "two page loads drew the same nonce");
+  });
+
+  test("an error meant for an earlier page instance, carrying this page's live id, is ignored", () => {
+    const p = load();
+    pick(p, "file");
+    const [asked] = fieldsRequests(p);
+    assert.notStrictEqual(asked.page, EARLIER_PAGE);
+    p.deliver({ command: "error", message: "could not read the engine's fields for the tcp transport", seq: asked.seq, page: EARLIER_PAGE });
+    assert.strictEqual(p.window.document.getElementById("transport").value, "file", "an earlier page's error moved the picker");
+    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "an earlier page's error was shown");
+    replyTo(p, asked);
+    assert.ok(control(p, "path"), "the real reply was not drawn");
+  });
+
+  test("a late reply meant for an earlier page instance, with the same id, transport and direction, is not drawn", () => {
+    const p = load();
+    pick(p, "file");
+    const [asked] = fieldsRequests(p);
+    // Built from what the earlier instance held: a value this page never had.
+    const earlier = { ...asked.settings, port: 9999 };
+    p.deliver({ command: "fields", seq: asked.seq, page: EARLIER_PAGE, transport: asked.transport, direction: asked.direction, groups: buildForm(SCHEMA, asked.transport, asked.direction, earlier) });
+    assert.strictEqual(saveClicks(p), 0, "an earlier page's reply was taken as this page's answer");
+    replyTo(p, asked);
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "file");
+    assert.strictEqual(conn.settings.port, 6661, "an earlier page's value was saved");
   });
 
   test("an error for a request a newer one replaced changes nothing", () => {
@@ -558,7 +608,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     pick(p, "mllp");
     pick(p, "file");
     const [older] = fieldsRequests(p);
-    p.deliver({ command: "error", message: "could not read the engine's fields for the mllp transport", seq: older.seq });
+    p.deliver({ command: "error", message: "could not read the engine's fields for the mllp transport", seq: older.seq, page: older.page });
     assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "a superseded failure was shown");
     assert.strictEqual(p.window.document.getElementById("transport").value, "file", "a superseded failure moved the picker");
     assert.strictEqual(saveClicks(p), 0, "the newer request is still loading");
@@ -579,7 +629,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     const p = load();
     pick(p, "file");
     const [asked] = fieldsRequests(p);
-    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport: synthetic cause. ", seq: asked.seq });
+    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport: synthetic cause. ", seq: asked.seq, page: asked.page });
     const shown = String(p.window.document.getElementById("error").textContent);
     assert.ok(!shown.includes(".."), `the message has a doubled period: ${shown}`);
     assert.match(shown, /synthetic cause\. The transport and direction are back/);
