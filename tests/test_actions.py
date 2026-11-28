@@ -441,8 +441,10 @@ def test_replace_literal() -> None:
 _MSH = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101120000||ADT^A01|MSG1|P|2.5.1\r"
 
 
-def _with_pid(pid5: str, pid4: str = "") -> Message:
-    return Message.parse(f"{_MSH}PID|1||100^^^HOSP^MR|{pid4}|{pid5}\r")
+def _with_pid(pid5: str, pid4: str = "", *, msh18: str | None = None) -> Message:
+    """A message whose MSH-18 is ``msh18`` as sent, or which ends before MSH-18 where it is None."""
+    msh = _MSH if msh18 is None else _MSH.replace("2.5.1\r", f"2.5.1||||||{msh18}\r")
+    return Message.parse(f"{msh}PID|1||100^^^HOSP^MR|{pid4}|{pid5}\r")
 
 
 def test_convert_case_keeps_a_rich_text_escape_on_a_whole_field() -> None:
@@ -479,6 +481,164 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
     convert_case(m, "PID-5.1", "title")
     assert m["PID-5.1"] == "O^Brien Abc"
     assert m["PID-5"] == "O\\S\\Brien \\X41\\bc"
+
+
+@pytest.mark.parametrize(
+    ("sent", "path", "mode", "expected"),
+    [
+        # BACKLOG #5928 step 1's own case: upper case leaves the hex escape, so the letter it
+        # carries keeps the case the sender sent.
+        ("jos\\XE9\\", "PID-5.1", "upper", "JOS\\XE9\\"),
+        # Lower-case hex digits tell "kept as sent" from upper-casing the wire text, on every path.
+        # Literal text after the escape is still cased, and the field keeps its components.
+        ("jos\\Xe9\\", "PID-5.1.1", "upper", "JOS\\Xe9\\"),
+        ("jos\\Xe9\\", "PID-5", "upper", "JOS\\Xe9\\"),
+        ("jos\\Xe9\\ab^x", "PID-5", "upper", "JOS\\Xe9\\AB^X"),
+        # e-acute is two bytes in UTF-8 (C3 A9). The decoder reads each byte as its own
+        # character, so casing that text byte by byte would write different bytes ("\xc3"
+        # lower-cased is "\xe3"). Kept as sent, the bytes stay intact.
+        ("ren\\Xc3a9\\", "PID-5.1", "upper", "REN\\Xc3a9\\"),
+        ("JOS\\XC389\\", "PID-5", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5", "title", "Jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "title", "Jos\\XC389\\"),
+    ],
+)
+def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
+    sent: str, path: str, mode: Literal["upper", "lower", "title"], expected: str
+) -> None:
+    # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
+    # What a hex escape's bytes mean is ADR 0205's, *The hex escape's meaning*; the decoder maps
+    # each byte to one character and reads no MSH-18, so casing the letter would mean guessing its
+    # character set. Keeping the escape as sent writes no byte the sender did not send.
+    # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
+    # every row here fails.
+    m = _with_pid(sent)
+    convert_case(m, path, mode)
+    assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1", "PID-5.1.1"])
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        # The last byte of UTF-8 e-acute, A9, decodes on its own to an uncased character, so a
+        # per-byte read capitalized the "e" after it mid-word.
+        ("ren\\XC3A9\\e", "Ren\\XC3A9\\e"),
+        ("REN\\Xc3a9\\E", "Ren\\Xc3a9\\e"),
+        # The mirror: AA, the last byte of the new shekel sign (E2 82 AA), decodes on its own to a
+        # cased character, so a per-byte read kept the next word's first letter lower case.
+        ("a \\XE282AA\\b", "A \\XE282AA\\B"),
+        # The run's bytes are read together, however the sender split them into escapes, and a
+        # stray byte before the last character does not hide it.
+        ("ren\\XC3\\\\XA9\\e", "Ren\\XC3\\\\XA9\\e"),
+        ("ren\\XFFC3A9\\e", "Ren\\XFFC3A9\\e"),
+        # Any other unit ends the run, so a byte after it starts afresh: literal text, a
+        # charset switch, an escape that decodes to nothing and a malformed hex escape.
+        ("a\\XC3\\b\\XA9\\c", "A\\XC3\\b\\XA9\\C"),
+        ("ren\\XC3\\\\C2842\\\\XA9\\e", "Ren\\XC3\\\\C2842\\\\XA9\\E"),
+        ("ren\\XC3\\\\.fi\\\\XA9\\e", "Ren\\XC3\\\\.fi\\\\XA9\\E"),
+        ("ren\\XC3\\\\XZZ\\\\XA9\\e", "Ren\\XC3\\\\XZZ\\\\XA9\\E"),
+        # Not valid UTF-8, so each byte is its own character: E9 is a Latin-1 e-acute, cased.
+        ("jos\\XE9\\e", "Jos\\XE9\\e"),
+        # An ASCII byte reads the same either way.
+        ("o\\X41\\b", "O\\X41\\b"),
+    ],
+)
+def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
+    sent: str, expected: str, path: str
+) -> None:
+    # BACKLOG #5928: title case decides whether a letter starts a word from the character before
+    # it, and under a UTF-8 MSH-18 a run of hex escapes is read as UTF-8 where its bytes end in a
+    # UTF-8 character. NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character,
+    # the first five rows fail on every path.
+    m = _with_pid(sent, msh18="UNICODE UTF-8")
+    convert_case(m, path, "title")
+    assert m["PID-5"] == expected
+
+
+# Read as UTF-8, the run C3 A9 is one character, e-acute, which is cased, so the "e" after it stays
+# lower case. Read per byte, its last byte A9 is an uncased character, so the "e" starts a word.
+_UTF8_READ = "Ren\\XC3A9\\e"
+_PER_BYTE_READ = "Ren\\XC3A9\\E"
+
+
+@pytest.mark.parametrize(
+    ("msh18", "expected"),
+    [
+        # HL7 table 0211 spells UTF-8 "UNICODE UTF-8". The match ignores case and surrounding
+        # spaces, and "UTF-8" alone is taken too, as the owner ruled on 2026-11-27.
+        ("UNICODE UTF-8", _UTF8_READ),
+        ("unicode utf-8", _UTF8_READ),
+        ("  Unicode UTF-8 ", _UTF8_READ),
+        ("UTF-8", _UTF8_READ),
+        ("utf-8", _UTF8_READ),
+        (" Utf-8  ", _UTF8_READ),
+        # Only ASCII spaces are stripped, so a tab or a no-break space is part of the name.
+        ("\tUTF-8", _PER_BYTE_READ),
+        ("UTF-8\u00a0", _PER_BYTE_READ),
+        # The value read is MSH-18.1, the whole first component, so a later component is not
+        # read, but a subcomponent is part of it. It is read unescaped.
+        ("UNICODE UTF-8^", _UTF8_READ),
+        ("UTF-8^x", _UTF8_READ),
+        ("UTF-8&x", _PER_BYTE_READ),
+        ("UTF\\X2D\\8", _UTF8_READ),
+        # Only the first repetition names the message's own character set; a later one names an
+        # alternate set a \C..\ escape may switch to.
+        ("UNICODE UTF-8~8859/1", _UTF8_READ),
+        ("UTF-8~UNICODE UTF-16", _UTF8_READ),
+        ("8859/1~UNICODE UTF-8", _PER_BYTE_READ),
+        # An empty MSH-18.1 reads as UTF-8 too (owner ruling 2026-11-27, corrected): an empty
+        # first repetition, a blank value, an empty or an absent MSH-18.
+        ("~8859/1", _UTF8_READ),
+        ("", _UTF8_READ),
+        ("   ", _UTF8_READ),
+        (None, _UTF8_READ),
+        # ISO 8859-1 maps each byte to the character unescape decodes it to, so C3 A9 is two
+        # characters. Every other declared set is read per byte too, as unescape reads it.
+        ("8859/1", _PER_BYTE_READ),
+        ("ASCII", _PER_BYTE_READ),
+        ("ISO IR87", _PER_BYTE_READ),
+        ("UNICODE UTF-16", _PER_BYTE_READ),
+        ("UTF-8X", _PER_BYTE_READ),
+        ("UNICODE", _PER_BYTE_READ),
+    ],
+)
+def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
+    msh18: str | None, expected: str
+) -> None:
+    # BACKLOG #5928, owner ruling 2026-11-27 (corrected): the UTF-8 reading of a hex escape's
+    # bytes is taken where MSH-18.1 is empty or names UTF-8; the rule is convert_case's docstring.
+    # NEGATIVE CONTROL: on f46051350ea, which read the whole first repetition raw, stripped any
+    # whitespace and read an empty MSH-18 per byte, at least the rows for a tab, a no-break space,
+    # a later component, an escaped name and an empty MSH-18.1 fail.
+    m = _with_pid("ren\\XC3A9\\e", msh18=msh18)
+    assert m["MSH-18"] == (msh18 or None)
+    convert_case(m, "PID-5", "title")
+    assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize(
+    ("sent", "mode", "expected"),
+    [
+        # Lower-case hex digits: a casing of the escape's wire text would upper-case them.
+        ("ren\\Xc3a9\\e", "upper", "REN\\Xc3a9\\E"),
+        # UTF-8 E-acute (C3 89): a casing of the letter the escape carries would write C3 A9, and
+        # a casing of the wire text would lower-case the X and the digits.
+        ("REN\\XC389\\E", "lower", "ren\\XC389\\e"),
+    ],
+)
+@pytest.mark.parametrize("msh18", ["UNICODE UTF-8", "UTF-8", None, "8859/1"])
+def test_convert_case_upper_and_lower_keep_hex_as_sent_whatever_msh18(
+    sent: str, mode: Literal["upper", "lower"], expected: str, msh18: str | None
+) -> None:
+    # Owner ruling 2026-11-27: escapes stay as sent for upper and lower case, as PR 2936 ruled, so
+    # MSH-18 changes nothing there; only literal text is cased. NEGATIVE CONTROL: a mutation that
+    # cases a hex escape's wire text in every mode wherever MSH-18 reads as UTF-8 fails every row
+    # but the 8859/1 ones.
+    m = _with_pid(sent, msh18=msh18)
+    convert_case(m, "PID-5", mode)
+    assert m["PID-5"] == expected
 
 
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
@@ -939,9 +1099,9 @@ def test_date_diff_field_still_refuses_a_code_beside_a_subcomponent(start: str) 
 
 
 def test_date_diff_field_shares_timezones_time_precisions() -> None:
-    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"). It pins
-    # behaviour already on origin/main, with no negative control: the
-    # helper reads the one tuple timezone.py defines rather than keeping its own copy.
+    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"): the
+    # helper reads the one tuple timezone.py defines rather than keeping its own copy. NEGATIVE
+    # CONTROL: this fails on 3681393c4ac^, where actions.py defined its own copy.
     import messagefoundry.timezone as timezone_mod
 
     assert vars(actions_mod)["_TIME_PRECISIONS"] is timezone_mod._TIME_PRECISIONS

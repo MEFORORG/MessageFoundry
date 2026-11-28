@@ -244,12 +244,36 @@ and uses your user value or the default instead, until you trust the workspace (
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
-  that passes through a link it can detect; set an outside file in user settings. The workspace
-  folder itself is taken as given, a link included: it is the first folder the workspace opens,
-  which a repository's `.code-workspace` file can set to any folder, the repository's own or not,
-  so a value that file sets can name a file outside the repository. It does not catch a user-set
-  alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
-  the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
+  that passes through a link it can detect; set an outside file in user settings. In a window
+  opened from a `.code-workspace` file, which chooses the workspace folder, the security editor
+  also refuses a path inside that folder, at either scope and the default one included, unless the
+  folder lies inside the folder holding the file, as spelled and by real path. Outside such a
+  window the workspace folder itself is taken as given, a link included. The alias and name checks
+  in the next sentences run on a user-set path outside the workspace folder. They, and the
+  `.code-workspace` rule, run only in the security editor: at least connection edits, the Alert
+  Wizard's writes and the status bar's Start and Restart pass the value to the CLI without them,
+  with only their own narrower link check and the other checks this entry describes. On Windows,
+  the security editor refuses, before any read, such a path with a folder or file name below its
+  root that ends in a dot or a space, holds a colon or is a device name. It also refuses, after
+  reading the workspace folder, one with a long-path or device prefix before a drive
+  (`\\?\C:\...`, `\\.\C:\...`), which earlier releases accepted as written. One that reaches the
+  workspace folder or a folder below it through a junction or a directory symbolic link outside the
+  folder (by real path), or a UNC loopback admin share (by file id), gets the same checks on the
+  part below the folder; those three were measured on Windows with standalone Node v24.20.0, not
+  the editor's Electron runtime. Open limits include at least: other spellings, a subst drive among
+  them, are unmeasured and may be accepted as written; where the workspace folder, or a folder on an
+  alias's real path, reports no file id, an alias only a file id would place, a UNC alias among
+  them, is accepted as written, no looser than before; an alias whose target passes through a link
+  the repository holds, at any depth (an alias onto `ws\linked\deeper`, measured), is followed where
+  that link leads, unchecked; the name checks skip the path's root, so a UNC server or share name
+  is not name-checked, and a one-component long-path or device spelling (`\\?\x.toml`,
+  `\\.\cfg.`, measured) is accepted as written with no name check, no looser than before; in a
+  `.code-workspace` window, a relative user value that leaves the workspace folder by `..`, or on
+  Windows a rooted value with no drive, at least `\x.toml`, `/x.toml`, `\\x.toml`, `\\\x.toml` and
+  `//x.toml`, is read against the folder the file chose, or that folder's drive or share root, and
+  is accepted as written when it reaches no folder inside; and a link made or a folder renamed
+  between the check and the CLI's write is not seen. The rules and the open limits are in the
+  `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless
   it is blank (a value that is not used refuses the edit, above), as `--service-config`, whether or not the file exists, so a missing file fails the edit with

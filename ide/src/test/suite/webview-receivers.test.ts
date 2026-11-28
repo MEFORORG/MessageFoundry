@@ -376,6 +376,14 @@ const SCHEMA: ConnectionSchema = {
  *  over a record that exercises an env reference, a literal, and a key the schema does not know. */
 const FIELDS_OK = {
   command: "fields",
+  // The id of the request answered, echoed with the transport and direction the groups were built
+  // for (fieldsReply). The page under test switches its direction to outbound on load, so its
+  // first request (id 1) is the one in flight. Its per-load page id is fixed by the load's stubbed
+  // random source (the connection receiver's load).
+  seq: 1,
+  page: "00005eed00005eed",
+  transport: "mllp",
+  direction: "outbound",
   groups: buildForm(SCHEMA, "mllp", "outbound", {
     host: { env: "PEER_HOST", cast: "str", default: "localhost" },
     port: 6661,
@@ -396,8 +404,13 @@ const FIELDS_BARE = variant(FIELDS_OK, (c) => {
 const connection: Receiver = {
   panel: "connection editor",
   key: "command",
-  load: () =>
-    page(
+  // The page draws a fields reply, or takes an error naming a request, only for the request in
+  // flight, so the load leaves one in flight: id 1, for mllp outbound.
+  load: () => {
+    const p = page(
+      // The page draws its per-load page id from crypto.getRandomValues; fixed here, so a fixture can
+      // name it. Every word is 0x5eed, which the page id writes as 00005eed00005eed.
+      "window.crypto.getRandomValues = (a) => a.fill(0x5eed);" +
       connectionEditorScript(TOKEN, {
         initial: undefined,
         routers: ["route_adt"],
@@ -418,11 +431,37 @@ const connection: Receiver = {
          <input id="maxAttempts" /></div>
        <div id="error">${SENTINEL}</div>
        <button id="save"></button><button id="cancel"></button><button id="delete"></button>`,
-    ),
-  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK, FIELDS_BARE] },
+    );
+    const direction = p.window.document.getElementById("direction");
+    direction.value = "outbound";
+    direction.dispatchEvent(new p.window.Event("change"));
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.deepStrictEqual(
+      asked.map((m) => [m.seq, m.page, m.transport, m.direction]),
+      [[1, FIELDS_OK.page, "mllp", "outbound"]],
+      "the load left no fields request in flight",
+    );
+    return p;
+  },
+  // An error answering a fields request the host could not rebuild carries that request's page id
+  // and request id, both or neither.
+  wellFormed: { error: [ERROR_OK, { ...ERROR_OK, seq: 1, page: FIELDS_OK.page }], fields: [FIELDS_OK, FIELDS_BARE] },
   malformed: {
-    error: badMessages(ERROR_OK),
+    error: [
+      ...badMessages(ERROR_OK),
+      ["seq is a string", { ...ERROR_OK, seq: "1" }],
+      ["page is a number", { ...ERROR_OK, seq: 1, page: 5 }],
+      ["seq with no page", { ...ERROR_OK, seq: 1 }],
+      ["page with no seq", { ...ERROR_OK, page: FIELDS_OK.page }],
+      ["seq is a fraction", { ...ERROR_OK, seq: 0.5 }],
+    ],
     fields: [
+      ["no seq", variant(FIELDS_OK, (c) => delete c.seq)],
+      ["no page", variant(FIELDS_OK, (c) => delete c.page)],
+      ["page is a number", variant(FIELDS_OK, (c) => (c.page = 5))],
+      ["seq is a string", variant(FIELDS_OK, (c) => (c.seq = "1"))],
+      ["no transport", variant(FIELDS_OK, (c) => delete c.transport)],
+      ["a direction outside inbound and outbound", variant(FIELDS_OK, (c) => (c.direction = "both"))],
       ["no groups", variant(FIELDS_OK, (c) => delete c.groups)],
       ["groups is an object", variant(FIELDS_OK, (c) => (c.groups = { 0: c.groups[0] }))],
       ["a group has no title", variant(FIELDS_OK, (c) => delete c.groups[0].title)],

@@ -3,7 +3,7 @@
 # messagefoundry-webconsole
 
 The **web ops console** for [MessageFoundry](https://messagefoundry.org/) — the same-origin browser
-dashboard served under `/ui` (ADR 0065). A separately-versioned second distribution that the engine
+dashboard served under `/ui` (ADR 0065). A separately released second distribution that the engine
 **mounts in-process, same-origin**, via one `mount_ui(app, deps)` call from `create_app`'s `serve_ui`
 tail (Option B).
 
@@ -15,10 +15,10 @@ pure `messagefoundry.parsing` lib — never `pipeline`/`store`/`transports`/`con
 
 ## Install
 
-Console 0.6.0 pairs with engine 0.5.3. Install the pair into one environment:
+Console 0.5.3 pairs with engine 0.5.3. Install the pair into one environment:
 
 ```
-pip install "messagefoundry==0.5.3" "messagefoundry-webconsole==0.6.0"
+pip install "messagefoundry==0.5.3" "messagefoundry-webconsole==0.5.3"
 # or, for development, beside an engine installed from the same checkout:
 pip install -e packaging/messagefoundry-webconsole
 ```
@@ -37,12 +37,12 @@ absent, it serves the JSON API only and prints a warning at startup. Setting
 
 The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE_SEAMS` +
 `assert_engine_seam`) and supports **exactly one** seam — the engine build it was released against
-(BACKLOG #279). Console 0.6.0 supports seam `2fdef0ec34ace13d`, which engine 0.5.3 provides. With
+(BACKLOG #279). Console 0.5.3 supports seam `2fdef0ec34ace13d`, which engine 0.5.3 provides. With
 the console on, the engine refuses to start beside any other console. The refusal is
 `UiSeamMismatch` when startup reaches the seam check, and an import error when a mismatched pair
 fails before it.
 
-Console 0.6.0 declares `messagefoundry>=0.5.3`, a floor with no ceiling. So pip will not leave it
+Console 0.5.3 declares `messagefoundry>=0.5.3`, a floor with no ceiling. So pip will not leave it
 beside an engine older than 0.5.3. It upgrades the engine instead, and an unpinned upgrade takes
 the newest release, whose seam may differ. The engine refuses that pair at startup. Pin both
 versions, as above.

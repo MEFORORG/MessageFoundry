@@ -1,7 +1,7 @@
 messagefoundry-webconsole (the MessageFoundry web ops console)
 Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 
-This is the separately-versioned web console distribution for MessageFoundry
+This is the separately released web console distribution for MessageFoundry
 (the same-origin browser ops dashboard mounted onto the engine under /ui; ADR
 0065). It is part of the MessageFoundry project and is licensed under the GNU
 Affero General Public License, version 3 or later (AGPL-3.0-or-later). See the

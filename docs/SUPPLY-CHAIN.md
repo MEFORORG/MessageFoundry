@@ -299,8 +299,9 @@ pypi-attestations verify pypi --repository https://github.com/MEFORORG/MessageFo
   pypi:messagefoundry_webconsole-<console-version>-py3-none-any.whl
 ```
 
-The console has its own version, so `<console-version>` is the console wheel you installed, not the
-engine version. Both commands should pass. A failure on either file means you should not install it.
+`<console-version>` is the version of the console wheel you installed. The console carries the
+engine's version, so for a matched pair it is the engine's `<version>`. Both commands should pass.
+A failure on either file means you should not install it.
 
 ### GitHub release artifacts (Sigstore + SLSA)
 

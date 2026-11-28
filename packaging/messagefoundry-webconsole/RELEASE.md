@@ -13,23 +13,26 @@
 > (`pip install -e packaging/messagefoundry-webconsole`), and the seam handshake is exercised in CI
 > against the source tree.
 
-Context: the console is a separately-versioned second distribution mounted same-origin onto the engine
-(Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the seam, and the
-version-skew gate are documented in [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md).
-The **`ENGINE_UI_SEAM` handshake means the engine and console versions can move independently above a
-floor** — you do not have to release them lockstep; you must only keep the floors and the two seam
-digests honest. Nobody chooses a seam value: it is derived (BACKLOG #1220), and
-`docs/WEBCONSOLE-PACKAGE.md` carries the procedure for moving it.
+Context: the console is a second distribution, at the engine's version, mounted same-origin onto
+the engine (Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the
+version rule, the seam, and the version-skew gate are documented in
+[`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md). Each console release carries
+the version of the engine release it pairs with. The number is not what the engine checks: the
+**`ENGINE_UI_SEAM` handshake** is, so keep the floors and the two seam digests honest. Nobody
+chooses a seam value: it is derived (BACKLOG #1220), and `docs/WEBCONSOLE-PACKAGE.md` carries the
+procedure for moving it.
 
 The console's own `release-webconsole` job already exists in
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml), modelled on `release-harness`
-but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep with the engine.
+but fired by the console's **own** `webconsole-v*` tag. That tag follows the engine's, because the
+console's floor names an engine that must already be on PyPI (step 2).
 
 ---
 
 ## 0. Decide version + compatibility
 
-- [ ] Set `messagefoundry_webconsole/__init__.py` `__version__` to the release version.
+- [ ] Set `messagefoundry_webconsole/__init__.py` `__version__` to the version of the engine
+      release this console pairs with.
 - [ ] Confirm `SUPPORTED_ENGINE_SEAMS` equals `{ENGINE_UI_SEAM}` — one seam, the engine this
       build was released against (BACKLOG #279). A test enforces it; do not widen without also
       landing the cross-seam CI matrix.

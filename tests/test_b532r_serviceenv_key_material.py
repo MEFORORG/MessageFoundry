@@ -519,9 +519,10 @@ def test_a_nameless_key_item_joins_an_empty_value_item() -> None:
 def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
     """Control: a line with no key material, under one of the few names that may end an empty
     secret-class value (``serviceenv._ends_blank_class``), still ends the empty key, on a later
-    line and in the next item alike, so the secret reads as unset. Every other name refuses there
-    since BACKLOG #5394 wave 3 (``tests/test_b532w3_serviceenv_split_shapes.py``). Each form the
-    positive tests above use is here."""
+    line and in the next item alike, so the secret reads as empty, not as set. Every other name
+    refuses there since BACKLOG #5394 wave 3 (``tests/test_b532w3_serviceenv_split_shapes.py``).
+    Each form the positive tests above use is here. An entry that names the key with nothing in
+    it refuses on its own (vault BACKLOG #5394), so the key is listed as one."""
     for entries in (
         [f"MEFOR_AI_ENVIRONMENT=prod\n{_KEY}=\n{line}"],
         [f"{_KEY}=", line],
@@ -529,7 +530,9 @@ def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
         [f"{_KEY}\n{line}"],
         [_KEY, line],
     ):
-        assert _read(entries).listed_keys == (), (entries, _read(entries).listed)
+        posture = _read(entries)
+        assert posture.empty_class_names == (_KEY,), (entries, posture.listed)
+        assert not posture.value_runs_on, entries
 
 
 _RETIRED = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
@@ -550,6 +553,7 @@ def test_a_retired_key_list_with_a_blank_entry_below_an_empty_secret_refuses(val
     Windows name set to it does not end the empty secret above it."""
     posture = _read([f"{_RETIRED}=", f"Path={value}"])
     assert posture.listed_keys == (_RETIRED,), posture.listed
+    assert posture.empty_class_names == (), posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None and _KEY_B64 not in refusal
 
@@ -557,8 +561,9 @@ def test_a_retired_key_list_with_a_blank_entry_below_an_empty_secret_refuses(val
 @pytest.mark.parametrize("value", [",", " , ", "C:\\Windows,"])
 def test_a_list_of_blanks_or_a_path_still_ends_the_empty_secret(value: str) -> None:
     """Control for the test above: with no key in it, the Windows name still ends the empty
-    value, so nothing refuses."""
-    assert _read([f"{_RETIRED}=", f"Path={value}"]).listed_keys == ()
+    value, which reads as empty, not as set. An entry that names a secret-class variable with
+    nothing in it refuses on its own (vault BACKLOG #5394), so it is listed as one."""
+    assert _read([f"{_RETIRED}=", f"Path={value}"]).empty_class_names == (_RETIRED,)
 
 
 def test_a_store_key_in_this_process_keeps_the_protect_key_step() -> None:

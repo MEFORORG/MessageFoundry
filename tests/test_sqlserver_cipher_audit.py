@@ -234,3 +234,28 @@ async def test_the_cipher_audit_command_reads_this_store(
     rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
     out = capsys.readouterr().out
     assert rc == 4 and json.loads(out.strip().splitlines()[-1])["status"] == "KEY_MISMATCH", out
+
+
+async def test_a_keyless_run_over_a_keyed_store_with_an_empty_log_is_key_mismatch(
+    keyed: tuple[Any, str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1719 item 22, live: with the audit log emptied, the #1916 guard refuses the keyless
+    open, and the read-only probe behind it finds the keyed cells, so exit 4, KEY_MISMATCH, as
+    SQLite says it. With every table emptied the store is fresh, and the refusal stays exit 2."""
+    from messagefoundry.__main__ import main
+
+    store, _key = keyed
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    await store._execute("DELETE FROM audit_log")
+    rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 4 and json.loads(out.strip().splitlines()[-1])["status"] == "KEY_MISMATCH", out
+    row = await store._fetchone("SELECT COUNT(*) AS n FROM audit_log")
+    assert row is not None and row["n"] == 0, "the probe appended an audit row"
+
+    await _clear(store)
+    rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 2, out
+    assert "KEYLESS audit chain" in out, out

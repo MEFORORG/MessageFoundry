@@ -4976,6 +4976,13 @@ class SqlServerStore(ServerCipherWalk):
             found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
         return {t: frozenset(c) for t, c in found.items()}
 
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+        """``None``: this backend's row filter, a SQL Server security policy, is not read yet, so
+        a walk under one is not reported as not audited whole, and ``cipher-audit --json`` prints
+        ``row_filtered`` as null. Its PostgreSQL twin reads row-level security (BACKLOG #1719
+        item 35); reading security policies here is a follow-up, unfiled."""
+        return None
+
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
         row = await self._fetchone(
@@ -6168,6 +6175,14 @@ class SqlServerStore(ServerCipherWalk):
                 await conn.rollback()
                 raise
         return found
+
+    @classmethod
+    def cipher_walk_probe(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AbstractAsyncContextManager[SqlServerStore]:
+        """The one-connection store, for ``base.open_cipher_walk_probe``, which says what
+        it is for and what it never does (BACKLOG #1719 item 22)."""
+        return cls._one_connection_store(settings, posture=posture)
 
     @classmethod
     async def probe_privileges(
@@ -14789,30 +14804,33 @@ class SqlServerStore(ServerCipherWalk):
             (*params, offset, limit),
         )
         failures: list[CellTagError] = []
-        for r in rows:
-            # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
-            # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
-            # each binds to its own cell (ASVS 11.3.3).
-            # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-            r["last_error"] = await cipher_call(
-                self._cipher,
-                open_listed_cell,
-                self._cipher,
-                r["last_error"],
-                cell_aad("queue", "last_error", r["outbox_id"]),
-                table="queue",
-            )
-            await cipher_call(
-                self._cipher,
-                withhold_message_cells,
-                self._cipher,
-                r,
-                ("summary",),
-                message_id=r["message_id"],
-                channel_id=r.pop("message_channel_id"),
-                failures=failures,
-            )
-        await report_cell_tag_failures(self, failures)
+        try:
+            for r in rows:
+                # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the
+                # messages row's (keyed by message_id and bound to the message's own channel,
+                # BACKLOG #2593) — each binds to its own cell (ASVS 11.3.3).
+                # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
+                r["last_error"] = await cipher_call(
+                    self._cipher,
+                    open_listed_cell,
+                    self._cipher,
+                    r["last_error"],
+                    cell_aad("queue", "last_error", r["outbox_id"]),
+                    table="queue",
+                )
+                await cipher_call(
+                    self._cipher,
+                    withhold_message_cells,
+                    self._cipher,
+                    r,
+                    ("summary",),
+                    message_id=r["message_id"],
+                    channel_id=r.pop("message_channel_id"),
+                    failures=failures,
+                )
+        finally:
+            # A later row's refusal still audits the earlier rows' tag failures (BACKLOG #5650).
+            await report_cell_tag_failures(self, failures)
         return rows
 
     async def count_dead(

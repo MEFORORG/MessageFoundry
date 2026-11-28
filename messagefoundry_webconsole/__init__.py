@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """MessageFoundry web console — the same-origin browser ops dashboard, mounted onto the engine.
 
-A separately-versioned second distribution (``messagefoundry-webconsole``) that the engine MOUNTS
+A separately released second distribution (``messagefoundry-webconsole``) that the engine MOUNTS
 in-process, same-origin, via one :func:`mount_ui` call from ``create_app``'s ``serve_ui`` tail (Option
 B, ADR 0065). It owns the entire ``/ui`` surface — rendering, the confined ``mf_session`` cookie auth,
 the write-action registry, and every ``/ui`` route — and reaches the reused JSON handlers through the
@@ -20,9 +20,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-#: Independent version root (NOT lockstep with the engine — that is the departure from
-#: ``messagefoundry-harness``); its own tag / changelog / PyPI cadence. Starts matched to the engine.
-__version__ = "0.6.0"
+#: The console's own version root, with its own tag and changelog. It carries the engine's version on
+#: every release (docs/WEBCONSOLE-PACKAGE.md); unlike ``messagefoundry-harness`` it does not read the
+#: engine's ``__version__``, so the number is set here by hand.
+__version__ = "0.5.3"
 
 #: The engine seam this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). Any other engine is
 #: refused at startup — the runtime backstop behind the PEP 508 compat range.
