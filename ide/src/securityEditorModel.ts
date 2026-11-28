@@ -159,13 +159,14 @@ function prefixOf(head: string, segments: readonly string[], n: number): string 
  * folder on `target`, shallowest first and the drive or share root included, that is inside it,
  * followed by the segments of `target` below that folder; and whether it was placed by file id
  * (`byId`) rather than by real path. A folder is inside when its real path is inside the folder's,
- * which places at least a junction, a symbolic link or a subst drive onto the folder or one below
- * it, or when a folder on its real path has the workspace folder's {@link LinkFs.fileId}, which
- * places a UNC loopback admin share: Node keeps a UNC spelling's server and share, so the real path
+ * which was measured to place a junction and a directory symbolic link onto the folder or one below
+ * it (a subst drive is UNMEASURED), or when a folder on its real path has the workspace folder's
+ * {@link LinkFs.fileId}, which was measured to place a UNC loopback admin share: Node keeps a UNC spelling's server and share, so the real path
  * of `\\localhost\C$\ws` is that spelling and not `C:\ws`, while the device and file id are the same
  * (measured 2026-11-27 on Windows 11 with Node v24.20.0, through `\\localhost\D$` and
  * `\\127.0.0.1\D$`). An entry with no file id ({@link NO_FILE_ID}), the workspace folder's own
- * included, is placed by real path only. False when no folder on `target` is inside, the walk
+ * included, is placed by real path only, so where the workspace folder has none a UNC alias of it
+ * is not placed (an open limit below). False when no folder on `target` is inside, the walk
  * stopping at the first that does not exist; undefined when the workspace folder cannot be read,
  * a folder on `target` is a dangling link, any other read fails, a spelling cannot be split into
  * its folders ({@link rootAndSegments}), or there is no `fileId`.
@@ -314,8 +315,9 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    the first that does not exist (BACKLOG #8237 item 16). The first that is inside the workspace
  *    folder by real path, or whose real path passes through a folder with the workspace folder's
  *    device and file id ({@link LinkFs.fileId}), means the path reaches the folder by another
- *    spelling: at least a junction, a symbolic link or a subst drive onto the folder or one below
- *    it, or a UNC loopback admin share (`\\localhost\C$\...`). The part below the workspace folder
+ *    spelling. Measured: a junction or a directory symbolic link onto the folder or one below it,
+ *    by real path, and a UNC loopback admin share (`\\localhost\C$\...`), by file id; other
+ *    spellings, a subst drive among them, are UNMEASURED (Open limits). The part below the workspace folder
  *    then gets rule 2's checks, spelled from the workspace folder, after those reads. Placed by real path, the path
  *    returned is spelled from the workspace folder; placed by file id alone, it is returned as
  *    written, so two entries that report one id (file ids are not unique on every file system, at
@@ -335,13 +337,16 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
  * a caller that passes no `fileId` refuses then.
  *
- * Open limits. Rule 3 places an alias by real path where the OS resolves it, and by file id only
- * where the file system reports the same device and file id through both spellings: measured for a
- * UNC loopback admin share on Windows, and tested for a junction onto the folder and onto a folder
- * below it. It was not measured for at least a subst or mapped drive, an 8.3 short name, a bind
- * mount or a macOS firmlink. A real path follows every link at once, so an alias onto a folder that
- * is itself a link the repository holds is placed where that link leads, and the repository's link
- * is not checked; following each link one hop at a time would be needed to see it. Where the
+ * Open limits. Rule 3's placement was measured on Windows 11 with Node v24.20.0 for a junction
+ * and a directory symbolic link (by real path) and a UNC loopback admin share (by file id), and
+ * nothing else: at least a subst or mapped drive, an 8.3 short name, a bind mount and a macOS
+ * firmlink are UNMEASURED, and may be accepted as written with no link check. Where the
+ * workspace folder reports no file id ({@link NO_FILE_ID}), a UNC alias of it is accepted as
+ * written with no link check: a fail-open, though no looser than before #8237 item 16, when every
+ * user-set path outside the folder was. A real path follows every link at once, so an alias onto
+ * a folder that is itself a link the repository holds is placed where that link leads, and the
+ * repository's link is not checked; following each link one hop at a time would be needed to see
+ * it. Where the
  * native realpath fails, at least with EISDIR on some RAM disks and virtual drives, every user-set
  * path refuses, as every rule 2 path already did. Its reads are synchronous, so a user-set path on a slow share holds the extension host while they
  * run. Nor does this check cover the files the CLI creates beside the target, or a link made
