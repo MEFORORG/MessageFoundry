@@ -50,6 +50,23 @@ export async function formSchemaFor(
   }
 }
 
+/** The reply to the connection form's "fields" request, for both hosts (this file and
+ *  configEditors.ts). It echoes the request's id (seq) with the transport and direction the groups
+ *  were built for, so the page draws only the answer to its latest request (BACKLOG #8243 item 18).
+ *  When the engine cannot describe the fields, an "error" naming the same id, so the page stops
+ *  waiting for an answer instead of holding Save back for good. */
+export async function fieldsReply(
+  cwd: string,
+  m: { transport: string; direction: "inbound" | "outbound"; settings?: Record<string, unknown>; seq?: unknown },
+): Promise<Record<string, unknown>> {
+  const seq = Number.isSafeInteger(m.seq) ? { seq: m.seq } : {};
+  const rebuilt = await formSchemaFor(cwd, m.transport, m.direction, m.settings ?? {});
+  if (!rebuilt) {
+    return { command: "error", message: `could not read the engine's fields for the ${m.transport} transport`, ...seq };
+  }
+  return { command: "fields", groups: rebuilt.groups, transport: m.transport, direction: m.direction, ...seq };
+}
+
 /** Sibling connections in the same connections.toml, for the customEditor's picker (#221b). When
  *  present, the form renders a "＋ New / <name>…" dropdown above the title so the whole file's
  *  connections are reachable from the one custom editor; omitted for the command-opened single form. */
@@ -129,6 +146,7 @@ export async function openConnectionEditor(
       transport?: string;
       direction?: string;
       settings?: Record<string, unknown>;
+      seq?: unknown;
     }) => {
       if (m?.command === "save" && m.conn) {
         await save(
@@ -153,11 +171,10 @@ export async function openConnectionEditor(
         // Rebuild the descriptors HERE, so the grouping/typing rules live in the one tested module
         // rather than being reimplemented in webview script.
         // Answered only while the page that asked is still the one showing (postToSameRender).
+        // The reply echoes the request's id, so the page draws only its latest request's answer.
         const asked = requestToken(m);
-        const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
-        if (rebuilt) {
-          void postToSameRender(current.webview, asked, { command: "fields", groups: rebuilt.groups });
-        }
+        const reply = await fieldsReply(ws, { transport: m.transport, direction: m.direction, settings: m.settings, seq: m.seq });
+        void postToSameRender(current.webview, asked, reply);
       }
     },
   );

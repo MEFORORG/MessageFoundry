@@ -72,11 +72,13 @@ const SCHEMA: ConnectionSchema = {
         tls_key_password: param({ secret: true }),
         db_password: param({ secret: true }),
         headers: param({ type: "table" }),
+        // Its schema default differs by transport: a ticked box carried to "file" equals file's default.
+        tls: param({ type: "bool", default: false }),
       },
     },
     file: {
       doc: "Files on disk.",
-      params: { path: param({}) },
+      params: { path: param({}), tls: param({ type: "bool", default: true }) },
     },
   },
   directionKeys: {
@@ -181,7 +183,13 @@ function fieldsRequests(p: Page): Payload[] {
 
 /** The host's reply to one fields request: the form rebuilt from what that request sent. */
 function replyTo(p: Page, request: Payload): void {
-  p.deliver({ command: "fields", groups: buildForm(SCHEMA, request.transport, request.direction, request.settings) });
+  p.deliver({
+    command: "fields",
+    seq: request.seq,
+    transport: request.transport,
+    direction: request.direction,
+    groups: buildForm(SCHEMA, request.transport, request.direction, request.settings),
+  });
 }
 
 /** Answer every fields request from index `from` on, oldest first; returns the next index. */
@@ -191,6 +199,25 @@ function answerFrom(p: Page, from: number): number {
     replyTo(p, request);
   }
   return asked.length;
+}
+
+/** Answer the latest request, and each one the page sends in its place, until it sends no more. */
+function answerLatest(p: Page): void {
+  for (let round = 0; round < 10; round++) {
+    const asked = fieldsRequests(p);
+    replyTo(p, asked[asked.length - 1]);
+    if (fieldsRequests(p).length === asked.length) {
+      return;
+    }
+  }
+  assert.fail("the page kept asking for its fields");
+}
+
+/** Click Save; the number of save posts the click made. */
+function saveClicks(p: Page): number {
+  const before = p.posted.filter((m) => m.command === "save").length;
+  p.window.document.getElementById("save").click();
+  return p.posted.filter((m) => m.command === "save").length - before;
 }
 
 /** Pick a transport, posting its fields request, with no reply. */
@@ -379,6 +406,98 @@ suite("connection editor: a removal and a keep survive a rebuild's reply (BACKLO
         assert.ok(!String(c.value).includes(value), `a credential is shown: ${value}`);
       }
     }
+  });
+});
+
+suite("connection editor: only the reply to the latest fields request is drawn (BACKLOG #8243 item 18)", () => {
+  teardown(closeWindows);
+
+  function savedConn(p: Page): Payload {
+    assert.strictEqual(saveClicks(p), 1, `expected one save post: ${JSON.stringify(p.posted)}`);
+    const save = p.posted.filter((m) => m.command === "save");
+    return JSON.parse(JSON.stringify(save[save.length - 1].conn)) as Payload;
+  }
+
+  test("Save waits while the picked transport's fields are loading, and posts them once drawn", () => {
+    const p = load();
+    pick(p, "file");
+    assert.strictEqual(saveClicks(p), 0, "a save went out with the mllp fields under the file transport");
+    assert.match(String(p.window.document.getElementById("error").textContent), /still loading/);
+    answerLatest(p);
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "file");
+    assert.ok(control(p, "path"), "the file fields were not drawn");
+  });
+
+  test("the latest reply is drawn even when the host normalized it into an older request's settings", () => {
+    const p = load();
+    control(p, "headers").value = '{"env":"X"}';
+    pick(p, "file");
+    // buildForm drops a cast that is not a string, so this request's reply reads like the first's.
+    control(p, "headers").value = '{"env":"X","cast":5}';
+    pick(p, "mllp");
+    pick(p, "file");
+    answerFrom(p, 0);
+    assert.ok(control(p, "path"), "the reply to the latest request was dropped");
+    assert.strictEqual(savedConn(p).transport, "file");
+  });
+
+  test("with many requests in flight, the last value typed is the one saved", () => {
+    const p = load();
+    for (let i = 0; i < 34; i++) {
+      control(p, "port").value = String(7000 + i);
+      pick(p, i % 2 === 1 ? "mllp" : "file");
+    }
+    answerFrom(p, 0);
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "mllp");
+    assert.strictEqual(conn.settings.port, 7033, "an older reply's value was saved");
+  });
+
+  test("a ticked box survives an older reply for a transport whose default it equals", () => {
+    const p = load();
+    control(p, "tls").checked = true;
+    pick(p, "file");
+    pick(p, "mllp");
+    answerFrom(p, 0);
+    assert.strictEqual(savedConn(p).settings.tls, true, "the ticked box was dropped");
+  });
+
+  test("a late reply for an older transport with the same settings is not drawn", () => {
+    const p = load();
+    pick(p, "file");
+    pick(p, "mllp");
+    const [toFile, toMllp] = fieldsRequests(p);
+    replyTo(p, toMllp);
+    replyTo(p, toFile);
+    assert.strictEqual(control(p, "path"), null, "the file reply was drawn under the mllp picker");
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "mllp");
+    assert.strictEqual(conn.settings.port, 6661);
+  });
+
+  test("a request the host could not answer puts the pickers back where the fields are, and Save works", () => {
+    const p = load();
+    pick(p, "file");
+    const [asked] = fieldsRequests(p);
+    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: asked.seq });
+    assert.strictEqual(p.window.document.getElementById("transport").value, "mllp", "the picker still names file");
+    assert.match(String(p.window.document.getElementById("error").textContent), /mllp outbound fields again/);
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "mllp");
+    assert.deepStrictEqual(conn.settings, RECORD.settings);
+  });
+
+  test("an error for a request a newer one replaced changes nothing", () => {
+    const p = load();
+    pick(p, "file");
+    pick(p, "mllp");
+    const [older] = fieldsRequests(p);
+    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: older.seq });
+    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "a superseded failure was shown");
+    assert.strictEqual(saveClicks(p), 0, "the newer request is still loading");
+    answerLatest(p);
+    assert.strictEqual(savedConn(p).transport, "mllp");
   });
 });
 

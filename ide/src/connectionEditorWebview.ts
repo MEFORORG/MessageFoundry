@@ -310,8 +310,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // reply is drawn, not when the request is sent, so a setting kept again before the reply
       // arrives keeps its default (BACKLOG #8243 items 18 and 20). A reference under another key
       // keeps it, so the original key typed back still finds it.
-      // A reply drawn here was built from the latest request's settings (the message handler), so a
-      // reply to an older request cannot prune a default the latest one carries (item 18).
+      // A rebuild's reply is drawn only when it answers the page's latest request, matched by the
+      // id the host echoes (the message handler), so a reply to an older request never reaches
+      // this prune (item 18).
       const envRefKeys = new Set();
       for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
       for (const k of HELD_DEFAULTS.keys()) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
@@ -338,11 +339,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
-    // The settings each fields request sent, in canonical form (canon), newest last; the last few
-    // only. The reply carries no request id, so the settings are how the page tells which request a
-    // reply answers (the message handler below).
-    const ASKED = [];
-    const ASKED_KEPT = 32;
+    // Each fields request carries an id, one more than the last (FIELDS_SEQ). Both hosts echo it
+    // in their reply (fieldsReply in connectionEditor.ts), with the transport and direction the
+    // groups were built for. The page draws only the reply to its latest request, so a reply to an
+    // older one can neither drop nor bring back a setting (BACKLOG #8243 items 18 and 20).
+    // FIELDS_ANSWERED is the id of the latest request answered. While the two differ, the drawn
+    // fields were built for another transport or direction than the pickers show, so Save waits
+    // (fieldsPending). ASKED_SETTINGS is what the latest request sent, as JSON.
+    let FIELDS_SEQ = 0;
+    let FIELDS_ANSWERED = 0;
+    let ASKED_SETTINGS = null;
+    // The transport and direction the drawn fields were built for, set once the load has drawn,
+    // so a request the host could not answer puts the pickers back where the fields are.
+    let DRAWN_FOR = null;
+    function fieldsPending() { return FIELDS_SEQ !== FIELDS_ANSWERED; }
 
     /** Ask the extension to rebuild the descriptors when the transport or direction changes.
      *  settings: what collectSettings(true) returns, when the caller already has it. */
@@ -351,12 +361,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // A setting this request leaves out (removed, or its env key box empty) loses its held default
       // when the reply is drawn (renderGroups), not here.
       if (settings === undefined) settings = collectSettings(true);
-      ASKED.push(canon(settings));
-      if (ASKED.length > ASKED_KEPT) ASKED.shift();
+      FIELDS_SEQ += 1;
+      ASKED_SETTINGS = JSON.stringify(settings);
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
         command: 'fields',
+        seq: FIELDS_SEQ,
         transport: $('transport').value,
         direction: $('direction').value,
         settings: settings,
@@ -364,36 +375,14 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       });
     }
 
-    // A settings table as text that does not depend on key order, so two tables compare by content.
+    // A value as text that does not depend on key order, so a recorded table matches a table
+    // choice by content (renderField).
     function canon(v) {
       if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
       if (v !== null && typeof v === 'object') {
         return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
       }
       return JSON.stringify(v);
-    }
-
-    // The settings a reply was built from, as far as its descriptors say. The host builds a reply
-    // from the settings its request sent: buildForm in connectionForm.ts draws every one of them,
-    // and only those, carrying its value, its env reference ({env, cast, default} as envKey, cast,
-    // envDefault), or its held credential (preserveValue). buildForm may normalize a value on the
-    // way (it drops a cast that is not a string), so a reply that matches no request is taken as
-    // the latest request's answer, never dropped.
-    function repliedSettings(groups) {
-      const settings = {};
-      for (const g of groups) for (const f of g.fields) {
-        if (f.isEnvRef) {
-          const ref = { env: f.envKey };
-          if (f.cast !== undefined) ref.cast = f.cast;
-          if (f.envDefault !== undefined) ref.default = f.envDefault;
-          settings[f.key] = ref;
-        } else if (f.preserveValue !== undefined) {
-          settings[f.key] = f.preserveValue;
-        } else if (f.value !== undefined) {
-          settings[f.key] = f.value;
-        }
-      }
-      return settings;
     }
 
     function refreshVisibility() {
@@ -456,6 +445,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       prefillHints();
     }
     refreshVisibility();
+    DRAWN_FOR = { transport: $('transport').value, direction: $('direction').value };
 
     $('direction').addEventListener('change', () => { refreshVisibility(); requestFields(); });
     $('transport').addEventListener('change', () => requestFields());
@@ -673,6 +663,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     }
 
     $('save').addEventListener('click', () => {
+      // The drawn fields belong to the transport and direction of the last answered request; until
+      // the latest one is answered, saving would post those fields under the pickers' transport.
+      if (fieldsPending()) {
+        errorEl.textContent = 'The fields for the ' + $('transport').value + ' transport are still loading; save once they show.';
+        errorEl.style.display = '';
+        return;
+      }
       const conn = build();
       if (!validate(conn)) return;
       vscode.postMessage({ command: 'save', conn: conn });
@@ -701,37 +698,52 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }
+    // A "fields" reply echoes its request's id (seq) and the transport and direction its groups were
+    // built for (fieldsReply in connectionEditor.ts). An "error" answering a fields request the host
+    // could not rebuild carries that request's id too; other errors carry none.
+    const DIRECTIONS = ['inbound', 'outbound'];
     const SHAPES = {
-      error: (d) => mfStr(d.message),
-      fields: (d) => mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
+      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt),
+      fields: (d) => mfInt(d.seq) && mfStr(d.transport) && mfOneOf(d.direction, DIRECTIONS) &&
+        mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
         mfOpt(g.description, mfStr) && mfArrOf(g.fields, mfFieldDescriptor)),
     };
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
       if (!d || !mfShapeOk(d, 'command', SHAPES, 'connection editor')) { return; }
-      if (d.command === 'error') { errorEl.textContent = d.message; errorEl.style.display = ''; }
+      if (d.command === 'error') {
+        let message = d.message;
+        if (d.seq !== undefined) {
+          // A newer request is still waiting for its answer: this one's failure no longer matters.
+          if (d.seq !== FIELDS_SEQ) return;
+          // The latest request could not be answered, so no reply will come: the pickers go back
+          // to the transport and direction the drawn fields belong to, and Save works again.
+          FIELDS_ANSWERED = FIELDS_SEQ;
+          $('transport').value = DRAWN_FOR.transport;
+          $('direction').value = DRAWN_FOR.direction;
+          refreshVisibility();
+          message += '. The form shows the ' + DRAWN_FOR.transport + ' ' + DRAWN_FOR.direction + ' fields again.';
+        }
+        errorEl.textContent = message; errorEl.style.display = '';
+      }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
-        if (ASKED.length) {
-          const latest = ASKED[ASKED.length - 1];
-          // A reply built from an older request's settings, and not the latest's, answers that
-          // older request: drawing it would drop or change a setting the latest request carries, or
-          // bring back one it left out. A reply that matches no request is taken as the latest's
-          // answer (repliedSettings). Two requests with the same settings cannot be told apart, so
-          // a reply to the older of them is drawn, as every reply was before; a request id and
-          // transport the hosts echo would settle it.
-          const replied = canon(repliedSettings(d.groups));
-          if (replied !== latest && ASKED.includes(replied)) return;
-          // The form changed since the latest request (a setting removed, kept again, emptied,
-          // retyped or switched between a literal and env()): drawing its reply would undo that, so
-          // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends
-          // at most one request, and the form does not change until a reply is drawn, so this stops
-          // once the user stops editing. If the host never answers, the form stays as it is.
+        // Only the reply to the latest request is drawn: a reply to an older one would drop or
+        // change a setting the latest request carries, or bring back one it left out.
+        if (d.seq !== FIELDS_SEQ) return;
+        // The form changed since the latest request (a setting removed, kept again, emptied,
+        // retyped or switched between a literal and env()): drawing its reply would undo that, so
+        // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends at
+        // most one request, and the form does not change until a reply is drawn, so this stops once
+        // the user stops editing. Save waits meanwhile (fieldsPending).
+        if (ASKED_SETTINGS !== null) {
           const now = collectSettings(true);
-          if (canon(now) !== latest) { requestFields(now); return; }
+          if (JSON.stringify(now) !== ASKED_SETTINGS) { requestFields(now); return; }
         }
+        FIELDS_ANSWERED = d.seq;
+        DRAWN_FOR = { transport: d.transport, direction: d.direction };
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);
       }

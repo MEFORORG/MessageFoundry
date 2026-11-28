@@ -16,7 +16,7 @@
 import * as vscode from "vscode";
 import { configDir, writerConfigTarget, runJson, workspaceDir, writerPathSetting } from "./cli";
 import { postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
-import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
+import { connectionFormHtml, fieldsReply, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, type Direction, nameCollisionError, planSave } from "./connectionMerge";
 import {
   connectionRemoveArgs,
@@ -222,6 +222,7 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         transport?: string;
         direction?: string;
         settings?: Record<string, unknown>;
+        seq?: unknown;
       }) => {
         const ws = workspaceDir();
         if (!ws) {
@@ -240,11 +241,10 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // #5565), and without an answer it kept the previous transport's fields.
           // A select or an external edit can re-render the panel before or while this runs; the
           // reply is then for a page that no longer exists, and is dropped (postToSameRender).
+          // The reply echoes the request's id, so the page draws only its latest request's answer.
           const asked = requestToken(m);
-          const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
-          if (rebuilt) {
-            void postToSameRender(panel.webview, asked, { command: "fields", groups: rebuilt.groups });
-          }
+          const reply = await fieldsReply(ws, { transport: m.transport, direction: m.direction, settings: m.settings, seq: m.seq });
+          void postToSameRender(panel.webview, asked, reply);
         } else if (m?.command === "save" && m.conn) {
           // #234: the ONE save policy, shared with the command-opened form (connectionEditor.ts
           // save()) via planSave — merge the posted (rendered-fields-only) object over a save-time

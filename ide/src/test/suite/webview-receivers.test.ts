@@ -376,6 +376,11 @@ const SCHEMA: ConnectionSchema = {
  *  over a record that exercises an env reference, a literal, and a key the schema does not know. */
 const FIELDS_OK = {
   command: "fields",
+  // The id of the request answered, echoed with the transport and direction the groups were built
+  // for (fieldsReply). The page under test has sent no request, so its latest id is 0.
+  seq: 0,
+  transport: "mllp",
+  direction: "outbound",
   groups: buildForm(SCHEMA, "mllp", "outbound", {
     host: { env: "PEER_HOST", cast: "str", default: "localhost" },
     port: 6661,
@@ -419,10 +424,19 @@ const connection: Receiver = {
        <div id="error">${SENTINEL}</div>
        <button id="save"></button><button id="cancel"></button><button id="delete"></button>`,
     ),
-  wellFormed: { error: [ERROR_OK], fields: [FIELDS_OK, FIELDS_BARE] },
+  // An error answering a fields request the host could not rebuild carries that request's id.
+  wellFormed: { error: [ERROR_OK, { ...ERROR_OK, seq: 0 }], fields: [FIELDS_OK, FIELDS_BARE] },
   malformed: {
-    error: badMessages(ERROR_OK),
+    error: [
+      ...badMessages(ERROR_OK),
+      ["seq is a string", { ...ERROR_OK, seq: "0" }],
+      ["seq is a fraction", { ...ERROR_OK, seq: 0.5 }],
+    ],
     fields: [
+      ["no seq", variant(FIELDS_OK, (c) => delete c.seq)],
+      ["seq is a string", variant(FIELDS_OK, (c) => (c.seq = "0"))],
+      ["no transport", variant(FIELDS_OK, (c) => delete c.transport)],
+      ["a direction outside inbound and outbound", variant(FIELDS_OK, (c) => (c.direction = "both"))],
       ["no groups", variant(FIELDS_OK, (c) => delete c.groups)],
       ["groups is an object", variant(FIELDS_OK, (c) => (c.groups = { 0: c.groups[0] }))],
       ["a group has no title", variant(FIELDS_OK, (c) => delete c.groups[0].title)],
