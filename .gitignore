@@ -36,6 +36,8 @@ bootstrap-admin.txt
 .env.*
 *.key
 *.pem
+*.pem.replaced
+*.pem.prior
 *.pfx
 secrets/
 

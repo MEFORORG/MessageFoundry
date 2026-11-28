@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The repository root `.gitignore` ignores the files the engine writes beside a dev store.
+
+The engine writes its generated TLS pair beside the store, and the dev command in CLAUDE.md
+section 7 puts the store at the repository root. A re-mint caused only by a trailing dot in the
+bind keeps the old private key at ``api-generated-key.pem.replaced``, and a renewal stages the old
+certificate at ``api-generated-cert.pem.prior`` (BACKLOG #5973). ``*.pem`` matches neither name, so
+without their own rules a ``git add -A`` in a dev checkout would stage a private key.
+
+The probes are pinned here, not read from `.gitignore`, as in ``test_private_paths_stay_ignored``:
+a guard that reads the file it guards moves with it.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+_PROBES = [
+    "api-generated-key.pem.replaced",
+    "api-generated-cert.pem.replaced",
+    "api-generated-cert.pem.prior",
+]
+
+
+@pytest.mark.parametrize("probe", _PROBES)
+def test_a_generated_pair_sibling_at_the_repo_root_is_ignored(probe: str) -> None:
+    result = subprocess.run(  # nosec B603 B607 -- fixed git argv, no shell
+        ["git", "check-ignore", "-q", "--no-index", probe],
+        cwd=_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"{probe} at the repo root is not ignored by .gitignore"
