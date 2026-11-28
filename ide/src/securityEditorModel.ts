@@ -7,6 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { isFullyQualifiedPath } from "./engineTrustModel";
 import { isPathWithin, isSamePath, nonAsciiCaseVariant, sameIgnoringAnyCase, segmentsBelow } from "./pathFold";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
@@ -286,13 +287,13 @@ function nameProblem(rel: string, inWhere: string): string | undefined {
 }
 
 /** Whether `setting` names its path by itself rather than one read against the workspace folder:
- *  absolute, and on Windows with its drive or share named too, since `\x` takes the folder's drive
- *  and `C:x` the drive's current folder. */
+ *  {@link isFullyQualifiedPath}, and a UNC spelling must name a server and a share as well, since
+ *  Node resolves `\\x.toml`, with no share, on the workspace folder's drive. */
 function namesItsOwnPath(setting: string): boolean {
-  if (process.platform !== "win32") {
-    return path.isAbsolute(setting);
+  if (!isFullyQualifiedPath(setting)) {
+    return false;
   }
-  return /^[A-Za-z]:[\\/]/.test(setting) || /^[\\/]{2}/.test(setting);
+  return path.sep !== "\\" || !/^[\\/]{2}/.test(setting) || path.win32.parse(setting).root.length > 2;
 }
 
 /** Whether the workspace folder `root` lies inside the folder that holds the `.code-workspace` file
@@ -355,13 +356,15 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    real path and file id, with the same open limits.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
- *    and the folder itself is refused. In a `.code-workspace` window, a value that does not name its
- *    own path (relative, or on Windows one with no drive or share, such as `\x` or `C:x`) and leaves
- *    the workspace folder, by `..` or by its root, is refused before any file-system call, since
- *    the file chose the folder it is read against. Otherwise every folder and file name on its whole path gets
+ *    and the folder itself is refused. Otherwise every folder and file name on its whole path gets
  *    rule 2's name checks first, before any file-system call: a name ending in a dot or a space,
  *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
- *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
+ *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Next,
+ *    in a `.code-workspace` window whose file chose the workspace folder from outside its own
+ *    folder, as rule 2 tests it, a value that is not a full path is refused, since it is read
+ *    against the folder the file chose. A full path is {@link isFullyQualifiedPath}, and on
+ *    Windows a UNC spelling must also name a server and a share; so at least `..\x`, `\x`, `C:x`,
+ *    `\\x` and `\\\x` are refused there. Then,
  *    once the case variant below is settled, each folder on its path is read, shallowest first and the drive or share root included, down to
  *    the first that does not exist (BACKLOG #8237 item 16). The first that is inside the workspace
  *    folder by real path, or whose real path passes through a folder with the workspace folder's
@@ -439,17 +442,6 @@ export function securityConfigTarget(
               "in user settings",
       };
     }
-    // A relative user value is read against the workspace folder, which a .code-workspace file
-    // chooses, so one that leaves that folder lands where the file chose (round-55360875 finding
-    // 2). Refused before any read; a full path is the operator's own.
-    if (scope.workspaceFile !== undefined && !namesItsOwnPath(setting)) {
-      return {
-        ok: false,
-        problem:
-          "messagefoundry.serviceConfig is a relative path that leaves the workspace folder, and this window's " +
-          ".code-workspace file chose that folder. Give the full path, with its drive, in user settings",
-      };
-    }
     // Every folder and file name on a user-set path outside the folder, before any read: Node reads
     // `ws.` as written and finds nothing, while the CLI's Win32 open drops the dot, so an alias of
     // the folder spelled that way would pass the walk below and reach the folder's links (BACKLOG
@@ -458,6 +450,22 @@ export function securityConfigTarget(
     const named = spelled === undefined ? undefined : nameProblem(spelled.segments.join(path.sep), "");
     if (named !== undefined) {
       return { ok: false, problem: named };
+    }
+    // A value that is not a full path is read against the workspace folder, so where a
+    // .code-workspace file chose that folder from outside its own folder, one that leaves it lands
+    // where the file chose (round-55360875 finding 2). Where the folder lies inside the file's own,
+    // as rule 2 tests it, the operator's placement of the file decides, as on main.
+    if (
+      scope.workspaceFile !== undefined &&
+      !namesItsOwnPath(setting) &&
+      !insideWorkspaceFileFolder(root, scope.workspaceFile, fsx)
+    ) {
+      return {
+        ok: false,
+        problem:
+          "messagefoundry.serviceConfig is not a full path and leaves the workspace folder, and this window's " +
+          ".code-workspace file chose that folder from outside the folder that holds the file. Give the full path",
+      };
     }
     if (variant !== undefined) {
       const same = isWorkspaceFolder(root, variant.head, fsx);

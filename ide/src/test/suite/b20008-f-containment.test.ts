@@ -495,19 +495,19 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     const repo = path.join(base, "repo");
     const chosen = path.join(base, "chosen");
     fs.mkdirSync(path.join(repo, "below"), { recursive: true });
-    fs.mkdirSync(path.join(chosen, "sub"), { recursive: true });
+    fs.mkdirSync(chosen);
     const workspaceFile = path.join(repo, "project.code-workspace");
     const up = `..${path.sep}messagefoundry.toml`;
-    // Chosen from outside the file's folder, and chosen below it: either way the file picked the
-    // folder the climb starts from.
-    for (const folder of [chosen, path.join(repo, "below")]) {
-      const got = securityConfigTarget(folder, up, inWindow(user, workspaceFile), real);
-      assert.ok(!got.ok && got.problem.includes("relative path"), `${folder} ${JSON.stringify(got)}`);
-    }
+    const climbs = [up];
     if (process.platform === "win32") {
-      // A rooted path with no drive takes the chosen folder's drive, so it is read against it too.
-      const rooted = securityConfigTarget(chosen, `\\${path.relative(path.parse(base).root, base)}\\x.toml`, inWindow(user, workspaceFile), real);
-      assert.ok(!rooted.ok && rooted.problem.includes("relative path"), JSON.stringify(rooted));
+      // Each of these Node reads on the chosen folder's drive (round-0d26a789 finding 1): a rooted
+      // path with no drive, and a doubled or tripled separator with no server and share.
+      const rest = path.relative(path.parse(base).root, base);
+      climbs.push(`\\${rest}\\x.toml`, "\\\\x.toml", `\\\\\\${rest}\\x.toml`, "//x.toml", `///${rest.replace(/\\/g, "/")}/x.toml`);
+    }
+    for (const setting of climbs) {
+      const got = securityConfigTarget(chosen, setting, inWindow(user, workspaceFile), real);
+      assert.ok(!got.ok && got.problem.includes("not a full path"), `${setting} ${JSON.stringify(got)}`);
     }
     // THE CONTROL: with no .code-workspace file the operator opened the folder, and the climb is
     // theirs, as before; a full path is accepted in the window; a relative value that stays inside
@@ -517,6 +517,20 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     assert.deepStrictEqual(securityConfigTarget(chosen, full, inWindow(user, workspaceFile), real), { ok: true, path: full });
     const inside = securityConfigTarget(path.join(repo, "below"), `sub${path.sep}..${path.sep}m.toml`, inWindow(user, workspaceFile), real);
     assert.deepStrictEqual(inside, { ok: true, path: path.join(repo, "below", "m.toml") });
+  });
+
+  test("a climb from a folder inside the file's own folder is accepted, as on main (round-0d26a789 finding 3)", () => {
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(path.join(repo, "below"), { recursive: true });
+    // `folders: ['.']`, the commonest layout, and a folder the file chose below its own.
+    const workspaceFile = path.join(repo, "self.code-workspace");
+    const out = path.join(base, "x.toml");
+    for (const [folder, setting] of [
+      [repo, `..${path.sep}x.toml`],
+      [path.join(repo, "below"), `..${path.sep}..${path.sep}x.toml`],
+    ] as const) {
+      assert.deepStrictEqual(securityConfigTarget(folder, setting, inWindow(user, workspaceFile), real), { ok: true, path: out }, `${folder} ${setting}`);
+    }
   });
 
   (process.platform === "win32" ? test : test.skip)("the name checks still run first, with no file-system call", () => {
