@@ -1229,6 +1229,16 @@ async def test_a_graph_stopped_during_the_preflight_is_refused(
         return out
 
     monkeypatch.setattr(engine, "_dr_preflight", demoting_preflight)
+    if not leads:
+        park = rr.park_intake
+
+        async def regaining_park(*args: Any, **kwargs: Any) -> Any:
+            # The lease comes back while the rollback awaits: the abort still names the lease,
+            # the refusal's cause when it was raised.
+            follower.leader = True
+            return await park(*args, **kwargs)
+
+        monkeypatch.setattr(rr, "park_intake", regaining_park)
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
     monkeypatch.undo()

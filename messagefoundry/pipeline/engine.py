@@ -1279,7 +1279,7 @@ class Engine:
 
     def _lease_lost(self) -> bool:
         """Whether the runner reads this node as lease-lost (BACKLOG #5906), read at each call
-        so it follows a reload that swaps the runner."""
+        since the engine's runner is set only once its graph is first added."""
         rr = self._registry_runner
         return rr is not None and rr.lease_lost
 
@@ -1398,6 +1398,9 @@ class Engine:
             # as not active. BaseException, not Exception (vault BACKLOG #2751): a cancelled reload
             # rolls its intake back to the previous graph (RegistryRunner.reload), so the latch has
             # to follow it there too.
+            # BACKLOG #5906: read before the awaits below, so a lease regained or lost while they
+            # run does not change which refusal the abort names.
+            not_leading = isinstance(exc, RunnerNotRunningError) and self._dr_not_leading()
             self._set_dr_active(was_active)
             standby = self._dr_standby_threshold()
             if rr is not None and standby is not None:
@@ -1423,9 +1426,7 @@ class Engine:
                         "DR activation failed, and closing the outbound sessions it had opened "
                         "failed too; POST /config/reload closes them"
                     )
-            if isinstance(exc, RunnerLeaseLostError) or (
-                isinstance(exc, RunnerNotRunningError) and self._dr_not_leading()
-            ):
+            if isinstance(exc, RunnerLeaseLostError) or not_leading:
                 # BACKLOG #5906: the DR coordinator's own type, so its abort row can name the
                 # lease without importing the runner. A graph stopped on a node that still leads
                 # keeps the runner's own refusal.
@@ -3837,7 +3838,8 @@ class Engine:
         if not dry_run and approval is None and self._lease_lost():
             # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
             # here, before the settings preflight reads the anchors and the load runs the config
-            # modules, for the inline route and convergence. The target check still runs first, so
+            # modules, for the inline route; convergence refuses before it calls this method, and
+            # this read backs that one. The target check still runs first, so
             # a directory outside the reload roots is still refused and audited as denied. A dry
             # run swaps nothing, so it still runs. A released reload is left to the gate's
             # before-claim check and the runner's, so its refusal still follows its digest check.

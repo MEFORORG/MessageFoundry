@@ -4,7 +4,9 @@
   settings preflight reads the trust anchors and before the load runs any config module; before,
   the refusal came only once the runner held its reload lock. A directory outside the reload roots
   is still refused and audited as denied. A dry run and a released dual-control hold are
-  unchanged. `POST /dr/activate` on such a node, or on a cluster follower, reads the lease after
+  unchanged. `POST /dr/activate` on such a node, or on a cluster follower, which only an embedder
+  that skips the settings check reaches since the service settings refuse `[dr]` together with
+  `[cluster]`, reads the lease after
   the archive confinement and again before the store recovery and before the takeover hook, and
   aborts with kind `lease` (a 503) and a `dr_activation_aborted` row. Before, a lease-lost node ran
   the cold-seed checks, the store recovery that re-pends in-flight rows and the takeover hook, and
