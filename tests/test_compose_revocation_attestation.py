@@ -15,10 +15,12 @@ required, non-optional reference for the same reason."""
 
 from __future__ import annotations
 
+import argparse
 import copy
 import functools
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +34,7 @@ from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
 
 _COMPOSE = Path(__file__).resolve().parents[1] / "docker" / "compose.yaml"
 _FALSE = {"false", "0", "no", "off", "n", "f"}
-_REQUIRED = re.compile(r"^\$\{" + TLS_REVOCATION_ATTESTED_ENV + r":\?[^}]+\}$")
+_REQUIRED = re.compile(r"^\$\{" + re.escape(TLS_REVOCATION_ATTESTED_ENV) + r":\?[^}]+\}$")
 
 
 @functools.cache
@@ -46,33 +48,83 @@ def _all_services() -> dict[str, dict[str, Any]]:
     return dict(_compose_doc().get("services") or {})
 
 
+def _argv(command: str | list[Any] | None) -> list[str]:
+    """A compose ``command`` or k8s ``args`` as argv. Compose takes a string as well as a list,
+    and splits the string shell-style, so a string goes through shlex."""
+    if isinstance(command, str):
+        return shlex.split(command)
+    return [str(a) for a in command or []]
+
+
+@functools.cache
+def _cli() -> argparse.ArgumentParser:
+    # Imported here, not at module level: sibling modules import this file's compose readers and
+    # should not pay for loading the whole CLI.
+    from messagefoundry.__main__ import _build_parser
+
+    return _build_parser()[0]
+
+
+#: A host that stands for one this file cannot read. It is not loopback, so it gates.
+_UNREAD_HOST = "<unread>"
+
+
+def _serve_host(argv: list[str]) -> str | None:
+    """The host ``serve`` takes from argv, or None where it names none. Read with the engine's own
+    parser, so it takes ``--host X``, ``--host=X`` and the last repeat as serve does, rather than
+    a hand-kept copy of those rules. Text serve's parser refuses, such as a compose substitution
+    in a typed option that compose would resolve first, reads as a host this file cannot read."""
+    if argv[:1] != ["serve"]:
+        return None
+    try:
+        host: str | None = _cli().parse_known_args(argv)[0].host
+    except SystemExit:
+        return _UNREAD_HOST
+    return host
+
+
 def _serving_engines() -> dict[str, dict[str, Any]]:
     """Every service whose command is ``serve``."""
-    return {n: s for n, s in _all_services().items() if (s.get("command") or [])[:1] == ["serve"]}
+    return {n: s for n, s in _all_services().items() if _argv(s.get("command"))[:1] == ["serve"]}
 
 
 def _env(svc: dict[str, Any]) -> dict[str, Any]:
-    return dict(svc.get("environment") or {})
-
-
-def _off_loopback(value: object) -> bool:
-    return bool(value) and str(value) not in _LOOPBACK_HOSTS
+    """A service's environment as a mapping. Compose also takes a list of ``KEY=VALUE``, and a
+    bare ``KEY`` there passes the variable through from the host, so it maps to None here."""
+    environment = svc.get("environment") or {}
+    if isinstance(environment, list):
+        return {
+            k: (v if sep else None) for k, sep, v in (str(e).partition("=") for e in environment)
+        }
+    return dict(environment)
 
 
 def _gated(svc: dict[str, Any]) -> bool:
     """Whether the revocation gate would read this service's bind: in-process TLS off loopback.
 
-    It errs toward gated. The API leaves loopback when local_access_only reads false beside a
-    non-loopback listen address, or when MEFOR_API_HOST or ``serve --host`` names one; a service
-    with none of those stays on 127.0.0.1 and needs no attestation."""
+    It errs toward gated, over at least the levers below. The API leaves loopback when
+    local_access_only reads false beside a non-loopback listen address, or when ``serve --host``
+    names one. MEFOR_API_HOST is read as a lever too, although the engine now refuses it at load
+    (ADR 0118), so a service carrying it errs toward gated. An empty host is not loopback to the
+    engine, so it gates here too.
+
+    A value this file cannot read counts as the value that gates: a bare list-form ``KEY``, which
+    passes the host's value through, and a ``${...}`` substitution compose resolves at ``up``.
+    Sources this reads nothing from, at least ``env_file:`` and TOML settings, are not covered."""
     env = _env(svc)
-    command = [str(a) for a in svc.get("command") or []]
-    host_arg = command[command.index("--host") + 1] if "--host" in command[:-1] else None
+    unread = {k for k, v in env.items() if v is None or "${" in str(v)}
+
+    def lever(key: str) -> bool:
+        return key in unread or (key in env and str(env[key]) not in _LOOPBACK_HOSTS)
+
     local_only = str(env.get("MEFOR_SECURITY_LOCAL_ACCESS_ONLY", "true")).strip().lower()
-    return bool(env.get("MEFOR_API_TLS_CERT_FILE")) and (
-        (local_only in _FALSE and _off_loopback(env.get("MEFOR_SECURITY_LISTEN_ADDRESS")))
-        or _off_loopback(env.get("MEFOR_API_HOST"))
-        or _off_loopback(host_arg)
+    local_only_off = local_only in _FALSE or "MEFOR_SECURITY_LOCAL_ACCESS_ONLY" in unread
+    host = _serve_host(_argv(svc.get("command")))
+    cert = "MEFOR_API_TLS_CERT_FILE"
+    return (bool(env.get(cert)) or cert in unread) and (
+        (local_only_off and lever("MEFOR_SECURITY_LISTEN_ADDRESS"))
+        or lever("MEFOR_API_HOST")
+        or (host is not None and host not in _LOOPBACK_HOSTS)
     )
 
 
@@ -94,6 +146,113 @@ def test_the_checks_refuse_what_they_must() -> None:
     assert not _gated({"command": ["serve"], "environment": cert})
     assert _gated({"command": ["serve", "--host", "0.0.0.0"], "environment": cert})
     assert _gated({"command": ["serve"], "environment": {**cert, "MEFOR_API_HOST": "0.0.0.0"}})
+    assert not _gated({"command": "serve --host 127.0.0.1", "environment": cert})
+    assert not _gated({"command": ["serve", "--host=127.0.0.1"], "environment": cert})
+    assert not _gated({"command": ["serve", "--hostname", "0.0.0.0"], "environment": cert})
+    assert not _gated({"command": ["serve"], "environment": ["MEFOR_API_HOST=0.0.0.0"]})
+    # serve takes the last --host, so a loopback one after an open one keeps it on loopback.
+    last = ["serve", "--host", "0.0.0.0", "--host=127.0.0.1"]
+    assert not _gated({"command": last, "environment": cert})
+    # A bare cert beside no lever, and a list environment holding a loopback bind, stay ungated.
+    bare = ["MEFOR_API_TLS_CERT_FILE", "MEFOR_STORE_PASSWORD"]
+    assert not _gated({"command": ["serve"], "environment": bare})
+    loopback = [
+        _CERT,
+        "MEFOR_SECURITY_LOCAL_ACCESS_ONLY=false",
+        "MEFOR_SECURITY_LISTEN_ADDRESS=127.0.0.1",
+    ]
+    assert not _gated({"command": ["serve"], "environment": loopback})
+
+
+_CERT_MAP = {"MEFOR_API_TLS_CERT_FILE": "/etc/mefor/tls/api.crt"}
+_CERT = "=".join(*_CERT_MAP.items())
+
+
+@pytest.mark.parametrize(
+    "svc",
+    [
+        pytest.param(
+            {"command": "serve --host 0.0.0.0", "environment": _CERT_MAP}, id="string-command"
+        ),
+        pytest.param(
+            {"command": ["serve", "--host=0.0.0.0"], "environment": _CERT_MAP}, id="host-equals"
+        ),
+        pytest.param(
+            {
+                "command": ["serve"],
+                "environment": [
+                    _CERT,
+                    "MEFOR_SECURITY_LOCAL_ACCESS_ONLY=false",
+                    "MEFOR_SECURITY_LISTEN_ADDRESS=0.0.0.0",
+                ],
+            },
+            id="list-environment",
+        ),
+        pytest.param(
+            {
+                "command": ["serve"],
+                "environment": {
+                    **_CERT_MAP,
+                    "MEFOR_SECURITY_LOCAL_ACCESS_ONLY": "false",
+                    "MEFOR_SECURITY_LISTEN_ADDRESS": "",
+                },
+            },
+            id="empty-listen-address",
+        ),
+        pytest.param(
+            {
+                "command": ["serve"],
+                "environment": {
+                    **_CERT_MAP,
+                    "MEFOR_SECURITY_LOCAL_ACCESS_ONLY": "${LOCAL_ONLY:-true}",
+                    "MEFOR_SECURITY_LISTEN_ADDRESS": "0.0.0.0",
+                },
+            },
+            id="substituted-local-only",
+        ),
+        pytest.param(
+            {"command": ["serve", "--port", "${MEFOR_API_PORT}"], "environment": _CERT_MAP},
+            id="unparsed-command",
+        ),
+        pytest.param({"command": ["serve", "--host="], "environment": _CERT_MAP}, id="empty-host"),
+        pytest.param(
+            {
+                "command": ["serve"],
+                "environment": [
+                    "MEFOR_API_TLS_CERT_FILE",
+                    "MEFOR_SECURITY_LOCAL_ACCESS_ONLY",
+                    "MEFOR_SECURITY_LISTEN_ADDRESS=0.0.0.0",
+                ],
+            },
+            id="pass-through",
+        ),
+    ],
+)
+def test_alternate_command_and_environment_shapes_are_read(
+    monkeypatch: pytest.MonkeyPatch, svc: dict[str, Any]
+) -> None:
+    # Positive controls: compose accepts each shape below, and each binds in-process TLS off
+    # loopback, or may once compose and the host resolve what this file cannot read, so the
+    # helpers must find the service and call it gated rather than drop it. These are at least the
+    # shapes the helpers read, not every shape compose accepts.
+    monkeypatch.setattr(sys.modules[__name__], "_all_services", lambda: {"svc": svc})
+    assert set(_serving_engines()) == {"svc"}
+    assert _gated(svc)
+
+
+def test_a_list_environment_reads_values_and_bare_keys() -> None:
+    assert _env({"environment": ["A=1", "B=x=y", "C=", "D"]}) == {
+        "A": "1",
+        "B": "x=y",
+        "C": "",
+        "D": None,
+    }
+
+
+def test_a_k8s_engine_reads_host_equals() -> None:
+    env = [{"name": "MEFOR_API_TLS_CERT_FILE", "value": "/etc/mefor/tls/api.crt"}]
+    assert _k8s_gated({"args": ["serve", "--host=0.0.0.0"], "env": env})
+    assert not _k8s_gated({"args": ["serve", "--host=127.0.0.1"], "env": env})
 
 
 @pytest.mark.parametrize("service", sorted(_serving_engines()))
@@ -102,7 +261,10 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
     if not _gated(svc):
         pytest.skip(f"{service} does not bind in-process TLS off loopback")
     value = _env(svc).get(TLS_REVOCATION_ATTESTED_ENV)
-    assert value is not None, f"{service} never passes {TLS_REVOCATION_ATTESTED_ENV}; serve exits 2"
+    assert value is not None, (
+        f"{service} sets no value for {TLS_REVOCATION_ATTESTED_ENV}: it is absent, or a bare "
+        "pass-through, and neither is the required compose substitution"
+    )
     assert _REQUIRED.match(str(value)), (
         f"{service} sets {TLS_REVOCATION_ATTESTED_ENV} to {value!r}. It must be a required compose "
         "substitution with no default, so the attestation stays the operator's own act."
@@ -117,7 +279,7 @@ _CHECK_HA = "revocation-attestation-check-ha"
 
 def _check_argv() -> list[str]:
     """The check service's argv after the image's interpreter, to run with this interpreter."""
-    entry = [str(a) for a in _all_services()[_CHECK]["entrypoint"]]
+    entry = _argv(_all_services()[_CHECK]["entrypoint"])
     return entry[entry.index("/opt/venv/bin/python") + 1 :]
 
 
@@ -315,12 +477,14 @@ def _k8s_engine_containers() -> dict[str, dict[str, Any]]:
         for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
             spec = ((doc or {}).get("spec") or {}).get("template", {}).get("spec") or {}
             for c in spec.get("containers") or []:
-                if (c.get("args") or [])[:1] == ["serve"]:
+                if _argv(c.get("args"))[:1] == ["serve"]:
                     out[f"{path.name}:{c['name']}"] = c
     return out
 
 
 def _k8s_gated(container: dict[str, Any]) -> bool:
+    # An entry with no literal value (valueFrom, or a bare name) maps to None, which _gated reads
+    # as a value it cannot read, so it errs toward gated.
     env = {e["name"]: e.get("value") for e in container.get("env") or []}
     return _gated({"command": container.get("args"), "environment": env})
 
