@@ -3864,9 +3864,10 @@ class UploadStore:
         except UnicodeDecodeError as exc:
             # Only a body reaches this arm today, since a sidecar that is not UTF-8 is refused
             # above, and it is lost for the BACKLOG #3181 reason in the arm above. The arm is its
-            # own because is_absent reads an OSError's errno and a decode error has none; it also
-            # keeps the decode error from any call that might render it, which
-            # tests/test_unicode_error_log_paths.py refuses unless its _SAFE_CALLS names the call.
+            # own because tests/test_unicode_error_log_paths.py refuses a raw Unicode error handed
+            # to any callee its _SAFE_CALLS does not name, whether or not that callee renders it,
+            # and it cannot see the isinstance guard that kept this error from is_absent when the
+            # two arms were one. Here the error reaches codec_safe_str alone.
             if kind == "body":
                 _log.warning(
                     "uploaded file %s (body): missing or not text; no key can read it", fid
