@@ -58,6 +58,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_guard import (
     _MAX_ROLLS_PER_WINDOW,
     GuardedFileHandler,
@@ -1183,8 +1184,8 @@ def test_a_roll_notice_whose_reason_the_stream_cannot_encode_is_escaped(
     # The sink's write fails for its own reason, whose text holds a character the strict cp1252
     # stdout the roll lands on has no byte for (a localized OS message, say). The roll notice is
     # escaped like any other guard write, so stage 1 completes.
-    # NEGATIVE CONTROL: on 49e92d442f4 the notice was written unescaped, so stage 1 failed and the
-    # sink was recorded unwritable, asking for the stop.
+    # NEGATIVE CONTROL: with _write_notice writing through _write_raw, so the notice is not
+    # escaped, stage 1 failed and the sink was recorded unwritable, asking for the stop.
     raw, live = _strict_cp1252()
     monkeypatch.setattr(sys, "stdout", live)
 
@@ -1211,7 +1212,8 @@ def test_a_stream_whose_encoding_misnames_its_encoder_gets_ascii_escapes(
 ) -> None:
     # A wrapper that says utf-8 but writes through a strict cp1252 stream: the escape for utf-8
     # changes nothing, so the line is written again with everything outside ASCII escaped.
-    # NEGATIVE CONTROL: on 49e92d442f4 the second write failed too and the sink reached stage 2.
+    # NEGATIVE CONTROL: with the ASCII fallback removed from _write_line, the write failed again
+    # and the sink reached stage 2.
     raw, inner = _strict_cp1252()
 
     class _Misnamed(io.StringIO):
@@ -1240,7 +1242,8 @@ def test_the_probe_escapes_a_line_the_stream_cannot_encode(
     # revalidate() probes through the same write, so a probe notice holding a character the
     # stream cannot encode (the sink label is any text register() was given) still lands and the
     # sink is marked healthy. The probe writes under the handler's lock.
-    # NEGATIVE CONTROL: on 49e92d442f4 the probe wrote unescaped and the sink stayed unwritable.
+    # NEGATIVE CONTROL: with _probe_write writing through _write_raw, so the probe notice is not
+    # escaped, the probe failed and the sink stayed unwritable.
     raw, stream = _strict_cp1252()
     monkeypatch.setattr(sys, "stdout", stream)
     guard = LogWriteGuard()
@@ -1283,6 +1286,95 @@ def test_a_lone_surrogate_on_the_utf8_file_sink_is_written_as_the_log_spells_it(
     assert [s.state for s in guard.status()] == ["healthy"]
     assert "id a\\\\udcffb" in log_path.read_text(encoding="utf-8")
     assert list(tmp_path.iterdir()) == [log_path]
+
+
+def test_serves_hardened_stdout_writes_the_escape_not_a_question_mark(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve hardens its console streams to errors="replace" before logging is configured
+    # (console_streams.harden_console_streams), so that stream never raises, and a guard that
+    # escaped only on UnicodeEncodeError wrote "?" there. The escape is taken before the stream's
+    # own replace, so the escaped form wins on serve's default stdout too.
+    # NEGATIVE CONTROL: with _write_line restored to try the raw write first and escape only on
+    # UnicodeEncodeError, and GuardedStreamHandler.emit removed, the line read "order caf? ? ?"
+    # (the e-acute kept, the two others replaced) and nothing was counted.
+    raw, stream = _strict_cp1252()
+    real_err = sys.stderr
+    monkeypatch.setattr(sys, "stdout", stream)
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    harden_console_streams()
+    monkeypatch.setattr(sys, "stderr", real_err)
+    assert stream.errors == "replace"
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    assert raw.getvalue().decode("cp1252").splitlines() == ["order caf\xe9 \\u4e2d \\ud83d\\ude00"]
+    assert events == []
+    assert [s.state for s in guard.status()] == ["healthy"]
+    assert f"{logging_guard._ESCAPED_FAULT} (x1)" in capsys.readouterr().err
+
+
+def test_a_stream_that_writes_in_chunks_gets_the_line_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stream that writes each character as it goes, and raises at the first one its codec has
+    # no byte for, has already written the prefix by then. The escape is taken before the write,
+    # so the line lands once rather than its prefix twice.
+    # NEGATIVE CONTROL: with _write_line restored to try the raw write first, the raw write landed
+    # "order caf\xe9 " before raising and the escaped re-write repeated it.
+    raw, inner = _strict_cp1252()
+
+    class _Chunked(io.StringIO):
+        encoding = "cp1252"
+
+        def write(self, text: str) -> int:
+            for ch in text:
+                inner.write(ch)
+            return len(text)
+
+    stream = _Chunked()
+    monkeypatch.setattr(sys, "stdout", stream)
+    guard = LogWriteGuard()
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("order %s", _UNENCODABLE))
+
+    assert raw.getvalue().decode("cp1252").splitlines() == ["order caf\xe9 \\u4e2d \\ud83d\\ude00"]
+
+
+def test_a_stream_refusing_an_ascii_line_reports_its_own_encode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stream that raises UnicodeEncodeError on every line, ASCII ones included, cannot be
+    # written, so it reaches stage 2, and what the write raises is the stream's own error, not one
+    # the guard made up. The stage-2 reason redacts an encode error's message, so the exception is
+    # read off the write itself.
+    # NEGATIVE CONTROL: with _write_line restored to raise its own UnicodeEncodeError when the
+    # escape changed nothing, the write raised that error ("the stream refused the line").
+    class _Refuses(io.StringIO):
+        def write(self, text: str) -> int:
+            raise UnicodeEncodeError("cp1252", text, 0, 1, "stream-own-reason")
+
+    stream = _Refuses()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("plain ascii"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    with pytest.raises(UnicodeEncodeError) as raised:
+        handler._write_line("plain ascii\n")
+    assert raised.value.reason == "stream-own-reason"
 
 
 @pytest.mark.parametrize(
