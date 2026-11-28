@@ -12,7 +12,7 @@ nothing anywhere reported a problem.
 **The posture is request-scoped on purpose, and the split must not be tidied away.** The engine's
 response models keep ``extra="ignore"`` because the same classes are the client's *reader*:
 :mod:`messagefoundry.apiclient.client` validates engine responses into them, and the web console
-ships as a separately-versioned wheel. A response model that forbade unknown keys would make an
+ships as a separate wheel. A response model that forbade unknown keys would make an
 older client raise on a newer engine that grew a field -- turning an additive server change into a
 hard client failure. Requests come from outside and must be refused when they are wrong; responses
 come from a trusted engine and must be read tolerantly. Two directions, two rules, one reason.

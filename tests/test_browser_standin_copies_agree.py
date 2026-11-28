@@ -5,7 +5,7 @@
 Both ``tests/conftest.py`` and the web console suite's ``conftest.py`` wrap
 ``httpx.ASGITransport`` so an in-process ``/ui`` write that names no provenance carries the
 ``Sec-Fetch-Site: same-origin`` a browser sends. There are two copies because the console suite is
-separately versioned and does not inherit the engine's conftest. One run collects both suites, and
+separately packaged and does not inherit the engine's conftest. One run collects both suites, and
 the two wrappers then stack, so a copy that drifted (another method set, another opt-out key) would
 change what the other suite's refusal tests measure with nothing reporting it.
 

@@ -14,7 +14,7 @@ request nobody made.
 The posture is deliberately DIRECTIONAL, and these tests pin both halves of it, because a blanket
 ``extra="forbid"`` across the module would be a different and worse defect:
 :mod:`messagefoundry.apiclient.client` validates engine RESPONSES into these same classes and the
-web console ships as a separately-versioned wheel, so a strict response model would make an older
+web console ships as a separate wheel, so a strict response model would make an older
 client raise on a newer engine that merely grew a field.
 
 Every assertion carries its positive control. "The request was refused" proves nothing on its own --

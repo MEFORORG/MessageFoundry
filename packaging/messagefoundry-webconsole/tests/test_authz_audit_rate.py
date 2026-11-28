@@ -205,7 +205,7 @@ def _mirror_grant_into_require_ui(monkeypatch: pytest.MonkeyPatch, app_state: An
     nothing, which is why ARM B lands below the request count instead of equal to it.
 
     NOTE FOR WHOEVER IMPLEMENTS THIS: the probe calls ``_grant_audit_permission``, a PRIVATE symbol
-    in ``messagefoundry.api.security``, from the separately-versioned console package. The real
+    in ``messagefoundry.api.security``, from the separately released console package. The real
     change would live in the console and could not make that call, so step one of the build is
     promoting that seam -- not writing this line into ``_auth``.
     """

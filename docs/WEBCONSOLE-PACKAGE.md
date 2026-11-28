@@ -6,9 +6,11 @@ The browser ops console served under `/ui` is a **separately released second dis
 `messagefoundry-webconsole` (import `messagefoundry_webconsole`) — that the engine **mounts in-process,
 same-origin**, rather than an in-tree part of the engine wheel. This is "Option B" of
 [ADR 0065](adr/0065-web-ops-dashboard.md): the console's routes, rendering, and write-action registry
-became independently *developable / testable / releasable* without editing engine core or bumping the
-engine version, while keeping the proven same-origin security model (the console was previously the
-in-engine `messagefoundry/api/webui/` tree).
+became independently *developable / testable* without editing engine core, and build as their own
+wheel, while keeping the proven same-origin security model (the console was previously the
+in-engine `messagefoundry/api/webui/` tree). The wheel is not released on its own: every engine
+release ships it, at the engine's version
+([the version rule](#1-architecture), owner ruling 2026-11-28).
 
 This is the authoritative doc for that package: its architecture, the injection **seam** the engine and
 package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (a shared
@@ -35,13 +37,15 @@ the extraction does and does not decouple).
   same mechanic that keeps `harness/` out of the engine wheel — so a plain `pip install messagefoundry`
   stays byte-identical. The console is on by default for a loopback bind (ADR 0143); with it absent,
   the engine serves the JSON API only and prints a warning at startup.
-- **The console carries the engine's version.** Every MessageFoundry distribution, the engine, the
-  web console, the toolkit and the harness, carries the engine's version (owner ruling
-  2026-11-28), so each console release takes the number of the engine release it pairs with:
-  console 0.5.3 pairs with engine 0.5.3. The console still keeps its **own** `__version__` in
-  `messagefoundry_webconsole/__init__.py`, set by hand at each release rather than read from the
-  engine as `messagefoundry-harness` does, and its own `webconsole-v*` tag, changelog and release
-  job. No CI check compares the two numbers.
+- **The console carries the engine's version, and ships with every engine release.** The engine,
+  the web console, the toolkit and the harness carry one version number (owner ruling 2026-11-28).
+  Every release ships each of them at that number, the console included when it did not change, and
+  a console-only fix ships as a patch release of all four, never as a `.postN` release. So console
+  0.5.3 pairs with engine 0.5.3. The console still keeps its **own** `__version__` in
+  `messagefoundry_webconsole/__init__.py`, set by hand in the engine version bump rather than read
+  from the engine as `messagefoundry-harness` does, and its own `webconsole-v*` tag, changelog and
+  release job. `tests/test_packaging.py::test_each_lockstep_distribution_ships_at_the_engine_version`
+  fails while the console's `__version__` differs from the engine's.
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
   an exact pin; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
   floor is raised at each console release, not as the engine moves.** Console 0.4.0 set the first
@@ -198,8 +202,9 @@ absent and the default deployment stays byte-identical:
 | `ui_ws_authorize` | `authorize_ui_ws` (browser cookie/CSWSH auth) | `/ws/stats` handshake | native `Authorization`-header path |
 | `ui_connections_render` | `pages.connections_fragment` (server-rendered enrichment) | `/ws/stats` push | counts-only push |
 
-Because CSP moves with the client assets it governs, a package-only CSP tweak for a new `app.js`
-source ships **package-only**.
+Because CSP moves with the client assets it governs, a CSP tweak for a new `app.js` source is a
+**package-only** change: it edits no engine code. It still ships in a release of every package
+([section 1](#1-architecture)).
 
 ---
 
@@ -369,16 +374,20 @@ python -m pytest packaging/messagefoundry-webconsole/tests -q
 
 ## 5. Honest scope — what this does and does not decouple
 
-Option B decouples **development, test, and release**. It does **not** buy deploy independence.
+Option B decouples **development and test**. It does **not** buy release or deploy independence:
+every release ships the console at the engine's version ([section 1](#1-architecture)).
 
 **Genuine wins**
 
 - The route paths and the WebAuthn ceremony JSON contract are now co-versioned with `app.js` (all in the
   package), resolving the previous latent JS-vs-endpoint split.
 - The `/ui` CSP is co-versioned with the `app.js`/`app.css` it governs (via the `ui_csp` hook), so a
-  client-asset CSP change ships package-only.
-- Console-internal changes — presentation, client JS, `app.js` CSP tweaks — ship as a
-  **package-only** release. Since BACKLOG #2709 at least these do not: a change that adds a console
+  client-asset CSP change is a package-only change.
+- Console-internal changes — presentation, client JS, `app.js` CSP tweaks — are **package-only**
+  changes: they edit no engine code and leave the seam where it was. They still ship in the next
+  release of every package, at the engine's next version, and a console-only fix is a patch release
+  of all of them, never a `.postN` release of the console. Since BACKLOG #2709 at least these are
+  not package-only: a change that adds a console
   route or changes a route's gate, and an edit to a console function a gate reaches by plain
   name, such as an `_auth` helper it calls, or to a middleware argument or the WebSocket
   authorizer. The seam digest records each of those, so the change moves the seam and needs an

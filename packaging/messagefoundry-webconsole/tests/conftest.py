@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared /ui fixtures for the web console's OWN test suite (Option B, ADR 0065).
 
-This package is separately versioned and tested (its own ``[tool.pytest.ini_options]`` in the
+This package is separately built and tested (its own ``[tool.pytest.ini_options]`` in the
 adjacent ``pyproject.toml`` — ``asyncio_mode="auto"`` + session loop scopes + timeout addopts), so it
 does NOT inherit the engine's ``tests/conftest.py``. The two pieces of that conftest the relocated
 /ui tests genuinely depend on are reproduced here:

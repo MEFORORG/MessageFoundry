@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Name a web console that is installed but will not import (BACKLOG #1907).
 
-The console is a separately versioned wheel. An old one, or one whose own import chain fails
+The console is a separately installed wheel. An old one, or one whose own import chain fails
 against this engine, raises ``ImportError`` at the engine's import of it. That import runs before
 ``assert_engine_seam`` can raise the clear ``UiSeamMismatch``. Without this module, ``serve`` would
 exit 1 through the CLI's last-resort catch with one generic log line, and ``create_app`` would call

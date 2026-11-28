@@ -556,6 +556,7 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
 # --- the harness pins the engine it ships with (BACKLOG #1585) --------------------------------------
 
 _HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
+_ENGINE_INIT = _REPO / "messagefoundry" / "__init__.py"
 
 # Where the pin failures below send a version bump. The list itself is guarded in
 # tests/test_install_docs_pin_the_current_version.py, which the docs-only CI lane runs.
@@ -665,7 +666,7 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
     # lockstep pin rests on the root being the engine's, so the premise moving must stop the test
     # rather than let it carry on asserting about whatever file the config now names.
     root = version_path(_HARNESS_PYPROJECT)
-    assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
+    assert root == _ENGINE_INIT.resolve(), (
         f"the harness takes its version from {root}, which is not the engine's __init__.py - the "
         f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
     )
@@ -976,7 +977,7 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     engine dependencies, so the exact pin makes the engine's set the toolkit's (ADR 0201 section 1).
     """
     root = version_path(_TOOLKIT_PYPROJECT)
-    assert root == (_REPO / "messagefoundry" / "__init__.py").resolve(), (
+    assert root == _ENGINE_INIT.resolve(), (
         f"the toolkit takes its version from {root}, which is not the engine's __init__.py - the "
         f"lockstep premise this pin rests on is gone, so re-derive the pin before trusting it"
     )
@@ -1046,12 +1047,76 @@ def test_the_harness_pins_the_toolkit_at_the_version_it_ships_with() -> None:
 #: Every separate distribution under packaging/, derived so a new one is covered on arrival.
 _SEPARATE_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
 
+#: The distributions that carry the engine's version (owner ruling 2026-11-28): every release ships
+#: each of them at the engine's number, even one that did not change. Named, not derived from the
+#: glob above, so a later distribution under packaging/ is not put in lockstep by arriving there.
+_LOCKSTEP_DISTRIBUTIONS = (
+    "messagefoundry-harness",
+    "messagefoundry-toolkit",
+    "messagefoundry-webconsole",
+)
+
 
 def test_the_separate_distributions_are_all_found() -> None:
     """Liveness for the parametrize below: an empty glob would run it zero times and pass."""
-    assert {"messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"} <= set(
-        _SEPARATE_DISTRIBUTIONS
-    ), _SEPARATE_DISTRIBUTIONS
+    assert set(_LOCKSTEP_DISTRIBUTIONS) <= set(_SEPARATE_DISTRIBUTIONS), _SEPARATE_DISTRIBUTIONS
+
+
+def _version_drift(pyproject: Path, engine_init: Path) -> str | None:
+    """Why the distribution ``pyproject`` builds does not ship at the engine's version, or ``None``.
+
+    Both versions are read from source, the ``__version__`` literal hatchling reads, never from
+    installed metadata: an editable install keeps the version it was installed at, so metadata can
+    agree while the tree does not. The strings must be equal, not merely equal PEP 440 versions,
+    because each release tag is spelled from the number and one release has one spelling.
+    """
+    root = version_path(pyproject)
+    shipped, engine = _version_literal(root), _version_literal(engine_init)
+    if shipped == engine:
+        return None
+    return (
+        f"{pyproject.parent.name} ships at {shipped} ({root.name} in {root.parent.name}/), but the "
+        f"engine is at {engine}. The engine, web console, toolkit and harness carry one version "
+        f"(owner ruling 2026-11-28); {_BUMP_LIST} lists what a bump moves."
+    )
+
+
+@pytest.mark.parametrize("distribution", _LOCKSTEP_DISTRIBUTIONS)
+def test_each_lockstep_distribution_ships_at_the_engine_version(distribution: str) -> None:
+    """The toolkit and harness read the engine's ``__version__``, so they match by construction and
+    this guards that construction. The web console keeps its own literal, set by hand, and this is
+    the check that the hand edit happened."""
+    drift = _version_drift(_REPO / "packaging" / distribution / "pyproject.toml", _ENGINE_INIT)
+    assert drift is None, drift
+
+
+def test_the_version_drift_check_fires_on_a_mismatch(tmp_path: Path) -> None:
+    """NEGATIVE CONTROL: the comparison above passes only while it can fail.
+
+    Mutation: make ``_version_drift`` return ``None`` unconditionally, or compare a file with
+    itself. Red: the mismatched arm returns ``None``.
+    """
+    engine = tmp_path / "engine" / "__init__.py"
+    engine.parent.mkdir()
+    engine.write_text('__version__ = "0.5.3"\n', encoding="utf-8")
+    console = tmp_path / "console" / "__init__.py"
+    console.parent.mkdir()
+    project = tmp_path / "packaging" / "synthetic"
+    project.mkdir(parents=True)
+    pyproject = _synthetic_pyproject(
+        project,
+        """[tool.hatch.version]
+path = "../../console/__init__.py"
+""",
+    )
+
+    console.write_text('__version__ = "0.5.3.post1"\n', encoding="utf-8")
+    drift = _version_drift(pyproject, engine)
+    assert drift is not None, "a console at 0.5.3.post1 beside engine 0.5.3 read as in lockstep"
+    assert "ships at 0.5.3.post1" in drift and "engine is at 0.5.3." in drift, drift
+
+    console.write_text('__version__ = "0.5.3"\n', encoding="utf-8")
+    assert _version_drift(pyproject, engine) is None
 
 
 @pytest.mark.parametrize("distribution", _SEPARATE_DISTRIBUTIONS)
