@@ -1785,9 +1785,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     whitespace opens with a line break, the only whitespace the line leaves after it;
     :func:`_ends_in_camel_head` can refuse the last word too, except behind a bound note
     (``noted``, below). Where those refuse it with no bound note,
-    :func:`_mask_keeping_glue_head` masks it but for the end of its last word that text glued
-    after the answer could complete (``</family Kim`` masks to ``</family Xxm``), and reads a line
-    break there as the text's end (``</family Li`` then a line break masks ``Li``). Where
+    :func:`_mask_keeping_glue_head` masks it but for the end of its last word that, at least, the
+    passes :func:`_glue_head_start` models could complete with glued text (``</family Kim`` masks
+    to ``</family Xxm``), and reads a line break there as the text's end (``</family Li`` then a
+    line break masks ``Li``). Where
     the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
     word is refused too, and a surname such as ``Johnson`` is masked there.
 
@@ -1886,7 +1887,12 @@ def _ends_in_camel_head(rest: str) -> bool:
     """Whether ``rest``'s last word ends on the head of a credential label word a caller's text could
     complete: from the word's start, which the filters read case-insensitively after a boundary
     (``shared`` and a caller's ``accesskey=``), or from a camelCase capital after a lower-case
-    letter or a digit (``zqxP`` and ``assword: x``)."""
+    letter or a digit (``zqxP`` and ``assword: x``). A caller's text can also complete a member
+    key's head at any index (:data:`_MEMBER_KEY_HEADS`), and this test does not refuse a rest for
+    that position: where a rest is refused for another reason, :func:`_glue_head_start` keeps such
+    a head, and a rest no rule refuses is masked whole, so a member key a caller's text completes
+    there is not read (``</family Zqtok`` then ``en=hunter2zz;Server=x``), a residual the glue-head
+    mask does not change."""
     last = _GLUED_WORD.findall(rest)[-1]
     return any(_camel_head_at(last, last.lower(), i) for i in range(len(last)))
 
@@ -1903,11 +1909,16 @@ def _camel_head_at(word: str, lower: str, i: int) -> bool:
 def _glue_head_start(word: str) -> int:
     """Where the end of ``word`` that text glued after it could complete starts: the first index
     from which ``word`` ends on a head of a word some pass reads with no boundary before it
-    (:data:`_UNBOUNDED_HEADS`, compared lower-cased), or on a head of a credential label word
-    (:func:`_camel_head_at`). ``len(word)`` where it ends on neither."""
+    (:data:`_UNBOUNDED_HEADS`, compared lower-cased), on a head of a credential label word
+    (:func:`_camel_head_at`), or on a member key's head (:data:`_MEMBER_KEY_HEADS`, compared
+    lower-cased). ``len(word)`` where it ends on none."""
     lower = word.lower()
     for i in range(max(0, len(word) - _GLUE_HEAD_MAX), len(word)):
-        if lower[i:] in _UNBOUNDED_HEAD_SET or _camel_head_at(word, lower, i):
+        if (
+            lower[i:] in _UNBOUNDED_HEAD_SET
+            or _camel_head_at(word, lower, i)
+            or lower[i:] in _MEMBER_KEY_HEADS
+        ):
             return i
     return len(word)
 
@@ -1917,12 +1928,16 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
     the end of its last word that a caller's text glued after it could complete
     (:func:`_glue_head_start`), which is kept as it stood (BACKLOG #5925 closing step 1:
     ``</family Kim`` masks to ``</family Xxm``, since ``m`` opens ``MSH`` and ``mfb``). That end
-    is what the end-of-text rules refused the whole rest for, and every pass that reads text
-    glued to the word reads the characters it keeps. A line break before the end is read as the
-    text's end, since an answer is stripped before a caller glues to it (``</family Li`` then a
-    line break masks ``Li``). ``None`` keeps the rest as it stood where those rules refuse it for
-    another reason: :func:`_rest_words` refuses it, its last word holds a digit, or the mask
-    would leave nothing changed or a last word some pass reads literally."""
+    starts at the first index :func:`_glue_head_start` finds; the passes it models read only the
+    characters it keeps; at least one pass, the connection-string member key reader in
+    ``secretscrub``, also reads a key's characters before them, and :data:`_MEMBER_KEY_HEADS` keeps
+    those. The credential filters' camelCase start also reads the masked letter before a kept
+    capital, which must be lower-case there; the mask keeps it so (:data:`_SHAPE` keeps a
+    letter's case). A line break before the end is read as the text's end, since an answer is
+    stripped before a caller glues to it (``</family Li`` then a line break masks ``Li``).
+    ``None`` keeps the rest as it stood where those rules refuse it for another reason:
+    :func:`_rest_words` refuses it, its last word holds a digit, or the mask would leave nothing
+    changed or a last word some pass reads literally."""
     if _rest_words(rest, camel=True) is None:
         return None
     last = list(_GLUED_WORD.finditer(rest))[-1]  # a rest _rest_words accepts holds a word
@@ -2534,8 +2549,51 @@ _CAMEL_LABEL_WORDS = (
     "secretkey",
     "authkey",
 )
+#: The key words and the ``_?<suffix>`` qualifier words the connection-string member reader reads
+#: (``secretscrub._MEMBER_KEY_RUN``). That reader takes any word characters before a key, so a
+#: caller's text glued after a masked word can complete one from any index (``Zqcreden`` and a
+#: caller's ``tial=``). This module is pure stdlib, so they are spelled here; a test holds them to
+#: that module's word tuples, which ``tests/test_connection_string_member_scrub.py`` holds to the
+#: reader's pattern.
+_MEMBER_KEY_WORDS = (
+    "passphrase",
+    "credential",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "pass",
+    "pwd",
+)
+_MEMBER_KEY_SUFFIXES = (
+    "secondary",
+    "plaintext",
+    "previous",
+    "primary",
+    "current",
+    "string",
+    "value",
+    "plain",
+    "next",
+    "prev",
+    "text",
+    "old",
+    "new",
+    "raw",
+)
+#: Every head of each key word, lower-cased, alone or followed by a qualifier, which
+#: :func:`_glue_head_start` reads at any index. It reads only a letters-only last word, so the heads
+#: holding the reader's ``_`` or its digit-run suffix are left out: none could match.
+_MEMBER_KEY_HEADS = frozenset(
+    key[:end]
+    for word in _MEMBER_KEY_WORDS
+    for key in (word, *(word + suffix for suffix in _MEMBER_KEY_SUFFIXES))
+    for end in range(1, len(key) + 1)
+)
 #: The longest head :func:`_glue_head_start` can find: no longer end of a word can open one.
-_GLUE_HEAD_MAX = max(len(word) for word in (*_UNBOUNDED_WORDS, *_CAMEL_LABEL_WORDS))
+_GLUE_HEAD_MAX = max(
+    len(word) for word in (*_UNBOUNDED_WORDS, *_CAMEL_LABEL_WORDS, *_MEMBER_KEY_HEADS)
+)
 
 
 #: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's

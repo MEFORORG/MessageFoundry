@@ -372,6 +372,118 @@ def test_the_camel_label_words_cover_the_credential_filter() -> None:
     assert {word.lower() for word in secretscrub._CAMEL_WORDS} <= set(redaction._CAMEL_LABEL_WORDS)
 
 
+#: The Lander's hold on PR 3387 at 9004a36d079: a connection-string member key split across the
+#: answer's end and glued text. The member reader takes any word characters before a key, so the
+#: glue-head mask kept only ``n`` of ``Zqcreden`` and the glued ``tial=`` no longer completed a key.
+_SPLIT_MEMBER_KEYS = {
+    "credential": ("<family>Smith</family Zqcreden", "tial=hunter2zz;Server=x"),
+    "camel-capital": ("<family>Smith</family zqpaS", "sword=hunter2zz;Server=x"),
+    "field-run": ("a|b|<family>Smith</family Zqcreden", "tial=hunter2zz;Server=x"),
+    "upper-case": ("<family>Smith</family ZQCREDEN", "TIAL=hunter2zz;Server=x"),
+}
+
+
+@pytest.mark.parametrize("first", [safe_text, redact], ids=["safe_text", "redact"])
+@pytest.mark.parametrize(
+    ("a", "raw"), list(_SPLIT_MEMBER_KEYS.values()), ids=list(_SPLIT_MEMBER_KEYS)
+)
+def test_a_member_key_split_across_the_answers_end_is_still_read(
+    first: Callable[[str], str], a: str, raw: str
+) -> None:
+    """The glue-head mask keeps a member key's head from any index (:data:`_MEMBER_KEY_HEADS`), so
+    the credential filter still reads the key a caller's glued text completes, as it did before
+    #5925 (:func:`_main`)."""
+    out = secretscrub.scrub_credentials(redact(first(a) + raw))
+    assert "hunter2zz" not in out, out
+    with _main():
+        assert "hunter2zz" not in secretscrub.scrub_credentials(redact(first(a) + raw))
+
+
+def test_the_member_key_words_cover_the_member_reader() -> None:
+    """THE DRIFT PIN: :mod:`redaction` is pure stdlib, so it spells the member reader's key words
+    and qualifiers; a word added to those tuples and not here fails this. The pattern is held to
+    the tuples in ``tests/test_connection_string_member_scrub.py``."""
+    assert set(redaction._MEMBER_KEY_WORDS) == set(
+        secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS
+    )
+    assert set(redaction._MEMBER_KEY_SUFFIXES) == set(secretscrub._MEMBER_QUALIFIERS)
+
+
+def _no_glue_head(rest: str) -> str | None:
+    """The glue-head mask switched off: a rest the end-of-text rules refuse is kept as it stood, as
+    main kept it."""
+    return None
+
+
+def _split_member_key_worse(trials: int, seed: int) -> tuple[list[str], int]:
+    """Each split member key whose glued value prints where the redactor without the glue-head mask
+    (:func:`_no_glue_head`) hid it, and how many splits that baseline hid, over ``trials`` keys
+    split at a random index after a random word start. That baseline, not :func:`_main`, is the
+    comparison: main masks a rest no end-of-text rule refuses too, so a key split there prints on
+    main as well (``</given Kimp`` then ``wd1=``), and :func:`_main` copies every rest."""
+    rand = random.Random(seed)
+    keys = [
+        key
+        for word in secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS
+        for key in (word, word + "_old", word + "Value", word + "1")
+    ]
+    worse: list[str] = []
+    hidden = 0
+    for _ in range(trials):
+        key = rand.choice(keys)
+        key = rand.choice(
+            (
+                key,
+                key.upper(),
+                key.title(),
+                "".join(rand.choice((c.lower(), c.upper())) for c in key),
+            )
+        )
+        # Half the cuts are drawn from those ending the answer on an `m`, `b`, `f` or `n`, which
+        # opens a word some pass reads, or on a capital after a lower-case letter, so more of them
+        # reach the glue-head mask; not every such cut is refused.
+        refused = [
+            i
+            for i in range(1, len(key))
+            if key[i - 1] in "mbfnMBFN" or (key[i - 1].isupper() and key[i - 2 : i - 1].islower())
+        ]
+        cut = (
+            rand.choice(refused)
+            if refused and rand.random() < 0.5
+            else rand.randint(1, len(key) - 1)
+        )
+        a = (
+            rand.choice(("", "a|b|", "x;", "|"))
+            + rand.choice(("<family>Smith</family ", "<given>Smith</given "))
+            + rand.choice(("Zq", "zq", "Kim", "", "Zx Q"))
+            + key[:cut]
+        )
+        raw = key[cut:] + "=hunter2zz;Server=x"
+        for first in (safe_text, redact):
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(redaction, "_mask_keeping_glue_head", _no_glue_head)
+                baseline = secretscrub.scrub_credentials(redact(first(a) + raw))
+            if "hunter2zz" in baseline:
+                continue
+            hidden += 1
+            if "hunter2zz" in secretscrub.scrub_credentials(redact(first(a) + raw)):
+                worse.append(f"{first.__name__}: {a!r} + {raw!r}")
+    return worse, hidden
+
+
+def test_a_split_member_key_prints_nothing_the_rest_kept_whole_hid() -> None:
+    """The generated arm for the hold's shape: no split key's glued value prints where the redactor
+    without the glue-head mask hid it, and the control, the member-key heads switched off, prints
+    one. A measurement of this corpus, not a proof, and not a comparison with main's own module."""
+    worse, hidden = _split_member_key_worse(300, 59253)
+    assert hidden, "the baseline hid no split value, so the arm is not exercised"
+    assert not worse, worse[:5]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_MEMBER_KEY_HEADS", frozenset())
+        control, _ = _split_member_key_worse(300, 59253)
+    assert control, "the control printed nothing, so this corpus cannot see the defect"
+
+
 def test_every_head_of_a_camel_label_word_is_refused_at_the_end() -> None:
     """Every head of every label word, whole or after a camelCase capital, refuses a last word that
     ends the text, since a caller's text could complete it into a label the filter reads."""
