@@ -988,7 +988,9 @@ def test_denylist_member_flags(tmp_path: Path, rule_id: str, name: str, snippet:
 
 # BACKLOG #5382, the lint half: file writes the ambient-authority lint used to miss. Every path below
 # is free of the letters w, a, x and +, so none is flagged by reading the PATH as the mode, which is
-# what the old `X.open` slot-0 reading did for codecs.open and io.open.
+# what the old `X.open` slot-0 reading did for codecs.open and io.open. The exceptions are the
+# `*_letters_after_colon` cases, which pin the slot-0 reading still made on a receiver not known to
+# be a path.
 FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("open_mode_variable", 'def f(msg, mode):\n    open("/tmp/in.hl7", mode)\n'),
     ("open_mode_keyword_variable", 'def f(msg, m):\n    open("/tmp/in.hl7", mode=m)\n'),
@@ -1153,6 +1155,48 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ),
     ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
     ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
+    # On a receiver not known to be a path, a 1st-positional string is as likely a path or a URL as
+    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit. Each passes on the letters
+    # in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not detected.
+    (
+        "dbm_open_drive_path_letters_after_colon",
+        'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
+    ),
+    (
+        "imported_opener_url_letters_after_colon",
+        "from _feeds import opener\n\ndef f(msg, body):\n"
+        '    opener.open("https://example.org/a", data=body)\n',
+    ),
+    (
+        "webbrowser_url_letters_after_colon",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
+    ),
+    # GzipFile with a fileobj and no mode takes the fileobj's mode, which may be a write.
+    (
+        "gzipfile_fileobj_no_mode",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(fileobj=w_handle).write(msg.raw)\n",
+    ),
+    (
+        "gzipfile_fileobj_mode_none",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(mode=None, fileobj=w_handle)\n",
+    ),
+    (
+        "gzipfile_fileobj_positional",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(None, None, 9, w_handle)\n",
+    ),
+    (
+        "gzipfile_fileobj_in_kwargs_splat",
+        "import gzip\n\ndef f(msg, kw):\n    gzip.GzipFile(mode=None, **kw)\n",
+    ),
+    (
+        "gzipfile_fileobj_in_args_splat",
+        "import gzip\n\ndef f(msg, rest):\n    gzip.GzipFile(None, None, *rest)\n",
+    ),
+    # A parameter named io is not the io module, so its BytesIO is not exempt.
+    (
+        "gzipfile_fileobj_bytesio_on_rebound_io",
+        "import gzip\nimport io\n\ndef f(msg, io):\n    gzip.GzipFile(fileobj=io.BytesIO())\n",
+    ),
 ]
 
 FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
@@ -1209,6 +1253,16 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     ("zipfile_read_default", "import zipfile\n\ndef f(msg, p):\n    zipfile.ZipFile(p)\n"),
     ("os_fdopen_read_default", "import os\n\ndef f(msg):\n    os.fdopen(3)\n"),
     ("io_fileio_read_default", "import io\n\ndef f(msg, p):\n    io.FileIO(p)\n"),
+    # Without a fileobj, GzipFile's default mode is a read; a read mode given with one stays a read.
+    ("gzipfile_read_default", "import gzip\n\ndef f(msg, p):\n    gzip.GzipFile(p)\n"),
+    (
+        "gzipfile_fileobj_bytesio",
+        "import gzip\nimport io\n\ndef f(msg):\n    gzip.GzipFile(fileobj=io.BytesIO(msg.raw)).read()\n",
+    ),
+    (
+        "gzipfile_fileobj_read_mode",
+        'import gzip\n\ndef f(msg, h):\n    gzip.GzipFile(fileobj=h, mode="rb")\n',
+    ),
     # A non-string literal is not a mode, and os.open with read-only flags opens read-only.
     (
         "receiver_open_int_slot_one",

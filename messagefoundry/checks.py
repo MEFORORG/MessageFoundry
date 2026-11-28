@@ -900,7 +900,10 @@ _AMBIENT_ROOT_EXEMPTIONS: Mapping[str, frozenset[str]] = {
     "tempfile": _TEMPFILE_READONLY,
 }
 # Openers whose mode is the 2nd positional, ``open(file, mode)``, by resolved dotted name; each
-# defaults to a read. ``X.open`` on any other receiver is read by :func:`_open_write_hit`.
+# defaults to a read, except ``gzip.GzipFile``, which takes its ``fileobj``'s mode when none is given
+# and is then treated as a possible write unless :func:`_takes_fileobj_mode` rules the fileobj out
+# (``None`` or an inline ``io.BytesIO(...)``). ``X.open`` on any other receiver is read by
+# :func:`_open_write_hit`.
 _MODULE_OPENERS = frozenset(
     {
         "open",
@@ -1302,10 +1305,13 @@ def _mode_may_write(call: ast.Call, index: int) -> bool:
     """True unless the open-style ``call`` provably opens read-only, its mode in positional slot
     ``index`` or the ``mode=`` keyword (BACKLOG #5382). A mode that is not a literal counts as a
     write, and so does a ``*args`` splat at or before the slot, or a ``**kwargs`` splat where no
-    mode is given otherwise (with one given, a mode in the splat would raise). No mode at all is the
-    opener's read default, and neither is a non-string literal such as ``2`` or ``None``, which no
-    opener takes as a write mode. A mode held in a name counts as a write even when every binding of
-    the name is a read literal: stricter than it needs to be, which this advisory lint accepts."""
+    mode is given otherwise (with one given, a mode in the splat would raise). No mode at all is not
+    read as a write here, and neither is a non-string literal such as ``2`` or ``None``: no mode is
+    the opener's read default, except for ``gzip.GzipFile`` given a ``fileobj`` and no mode or a
+    ``None`` one, which takes that fileobj's mode and which :func:`_open_write_hit` treats as a
+    possible write (:func:`_takes_fileobj_mode`). A mode held in a name counts as a write even when
+    every binding of the name is a read literal: stricter than it needs to be, which this advisory
+    lint accepts."""
     if any(isinstance(arg, ast.Starred) for arg in call.args[: index + 1]):
         return True
     modes: list[ast.expr] = call.args[index : index + 1]
@@ -1318,6 +1324,39 @@ def _mode_may_write(call: ast.Call, index: int) -> bool:
     if splat and not modes:
         return True
     return any(_is_write_mode_literal(mode) or not isinstance(mode, ast.Constant) for mode in modes)
+
+
+def _takes_fileobj_mode(call: ast.Call, resolver: _NameResolver) -> bool:
+    """``gzip.GzipFile(filename, mode, compresslevel, fileobj)`` given a ``fileobj`` and no mode, or
+    a ``None`` mode, takes that fileobj's mode, which may be a write (BACKLOG #5382). A ``*args`` or
+    ``**kwargs`` splat may carry a fileobj. A ``None`` fileobj, or an inline ``io.BytesIO(...)`` call
+    (:func:`_is_bytesio_call`), which has no mode, leaves GzipFile its ``"rb"`` default; any other
+    fileobj, a BytesIO held in a name or a read handle among them, counts as a possible write. A
+    mode it is given is read by :func:`_mode_may_write`."""
+    if any(isinstance(arg, ast.Starred) for arg in call.args) or any(
+        kw.arg is None for kw in call.keywords
+    ):
+        fileobj = True
+    else:
+        fileobjs = call.args[3:4] + [kw.value for kw in call.keywords if kw.arg == "fileobj"]
+        fileobj = not all(
+            (isinstance(f, ast.Constant) and f.value is None) or _is_bytesio_call(f, resolver)
+            for f in fileobjs
+        )
+    if not fileobj:
+        return False
+    modes = call.args[1:2] + [kw.value for kw in call.keywords if kw.arg == "mode"]
+    return all(isinstance(m, ast.Constant) and m.value is None for m in modes)
+
+
+def _is_bytesio_call(node: ast.expr, resolver: _NameResolver) -> bool:
+    """``node`` is a call written ``io.BytesIO(...)``, with ``io`` a module imported by that name and
+    bound no other way here. A BytesIO has no ``mode`` attribute."""
+    return (
+        isinstance(node, ast.Call)
+        and _dotted_call_name(node.func) == "io.BytesIO"
+        and resolver.is_module_named_directly("io")
+    )
 
 
 # os.open flags that grant no write: any other flag, a literal number or a name the lint cannot read
@@ -1606,17 +1645,21 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
     """An open-style call that may write (BACKLOG #5382), its mode read from the slot it really has.
 
     * A module opener (:data:`_MODULE_OPENERS`: builtin ``open``, ``codecs.open``, ``io.open``,
-      ``os.fdopen``, ``zipfile.ZipFile``, ...): the mode is the 2nd positional. Builtin ``open``
-      bound no other way here, or an opener called through a module imported by its own name and
-      bound no other way here, has that reading only.
-    * ``os.open``: its flags, read by :func:`_os_open_may_write`.
+      ``os.fdopen``, ``zipfile.ZipFile``, ...): the mode is the 2nd positional, and a
+      ``gzip.GzipFile`` given a ``fileobj`` and no mode may write (:func:`_takes_fileobj_mode`).
+      Builtin ``open`` bound no other way here, or an opener called through a module imported by
+      its own name and bound no other way here, has that reading only.
+    * ``os.open``: its flags, read by :func:`_os_open_may_write`. Its 1st positional is also read
+      as the last bullet reads one, so a literal path holding a ``w``, ``a``, ``x`` or ``+`` flags
+      even a read-only ``os.open``: a false positive this advisory lint accepts.
     * ``.open`` on a ``pathlib`` path expression (``Path(p).open(mode)``): the mode is the 1st
       positional, the only reading.
-    * ``.open`` on any other receiver, an aliased opener among them: a write-mode literal in the
-      1st positional, as the lint always read it, or a mode in the 2nd positional that is not
-      provably read-only; and on a name bound to a path somewhere in the file, a 1st-positional
-      mode that is not provably read-only too. Because a binding is only possibly the one in force,
-      every reading it calls for is kept.
+    * ``.open`` on any other receiver, an aliased opener among them: a 1st-positional string
+      holding a ``w``, ``a``, ``x`` or ``+`` anywhere, not split at ``:`` or ``|``, as the lint
+      always read it, or a mode in the 2nd positional or the ``mode=`` keyword that is not provably
+      read-only, read split at ``:`` or ``|`` (:func:`_is_write_mode`); and on a name bound to a
+      path somewhere in the file, a 1st-positional mode that is not provably read-only too.
+      Because a binding is only possibly the one in force, every reading it calls for is kept.
 
     Any mode that is not a literal counts as a write (:func:`_mode_may_write`). A non-literal 1st
     positional on a receiver not known to be a path is not flagged, because it is as likely a member
@@ -1625,7 +1668,9 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
     as_written = _dotted_call_name(call.func)
     head = as_written.partition(".")[0] if as_written is not None else ""
     if names & _MODULE_OPENERS:
-        hit = _mode_may_write(call, 1)
+        hit = _mode_may_write(call, 1) or (
+            "gzip.GzipFile" in names and _takes_fileobj_mode(call, resolver)
+        )
         if as_written in _MODULE_OPENERS and (
             (as_written == "open" and resolver.is_unbound("open"))
             or resolver.is_module_named_directly(head)
@@ -1639,7 +1684,14 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
         return hit
     if resolver.is_path_expr(func.value, frozenset()):
         return hit or _mode_may_write(call, 0)
-    if call.args and _is_write_mode_literal(call.args[0]):
+    first = call.args[0] if call.args else None
+    # Not split at ':' or '|': on a receiver not known to be a path, a 1st-positional string is as
+    # likely a path or URL as a mode, and main read any w/a/x/+ in it as a hit (BACKLOG #5382).
+    if (
+        isinstance(first, ast.Constant)
+        and isinstance(first.value, str)
+        and any(c in first.value for c in ("w", "a", "x", "+"))
+    ):
         return True
     if resolver.is_path_expr(func.value, resolver.path_names) and _mode_may_write(call, 0):
         return True
@@ -1676,11 +1728,13 @@ def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
     an opener or writer bound any other way (``functools.partial(open, mode="w")``, a dynamic
     ``getattr``, a walrus); a non-literal mode in the 1st slot of an ``X.open`` whose receiver it
     cannot tell is a path; a write through a handle passed in, or by ``json.dump``/``csv.writer``;
-    an opener not in :data:`_MODULE_OPENERS` (``dbm.open``) or an archive
-    extraction; and any ``os`` call not named in :data:`_AMBIENT_OS_PATHS`. A call whose alias
-    expansion hit a bound in :meth:`_NameResolver.expand` is flagged when a name it left unread could
-    still be a hit, since what it stands for was not all read. The other rules in this check follow
-    no alias."""
+    an opener not in :data:`_MODULE_OPENERS` (``dbm.open``) or an archive extraction; an ``.open``
+    on a receiver it cannot resolve that sends or launches (a ``urllib`` opener's
+    ``.open(url, data=...)``, ``webbrowser.open(url)``), flagged only when the 1st positional is a
+    string holding a ``w``, ``a``, ``x`` or ``+``; and any ``os`` call not named in
+    :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
+    :meth:`_NameResolver.expand` is flagged when a name it left unread could still be a hit, since
+    what it stands for was not all read. The other rules in this check follow no alias."""
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr in _AMBIENT_FS_WRITE_ATTRS:
         return True
