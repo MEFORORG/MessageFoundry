@@ -4464,7 +4464,7 @@ def test_a_bind_move_across_a_trailing_dot_serves_a_pair_that_verifies_at_the_ne
     with pytest.raises(ssl.SSLCertVerificationError) as refused:
         _handshake(
             old_server,
-            ssl.create_default_context(cafile=str(old_cert)),
+            _verifying_client_ctx(old_cert),
             client_cert=None,
             server_hostname=then,
         )
@@ -4478,7 +4478,7 @@ def test_a_bind_move_across_a_trailing_dot_serves_a_pair_that_verifies_at_the_ne
     assert [e.reason for e in events] == ["bind_changed"]
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_ctx.load_cert_chain(cert, key)
-    client_ctx = ssl.create_default_context(cafile=cert)
+    client_ctx = _verifying_client_ctx(Path(cert))
     assert client_ctx.check_hostname
     assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=then)
 
