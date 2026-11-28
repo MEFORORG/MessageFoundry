@@ -3,7 +3,7 @@
   guard rolled the sink, failed the re-write the same way and recorded the sink unwritable, which
   could ask for the stop. On serve's default stdout, which serve sets to replace such a
   character, the line was written with `?`. The guard now writes each such character as a JSON
-  `\uXXXX` escape, taken before the write for the stream's encoding, so the escape wins on both.
+  `\uXXXX` escape.
   The escape is counted on the rate-limited stderr format-fault line only: it raises no alert and
   shows nothing on `GET /status`. A sink that refuses the escaped line too is handled as any
   failed write, and can still reach the stop. (`BACKLOG #5813`)

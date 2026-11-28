@@ -820,9 +820,7 @@ def _encodable(line: str, encoding: object) -> str:
     log spells it (:func:`~messagefoundry.controlchars.escape_lone_surrogates`) (BACKLOG #5813). An
     ``encoding`` that is not a known text codec, or that cannot encode the escapes themselves,
     reads as ASCII. It catches ``LookupError``, ``ValueError`` (``UnicodeError`` among them) and
-    ``TypeError`` only. Any other exception a codec raises propagates, and from
-    :meth:`_GuardedHandlerMixin._write_line` it is a failed write, which the two stages decide, so
-    it can reach stage 2."""
+    ``TypeError`` only. Any other exception a codec raises propagates."""
     codec = encoding if isinstance(encoding, str) else "ascii"
     try:
         return line.encode(codec, _ESCAPE_HANDLER).decode(codec)
@@ -1252,11 +1250,9 @@ class _GuardedSinkMixin(_SinkBase):
     def _write_line(self, line: str) -> None:
         """Write and flush an already formatted line; a sink failure propagates.
 
-        Every write the guard makes comes here, the stdout sink's own record writes included
-        (:meth:`GuardedStreamHandler.emit`), so a line the stream has no byte for is escaped for
-        every one of them, the roll notice and the probe included (BACKLOG #5813). When the stream
+        When the stream
         names its ``encoding``, each character that codec cannot encode is escaped
-        (:func:`_encodable`) BEFORE the write, so the escape wins over a stream that would replace
+        (:func:`_encodable`), so the escape wins over a stream that would replace
         the character itself, as serve's hardened stdout does (``errors="replace"``,
         ``console_streams.harden_console_streams``), and a stream that writes in chunks does not
         take a prefix twice unless its ``encoding`` names a codec wider than the one it uses. The
@@ -1332,8 +1328,7 @@ class _GuardedSinkMixin(_SinkBase):
                 line.encode(codec)
             except (LookupError, ValueError, TypeError):
                 # ValueError covers UnicodeEncodeError; the rest are a name codecs refuses. Any
-                # other exception a codec raises propagates as a failed write, and the two stages
-                # decide, so it can reach stage 2.
+                # other exception a codec raises propagates.
                 written = _encodable(line, codec)
         try:
             self._write_raw(written)
