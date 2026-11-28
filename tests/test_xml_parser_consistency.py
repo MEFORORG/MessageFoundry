@@ -468,3 +468,33 @@ def test_xmlschema_still_disables_remote_schema_resolution() -> None:
     assert type(ei.value.__cause__).__name__ == "XMLResourceBlocked"
     # xmlschema's own allow="local" refusal, not the opener's, which would also block it.
     assert "remote resource" in str(ei.value.__cause__)
+
+
+# --- allowlisted surfaces this corpus cannot drive ----------------------------
+#
+# Recorded rather than driven, and the record is checked rather than left as prose. Owner decision
+# 2026-11-28 recorded the runbook hook's workbook read in the ASVS 1.5.3 allowlist and here. The
+# corpus cannot drive it: openpyxl is in no extra, no lock file and no CI workflow (the reason
+# tests/test_csv_formula_consistency.py stubs it), and load_workbook takes a workbook package, not a
+# document string. It would not pass the refusal leg either: on the hook's tools interpreter part of
+# the workbook is read by a parser that expands an internal DTD entity. Which parser reads which part
+# is stated once, in that file's tests/test_security_static.py _XML_PARSER_ALLOWLIST entry.
+
+#: Repo-relative path -> why the hostile corpus above does not drive it.
+OUTSIDE_THE_CORPUS = {
+    "scripts/hooks/runbook_take_prompt.py": (
+        "openpyxl load_workbook(read_only=True, data_only=True) over the owner's own local runbook "
+        "workbook, in a dev hook under scripts/ that the wheel does not ship. Not fully defused (see "
+        "above), and openpyxl is installed in no environment this suite runs in"
+    ),
+}
+
+
+@pytest.mark.parametrize("rel", sorted(OUTSIDE_THE_CORPUS))
+def test_a_surface_outside_the_corpus_is_allowlisted_and_still_makes_its_call(rel: str) -> None:
+    from tests.test_security_static import _REPO, _XML_PARSER_ALLOWLIST
+
+    assert rel in _XML_PARSER_ALLOWLIST, f"{rel} is recorded outside the corpus but not allowlisted"
+    source = (_REPO / rel).read_text(encoding="utf-8")
+    # Stale-record check: the file still makes the call the record describes, with its keywords.
+    assert "openpyxl.load_workbook(path, read_only=True, data_only=True)" in source, rel

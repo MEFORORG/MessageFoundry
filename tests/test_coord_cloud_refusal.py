@@ -492,6 +492,9 @@ NOT_GUARDED = {
     "hooks/mail-drain.ps1": "user-scope hook",
     "hooks/mail-watch.ps1": "user-scope hook, retired from the wiring",
     "hooks/wiki-write-prompt.ps1": "user-scope hook",
+    # Run only by runbook-take-prompt.ps1, a user-scope hook that also refuses under
+    # CLAUDE_CODE_REMOTE; it writes only a clone-local cache of what this session was told.
+    "hooks/runbook_take_prompt.py": "user-scope hook helper; clone-local cache",
     "worktree/session-context.ps1": "user-scope hook",
     # Defines functions only; its two callers, decision.ps1 and digest.ps1, carry the refusal.
     "coord/_decisionlog.ps1": "helper, dot-sourced by guarded scripts",
