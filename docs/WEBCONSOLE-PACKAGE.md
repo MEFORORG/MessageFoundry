@@ -8,9 +8,8 @@ same-origin**, rather than an in-tree part of the engine wheel. This is "Option 
 [ADR 0065](adr/0065-web-ops-dashboard.md): the console's routes, rendering, and write-action registry
 became independently *developable / testable* without editing engine core, and build as their own
 wheel, while keeping the proven same-origin security model (the console was previously the
-in-engine `messagefoundry/api/webui/` tree). The wheel is not released on its own: every engine
-release ships it, at the engine's version
-([the version rule](#1-architecture), owner ruling 2026-11-28).
+in-engine `messagefoundry/api/webui/` tree). It is not released on its own schedule: every engine
+release has a console release at the same version ([section 1](#1-architecture) states the rule).
 
 This is the authoritative doc for that package: its architecture, the injection **seam** the engine and
 package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (a shared
@@ -37,18 +36,23 @@ the extraction does and does not decouple).
   same mechanic that keeps `harness/` out of the engine wheel — so a plain `pip install messagefoundry`
   stays byte-identical. The console is on by default for a loopback bind (ADR 0143); with it absent,
   the engine serves the JSON API only and prints a warning at startup.
-- **The console carries the engine's version, and ships with every engine release.** The engine,
-  the web console, the toolkit and the harness carry one version number (owner ruling 2026-11-28).
-  Every release ships each of them at that number, the console included when it did not change, and
-  a console-only fix ships as a patch release of all four, never as a `.postN` release. So console
-  0.5.3 pairs with engine 0.5.3. The console still keeps its **own** `__version__` in
+- **The console carries the engine's version, and every release includes it.** This is the one
+  statement of the version rule; other documents link here. The engine, the web console, the
+  toolkit and the harness carry one version number (owner ruling 2026-11-28). Every release ships
+  each of them at that number, the console included when it did not change, and a console-only fix
+  ships as a patch release of all four, never as a `.postN` release. So console 0.5.3 pairs with
+  engine 0.5.3. **Nothing tags the console for you.** The engine tag does not build or publish it:
+  a maintainer pushes `webconsole-v<version>` once the engine release is on PyPI
+  ([`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) step 6), and no job checks that
+  the engine is there first. The console still keeps its **own** `__version__` in
   `messagefoundry_webconsole/__init__.py`, set by hand in the engine version bump rather than read
   from the engine as `messagefoundry-harness` does, and its own `webconsole-v*` tag, changelog and
   release job. `tests/test_packaging.py::test_each_lockstep_distribution_ships_at_the_engine_version`
   fails while the console's `__version__` differs from the engine's.
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
   an exact pin; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
-  floor is raised at each console release, not as the engine moves.** Console 0.4.0 set the first
+  floor moves only when the seam does.** X is the first engine release that carries the console's
+  seam, so a release that leaves the seam where it was leaves the floor too. Console 0.4.0 set the first
   one, `messagefoundry>=0.5.0`, console 0.5.0 raised it to `messagefoundry>=0.5.2`, and console
   0.5.3 raised it to `messagefoundry>=0.5.3`; 0.3.0 and earlier declared a bare `messagefoundry`
   dependency. Step 2
@@ -375,7 +379,7 @@ python -m pytest packaging/messagefoundry-webconsole/tests -q
 ## 5. Honest scope — what this does and does not decouple
 
 Option B decouples **development and test**. It does **not** buy release or deploy independence:
-every release ships the console at the engine's version ([section 1](#1-architecture)).
+the console is released with every engine release, at its version ([section 1](#1-architecture)).
 
 **Genuine wins**
 
@@ -385,8 +389,7 @@ every release ships the console at the engine's version ([section 1](#1-architec
   client-asset CSP change is a package-only change.
 - Console-internal changes — presentation, client JS, `app.js` CSP tweaks — are **package-only**
   changes: they edit no engine code and leave the seam where it was. They still ship in the next
-  release of every package, at the engine's next version, and a console-only fix is a patch release
-  of all of them, never a `.postN` release of the console. Since BACKLOG #2709 at least these are
+  release of every package ([section 1](#1-architecture)). Since BACKLOG #2709 at least these are
   not package-only: a change that adds a console
   route or changes a route's gate, and an edit to a console function a gate reaches by plain
   name, such as an `_auth` helper it calls, or to a middleware argument or the WebSocket

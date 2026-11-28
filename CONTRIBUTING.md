@@ -240,15 +240,16 @@ This is the one list of what an engine version bump edits, and it is kept here o
 at least these edits; if a bump needs one it does not name, add it here. The comments in the
 harness and toolkit `pyproject.toml` files, ADR 0201 and the pin failures in
 `tests/test_packaging.py` are at least the places that point here. Nothing performs these edits for you. CI fails a
-release pull request that leaves a test-held pin or version behind (items 2 to 5, except the
-untested prose item 5 names), but not one that skips the rest, so make them all in the pull
+release pull request that leaves a test-held pin or version behind (items 2 to 4, and item 5's
+`__version__` and pins), but not one that skips the rest of item 5, so make them all in the pull
 request that moves the version.
 
-The engine, the web console, the toolkit and the harness carry one version number, and every
-release ships each of them at it, even one that did not change (owner ruling 2026-11-28). A
-console-only fix is a patch release of all four, never a `.postN` release. So every bump is a
-console bump too, and every release tags the console (`webconsole-v<version>`) as well as the
-engine.
+Every release includes the web console at the engine's version
+([`docs/WEBCONSOLE-PACKAGE.md`](docs/WEBCONSOLE-PACKAGE.md), section 1, states the rule). So every
+bump is a console bump too, and every release pushes a console tag, `webconsole-v<version>`, by
+hand, after the engine release is on PyPI
+([`packaging/messagefoundry-webconsole/RELEASE.md`](packaging/messagefoundry-webconsole/RELEASE.md)
+step 6). Nothing pushes it for you.
 
 1. `messagefoundry/__init__.py`: `__version__`. Every other engine pin below must match it.
 2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin and the

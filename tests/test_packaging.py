@@ -1047,6 +1047,46 @@ def test_the_harness_pins_the_toolkit_at_the_version_it_ships_with() -> None:
 #: Every separate distribution under packaging/, derived so a new one is covered on arrival.
 _SEPARATE_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
 
+
+def test_the_separate_distributions_are_all_found() -> None:
+    """Liveness for the parametrize below: an empty glob would run it zero times and pass."""
+    assert {"messagefoundry-toolkit", "messagefoundry-webconsole", "messagefoundry-harness"} <= set(
+        _SEPARATE_DISTRIBUTIONS
+    ), _SEPARATE_DISTRIBUTIONS
+
+
+@pytest.mark.parametrize("distribution", _SEPARATE_DISTRIBUTIONS)
+def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> None:
+    """The toolkit (BACKLOG #1192) and harness (BACKLOG #2513) wheels carried no LICENSE or NOTICE.
+
+    Each separate distribution declares both as PEP 639 ``license-files`` from its own directory,
+    and its LICENSE is a copy of the root one, so this pins each copy byte-identical: a license text
+    edited in one place only would ship two different licenses under one project name. On a Windows
+    checkout the compare also fails if a copy lost its ``eol=lf`` pin, as the console's had.
+    """
+    project_dir = _REPO / "packaging" / distribution
+    declared = _project(distribution).get("license-files")
+    assert declared == ["LICENSE", "NOTICE"], declared
+    # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
+    # A NOTICE copied from a sibling would name the wrong distribution, so the first line must name
+    # this one, and the license it states must be the project's.
+    notice = (project_dir / "NOTICE").read_text(encoding="utf-8")
+    assert notice.startswith(f"{distribution} ("), f"{distribution} NOTICE opens {notice[:80]!r}"
+    assert "AGPL-3.0-or-later" in notice, f"{distribution} NOTICE does not state the license"
+    license_bytes = (project_dir / "LICENSE").read_bytes()
+    if b"\r\n" in license_bytes and b"\r\n" not in (_REPO / "LICENSE").read_bytes():
+        # A Windows checkout made before the eol=lf pin (BACKLOG #2513) keeps CRLF here while
+        # `git status` stays clean, so name the cure rather than leave it looking like an edit.
+        pytest.fail(
+            f"packaging/{distribution}/LICENSE has CRLF line endings in this checkout: it predates "
+            f"the eol=lf pin. Delete packaging/{distribution}/LICENSE and NOTICE, then run "
+            f"`git checkout -- packaging/{distribution}/LICENSE packaging/{distribution}/NOTICE`."
+        )
+    assert license_bytes == (_REPO / "LICENSE").read_bytes(), (
+        f"packaging/{distribution}/LICENSE differs from the root LICENSE"
+    )
+
+
 #: The distributions that carry the engine's version (owner ruling 2026-11-28): every release ships
 #: each of them at the engine's number, even one that did not change. Named, not derived from the
 #: glob above, so a later distribution under packaging/ is not put in lockstep by arriving there.
@@ -1057,9 +1097,12 @@ _LOCKSTEP_DISTRIBUTIONS = (
 )
 
 
-def test_the_separate_distributions_are_all_found() -> None:
-    """Liveness for the parametrize below: an empty glob would run it zero times and pass."""
+def test_every_lockstep_distribution_is_one_under_packaging() -> None:
+    """Liveness for the lockstep parametrize below: a name that matches no project would make its
+    case fail on a missing file, but a dropped name would just stop being checked, so say which
+    ones are expected."""
     assert set(_LOCKSTEP_DISTRIBUTIONS) <= set(_SEPARATE_DISTRIBUTIONS), _SEPARATE_DISTRIBUTIONS
+    assert "messagefoundry-webconsole" in _LOCKSTEP_DISTRIBUTIONS, _LOCKSTEP_DISTRIBUTIONS
 
 
 def _version_drift(pyproject: Path, engine_init: Path) -> str | None:
@@ -1117,38 +1160,6 @@ path = "../../console/__init__.py"
 
     console.write_text('__version__ = "0.5.3"\n', encoding="utf-8")
     assert _version_drift(pyproject, engine) is None
-
-
-@pytest.mark.parametrize("distribution", _SEPARATE_DISTRIBUTIONS)
-def test_each_separate_wheel_ships_the_license_and_notice(distribution: str) -> None:
-    """The toolkit (BACKLOG #1192) and harness (BACKLOG #2513) wheels carried no LICENSE or NOTICE.
-
-    Each separate distribution declares both as PEP 639 ``license-files`` from its own directory,
-    and its LICENSE is a copy of the root one, so this pins each copy byte-identical: a license text
-    edited in one place only would ship two different licenses under one project name. On a Windows
-    checkout the compare also fails if a copy lost its ``eol=lf`` pin, as the console's had.
-    """
-    project_dir = _REPO / "packaging" / distribution
-    declared = _project(distribution).get("license-files")
-    assert declared == ["LICENSE", "NOTICE"], declared
-    # LICENSE needs no is_file() check: the byte compare below raises if it is missing.
-    # A NOTICE copied from a sibling would name the wrong distribution, so the first line must name
-    # this one, and the license it states must be the project's.
-    notice = (project_dir / "NOTICE").read_text(encoding="utf-8")
-    assert notice.startswith(f"{distribution} ("), f"{distribution} NOTICE opens {notice[:80]!r}"
-    assert "AGPL-3.0-or-later" in notice, f"{distribution} NOTICE does not state the license"
-    license_bytes = (project_dir / "LICENSE").read_bytes()
-    if b"\r\n" in license_bytes and b"\r\n" not in (_REPO / "LICENSE").read_bytes():
-        # A Windows checkout made before the eol=lf pin (BACKLOG #2513) keeps CRLF here while
-        # `git status` stays clean, so name the cure rather than leave it looking like an edit.
-        pytest.fail(
-            f"packaging/{distribution}/LICENSE has CRLF line endings in this checkout: it predates "
-            f"the eol=lf pin. Delete packaging/{distribution}/LICENSE and NOTICE, then run "
-            f"`git checkout -- packaging/{distribution}/LICENSE packaging/{distribution}/NOTICE`."
-        )
-    assert license_bytes == (_REPO / "LICENSE").read_bytes(), (
-        f"packaging/{distribution}/LICENSE differs from the root LICENSE"
-    )
 
 
 def test_the_toolkit_console_script_is_its_main() -> None:

@@ -372,8 +372,9 @@ jobs:
     #
     # `==` is also the safe form now: a fork, or the retired private vault, still cannot release.
     # NOT on a console tag: the console has its own job below, run on its own tag. The two numbers
-    # are the same by rule, but an engine release fired from `webconsole-v*` would run the engine
-    # release a second time, from whatever commit the console tag names.
+    # are the same by rule, so the engine's version check would not catch an engine release fired
+    # from `webconsole-v*`; this `if:` and the tag-spelling step below, which refuses any
+    # `webconsole-` tag, both keep it out.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     # The two engine SBOMs it signs; the comment above `sbom-linux` says why they are built apart.
     # And the provenance gate, so nothing here is built from a commit that is not on main.
@@ -1578,15 +1579,17 @@ jobs:
         with:
           python-version-file: ci/python-version
 
-      # The engine job's tag-spelling guard (BACKLOG #2534), on the console tag with its
-      # `webconsole-` prefix stripped. The trigger accepts any `webconsole-vX.Y.Z-*` tag, so without
-      # this `webconsole-v0.5.3-post1` would run the job, and the release step below marks any
-      # hyphenated tag a GitHub pre-release. A `.postN` console release is what the version rule
-      # forbids (owner ruling 2026-11-28), and no engine tag can pair with that spelling. Runs
-      # first, before anything is built.
+      # The engine job's tag-spelling guard (BACKLOG #2534), on the console tag: `--prefix` makes
+      # the script require `webconsole-` and check the rest as an engine spelling. The trigger
+      # accepts any `webconsole-vX.Y.Z-*` tag, so without this `webconsole-v0.5.3-post1` would run
+      # the job, and the release step below marks any hyphenated tag a GitHub pre-release. A
+      # `.postN` console release is what the version rule forbids (docs/WEBCONSOLE-PACKAGE.md),
+      # and no engine tag can pair with that spelling. The prefix is required, never stripped
+      # where present, so a plain engine tag fails here too if the job's `if:` ever lets one in.
+      # Runs first, before anything is built.
       - name: The tag is spelled webconsole-vX.Y.Z or webconsole-vX.Y.Z-(a|b|rc)N
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        run: python scripts/release/tag_spelling.py "${GITHUB_REF_NAME#webconsole-}"
+        run: python scripts/release/tag_spelling.py --prefix webconsole- "$GITHUB_REF_NAME"
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
