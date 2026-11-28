@@ -12,6 +12,7 @@ tell from a real close. In both, a single-token value after the closer walked th
 from __future__ import annotations
 
 import ast
+import logging
 import random
 import re
 from collections.abc import Callable
@@ -19,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+import messagefoundry.redaction as redaction
+from messagefoundry.logging_setup import _shipped_filters
 from messagefoundry.redaction import (
     _JSON_PHI_KEY,
     _JSON_STRUCTURE,
@@ -47,6 +50,17 @@ STRAY = [
 
 #: Some texts whose PHI value is kept: examples, not a complete list. Strict, so a change that
 #: catches one turns this red.
+#:
+#: BACKLOG #5814 built three rules that blanked some of these whole and reverted them on review: a value
+#: straight after a PHI value's container raised in the JSON scrub, the same walk ran on the text
+#: as received, and the stray-closer walk read a closer with nothing open, and a line break inside
+#: a key, as stray. Each fixed the single call, but its answer was the bare placeholder, which drops
+#: the token at the text's edge that glued text completes. So redacting an answer with text glued
+#: before or after it printed values that this module hides (``GLUED``, ``GLUED_BEFORE``). A fix
+#: has to pass those pins as well as turn these green. The mismatched-closer rule this module
+#: keeps answers with the same placeholder and has the same leak: ``redact`` hides ``Smith`` in
+#: ``{"given": [x] y]} Doe\nSmith``, but not once ``\nSmith`` is glued after the answer for
+#: ``{"given": [x] y]} Doe`` (``KEPT_RULE_GLUED``).
 MISSED = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
     f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
@@ -57,9 +71,80 @@ MISSED = [
     f'"telecom"\n: [a|b|c ) , {{"value": "{SECRET}"}}]',
     # One token after a closed PHI value, with no stray closer.
     f'{{"given": [x] {SECRET}}}',
-    # An apostrophe before a same-kind stray closer. origin/main keeps the value identically.
+    # An apostrophe before a same-kind stray closer.
     f'{{"given": [Jane] can\'t {SECRET}]}}',
+    # A stray closer after the value, then the token.
+    f'"given": [Jane] ] {SECRET}',
+    # A PHI key nested in another PHI key's value.
+    f'{{"identifier": [{{"value": ["x"] {SECRET}}}]}}',
+    # A token after the value that a colon follows, and one inside a call after the value.
+    f'{{"given": [Jane] {SECRET}: 1}}',
+    f'{{"given": [Jane] frozenset({{{SECRET}}})}}',
+    # The key's own container closed by a same-kind stray closer, then another closer, then the token.
+    f'{{"given": [x] }} }} {SECRET}',
+    # A line break before the token. The walk starts at the key, so a line break after the key's
+    # own container ends the value there, even inside an object opened before the key.
+    f'{{"given": [x]\n {SECRET}}}',
+    f'{{\n  "given": [x]\n  {SECRET}}}\n}}',
+    # The key's own container closed, then a colon: the walk has returned before it.
+    f'{{"given": [Jane]}}:{SECRET}}}',
+    # A container after a scalar value.
+    f'"given": x [{SECRET}]',
+    # A line break after the colon: the walk reads no value on the next line.
+    f'"telecom":\n[a|b|c ) , {{"value": "{SECRET}"}}]',
+    f'{{"telecom":\n  [{{"value": "{SECRET}"}}]}}',
+    # The placeholder written by the text itself, inside a searched object.
+    f'{{"identifier": {{"system": "x", "value": [redacted] {SECRET}}}}}',
+    # A member after a comma with no key: the walk reads it under the object's policy.
+    f'{{"identifier": {{"value": ["x"], {SECRET}}}}}',
+    # A closer of the enclosing object's kind, then the token, then a stray closer.
+    f'{{"given": ["x"]}} {SECRET}}}',
+    # A colon after a tuple, which can be a dict key.
+    f'{{"given": (Jane): {SECRET}}}',
+    # A token after a scalar value.
+    f'"family": "Doe" {SECRET}',
+    # The placeholder written by the text itself.
+    f'"given": [redacted] {SECRET}',
+    # An unclosed opener after the value, a second PHI key after the first's value, and an opener
+    # after the value with the token on the next line.
+    f'{{"family": ["x"] [ {SECRET}',
+    f'"name": [a] "given": [b] {SECRET}',
+    f'{{"given": [Jane] (\n{SECRET}\nline2 Pqwerty',
 ]
+
+#: An UNBRACKETED field run, then the token, top-level, in an object and nested, with some other
+#: shapes. For a row whose run is the key's whole value, at least this is why it is kept: the
+#: field-run pass writes the placeholder over the run before the JSON walk reads it, and the walk
+#: then takes that placeholder as the key's whole value, so the token after it is no key's value at
+#: the top level, and is kept under an enclosing INHERIT frame.
+FIELD_RUN_MISSED = [
+    f'"given": a|b|c {SECRET}',
+    f'{{"given": a|b|c {SECRET}}}',
+    f'{{"family": DOE^JANE^Q {SECRET}}}',
+    f'{{"identifier": {{"value": a|b|c {SECRET}}}}}',
+    # A date, an SSN, a scalar before the run, a line break, a tab, a trailing count note,
+    # a comma after the token, a string or a container after the placeholder.
+    f'"given": a|b|c 1980-05-05 {SECRET}',
+    f'"given": a|b|c 123-45-6789 {SECRET}',
+    f'"given": x a|b|c {SECRET}',
+    f'{{"given": x a|b|c {SECRET}}}',
+    f'"given": [a|b|c]\n {SECRET}',
+    f'{{"given": [a|b|c]\n {SECRET}}}',
+    f'"given": a|b|c\t{SECRET}',
+    f'"given":\ta|b|c {SECRET}',
+    f'"given": a|b|c {SECRET}…(+12 chars)',
+    f'"given": a|b|c {SECRET}, x',
+    f'"given": a|b|c "{SECRET}"',
+    f'"given": a|b|c [{SECRET}]',
+    # A value key, the name/address keys, and array-of-object forms.
+    f'"identifier": a|b|c {SECRET}',
+    f'"name": a|b|c {SECRET}',
+    f'"address": a|b|c {SECRET}',
+    f'{{"name": a|b|c {SECRET}}}',
+    f'[{{"given": a|b|c {SECRET}}}]',
+    f'{{"telecom": [{{"value": a|b|c {SECRET}}}]}}',
+]
+MISSED += FIELD_RUN_MISSED
 
 
 @pytest.mark.parametrize(
@@ -80,10 +165,62 @@ def test_a_cut_or_quoted_string_after_a_key_keeps_its_diagnostic(text: str) -> N
         assert once != PLACEHOLDER and safe_text(once, limit=limit) != PLACEHOLDER, once
 
 
-@pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED")
+@pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED"
+)
 @pytest.mark.parametrize("text", MISSED)
 def test_a_documented_miss_still_keeps_the_value(text: str) -> None:
     assert SECRET not in redact(text)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="KNOWN RESIDUAL of BACKLOG #5814: see FIELD_RUN_MISSED",
+)
+@pytest.mark.parametrize("scrub", [safe_text, redact_log_line])
+@pytest.mark.parametrize("text", FIELD_RUN_MISSED)
+def test_a_field_run_miss_keeps_the_value_through_safe_text_and_the_bundle(
+    scrub: Callable[[str], str], text: str
+) -> None:
+    assert SECRET not in scrub(text)
+
+
+#: Texts the unbracketed field-run residual does NOT reach: another pass hides the token.
+FIELD_RUN_HIDDEN = [
+    f'"given": a|b|c Jane Doe {SECRET}',
+    f'"given": a|b|c {SECRET}, Jane',
+    f'{{"name": [{{"given": a|b|c {SECRET}}}]}}',
+]
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize("text", FIELD_RUN_HIDDEN)
+def test_a_field_run_another_pass_reaches_is_hidden(scrub: Callable[[str], str], text: str) -> None:
+    assert SECRET not in scrub(text)
+
+
+#: Texts left legible, each a fixed point of ``safe_text``. They include at least a placeholder a
+#: scrub wrote before another value, and the count note after a closed value.
+KEPT = [
+    '{"identifier": {"value": x y}}',
+    '"given": x y',
+    '{"given": [x, "y"], "family": ("a") }',
+    '{"given": ["x"]…(+12 chars)',
+    '{"telecom": [build(t) for t in tels], "x": 1}',
+]
+
+
+@pytest.mark.parametrize("text", KEPT)
+def test_a_kept_text_is_legible_and_a_fixed_point(text: str) -> None:
+    once = safe_text(text)
+    assert once != PLACEHOLDER
+    assert safe_text(once) == once
+
+
+def test_the_count_note_after_a_closed_value_keeps_the_answer_legible() -> None:
+    note = "…(+12 chars)"
+    assert redact('{"given": ["x"]' + note) == '{"given": ["[redacted]"]' + note
 
 
 def test_the_placeholder_keeps_the_bound_note() -> None:
@@ -258,3 +395,149 @@ def test_the_structure_walk_matches_the_token_walk() -> None:
         verdicts[verdict] += 1
     # Positive controls: the corpus reaches both verdicts often.
     assert verdicts[True] > 500 and verdicts[False] > 500, verdicts
+
+
+def _log_chain(text: str) -> str:
+    """``text`` through the filters a shipped log handler runs: the redactor, then the credential
+    filters after it."""
+    record = logging.LogRecord("b5814", logging.WARNING, __file__, 0, "%s", (text,), None)
+    for log_filter in _shipped_filters():
+        log_filter.filter(record)
+    return record.getMessage()
+
+
+#: ``(answer's input, text a caller glues straight after the answer, a value it must not print,
+#: whether that value is PHI)``. Each printed its value through a glued route under a rule
+#: BACKLOG #5814 built and reverted (see ``MISSED``). The token the answer ends with, or ends with
+#: before a delimiter, is the head of a segment id, a backstop opener, a credential label or a name
+#: run the glued text completes. These came from a read-on past a field-run placeholder.
+GLUED_READ_ON = [
+    ('"given": a|b|c ZqMSH', "*^~\\&*A*B\rPID*1**DOEX$JANEX", "DOEX", True),
+    ('"given": a|b|c Zqnon', "numeric port: 'hunterpw@host'", "hunterpw", True),
+    ('"given": a|b|c pri', "vate_key=QzSecret1 done", "QzSecret1", False),
+    ('"given": a|b|c MEFOR', "_DB_PW=QzSecret1", "QzSecret1", False),
+    ('"given": a|b|c Doe', "\nSmith", "Smith", True),
+    ('"given": a|b|c Doe', ", Jane", "Jane", True),
+    ('"family": DOE^JANE^Q Doe', "\nSmith", "Smith", True),
+    ('"given": a|b|c Doe,', " Jane", "Jane", True),
+    ('{"given": a|b|c ZqMSH}', "*$!?}A}B\rPID}1}}DOEX$JANEX", "DOEX", True),
+    ('{"identifier": {"value": a|b|c Doe,', " Jane", "Jane", True),
+    ('{"identifier": {"value": a|b|c ZqMSH}}', "$!?}A}B\rPID}1}}DOEX$JANEX", "DOEX", True),
+]
+#: The same, from the rules that made the answer the whole-text placeholder.
+GLUED_PLACEHOLDER = [
+    ('"given": [x] Doe', "\nSmith", "Smith", True),
+    ('"given": [x] ZqMSH', "*^~\\&*A*B\rPID*1**DOEX$JANEX", "DOEX", True),
+    ('"given": [x] pri', "vate_key=QzSecret1 done", "QzSecret1", False),
+    ('"given": [x] token', "\n= QzSecret1", "QzSecret1", False),
+    ('"family": "x") Doe', "\nSmith", "Smith", True),
+    ('"family"\n: "x" ] Doe', "\nSmith", "Smith", True),
+    ('{"identifier": {"value": [x] Doe,', " Jane", "Jane", True),
+    ('"telecom"\n: [a|b|c ) Doe', "\nSmith", "Smith", True),
+]
+GLUED = [*GLUED_READ_ON, *GLUED_PLACEHOLDER]
+
+
+def _glued_routes(head: str, glued: str, phi: bool) -> list[str]:
+    """Each route a caller can glue text on and redact again. A credential is a log filter's to
+    hide, so it is read only through the log routes; ``redact`` and ``safe_text`` keep it by design."""
+    routes = [
+        redact_log_line(safe_text(head) + glued),
+        _log_chain(safe_text(head) + glued),
+    ]
+    if phi:
+        routes += [redact(redact(head) + glued), safe_text(safe_text(head) + glued)]
+    return routes
+
+
+@pytest.mark.parametrize(("head", "glued", "value", "phi"), GLUED)
+def test_text_glued_after_an_answer_prints_no_hidden_value(
+    head: str, glued: str, value: str, phi: bool
+) -> None:
+    for out in _glued_routes(head, glued, phi):
+        assert value not in out, out
+
+
+#: The kept mismatched-closer rule's glued leak (see ``MISSED``).
+KEPT_RULE_GLUED = [
+    ('{"given": [x] y]} Doe', "\nSmith", "Smith", True),
+]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="KNOWN RESIDUAL: see KEPT_RULE_GLUED")
+@pytest.mark.parametrize(("head", "glued", "value", "phi"), KEPT_RULE_GLUED)
+def test_the_kept_rule_prints_a_value_glued_after_its_answer(
+    head: str, glued: str, value: str, phi: bool
+) -> None:
+    for out in _glued_routes(head, glued, phi):
+        assert value not in out, out
+
+
+#: ``(text a caller glues straight before the answer, answer's input, a value it must not print)``,
+#: the same leak at the answer's other edge: a whole-text placeholder dropped the ``Doe`` that
+#: completes the name run. Read through ``redact`` only: :func:`safe_text` strips the answer's
+#: leading space, so ``Jane`` and ``Doe`` meet as one word and its route keeps ``Jane`` either way.
+GLUED_BEFORE = [
+    ("patient Jane", ' Doe "given": [x] y', "Jane"),
+]
+
+
+@pytest.mark.parametrize(("glued", "tail", "value"), GLUED_BEFORE)
+def test_text_glued_before_an_answer_prints_no_hidden_value(
+    glued: str, tail: str, value: str
+) -> None:
+    out = redact(glued + redact(tail))
+    assert value not in out, out
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="KNOWN RESIDUAL: see GLUED_BEFORE")
+@pytest.mark.parametrize(("glued", "tail", "value"), GLUED_BEFORE)
+def test_safe_text_glued_before_its_stripped_answer_keeps_the_value(
+    glued: str, tail: str, value: str
+) -> None:
+    assert value not in safe_text(glued + safe_text(tail))
+
+
+def test_the_glued_pins_see_a_whole_text_placeholder_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: with the whole-text placeholder rule widened to every PHI-keyed text, the
+    shape the reverted rules had, each pin that came from them prints its value on some route."""
+    monkeypatch.setattr(
+        redaction, "_stray_json_closer", lambda text: _JSON_PHI_KEY.search(text) is not None
+    )
+    for head, glued, value, phi in GLUED_PLACEHOLDER:
+        assert any(value in out for out in _glued_routes(head, glued, phi)), head
+    for glued, tail, value in GLUED_BEFORE:
+        assert value in redact(glued + redact(tail)), tail
+
+
+#: Leak probes from an earlier attempt at the run-on rule (04102211b39, reverted in 71752f81d0d),
+#: which this module hides; the PHI ones it keeps are in ``MISSED``.
+LEAK_PROBES_HIDDEN = [
+    f'"family": ["x"] (see [ref) {SECRET}',
+    f'"family": ["x"] PatientID: {SECRET}',
+]
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize("text", LEAK_PROBES_HIDDEN)
+def test_a_hidden_leak_probe_keeps_no_secret(scrub: Callable[[str], str], text: str) -> None:
+    assert SECRET not in scrub(text)
+
+
+#: A credential label after a field run, with its separator or value on the next line, or a bare
+#: ``bearer`` the whole-text gate reads. The shipped log chain hides each; a read-on that wrote
+#: such a label as the placeholder printed the secret (BACKLOG #5814's reverted attempt).
+LOG_CHAIN = [
+    '"given": a|b|c token\n= QzorvexSecret1',
+    '"given": a|b|c bearer\nQzorvexSecret1',
+    '"given": a|b|c password\n: QzorvexSecret1',
+    '"given": a|b|c MEFOR_DB_PASSWORD\n= QzorvexSecret1',
+    '{"given": a|b|c x api_key\n= QzorvexSecret1, "k": 1}',
+    '"given": a|b|c bearer abcd1234, a%7Cb%7Cc;sslpassword=x qzorvexpw',
+]
+
+
+@pytest.mark.parametrize("text", LOG_CHAIN)
+def test_the_log_chain_prints_no_credential_after_a_field_run(text: str) -> None:
+    out = _log_chain(text)
+    assert "QzorvexSecret1" not in out and "qzorvexpw" not in out, out
