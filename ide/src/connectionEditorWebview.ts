@@ -355,10 +355,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // latest request sent, as JSON.
     let FIELDS_SEQ = 0;
     let FIELDS_ANSWERED = 0;
-    // This page load's nonce, sent with every request and echoed with every answer. VS Code rebuilds
-    // a hidden panel from the same html and token, and the new page restarts its ids, so an answer
-    // meant for the page before it can carry a live id: only the nonce tells the two apart. From
-    // crypto.getRandomValues, so two loads cannot share it by construction of a seed.
+    // This page load's id, sent with every request and echoed with every answer. VS Code rebuilds a
+    // hidden panel from the same html and token, and the new page restarts its request ids, so an
+    // answer meant for the page before it can carry a live request id: only the page id tells the
+    // two apart. It is not a CSP nonce and guards nothing; it only has to differ between loads, and
+    // 64 bits of crypto.getRandomValues make two loads match only by a 2^-64 chance.
     const FIELDS_PAGE = (() => {
       const words = new Uint32Array(2);
       crypto.getRandomValues(words);
@@ -748,7 +749,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }
-    // A "fields" reply echoes its request's page nonce and id (page, seq) and the transport and
+    // A "fields" reply echoes its request's page id and request id (page, seq) and the transport and
     // direction its groups were built for (fieldsReply in connectionEditor.ts). An "error" answering
     // a fields request the host could not rebuild carries that request's page and id too; other
     // errors carry neither.
@@ -759,7 +760,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
         mfOpt(g.description, mfStr) && mfArrOf(g.fields, mfFieldDescriptor)),
     };
-    // Whether an answer is to this page load's request in flight: its nonce and its latest id. An
+    // Whether an answer is to this page load's request in flight: its page id and latest id. An
     // older request's answer no longer matters, an earlier page instance's is not this page's, and
     // one naming no request in flight (the page never sends id 0) is not an answer at all.
     function answersInFlight(d) { return fieldsPending() && d.page === FIELDS_PAGE && d.seq === FIELDS_SEQ; }
@@ -780,8 +781,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         // one meant for an earlier page instance was built from that instance's settings.
         if (!answersInFlight(d)) return;
         // Every picker change sends a new request, so this page's answer names the pickers'
-        // transport and direction; a reply that does not was mislabelled by its host.
-        if (d.transport !== $('transport').value || d.direction !== $('direction').value) return;
+        // transport and direction; a reply that does not was mislabelled by its host. It is still
+        // this request's answer, so it ends the wait rather than holding Save back until the timeout.
+        if (d.transport !== $('transport').value || d.direction !== $('direction').value) {
+          fieldsFailed('The fields the editor sent were built for a different transport or direction');
+          return;
+        }
         // The form changed since the latest request (a setting removed, kept again, emptied,
         // retyped or switched between a literal and env()): drawing its reply would undo that, so
         // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends at

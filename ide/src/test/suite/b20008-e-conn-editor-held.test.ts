@@ -535,15 +535,17 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "the page still says the fields are loading");
   });
 
-  test("a reply whose transport is not the picker's is not drawn, even with a live id", () => {
+  test("a reply whose transport is not the picker's is not drawn, and ends the wait", () => {
     const p = load();
     pick(p, "file");
     const [asked] = fieldsRequests(p);
-    // A reply meant for an earlier page instance, which restarted its ids at the same number.
+    // This page's own request, answered by a host that mislabelled the reply.
     p.deliver({ command: "fields", seq: asked.seq, page: asked.page, transport: "mllp", direction: "outbound", groups: buildForm(SCHEMA, "mllp", "outbound", {}) });
-    assert.strictEqual(saveClicks(p), 0, "the mismatched reply was taken as the answer");
-    replyTo(p, asked);
-    assert.ok(control(p, "path"), "the matching reply was not drawn");
+    const doc = p.window.document;
+    assert.match(String(doc.getElementById("error").textContent), /different transport or direction/, "the mislabelled reply was not reported");
+    assert.strictEqual(doc.getElementById("transport").value, "mllp", "the picker did not go back to the drawn transport");
+    assert.ok(!control(p, "path"), "the mislabelled reply drew the picked transport's fields");
+    assert.strictEqual(saveClicks(p), 1, "Save still waits after the mislabelled answer");
   });
 
   test("a reply or an error naming no request in flight is ignored", () => {
@@ -551,7 +553,7 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     pick(p, "file");
     answerLatest(p);
     const [answered] = fieldsRequests(p);
-    // This page's own nonce, for its id 0, never sent, and for its id 1, already answered.
+    // This page's own page id, for its id 0, never sent, and for its id 1, already answered.
     for (const seq of [0, answered.seq]) {
       p.deliver({ command: "fields", seq, page: answered.page, transport: "file", direction: "outbound", groups: [] });
       assert.ok(control(p, "path"), `an unsolicited reply was drawn: id ${seq}`);
@@ -562,19 +564,19 @@ suite("connection editor: only the reply to the latest fields request is drawn (
 
   // VS Code rebuilds a hidden panel from the same html and token, so a new page instance restarts
   // its ids; a reply or error meant for the instance before it can carry a live id. Its per-load
-  // nonce is what tells the two apart.
+  // page id is what tells the two apart.
   const EARLIER_PAGE = "0000000000000000";
 
-  test("each request names this page with a per-load nonce, the same for every request", () => {
+  test("each request names this page with a per-load page id, the same for every request", () => {
     const p = load();
     pick(p, "file");
     pick(p, "mllp");
     const pages = fieldsRequests(p).map((r) => r.page);
-    assert.ok(typeof pages[0] === "string" && /^[0-9a-f]{16}$/.test(pages[0]), `no nonce: ${String(pages[0])}`);
-    assert.strictEqual(pages[1], pages[0], "the nonce changed between requests of one page");
+    assert.ok(typeof pages[0] === "string" && /^[0-9a-f]{16}$/.test(pages[0]), `no page id: ${String(pages[0])}`);
+    assert.strictEqual(pages[1], pages[0], "the page id changed between requests of one page");
     const q = load();
     pick(q, "file");
-    assert.notStrictEqual(fieldsRequests(q)[0].page, pages[0], "two page loads drew the same nonce");
+    assert.notStrictEqual(fieldsRequests(q)[0].page, pages[0], "two page loads drew the same page id");
   });
 
   test("an error meant for an earlier page instance, carrying this page's live id, is ignored", () => {

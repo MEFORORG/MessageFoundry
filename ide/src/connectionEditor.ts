@@ -53,10 +53,10 @@ export async function formSchemaFor(
 }
 
 /** The reply to the connection form's "fields" request, for both hosts (this file and
- *  configEditors.ts). It echoes the request's page nonce (page) and id (seq) with the transport and
- *  direction the groups were built for, so the page draws only the answer to its own latest request
- *  (BACKLOG #8243 item 18): a page VS Code rebuilt from the same html restarts its ids, and the
- *  nonce tells its answers apart from the earlier instance's. When the engine cannot describe the
+ *  configEditors.ts). It echoes the request's page id (page) and request id (seq) with the
+ *  transport and direction the groups were built for, so the page draws only the answer to its own
+ *  latest request (BACKLOG #8243 item 18): a page VS Code rebuilt from the same html restarts its
+ *  request ids, and the page id tells its answers apart from the earlier instance's. When the engine cannot describe the
  *  fields, an "error" naming the same page and id and the cause, so the page stops waiting for an
  *  answer instead of holding Save back. A request with no valid id or page gets no reply
  *  (undefined): the page discards a reply without both, so building it would be wasted. */
@@ -199,6 +199,10 @@ export async function openConnectionEditor(
         // rather than being reimplemented in webview script.
         // Answered only while the page that asked is still the one showing (postToSameRender).
         // The reply echoes the request's page and id, so the page draws only its latest request's answer.
+        // A closed panel has no page to answer, before the rebuild or after it.
+        if (disposed) {
+          return;
+        }
         const asked = requestToken(m);
         const reply = await fieldsReply(ws, {
           transport: m.transport,

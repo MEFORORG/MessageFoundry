@@ -378,7 +378,7 @@ const FIELDS_OK = {
   command: "fields",
   // The id of the request answered, echoed with the transport and direction the groups were built
   // for (fieldsReply). The page under test switches its direction to outbound on load, so its
-  // first request (id 1) is the one in flight. Its per-load nonce is fixed by the load's stubbed
+  // first request (id 1) is the one in flight. Its per-load page id is fixed by the load's stubbed
   // random source (the connection receiver's load).
   seq: 1,
   page: "00005eed00005eed",
@@ -408,8 +408,8 @@ const connection: Receiver = {
   // flight, so the load leaves one in flight: id 1, for mllp outbound.
   load: () => {
     const p = page(
-      // The page draws its per-load nonce from crypto.getRandomValues; fixed here, so a fixture can
-      // name it. Every word is 0x5eed, which the nonce writes as 00005eed00005eed.
+      // The page draws its per-load page id from crypto.getRandomValues; fixed here, so a fixture can
+      // name it. Every word is 0x5eed, which the page id writes as 00005eed00005eed.
       "window.crypto.getRandomValues = (a) => a.fill(0x5eed);" +
       connectionEditorScript(TOKEN, {
         initial: undefined,

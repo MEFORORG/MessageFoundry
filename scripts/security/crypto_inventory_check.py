@@ -246,10 +246,10 @@ NON_PYTHON_INVENTORY: dict[str, frozenset[str]] = {
     # capability, so its entropy SOURCE is the security property; the file's own header explains why
     # ``node:crypto`` and not ``crypto.getRandomValues`` (extension-host code, not webview code).
     "ide/src/cspNonce.ts": frozenset({"randomBytes"}),
-    # BACKLOG #5565 / #8243 item 18. A per-load page nonce in the connection editor webview: 8 bytes
-    # of crypto.getRandomValues as hex, sent with every fields request so a page VS Code rebuilt from
-    # the same html cannot take an earlier instance's answer as its own. It is not a capability;
-    # a CSPRNG is used because Math.random is banned by this gate.
+    # BACKLOG #5565 / #8243 item 18. A per-load page id in the connection editor webview: 8 bytes of
+    # crypto.getRandomValues as hex, sent with every fields request so a page VS Code rebuilt from
+    # the same html does not take an earlier instance's answer as its own. It is not a CSP nonce and
+    # not a capability; a CSPRNG is used because Math.random is banned by this gate.
     "ide/src/connectionEditorWebview.ts": frozenset({"getRandomValues"}),
 }
 
@@ -2937,6 +2937,9 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The single source of CSP nonces for every webview the extension builds (see the randomness
     # arm's row for the same file, which is where the entropy argument lives).
     "ide/src/cspNonce.ts": frozenset({"csprng:randomBytes"}),
+    # Not a security control: the connection editor webview's per-load page id (see the randomness
+    # arm's row for the same file, which says what it is for).
+    "ide/src/connectionEditorWebview.ts": frozenset({"csprng:getRandomValues"}),
     # The TLS floors and suite pin the extension applies to every https request it makes to the
     # engine; `tlsOptions` in that file says what it returns. Certificate verification is never
     # switched off. The protocol floor is a named constant, not a literal, so the token does not

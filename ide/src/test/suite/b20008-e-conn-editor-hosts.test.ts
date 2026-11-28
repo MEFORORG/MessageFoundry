@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // BACKLOG #5565, remainder #8243 item 18. The connection form draws only the reply to its latest
-// "fields" request, matched by the id the request carries (connectionEditorWebview.ts). This pins
-// that BOTH hosts echo that id, with the transport and direction the groups were built for, and
-// answer a request they cannot rebuild with an "error" naming the same id, so the page stops
-// waiting. It drives the REAL message handlers of the command-opened editor (connectionEditor.ts)
+// "fields" request, matched by the page id and request id the request carries
+// (connectionEditorWebview.ts). This pins that BOTH hosts echo both, with the transport and
+// direction the groups were built for, answer a request they cannot rebuild with an "error" naming
+// the same ids, so the page stops waiting, and give no reply to a request missing either. It drives the REAL message handlers of the command-opened editor (connectionEditor.ts)
 // and the connections.toml custom editor (configEditors.ts) against a vscode stub, with the CLI
 // replaced by a recorded-shape answer. The stub and loader are copied from
 // b622w2-5833-connections-editor-fields.test.ts, not shared, so this branch owns its own file.
@@ -259,7 +259,7 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
     ["the command-opened editor", openCommandEditor],
   ];
 
-  // The page's per-load nonce, which the hosts echo with the id.
+  // The page's per-load page id, which the hosts echo with the id.
   const PAGE = "0123456789abcdef";
   const ask = (token: string, extra: Record<string, unknown>): Promise<void> =>
     handler!({ command: "fields", page: PAGE, transport: "file", direction: "inbound", settings: {}, __mfChannel: token, ...extra });
