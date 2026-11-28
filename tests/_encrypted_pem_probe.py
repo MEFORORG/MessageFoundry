@@ -96,8 +96,9 @@ ENCRYPTION_HEADERS = (
     "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
 )
 
-#: The private-key PEM labels vault BACKLOG #3745 step 2 names, one test case each at every check
-#: site: plain, PKCS#8 encrypted, legacy RSA and EC. Each is split in the source, so no committed
+#: The private-key PEM labels vault BACKLOG #3745 step 2 names: plain, PKCS#8 encrypted, legacy
+#: RSA and EC. A private-key check site's test parametrizes over it, one case per label, though
+#: nothing enforces that a new site's test does. Each is split in the source, so no committed
 #: byte reads as a key to a secret scanner.
 PRIVATE_KEY_LABELS = tuple(kind + "PRIVATE" + " KEY" for kind in ("", "ENCRYPTED ", "RSA ", "EC "))
 
