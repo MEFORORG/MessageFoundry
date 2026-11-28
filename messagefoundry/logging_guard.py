@@ -831,6 +831,11 @@ def _encodes_ascii(encoding: str) -> bool:
     return _encodable(_ALL_ASCII, encoding) == _ALL_ASCII
 
 
+#: A class namespace's "no ``encoding`` here" for :func:`_encoding_read_can_fail`, since
+#: ``encoding = None`` is a definition.
+_NO_ATTRIBUTE = object()
+
+
 def _encoding_read_can_fail(cls: type) -> bool:
     """Whether an ``AttributeError`` from reading ``encoding`` on a ``cls`` stream is a read that
     failed rather than an attribute that is not there: a class on ``cls``'s own MRO defines
@@ -841,8 +846,8 @@ def _encoding_read_can_fail(cls: type) -> bool:
     turn a healthy stream into a failed write. Walked per call, with no cache to hold classes."""
     try:
         for klass in cls.__mro__:
-            found = vars(klass).get("encoding")
-            if found is not None:
+            found = vars(klass).get("encoding", _NO_ATTRIBUTE)
+            if found is not _NO_ATTRIBUTE:
                 return not isinstance(found, types.MemberDescriptorType)
     except Exception:  # an exotic class whose MRO or namespace cannot be read
         return False
@@ -974,7 +979,7 @@ class _GuardedSinkMixin(_SinkBase):
                         f"could not format a record ({kind}), nor the notice standing in for it "
                         f"({notice_kind}); nothing was written for it"
                     )
-                    self._report_format_faults()
+                    was_down = self._sink_down()
                     # Built from literals and ``ascii()`` type names, so already scrubbed.
                     self._guard.record_unwritable(
                         self._sink_label,
@@ -985,6 +990,7 @@ class _GuardedSinkMixin(_SinkBase):
                         ),
                         cause="because its formatter fails",
                     )
+                    self._say_faults_once_down(was_down)
                     return
                 self._note_format_fault(
                     f"could not format a record ({kind}); a notice naming its logger is written "
@@ -1042,16 +1048,17 @@ class _GuardedSinkMixin(_SinkBase):
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
                 # what keeps the stage-2 cause -- the operationally important half -- from being the
                 # part a single bound on the composed string would cut.
+                was_down = self._sink_down()
                 self._guard.record_unwritable(
                     self._sink_label,
                     reason=f"{reason}; the replacement failed too: {_safe_reason(roll_exc)}",
                 )
-                # Say every counted fault now, the interval notwithstanding: the sink is dead, so no
-                # later write will, and a fault counted on the way here (an unreadable encoding,
-                # say) can be the cause the operator needs.
-                self._report_format_faults(force=True)
+                self._say_faults_once_down(was_down)
                 return
+            # A roll past the flap bound reads unwritable too: the same transition.
+            was_down = self._sink_down()
             self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
+            self._say_faults_once_down(was_down)
         finally:
             self._reentry.active = False
 
@@ -1107,13 +1114,29 @@ class _GuardedSinkMixin(_SinkBase):
             detail = _FORMAT_FAULT_OTHER
         faults[detail] = faults.get(detail, 0) + 1
 
+    def _sink_down(self) -> bool:
+        """Whether this sink reads ``unwritable`` now, as ``GET /status`` shows it."""
+        return any(
+            s.sink == self._sink_label and s.state == "unwritable" for s in self._guard.status()
+        )
+
+    def _say_faults_once_down(self, was_down: bool) -> None:
+        """On the transition into stage 2, say every counted fault at once, the interval
+        notwithstanding: the sink is dead, so no later write will, and a fault counted on the way
+        (an unreadable encoding, say) can be the cause the operator needs. Only on the transition:
+        each later record on a sink already down goes back to the rated line, so a dead sink
+        cannot make a stderr storm."""
+        if not was_down and self._sink_down():
+            self._report_format_faults(force=True)
+
     def _report_format_faults(self, *, force: bool = False) -> None:
         """Say on the stderr last-resort line the format faults counted since the last such line,
         each kind with its count, at most once per :data:`_FORMAT_FAULT_REPORT_SECONDS` unless
         ``force``. Faults counted inside that interval wait for the next call after it: the next
         fault, the next guard write (:meth:`_write_line` ends in this call, and the stdout sink
-        writes every record through it), the next ``flush`` (a file sink record ends in one) or
-        ``close``, which forces it. Called under the handler's lock. Never raises."""
+        writes every record through it), the next ``flush`` (a file sink record ends in one),
+        the sink's transition into stage 2 (:meth:`_say_faults_once_down`), or ``close``; the last
+        two force it. Called under the handler's lock. Never raises."""
         # ``getattr``: logging can flush or close a handler whose constructor raised before
         # ``_init_guard`` ran.
         faults: dict[str, int] | None = getattr(self, "_format_faults", None)
@@ -1232,9 +1255,11 @@ class _GuardedSinkMixin(_SinkBase):
         try:
             encoding = self.stream.encoding
         except Exception as exc:
-            # A stream that has no ``encoding`` is written as the line came. Any other failure is a
-            # proxy whose ``encoding`` cannot be read: not a failed write, and not "no encoding"
-            # either, since on a replacing stream that would write ``?`` unseen. So the line is
+            # A stream that has no ``encoding`` is written as the line came, a forwarding proxy
+            # whose target has none or is gone included (:func:`_encoding_read_can_fail`). Any
+            # other failure is a stream whose class defines ``encoding`` but cannot read it: not a
+            # failed write, and not "no encoding" either, since on a replacing stream that would
+            # write ``?`` unseen. So the line is
             # escaped for ASCII, which almost every text stream takes, and the cause is counted
             # before the write, so a write that then fails does not hide it. A stream that refuses
             # even that line (cp864 has no byte for ``%``) fails the write; the stages decide.

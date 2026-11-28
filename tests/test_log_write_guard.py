@@ -1496,8 +1496,9 @@ def test_classifying_an_odd_stream_class_never_fails_the_write(
 ) -> None:
     # A stream class with an unhashable metaclass, and one whose metaclass forwards attributes:
     # classifying either must not raise, nor read it as unreadable. Both are written as they came.
-    # NEGATIVE CONTROL: with the classification cached by lru_cache, the unhashable class raised
-    # TypeError from every write and the sink reached stage 2.
+    # NEGATIVE CONTROL: with the classification hashing the class, as the lru_cache at head
+    # 2364d685424 of this branch did, the unhashable class raised TypeError from the write and the
+    # sink rolled onto sys.stdout, so the stream under test received nothing.
     class _Unhashable(type):
         def __eq__(cls, other: object) -> bool:
             return cls is other
@@ -1568,6 +1569,86 @@ def test_an_unreadable_encoding_is_printed_when_the_write_fails(
     assert [e.stage for e in events] == ["unwritable"]
     err = capsys.readouterr().err
     assert f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('RuntimeError')" in err
+
+
+def test_a_dead_sink_says_its_faults_once_not_per_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The forced report at stage 2 runs on the transition only. Later records on the dead sink
+    # go back to the rated line, so they cannot make a stderr storm.
+    # NEGATIVE CONTROL: with the report forced on every pass through stage 2, each of the ten
+    # later records wrote its own format-fault line.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Dead:
+        @property
+        def encoding(self) -> str:
+            raise RuntimeError("encoding unavailable")
+
+        def write(self, text: str) -> int:
+            raise OSError(5, "EIO")
+
+    stream = _Dead()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("first"))
+    assert capsys.readouterr().err.count("format faults since") == 1
+    for _ in range(10):
+        handler.emit(_record("later"))
+
+    assert capsys.readouterr().err.count("format faults since") == 0
+
+
+def test_a_formatter_fault_stage_2_says_a_pending_cause(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The formatter-fault path into stage 2 forces the report too, so an unreadable-encoding
+    # cause counted inside the interval is on stderr when the sink goes down.
+    # NEGATIVE CONTROL: with that path keeping the rated report, the second record's cause stayed
+    # unsaid until close.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Unreadable:
+        @property
+        def encoding(self) -> str:
+            raise RuntimeError("encoding unavailable")
+
+        def write(self, text: str) -> int:
+            return len(text)
+
+    class _Breaks(logging.Formatter):
+        broken = False
+
+        def format(self, record: logging.LogRecord) -> str:
+            if self.broken:
+                raise ValueError("formatter gone")
+            return super().format(record)
+
+    stream = _Unreadable()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
+    formatter = _Breaks("%(message)s")
+    handler.setFormatter(formatter)
+    capsys.readouterr()
+
+    handler.emit(_record("one"))  # said at once, which starts the interval
+    capsys.readouterr()
+    clock.now += 1
+    handler.emit(_record("two"))  # counted, inside the interval
+    assert capsys.readouterr().err == ""
+    formatter.broken = True
+    handler.emit(_record("three"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert logging_guard._ENCODING_UNREADABLE_FAULT in capsys.readouterr().err
 
 
 def test_a_falsy_stream_is_still_flushed() -> None:
