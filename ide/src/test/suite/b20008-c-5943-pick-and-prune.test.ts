@@ -55,6 +55,8 @@ class FakeEditor {
   text: string;
   readonly refused: string[] = [];
   readonly applied: string[] = [];
+  // Refuse the next edit whatever it reads, as the engine refuses a mode or template it cannot write.
+  refuseNext = false;
   readonly rebaser = new QueuedEditRebaser();
   private gate: Promise<void> | undefined;
   private open: (() => void) | undefined;
@@ -83,7 +85,9 @@ class FakeEditor {
     }
     const lines = physicalLines(before);
     const found = /^ {4}msg\.set\("([^"]*)", "([^"]*)"\)$/.exec(lines[LINE - 1]);
-    if (found === null || (msg.expectSrc !== undefined && msg.expectSrc !== lines[LINE - 1])) {
+    const refuse = this.refuseNext;
+    this.refuseNext = false;
+    if (refuse || found === null || (msg.expectSrc !== undefined && msg.expectSrc !== lines[LINE - 1])) {
       this.refused.push(`${msg.name}=${String(msg.value)}`);
       return undefined;
     }
@@ -168,17 +172,35 @@ suite("b20008 C #5943 item 42 -- a typed edit queued behind a field pick", () =>
     const ed = new FakeEditor(S0);
     await drainEdits(new EditLoopGuard(), edit("value", "A", rowOf(S0), 1), ed.apply, undefined, undefined, ed.options(false));
     assert.deepStrictEqual(ed.applied, ["value=A"]);
-    // The pick was made on the page from before that rewrite, so the engine refuses it as stale.
+    ed.refuseNext = true; // the engine refuses the pick, so it writes nothing
     await drainWithQueued(ed, edit("path", "PID-9", rowOf(S0), 1), [edit("value", "B", rowOf(S0), 1)]);
     assert.deepStrictEqual(ed.refused, ["path=PID-9"]);
     assert.deepStrictEqual(ed.applied, ["value=A", "value=B"]);
   });
 
-  test("the pick itself is sent as posted, never carried over an earlier rewrite", async () => {
+  test("finding 2: a pick is carried over an earlier typed rewrite of another field of its row", async () => {
     const ed = new FakeEditor(S0);
     await drainEdits(new EditLoopGuard(), edit("value", "A", rowOf(S0), 1), ed.apply, undefined, undefined, ed.options(false));
+    // The page still shows the row as projected, so the pick posts that row's old text.
     await drainWithQueued(ed, edit("path", "PID-9", rowOf(S0), 1), []);
-    assert.deepStrictEqual(ed.refused, ["path=PID-9"]);
+    assert.deepStrictEqual(ed.refused, []);
+    assert.deepStrictEqual(ed.applied, ["value=A", "path=PID-9"]);
+    assert.strictEqual(rowOf(ed.text), row("PID-9", "A"));
+  });
+
+  test("a pick is carried over a typed write of its own field made on its own page", async () => {
+    const ed = new FakeEditor(S0);
+    await drainEdits(new EditLoopGuard(), edit("path", "PID-7", rowOf(S0), 1), ed.apply, undefined, undefined, ed.options(false));
+    await drainWithQueued(ed, edit("path", "PID-9", rowOf(S0), 1), []);
+    assert.deepStrictEqual(ed.applied, ["path=PID-7", "path=PID-9"]);
+  });
+
+  test("a pick is not carried over an earlier pick of its own field, which its page does not show", async () => {
+    const ed = new FakeEditor(S0);
+    await drainWithQueued(ed, edit("path", "PID-9", rowOf(S0), 1), []);
+    await drainWithQueued(ed, edit("path", "PID-8", rowOf(S0), 1), []);
+    assert.deepStrictEqual(ed.applied, ["path=PID-9"]);
+    assert.deepStrictEqual(ed.refused, ["path=PID-8"]);
   });
 
   test("an edit on the picked field from a projection made after the pick is carried as usual", async () => {
@@ -250,6 +272,24 @@ suite("b20008 C #5943 item 42 -- a typed edit queued behind a field pick", () =>
     const pick = page.posted.find((m) => m.command === "pickPath");
     assert.ok(pick, "a pickPath was posted");
     assert.strictEqual(pick.projection, 7);
+  });
+});
+
+suite("b20008 C #5943 finding 1 -- a value retyped back carries no stale mark", () => {
+  test("a page projected from a reproduced buffer rebases a field rewritten before it", async () => {
+    const S0 = source();
+    const ed = new FakeEditor(S0);
+    const typed = async (msg: EditMessage): Promise<void> =>
+      drainEdits(new EditLoopGuard(), msg, ed.apply, undefined, undefined, ed.options(false));
+    await typed(edit("value", "A", rowOf(S0), 1));
+    await typed(edit("value", "OLD", rowOf(S0), 1)); // retyped back: the buffer is S0 again
+    assert.strictEqual(ed.text, S0);
+    ed.rebaser.project(2, S0);
+    await typed(edit("path", "PID-7", rowOf(S0), 2));
+    // Posted on page 2 before the next render, so it carries page 2's row text.
+    await typed(edit("value", "NEW", rowOf(S0), 2));
+    assert.deepStrictEqual(ed.refused, []);
+    assert.deepStrictEqual(ed.applied, ["value=A", "value=OLD", "path=PID-7", "value=NEW"]);
   });
 });
 
