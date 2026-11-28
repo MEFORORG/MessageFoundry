@@ -879,7 +879,54 @@ _AMBIENT_OS_PATHS = frozenset(
         "os.kill",
         "os.putenv",
         "os.fork",
+        # raw descriptor writes (BACKLOG #5382): data written to an fd reaches a file or a stream.
+        "os.write",
+        "os.writev",
+        "os.pwrite",
+        "os.pwritev",
+        "os.truncate",
+        "os.ftruncate",
+        "os.sendfile",
+        "os.copy_file_range",
+        "os.splice",
+        "os.posix_fallocate",
     }
+)
+# tempfile creates files and directories on disk; only its path lookups are exempt (BACKLOG #5382).
+_TEMPFILE_READONLY = frozenset({"gettempdir", "gettempdirb", "gettempprefix", "gettempprefixb"})
+# Roots where every call is ambient EXCEPT the named read-only members.
+_AMBIENT_ROOT_EXEMPTIONS: Mapping[str, frozenset[str]] = {
+    "socket": _SOCKET_READONLY,
+    "tempfile": _TEMPFILE_READONLY,
+}
+# Openers whose mode is the 2nd positional, ``open(file, mode)``, by resolved dotted name; each
+# defaults to a read, except ``gzip.GzipFile``, which takes its ``fileobj``'s mode when none is given
+# and is then treated as a possible write unless :func:`_takes_fileobj_mode` rules the fileobj out
+# (``None`` or an inline ``io.BytesIO(...)``). ``X.open`` on any other receiver is read by
+# :func:`_open_write_hit`.
+_MODULE_OPENERS = frozenset(
+    {
+        "open",
+        "builtins.open",
+        "io.open",
+        "io.FileIO",
+        "codecs.open",
+        "os.fdopen",
+        "gzip.open",
+        "bz2.open",
+        "lzma.open",
+        "tarfile.open",
+        "tarfile.TarFile",
+        "tarfile.TarFile.open",
+        "gzip.GzipFile",
+        "bz2.BZ2File",
+        "lzma.LZMAFile",
+        "zipfile.ZipFile",
+        "zipfile.PyZipFile",
+    }
+)
+_PATH_CLASSES = frozenset(
+    {"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"}
 )
 # filesystem-mutating method names matched on any receiver (pathlib + friends). Receiver-agnostic,
 # so a rare same-named in-memory method is an accepted advisory FP (ADR 0144 known gaps).
@@ -1237,52 +1284,551 @@ def _unsafe_lookup_hit(
     return query is not None and _is_dynamic_string(query, env)
 
 
-def _open_mode(call: ast.Call, index: int = 1) -> str | None:
-    """The literal string mode of an open-style call, or None. ``index`` is the positional slot of the
-    mode arg — ``1`` for builtin ``open(file, mode)``, ``0`` for ``Path(...).open(mode)`` — and the
-    ``mode=`` keyword is honored either way."""
-    if len(call.args) > index:
-        arg = call.args[index]
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            return arg.value
+#: The mode shape :func:`_is_write_mode` splits, on the calls :func:`_open_write_hit` names.
+_TARFILE_MODE = re.compile(r"^[rwxa][:|](?:\*|gz|bz2|xz|zst)?$")
+#: ``tarfile.open`` and its classmethod twin ``tarfile.TarFile.open``: the only openers whose mode
+#: may be split, under the conditions :func:`_open_write_hit` states.
+_TARFILE_OPENERS = frozenset({"tarfile.open", "tarfile.TarFile.open"})
+
+
+def _is_write_mode(mode: str, *, split: bool) -> bool:
+    """True when an ``open(...)`` mode string requests write/append/create/update access.
+
+    With ``split``, which :func:`_open_write_hit` sets only where it says, a string that wholly
+    matches :data:`_TARFILE_MODE` is read by its access letter alone, ahead of its ``:`` or ``|``;
+    every other string, and every string read without ``split``, is read whole, so any ``w``,
+    ``a``, ``x`` or ``+`` in it is a hit (BACKLOG #5382). The pattern is narrower and wider than
+    ``tarfile``'s grammar: it does not split at least the read modes ``"r:tar"``, ``":xz"`` and
+    ``"|xz"``, which ``tarfile`` accepts and which are then flagged, and splits some modes
+    ``tarfile`` refuses, whose access letter is a write anyway."""
+    access = mode[0] if split and _TARFILE_MODE.fullmatch(mode) else mode
+    return any(c in access for c in ("w", "a", "x", "+"))
+
+
+def _is_write_mode_literal(node: ast.expr, *, split: bool) -> bool:
+    """``node`` is a string literal that :func:`_is_write_mode` reads as a write."""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _is_write_mode(node.value, split=split)
+    )
+
+
+def _mode_may_write(call: ast.Call, index: int, *, split: bool = False) -> bool:
+    """True unless the open-style ``call`` provably opens read-only, its mode in positional slot
+    ``index`` or the ``mode=`` keyword (BACKLOG #5382). A mode that is not a literal counts as a
+    write, and so does a ``*args`` splat at or before the slot, or a ``**kwargs`` splat where no
+    mode is given otherwise (with one given, a mode in the splat would raise). No mode at all is not
+    read as a write here, and neither is a non-string literal such as ``2`` or ``None``: no mode is
+    the opener's read default, except for ``gzip.GzipFile`` given a ``fileobj`` and no mode or a
+    ``None`` one, which takes that fileobj's mode and which :func:`_open_write_hit` treats as a
+    possible write (:func:`_takes_fileobj_mode`). A mode held in a name counts as a write even when
+    every binding of the name is a read literal: stricter than it needs to be, which this advisory
+    lint accepts. A literal mode is read by :func:`_is_write_mode`, split only when ``split`` is
+    set."""
+    if any(isinstance(arg, ast.Starred) for arg in call.args[: index + 1]):
+        return True
+    modes: list[ast.expr] = call.args[index : index + 1]
+    splat = False
     for kw in call.keywords:
-        if (
-            kw.arg == "mode"
-            and isinstance(kw.value, ast.Constant)
-            and isinstance(kw.value.value, str)
-        ):
-            return kw.value.value
+        if kw.arg is None:
+            splat = True
+        elif kw.arg == "mode":
+            modes.append(kw.value)
+    if splat and not modes:
+        return True
+    return any(
+        _is_write_mode_literal(mode, split=split) or not isinstance(mode, ast.Constant)
+        for mode in modes
+    )
+
+
+def _takes_fileobj_mode(call: ast.Call, resolver: _NameResolver) -> bool:
+    """``gzip.GzipFile(filename, mode, compresslevel, fileobj)`` given a ``fileobj`` and no mode, or
+    a ``None`` mode, takes that fileobj's mode, which may be a write (BACKLOG #5382). A ``*args`` or
+    ``**kwargs`` splat may carry a fileobj. A ``None`` fileobj, or an inline ``io.BytesIO(...)`` call
+    (:func:`_is_bytesio_call`), which has no mode, leaves GzipFile its ``"rb"`` default; any other
+    fileobj, a BytesIO held in a name or a read handle among them, counts as a possible write. A
+    mode it is given is read by :func:`_mode_may_write`."""
+    if any(isinstance(arg, ast.Starred) for arg in call.args) or any(
+        kw.arg is None for kw in call.keywords
+    ):
+        fileobj = True
+    else:
+        fileobjs = call.args[3:4] + [kw.value for kw in call.keywords if kw.arg == "fileobj"]
+        fileobj = not all(
+            (isinstance(f, ast.Constant) and f.value is None) or _is_bytesio_call(f, resolver)
+            for f in fileobjs
+        )
+    if not fileobj:
+        return False
+    modes = call.args[1:2] + [kw.value for kw in call.keywords if kw.arg == "mode"]
+    return all(isinstance(m, ast.Constant) and m.value is None for m in modes)
+
+
+def _is_bytesio_call(node: ast.expr, resolver: _NameResolver) -> bool:
+    """``node`` is a call written ``io.BytesIO(...)``, with ``io`` a module imported by that name and
+    bound no other way this resolver reads. A BytesIO has no ``mode`` attribute."""
+    return (
+        isinstance(node, ast.Call)
+        and _dotted_call_name(node.func) == "io.BytesIO"
+        and resolver.is_module_named_directly("io")
+    )
+
+
+# os.open flags that grant no write: any other flag, a literal number or a name the lint cannot read
+# makes the open a possible write.
+_OS_OPEN_READ_FLAGS = frozenset(
+    {
+        "O_RDONLY",
+        "O_CLOEXEC",
+        "O_BINARY",
+        "O_NOINHERIT",
+        "O_NOFOLLOW",
+        "O_NONBLOCK",
+        "O_DIRECTORY",
+        "O_NOCTTY",
+        "O_SEQUENTIAL",
+        "O_RANDOM",
+        "O_TEXT",
+        "O_NOATIME",
+    }
+)
+
+
+def _os_open_may_write(call: ast.Call) -> bool:
+    """``os.open(path, flags)`` whose flags are not provably read-only: every flag a ``|`` of
+    :data:`_OS_OPEN_READ_FLAGS` names (``os.O_RDONLY | os.O_CLOEXEC``)."""
+    flags: ast.expr | None = call.args[1] if len(call.args) > 1 else None
+    for kw in call.keywords:
+        if kw.arg is None:
+            return True
+        if kw.arg == "flags":
+            flags = kw.value
+    if flags is None or any(isinstance(arg, ast.Starred) for arg in call.args[:2]):
+        return True
+    stack = [flags]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            stack += [node.left, node.right]
+        elif isinstance(node, ast.Attribute):
+            if node.attr not in _OS_OPEN_READ_FLAGS:
+                return True
+        elif not (isinstance(node, ast.Name) and node.id in _OS_OPEN_READ_FLAGS):
+            return True
+    return False
+
+
+#: Bounds on one :meth:`_NameResolver.expand`: the longest dotted name it produces, in parts, and the
+#: most names it returns. Bindings that extend each other (``a = b.x`` and ``b = a.y``) would grow
+#: without end, and ordinary code has them: a linked-list walk (``cur = nxt``, ``nxt = cur.next``)
+#: or one generic name bound in several functions reaches a bound on every call through it. So an
+#: expansion cut short is reported as truncated only when the bindings it follows reach a head or a
+#: part some name test of this rule reads (:meth:`_NameResolver.cut_may_hit`), and the call is then
+#: flagged rather than passed unread. That is coarser than whether an unread name is a hit: one
+#: binding to ``os.environ`` among them is enough to flag.
+_MAX_ALIAS_PARTS = 16
+_MAX_ALIAS_NAMES = 256
+#: The heads a resolved call name must start with to meet a name test of the ambient-authority rule
+#: that reads its head (:func:`_ambient_name_hit`, :func:`_open_write_hit`). The tests that read a
+#: part instead include at least a filesystem-write method (:data:`_AMBIENT_FS_WRITE_ATTRS`) and a
+#: ``pathlib`` class (:data:`_PATH_CLASSES`), which :meth:`_NameResolver.cut_may_hit` reads too. A
+#: new name test must be added to one of the three, or a cut expansion can pass it unread.
+_HIT_HEADS = frozenset(
+    {"builtins", "importlib", "urllib", "http", "os"}
+    | _AMBIENT_BARE_NAMES
+    | _AMBIENT_ROOTS
+    | _AMBIENT_ROOT_EXEMPTIONS.keys()
+    | {name.partition(".")[0] for name in _MODULE_OPENERS | _AMBIENT_OS_PATHS}
+)
+_CUT_HIT_PARTS = _AMBIENT_FS_WRITE_ATTRS | _PATH_CLASSES
+
+
+def _non_import_binding(node: ast.AST) -> str | None:
+    """The name ``node`` binds other than by an import, or None: an assignment, ``for``, ``with``,
+    comprehension or walrus target, a parameter, an ``except`` name, a ``def``/``class`` name, a type
+    parameter or a ``match`` capture."""
+    if isinstance(node, ast.Name):
+        return node.id if isinstance(node.ctx, ast.Store) else None
+    if isinstance(node, ast.arg):
+        return node.arg
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.TypeVar,
+            ast.ParamSpec,
+            ast.TypeVarTuple,
+            ast.ExceptHandler,
+            ast.MatchAs,
+            ast.MatchStar,
+        ),
+    ):
+        return node.name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest
     return None
 
 
-def _is_write_mode(mode: str | None) -> bool:
-    """True when an ``open(...)`` mode string requests write/append/create/update access."""
-    return mode is not None and any(c in mode for c in ("w", "a", "x", "+"))
+#: The last part of each module opener's name (``open``, ``TarFile``, ...): a patch that stores one
+#: of these, or any name ending in ``open``, may replace an opener (BACKLOG #5382).
+_OPENER_PARTS = frozenset(name.rsplit(".", 1)[-1] for name in _MODULE_OPENERS)
 
 
-def _ambient_authority_hit(call: ast.Call) -> bool:
-    """The call reaches past the sanctioned Send/db_lookup boundary (subprocess/socket/eval/raw
-    HTTP/dynamic-import/file-write). The sanctioned reads and pure stdlib data ops are exempt."""
-    func = call.func
-    if isinstance(func, ast.Name):
-        if func.id in _AMBIENT_BARE_NAMES:
+def _constant_str(node: ast.expr | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _opener_patch_root(node: ast.AST) -> str | None:
+    """The head name of what ``node`` may replace an opener on, or None (BACKLOG #5382). It reads an
+    attribute assignment, ``del``, ``for`` or ``with`` target (``tarfile.open = f``), an item of
+    ``vars(X)`` or ``X.__dict__`` stored or deleted (``vars(tarfile)["open"] = f``), and the
+    receiver of a ``setattr`` or ``delattr`` call written by that name, each counted only when the
+    name it stores is not a constant, ends in ``open`` or is in :data:`_OPENER_PARTS`, so
+    ``tarfile.TarFile.extraction_filter = f`` is not one. A receiver that is not a dotted name, such
+    as a call's result, yields None."""
+    stored: str | None
+    if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        base, stored = node.value, node.attr
+    elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        base, stored = node.value, _constant_str(node.slice)
+        if (
+            isinstance(base, ast.Call)
+            and isinstance(base.func, ast.Name)
+            and base.func.id == "vars"
+            and len(base.args) == 1
+        ):
+            base = base.args[0]
+        elif isinstance(base, ast.Attribute) and base.attr == "__dict__":
+            base = base.value
+        else:
+            return None
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("setattr", "delattr")
+        and node.args
+    ):
+        base = node.args[0]
+        stored = _constant_str(node.args[1]) if len(node.args) > 1 else None
+    else:
+        return None
+    if stored is not None and not stored.endswith("open") and stored not in _OPENER_PARTS:
+        return None
+    dotted = _dotted_call_name(base)
+    return dotted.partition(".")[0] if dotted is not None else None
+
+
+class _NameResolver:
+    """The name bindings of one config module that the ambient-authority rule follows (BACKLOG
+    #5382): ``import a as x``, ``from m import n [as x]`` and ``x = <dotted name>`` (a constant
+    ``getattr`` included), each local name to every dotted name it may stand for; and the names
+    bound to a ``pathlib`` path expression, so ``p = Path(x); p.open(mode)`` reads ``p`` as a path.
+
+    Scope-blind on purpose: a binding anywhere in the file counts everywhere in it, which
+    over-reports rather than let an alias in another function go unseen (ADR 0144: a filter, not a
+    boundary). So a name it resolves is only *possibly* that binding, and the open-mode reading in
+    :func:`_open_write_hit` keeps every reading a possible binding calls for. Relative and star
+    imports are not followed; they only make a name, or with ``*`` every name, not certainly the
+    module an ``import`` of it named (:meth:`is_unbound`).
+
+    A binding from the bound name itself (``node = node.left``, ``out = out.write_text``) is applied
+    at most once on the way to any name, so a tree walk that rebinds ``node`` several ways costs a
+    few names rather than every combination of them."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self._aliases: dict[str, set[str]] = {}
+        self._self_suffixes: dict[str, set[str]] = {}
+        self._cache: dict[str, tuple[frozenset[str], bool]] = {}
+        self._reach: dict[str, bool] = {}  # cut_may_hit's reading of the bindings, per head
+        self._imported: set[str] = set()
+        self._rebound: set[str] = set()
+        self._patch_roots: set[str] = set()  # heads an opener may be replaced on here
+        self._patched: dict[str, bool] = {}  # may_patch's answer, per module
+        self._star_import = False
+        # ``lzma = None`` (the optional-import fallback) adds no reading: a constant has no .open.
+        constant_targets: set[int] = set()
+        values: list[tuple[list[str], ast.expr]] = []
+        for node in ast.walk(tree):  # breadth-first, so an Assign is seen before its targets
+            # A module global may be rebound by name through globals(), vars(), locals(), exec or
+            # sys.modules, which no binding this resolver reads shows, so none is read as its module.
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"globals", "vars", "locals", "exec"}
+            ) or (isinstance(node, ast.Attribute) and node.attr == "modules"):
+                self._star_import = True
+            rebound = _non_import_binding(node)
+            if rebound is not None and id(node) not in constant_targets:
+                self._rebound.add(rebound)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                constant_targets.update(id(t) for t in node.targets if isinstance(t, ast.Name))
+            patch_root = _opener_patch_root(node)
+            if patch_root is not None:
+                self._patch_roots.add(patch_root)
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        self._bind(alias.asname, alias.name)
+                    else:
+                        self._imported.add(alias.name.partition(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        self._star_import = True
+                    elif node.module is None or node.level:
+                        self._rebound.add(alias.asname or alias.name)
+                    else:
+                        self._bind(alias.asname or alias.name, f"{node.module}.{alias.name}")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [name for target in targets for name in _assigned_names(target)]
+                dotted = _dotted_call_name(node.value)
+                if dotted is not None:
+                    for name in names:
+                        self._bind(name, dotted)
+                values.append((names, node.value))
+        # Repeated to a fixed point, so a name bound from another path name (q = p.parent) is a
+        # path too, whichever order the two bindings come in.
+        path_names: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for names, value in values:
+                if not path_names.issuperset(names) and self.is_path_expr(value, path_names):
+                    path_names.update(names)
+                    changed = True
+        self.path_names = frozenset(path_names)
+
+    def _bind(self, name: str, dotted: str) -> None:
+        head, _, rest = dotted.partition(".")
+        if head != name:
+            self._aliases.setdefault(name, set()).add(dotted)
+        elif rest:
+            self._self_suffixes.setdefault(name, set()).add(rest)
+
+    def is_unbound(self, name: str) -> bool:
+        """No binding but a plain ``import name`` names ``name``: none this resolver follows, no path
+        binding, no relative or star import, and no other (:func:`_non_import_binding`) except an
+        assignment of a constant, so a parameter, loop target or ``except`` name spelt like an
+        imported module is not read as that module. A file that calls ``globals``, ``vars``,
+        ``locals`` or ``exec`` by that bare name, or names an attribute ``modules`` in any context
+        (``sys.modules``), counts as a star import, since each may rebind a module name in a way no
+        binding here shows. Other rebinding routes are not seen, at least an alias or a
+        ``builtins.`` spelling of those names, ``from sys import modules``,
+        ``getattr(sys, "modules")``, a function's ``__globals__``, a frame's ``f_globals``,
+        ``del name`` followed by a ``builtins`` store, and a store from another module."""
+        return (
+            not self._star_import
+            and name not in self._aliases
+            and name not in self._self_suffixes
+            and name not in self.path_names
+            and name not in self._rebound
+        )
+
+    def is_module_named_directly(self, name: str) -> bool:
+        """``name`` is a module imported by that name and bound no other way this resolver reads; it
+        does not see every dynamic rebinding (``__globals__``, frames, ``importlib``, and at least
+        others)."""
+        return name in self._imported and self.is_unbound(name)
+
+    def may_patch(self, module: str) -> bool:
+        """An opener on ``module``, or on anything reached from it, may be replaced here, as
+        :func:`_opener_patch_root` reads a patch, through a name this resolver ties to ``module``:
+        at least ``tarfile.open = sftp.open``, ``setattr(tarfile, "open", f)`` and
+        ``from tarfile import TarFile; TarFile.open = f``. A cut expansion counts too. Not seen
+        include at least a patch in another module, through a parameter or ``sys.modules``, or by
+        a call such as ``mock.patch.object`` or ``vars(tarfile).update``."""
+        cached = self._patched.get(module)
+        if cached is None:
+            cached = False
+            for root in self._patch_roots:
+                names, truncated = self.expand(root)
+                if truncated or any(n == module or n.startswith(f"{module}.") for n in names):
+                    cached = True
+                    break
+            self._patched[module] = cached
+        return cached
+
+    def expand(self, dotted: str) -> tuple[frozenset[str], bool]:
+        """``dotted`` as written plus every name its head may stand for, and whether a bound in
+        :data:`_MAX_ALIAS_NAMES` / :data:`_MAX_ALIAS_PARTS` cut the expansion short where a name it
+        left unread could meet a name test (:meth:`cut_may_hit`).
+
+        Each distinct name is expanded once, whatever path reached it, so a lattice of names bound
+        from one another costs the number of names it reaches, not the number of paths through it.
+        Bindings are read in sorted order, so a truncated result does not vary with string hashing.
+        The result is cached per name, because a module calls the same names many times."""
+        cached = self._cache.get(dotted)
+        if cached is not None:
+            return cached
+        # (name, whether a self-binding was applied on the way to it)
+        queue: list[tuple[str, bool]] = [(dotted, False)]
+        seen = set(queue)
+        truncated = False
+        for current, used_self in queue:  # breadth-first: the loop reads what it appends
+            head, _, rest = current.partition(".")
+            tail = f".{rest}" if rest else ""
+            nexts = [(f"{t}{tail}", used_self) for t in sorted(self._aliases.get(head, ()))]
+            if not used_self:
+                suffixes = sorted(self._self_suffixes.get(head, ()))
+                nexts += [(f"{head}.{s}{tail}", True) for s in suffixes]
+            for item in nexts:
+                if item in seen:
+                    continue
+                if item[0].count(".") >= _MAX_ALIAS_PARTS or len(seen) >= _MAX_ALIAS_NAMES:
+                    truncated = True
+                    continue
+                seen.add(item)
+                queue.append(item)
+        result = (frozenset(name for name, _ in seen), truncated and self.cut_may_hit(dotted))
+        self._cache[dotted] = result
+        return result
+
+    def cut_may_hit(self, dotted: str) -> bool:
+        """Whether a name :meth:`expand` could reach from ``dotted`` may meet a name test: a head
+        reachable through the bindings is in :data:`_HIT_HEADS`, or a part of ``dotted`` or of a
+        binding reachable from it is a write method or a ``pathlib`` class (:data:`_CUT_HIT_PARTS`).
+        Every name an expansion produces is a reachable head followed by such parts, so when neither
+        holds, no name it left unread can meet a test those constants cover."""
+        head = dotted.partition(".")[0]
+        reach = self._reach.get(head)
+        if reach is None:
+            heads, parts = {head}, set()
+            stack = [head]
+            while stack:
+                current = stack.pop()
+                for target in self._aliases.get(current, ()):
+                    parts.update(target.split("."))
+                    target_head = target.partition(".")[0]
+                    if target_head not in heads:
+                        heads.add(target_head)
+                        stack.append(target_head)
+                for suffix in self._self_suffixes.get(current, ()):
+                    parts.update(suffix.split("."))
+            reach = not heads.isdisjoint(_HIT_HEADS) or not parts.isdisjoint(_CUT_HIT_PARTS)
+            self._reach[head] = reach
+        return reach or not _CUT_HIT_PARTS.isdisjoint(dotted.split("."))
+
+    def call_names(self, func: ast.expr) -> tuple[frozenset[str], bool]:
+        """Every dotted name a call's ``func`` may resolve to, or none when it is not a dotted chain
+        (``Path(p).open``), and whether the expansion was truncated (:meth:`expand`)."""
+        dotted = _dotted_call_name(func)
+        return (frozenset(), False) if dotted is None else self.expand(dotted)
+
+    def _names_a_path_class(self, node: ast.expr) -> bool:
+        dotted = _dotted_call_name(node)
+        return dotted is not None and any(
+            name.rsplit(".", 1)[-1] in _PATH_CLASSES for name in self.expand(dotted)[0]
+        )
+
+    def is_path_expr(self, node: ast.expr, path_names: Set[str]) -> bool:
+        """True when ``node`` is a ``pathlib`` path: a ``Path(...)`` call or a classmethod on the
+        class (``Path.home()``), through an alias too; a method or attribute on one
+        (``Path(p).with_suffix(".x")``, ``.parent``); a ``/`` join; or a name in ``path_names``.
+        Pass an empty ``path_names`` to ask whether the expression itself reads as a path; any class
+        named like a pathlib class, from any module or through a name bound to one anywhere in the
+        file, reads as one."""
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             return True
-        if func.id == "open" and _is_write_mode(_open_mode(call)):
-            return True
-    if isinstance(func, ast.Attribute):
-        if func.attr in _AMBIENT_FS_WRITE_ATTRS:
-            return True
-        # the attribute form ``Path(...).open("w")`` — mode is the FIRST arg here — flag only a write.
-        if func.attr == "open" and _is_write_mode(_open_mode(call, 0)):
-            return True
-    dotted = _dotted_call_name(func)
-    if dotted is None:
+        if isinstance(node, ast.Name):
+            return node.id in path_names
+        if isinstance(node, ast.Call):
+            if self._names_a_path_class(node.func):
+                return True
+            node = node.func
+            if isinstance(node, ast.Attribute) and self._names_a_path_class(node.value):
+                return True
+        if isinstance(node, ast.Attribute):
+            return self.is_path_expr(node.value, path_names)
         return False
+
+
+def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolver) -> bool:
+    """An open-style call that may write (BACKLOG #5382), its mode read from the slot it really has.
+
+    * A module opener (:data:`_MODULE_OPENERS`: builtin ``open``, ``codecs.open``, ``io.open``,
+      ``os.fdopen``, ``zipfile.ZipFile``, ...): the mode is the 2nd positional, and a
+      ``gzip.GzipFile`` given a ``fileobj`` and no mode may write (:func:`_takes_fileobj_mode`).
+      Builtin ``open`` bound no other way this resolver reads, or an opener called through a module
+      imported by its own name and bound no other way this resolver reads, has that reading only,
+      unless :meth:`_NameResolver.may_patch` sees an opener patch on that name.
+    * ``tarfile.open`` and ``tarfile.TarFile.open`` (:data:`_TARFILE_OPENERS`) are module openers
+      too. Written through ``tarfile`` imported by its own name and bound no other way this
+      resolver reads, with no opener patch on it that :meth:`_NameResolver.may_patch` sees, either
+      call is resolved as ``tarfile.open``, and its mode is the only one the lint splits. An alias
+      of either, or a ``tarfile`` the lint cannot tie to the module, reads its mode whole, so
+      ``tf.open(p, mode="r:xz")`` is flagged: a false positive this advisory lint accepts.
+    * ``os.open``: its flags, read by :func:`_os_open_may_write`. Its 1st positional is also read
+      as the last bullet reads one, so a literal path holding a ``w``, ``a``, ``x`` or ``+`` flags
+      even a read-only ``os.open``: a false positive this advisory lint accepts.
+    * ``.open`` on an expression read as a ``pathlib`` path, as :meth:`_NameResolver.is_path_expr`
+      reads one with no names (``Path(p).open(mode)``, and at least any class with a pathlib
+      class's name, a ``/`` join, or a method or attribute on either): the mode is the 1st
+      positional or the ``mode=`` keyword.
+    * ``.open`` on any other receiver, an aliased opener among them: a 1st-positional string
+      holding a ``w``, ``a``, ``x`` or ``+``, or a mode in the 2nd positional or the ``mode=``
+      keyword that is not provably read-only; and on a name bound to a path somewhere in the file,
+      a 1st-positional mode that is not provably read-only too. Because a binding is only possibly
+      the one in force, every reading it calls for is kept.
+
+    Only a resolved ``tarfile.open`` mode is split: on a call resolved as ``tarfile.open`` or
+    ``tarfile.TarFile.open``, its 2nd positional or ``mode=`` keyword, when it wholly matches
+    :data:`_TARFILE_MODE`, is read by its access letter alone. Any other string the lint reads,
+    as a mode or as a 1st-positional string on an ``.open``, is read whole, ``mode=`` included,
+    so any ``w``, ``a``, ``x`` or ``+`` in it is a hit. A pathlib mode never holds ``:`` or ``|``,
+    so pathlib needs no split. Any mode that is not a literal counts as a write
+    (:func:`_mode_may_write`). A non-literal 1st positional on a receiver not known to be a path is
+    not flagged, because it is as likely a member name as a mode."""
+    hit = False
+    as_written = _dotted_call_name(call.func)
+    head = as_written.partition(".")[0] if as_written is not None else ""
+    if names & _MODULE_OPENERS:
+        tar = (
+            as_written in _TARFILE_OPENERS
+            and resolver.is_module_named_directly("tarfile")
+            and not resolver.may_patch("tarfile")
+        )
+        hit = _mode_may_write(call, 1, split=tar) or (
+            "gzip.GzipFile" in names and _takes_fileobj_mode(call, resolver)
+        )
+        if (
+            as_written in _MODULE_OPENERS
+            and (
+                (as_written == "open" and resolver.is_unbound("open"))
+                or resolver.is_module_named_directly(head)
+            )
+            and not resolver.may_patch(head)
+        ):
+            return hit
+    if "os.open" in names and _os_open_may_write(call):
+        return True
+    os_open = as_written == "os.open" and resolver.is_module_named_directly("os")
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "open"):
+        return hit
+    # Slot 0 is never split (see the docstring).
+    if resolver.is_path_expr(func.value, frozenset()):
+        return hit or _mode_may_write(call, 0)
+    if call.args and _is_write_mode_literal(call.args[0], split=False):
+        return True
+    if resolver.is_path_expr(func.value, resolver.path_names) and _mode_may_write(call, 0):
+        return True
+    return hit or (not os_open and _mode_may_write(call, 1))
+
+
+def _ambient_name_hit(dotted: str) -> bool:
+    """One resolved dotted call name reaches past the sanctioned Send/db_lookup boundary."""
+    if dotted.removeprefix("builtins.") in _AMBIENT_BARE_NAMES:
+        return True
     parts = dotted.split(".")
     root = parts[0]
-    if root == "socket":
-        # every socket.* is egress EXCEPT the read-only host lookups.
-        return len(parts) < 2 or parts[1] not in _SOCKET_READONLY
+    exempt = _AMBIENT_ROOT_EXEMPTIONS.get(root)
+    if exempt is not None:
+        return len(parts) < 2 or parts[1] not in exempt
     if root in _AMBIENT_ROOTS:
         return True
     if dotted in _AMBIENT_OS_PATHS:
@@ -1292,6 +1838,46 @@ def _ambient_authority_hit(call: ast.Call) -> bool:
     if dotted.startswith(("urllib.request.", "http.client.")):
         return True
     return dotted == "importlib.import_module"
+
+
+def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
+    """The call reaches past the sanctioned Send/db_lookup boundary (subprocess/socket/eval/raw
+    HTTP/dynamic-import/file-write). The sanctioned reads and pure stdlib data ops are exempt.
+
+    The call is checked as every name ``resolver`` says it may stand for, so an import alias, a
+    ``from`` import or a plain assignment is followed (``import shutil as sh``, ``from os import
+    write``, ``opener = open``, ``w = out.write_text``; BACKLOG #5382). Known gaps include at least:
+    an opener or writer bound any other way (``functools.partial(open, mode="w")``, a dynamic
+    ``getattr``, a walrus); a non-literal mode in the 1st slot of an ``X.open`` whose receiver it
+    cannot tell is a path; a write through a handle passed in, or by ``json.dump``/``csv.writer``;
+    an opener not in :data:`_MODULE_OPENERS` (``dbm.open``) or an archive extraction; an ``.open``
+    on a receiver it cannot resolve that sends or launches (a ``urllib`` opener's
+    ``.open(url, data=...)``, ``webbrowser.open(url)``), flagged only on a mode it reads (a
+    1st-positional string holding a ``w``, ``a``, ``x`` or ``+``, or a 2nd positional or ``mode=``
+    keyword that is not provably read-only), never for the send itself; the 2nd positional of an
+    ``.open`` on a receiver :meth:`_NameResolver.is_path_expr` reads as pathlib that is not one, at
+    least a class from another module with a pathlib class's name, a ``/`` join of other objects,
+    or a method or attribute on either, which is not read, so ``(a / b).open("r", "w")`` is not
+    flagged; an opener patch :meth:`_NameResolver.may_patch` does not see, which leaves the
+    patched call read as the module's own opener, so ``tarfile.open(p, mode="r:xz")`` after
+    ``mock.patch.object(tarfile, "open", sftp.open)`` is split and not flagged; a module name
+    rebound dynamically in ways the resolver does not read, at least through ``__globals__``,
+    ``sys._getframe()``, ``importlib.import_module(__name__)`` or a ``builtins`` name, which can
+    leave a non-tarfile ``.open(p, mode="r:xz")`` split and not flagged; and any ``os`` call not
+    named in :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
+    :meth:`_NameResolver.expand` is flagged when a name it left unread could still be a hit, since
+    what it stands for was not all read. The other rules in this check follow no alias."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr in _AMBIENT_FS_WRITE_ATTRS:
+        return True
+    names, truncated = resolver.call_names(func)
+    if truncated:
+        return True
+    if any("." in name and name.rsplit(".", 1)[1] in _AMBIENT_FS_WRITE_ATTRS for name in names):
+        return True
+    if _open_write_hit(call, names, resolver):
+        return True
+    return any(_ambient_name_hit(name) for name in names)
 
 
 def _impure_transform_hit(call: ast.Call, imported: set[str]) -> bool:
@@ -1727,12 +2313,13 @@ def _check_handler_security(
         # composed a line earlier and passed by name is seen (BACKLOG #1658).
         scoped = list(_scoped_nodes(tree))
         lookup_envs = _lookup_scope_envs(scoped)
+        resolver = _NameResolver(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
-            if _ambient_authority_hit(node):
+            if _ambient_authority_hit(node, resolver):
                 file_hits.append((node.lineno, "ambient-authority"))
         file_hits += _leaf_to_whole_field_hits(scoped)
         # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body

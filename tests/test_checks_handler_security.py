@@ -986,6 +986,626 @@ def test_denylist_member_flags(tmp_path: Path, rule_id: str, name: str, snippet:
     assert f"[{rule_id}]" in result.detail, f"{name}: {result.detail!r}"
 
 
+# BACKLOG #5382, the lint half: file writes the ambient-authority lint used to miss. Every path below
+# is free of the letters w, a, x and +, so none is flagged by reading the PATH as the mode, which is
+# what the old `X.open` slot-0 reading did for codecs.open and io.open. The exceptions include at
+# least the `*_letters_after_colon` and `*_tarfile_*` slot-0 cases, which pin the slot-0 reading
+# still made on a receiver not known to be a path.
+FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
+    ("open_mode_variable", 'def f(msg, mode):\n    open("/tmp/in.hl7", mode)\n'),
+    ("open_mode_keyword_variable", 'def f(msg, m):\n    open("/tmp/in.hl7", mode=m)\n'),
+    ("open_mode_splat", 'def f(msg, opts):\n    open("/tmp/in.hl7", **opts)\n'),
+    ("open_args_splat", "def f(msg, args):\n    open(*args)\n"),
+    (
+        "codecs_open_mode_slot",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/tmp/in.hl7", "w")\n',
+    ),
+    ("io_open_mode_slot", 'import io\n\ndef f(msg):\n    io.open("/tmp/in.hl7", "w")\n'),
+    ("gzip_open_mode_slot", 'import gzip\n\ndef f(msg):\n    gzip.open("/tmp/in.hl7", "wt")\n'),
+    ("os_fdopen", 'import os\n\ndef f(msg):\n    os.fdopen(3, "w")\n'),
+    (
+        "builtins_module_alias",
+        'import builtins as b\n\ndef f(msg):\n    b.open("/tmp/in.hl7", "w")\n',
+    ),
+    (
+        "open_import_alias",
+        'from builtins import open as bopen\n\ndef f(msg):\n    bopen("/tmp/in.hl7", "w")\n',
+    ),
+    (
+        "codecs_open_import_alias",
+        'from codecs import open as copen\n\ndef f(msg):\n    copen("/tmp/in.hl7", "w")\n',
+    ),
+    ("open_name_alias", 'opener = open\n\ndef f(msg):\n    opener("/tmp/in.hl7", "w")\n'),
+    (
+        "io_open_name_alias",
+        'import io\n\nopener = io.open\n\ndef f(msg):\n    opener("/tmp/in.hl7", "w")\n',
+    ),
+    ("os_write", "import os\n\ndef f(msg):\n    os.write(3, msg.raw)\n"),
+    ("os_write_import_alias", "from os import write as w\n\ndef f(msg):\n    w(3, msg.raw)\n"),
+    ("os_module_alias_write", "import os as o\n\ndef f(msg):\n    o.write(3, msg.raw)\n"),
+    ("tempfile_named", "import tempfile\n\ndef f(msg):\n    tempfile.NamedTemporaryFile()\n"),
+    ("tempfile_mkstemp", "import tempfile\n\ndef f(msg):\n    tempfile.mkstemp()\n"),
+    (
+        "tempfile_import_alias",
+        "from tempfile import TemporaryFile as T\n\ndef f(msg):\n    T()\n",
+    ),
+    (
+        "shutil_module_alias",
+        'import shutil as sh\n\ndef f(msg):\n    sh.copy("/tmp/i", "/tmp/o")\n',
+    ),
+    (
+        "shutil_from_import",
+        'from shutil import copyfile\n\ndef f(msg):\n    copyfile("/tmp/i", "/tmp/o")\n',
+    ),
+    (
+        "path_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    Path("/tmp/in.hl7").open(mode)\n',
+    ),
+    (
+        "path_name_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    p = Path("/tmp/in.hl7")\n'
+        "    p.open(mode)\n",
+    ),
+    (
+        "path_div_open_mode_variable",
+        'from pathlib import Path\n\ndef f(msg, mode):\n    (Path("/tmp") / "in.hl7").open(mode)\n',
+    ),
+    ("receiver_open_mode_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "w")\n'),
+    ("receiver_open_mode_slot_one_variable", 'def f(msg, zf, m):\n    zf.open("in.hl7", m)\n'),
+    # Scope-blind bindings keep every reading: a name aliased to an opener module, or bound to a path,
+    # somewhere else in the file still gets the reading its own call calls for.
+    (
+        "module_alias_name_reused_as_param",
+        'import gzip as zf\n\ndef a(msg):\n    zf.open("/tmp/i")\n\n'
+        'def b(msg, zf):\n    zf.open("w")\n',
+    ),
+    ("module_bound_by_assignment", 'import io\n\nx = io\n\ndef f(msg):\n    x.open("w")\n'),
+    (
+        "path_name_reused_as_param",
+        'from pathlib import Path\n\ndef a(msg):\n    p = Path("/tmp/i")\n    return p\n\n'
+        'def b(msg, p):\n    p.open("in.hl7", "w")\n',
+    ),
+    (
+        "derived_path_name",
+        'from pathlib import Path\n\ndef f(msg, m):\n    p = Path("/tmp/i")\n    q = p.parent\n'
+        "    q.open(m)\n",
+    ),
+    (
+        "path_name_bound_from_path_name",
+        'from pathlib import Path\n\ndef f(msg, m):\n    q = p\n    p = Path("/tmp/i")\n'
+        "    q.open(m)\n",
+    ),
+    ("fs_write_method_bound", "def f(msg, out):\n    w = out.write_text\n    w(msg.raw)\n"),
+    ("builtins_exec", "import builtins\n\ndef f(msg):\n    builtins.exec(msg.raw)\n"),
+    ("builtins_eval_alias", "from builtins import eval as e\n\ndef f(msg):\n    e(msg.raw)\n"),
+    ("os_sendfile", "import os\n\ndef f(msg):\n    os.sendfile(3, 4, 0, 10)\n"),
+    ("zipfile_write", 'import zipfile\n\ndef f(msg):\n    zipfile.ZipFile("/tmp/i.zip", "w")\n'),
+    ("tarfile_write_stream", 'import tarfile\n\ndef f(msg):\n    tarfile.open("/tmp/i", "w|gz")\n'),
+    # A name spelt like an opener module is that module only when imported and bound no other way.
+    (
+        "opener_module_name_bound_to_path",
+        'from pathlib import Path\n\ngzip = Path("/tmp/q")\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    ("opener_module_name_is_a_param", 'def g(msg, codecs):\n    codecs.open("w")\n'),
+    # ... and an import does not make it that module where a parameter, loop, with, except,
+    # comprehension, walrus, lambda or call result rebinds the name: the slot-0 reading still holds.
+    ("imported_opener_rebound_by_param", 'import gzip\n\ndef f(msg, gzip):\n    gzip.open("w")\n'),
+    (
+        "imported_opener_rebound_by_loop",
+        'import io\n\ndef f(msg, items):\n    for io in items:\n        io.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_with",
+        'import codecs\n\ndef f(msg, cm):\n    with cm as codecs:\n        codecs.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_except",
+        "import gzip\n\ndef f(msg):\n    try:\n        pass\n    except OSError as gzip:\n"
+        '        gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_comprehension",
+        'import io\n\ndef f(msg, items):\n    return [io.open("w") for io in items]\n',
+    ),
+    (
+        "imported_opener_rebound_by_walrus",
+        'import gzip\n\ndef f(msg, g):\n    if gzip := g:\n        gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_lambda",
+        'import codecs\n\nf = lambda msg, codecs: codecs.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_call_result",
+        'import codecs\n\ndef f(msg, make):\n    codecs = make()\n    codecs.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_relative_import",
+        'import gzip\nfrom .compat import gzip\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_star_import",
+        'import gzip\nfrom _compat import *\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    # A binding from the bound name itself is still followed, once.
+    (
+        "self_binding_on_import_alias",
+        "import os as o\n\ndef f(msg):\n    o = o.write\n    o(3, msg.raw)\n",
+    ),
+    ("self_binding_on_method", "def f(msg, out):\n    out = out.write_text\n    out(msg.raw)\n"),
+    (
+        "constant_getattr_bound",
+        'import os\n\ndef f(msg):\n    w = getattr(os, "write")\n    w(3, msg.raw)\n',
+    ),
+    ("gzipfile_write", 'import gzip\n\ndef f(msg):\n    gzip.GzipFile("/tmp/q", "wb")\n'),
+    (
+        "path_classmethod_open_mode",
+        "from pathlib import Path\n\ndef f(msg, m):\n    Path.home().open(m)\n",
+    ),
+    (
+        "os_open_write_flags",
+        "import os\n\ndef f(msg, p):\n    os.open(p, os.O_WRONLY | os.O_CREAT)\n",
+    ),
+    # Already flagged before #5382; pinned so the widening cannot have lost them.
+    ("open_literal_write", 'def f(msg):\n    open("/tmp/in.hl7", "w")\n'),
+    ("open_keyword_write", 'def f(msg):\n    open("/tmp/in.hl7", mode="ab")\n'),
+    (
+        "path_open_literal_write",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/in.hl7").open("w")\n',
+    ),
+    ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
+    ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
+    # A 1st-positional string on an .open is read whole on every receiver, so a w, a, x or + after
+    # a ':' or '|' in it is still a hit, an exact tarfile mode ("r:xz") included; on a receiver not
+    # known to be a path it is as likely a path or a URL as a mode. Each is flagged on the letters
+    # in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not detected.
+    (
+        "dbm_open_drive_path_letters_after_colon",
+        'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
+    ),
+    ("dbm_open_tarfile_shaped_path", 'import dbm\n\ndef f(msg):\n    dbm.open("r:wal", "c")\n'),
+    ("dbm_open_tarfile_mode_path", 'import dbm\n\ndef f(msg):\n    dbm.open("r:xz", "c")\n'),
+    ("receiver_open_slot_zero_tarfile_mode", 'def f(msg, x):\n    x.open("r:xz")\n'),
+    (
+        "webbrowser_open_tarfile_shaped_url",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("r:w")\n',
+    ),
+    (
+        "webbrowser_open_tarfile_mode_url",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("r:xz")\n',
+    ),
+    # A name bound to a path somewhere in the file is only possibly that path, so its slot 0 is read
+    # whole too.
+    (
+        "path_name_open_slot_zero_tarfile_mode",
+        'from pathlib import Path\n\ndef f(msg):\n    p = Path("/tmp/i")\n    p.open("r:xz")\n',
+    ),
+    (
+        "imported_opener_url_letters_after_colon",
+        "from _feeds import opener\n\ndef f(msg, body):\n"
+        '    opener.open("https://example.org/a", data=body)\n',
+    ),
+    (
+        "webbrowser_url_letters_after_colon",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
+    ),
+    # A receiver that reads as a path reads its 1st-positional string whole too, whether through a
+    # class named Path from any module, a name bound to one, an unbound Path, or a '/' join. Each
+    # is flagged on the letters in its literal alone, not on the body or data argument.
+    (
+        "path_named_import_url_letters_after_colon",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("https://example.org/a")\n',
+    ),
+    (
+        "unbound_path_url_letters_after_colon",
+        'def f(msg, body):\n    Path("x").open("https://example.org/a", body)\n',
+    ),
+    (
+        "module_attribute_path_url_letters_after_colon",
+        "import _feeds\n\ndef f(msg, body):\n"
+        '    _feeds.Path("cfg").open("https://example.org/a", data=body)\n',
+    ),
+    (
+        "name_bound_to_path_url_letters_after_colon",
+        "from _feeds import Path\n\nfactory = Path\n\ndef f(msg, body):\n"
+        '    factory().open("https://example.org/a", body)\n',
+    ),
+    (
+        "div_join_url_letters_after_colon",
+        'def f(msg, p):\n    (p / "x").open("https://example.org/a")\n',
+    ),
+    (
+        "attribute_path_classmethod_drive_path_letters_after_colon",
+        'import client\n\ndef f(msg):\n    client.Path.home().open("C:\\\\mefor\\\\cache", "c")\n',
+    ),
+    # Only a resolved tarfile.open mode is split; a URL or any other string in a mode slot the lint
+    # reads is read whole, on a rebound or imported open and on any receiver.
+    (
+        "rebound_open_url_in_mode_slot",
+        'from _helpers import open\n\ndef f(msg):\n    open("f", "https://example.org/a")\n',
+    ),
+    (
+        "imported_webbrowser_open_url_in_mode_slot",
+        'from webbrowser import open\n\ndef f(msg, u):\n    open(u, "https://example.org/a")\n',
+    ),
+    (
+        "path_named_import_mode_keyword_url",
+        "from _helpers import Path\n\ndef f(msg):\n"
+        '    Path("x").open(mode="https://example.org/a")\n',
+    ),
+    (
+        "path_named_import_mode_keyword_not_tarfile_mode",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open(mode="r|w")\n',
+    ),
+    (
+        "receiver_open_mode_keyword_url",
+        'def f(msg, x, p):\n    x.open(p, mode="https://example.org/a")\n',
+    ),
+    # Only the mode of a call resolved as tarfile.open or tarfile.TarFile.open is split, so a
+    # tarfile-mode string in any other mode slot the lint reads, or in an .open's 1st positional, is
+    # read whole and its "x" is a hit: on builtin open, on any receiver (paramiko's SFTP open
+    # creates a file on an "x"), on a pathlib or Path-named receiver's slot 0, and on a tarfile name
+    # the lint cannot tie to the module. The two Path receivers given a "w" are flagged on slot 0
+    # alone: their 2nd positional is not read, as on origin/main.
+    ("builtin_open_xz_mode_slot_one", 'def f(msg):\n    open("f", "r:xz")\n'),
+    ("builtin_open_xz_stream_mode_keyword", 'def f(msg, p):\n    open(p, mode="r|xz")\n'),
+    ("receiver_open_mode_keyword_xz", 'def f(msg, x, p):\n    x.open(p, mode="r:xz")\n'),
+    ("sftp_open_mode_keyword_xz", 'def f(msg, sftp, p):\n    sftp.open(p, mode="r:xz")\n'),
+    (
+        "pathlib_open_xz_mode",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("x").open("r:xz")\n',
+    ),
+    (
+        "path_named_import_open_xz_mode",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("r:xz")\n',
+    ),
+    ("div_join_open_xz_mode", 'def f(msg, a, b):\n    (a / b).open("r:xz", "w")\n'),
+    (
+        "zipfile_path_root_open_xz_mode",
+        'import zipfile\n\ndef f(msg, zf):\n    zipfile.Path(zf).root.open("r:xz", "w")\n',
+    ),
+    ("gzip_open_mode_keyword_xz", 'import gzip\n\ndef f(msg, p):\n    gzip.open(p, mode="r:xz")\n'),
+    (
+        "tarfile_parameter_mode_keyword_xz",
+        'def f(msg, tarfile, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_alias_mode_keyword_xz",
+        'import tarfile as tf\n\ndef f(msg, p):\n    tf.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_parameter_mode_keyword_xz",
+        'import tarfile\n\ndef f(msg, p, tarfile):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    # An opener patch on tarfile that the lint sees in the file (an attribute store, setattr, del,
+    # a vars() item), through tarfile or a name bound to a member of it, means a call spelled
+    # tarfile.open may not be tarfile's own, so its mode is read whole.
+    (
+        "tarfile_open_patched_mode_keyword_xz",
+        "import tarfile\n\ndef g(sftp):\n    tarfile.open = sftp.open\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_setattr_mode_keyword_xz",
+        'import tarfile\n\ndef g(c):\n    setattr(tarfile, "open", c)\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_vars_item_mode_keyword_xz",
+        'import tarfile\n\ndef g(c):\n    vars(tarfile)["open"] = c\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_open_deleted_mode_keyword_xz",
+        "import tarfile\n\ndef g():\n    del tarfile.open\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    # A module global rebound by name through at least these spellings of globals(), vars(),
+    # locals(), exec and sys.modules is not read as its module, so a read through it gets the
+    # stricter reading and is flagged. The is_unbound docstring names routes the lint misses.
+    (
+        "tarfile_rebound_by_globals_item_mode_keyword_xz",
+        'import tarfile\n\ndef g(obj):\n    globals()["tarfile"] = obj\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_vars_item_mode_keyword_xz",
+        'import tarfile\n\nvars()["tarfile"] = object()\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_locals_item_mode_keyword_xz",
+        'import tarfile\n\nlocals()["tarfile"] = object()\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_globals_update_mode_keyword_xz",
+        "import tarfile\n\ndef g(obj):\n    globals().update(tarfile=obj)\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_through_sys_modules_attribute_mode_keyword_xz",
+        "import sys\nimport tarfile\n\ndef g(obj):\n    sys.modules[__name__].tarfile = obj\n\n"
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_through_sys_modules_setattr_mode_keyword_xz",
+        "import sys\nimport tarfile\n\ndef g(obj):\n"
+        '    setattr(sys.modules[__name__], "tarfile", obj)\n\n'
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_exec_mode_keyword_xz",
+        'import tarfile\n\ndef g(obj):\n    exec("global tarfile; tarfile = obj")\n\n'
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "gzip_rebound_by_globals_item_slot_zero",
+        'import gzip\n\ndef g(obj):\n    globals()["gzip"] = obj\n\ndef f(msg):\n'
+        '    gzip.open("/data/a.gz")\n',
+    ),
+    (
+        "codecs_rebound_through_sys_modules_attribute_slot_zero",
+        "import codecs\nimport sys\n\ndef g(obj):\n    sys.modules[__name__].codecs = obj\n\n"
+        'def f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
+    (
+        "codecs_rebound_by_exec_slot_zero",
+        'import codecs\n\ndef g(obj):\n    exec("global codecs; codecs = obj")\n\n'
+        'def f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
+    # A patched module opener is not read as the module's own, so its 1st positional is read too.
+    (
+        "gzip_open_patched_slot_zero_write",
+        'import gzip\n\ndef g(fh):\n    gzip.open = fh.open\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    (
+        "tarfile_class_open_patched_slot_zero_write",
+        "import tarfile\n\ndef g(fh):\n    tarfile.TarFile.open = fh.open\n\ndef f(msg):\n"
+        '    tarfile.TarFile.open("w")\n',
+    ),
+    (
+        "tarfile_class_patched_by_name_mode_keyword_xz",
+        "import tarfile\nfrom tarfile import TarFile\n\ndef g(c):\n    TarFile.open = c\n\n"
+        'def f(msg, p):\n    tarfile.TarFile.open(p, mode="r:xz")\n',
+    ),
+    # tarfile.TarFile.open is read as a module opener, its mode in the 2nd positional.
+    (
+        "tarfile_class_open_write",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.TarFile.open(p, "w:xz")\n',
+    ),
+    (
+        "tarfile_class_open_getattr_write",
+        'import tarfile\n\ndef f(msg, p):\n    getattr(tarfile.TarFile, "open")(p, "w:xz")\n',
+    ),
+    # GzipFile with a fileobj and no mode takes the fileobj's mode, which may be a write.
+    (
+        "gzipfile_fileobj_no_mode",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(fileobj=w_handle).write(msg.raw)\n",
+    ),
+    (
+        "gzipfile_fileobj_mode_none",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(mode=None, fileobj=w_handle)\n",
+    ),
+    (
+        "gzipfile_fileobj_positional",
+        "import gzip\n\ndef f(msg, w_handle):\n    gzip.GzipFile(None, None, 9, w_handle)\n",
+    ),
+    (
+        "gzipfile_fileobj_in_kwargs_splat",
+        "import gzip\n\ndef f(msg, kw):\n    gzip.GzipFile(mode=None, **kw)\n",
+    ),
+    (
+        "gzipfile_fileobj_in_args_splat",
+        "import gzip\n\ndef f(msg, rest):\n    gzip.GzipFile(None, None, *rest)\n",
+    ),
+    # A parameter named io is not the io module, so its BytesIO is not exempt.
+    (
+        "gzipfile_fileobj_bytesio_on_rebound_io",
+        "import gzip\nimport io\n\ndef f(msg, io):\n    gzip.GzipFile(fileobj=io.BytesIO())\n",
+    ),
+]
+
+FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
+    ("open_read_default", 'def f(msg):\n    open("/tmp/in.hl7")\n'),
+    ("open_read_literal", 'def f(msg):\n    open("/tmp/in.hl7", "rb")\n'),
+    (
+        "codecs_open_read",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/tmp/in.hl7", "r", "utf-8")\n',
+    ),
+    # The old slot-0 reading flagged this read, because its PATH holds an `a`.
+    (
+        "codecs_open_read_path_with_a",
+        'import codecs\n\ndef f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
+    ("path_open_read", 'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/in.hl7").open()\n'),
+    (
+        "path_open_read_literal",
+        'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/i").open("rb")\n',
+    ),
+    ("path_open_read_r", 'from pathlib import Path\n\ndef f(msg):\n    Path("x").open("r")\n'),
+    ("receiver_open_read", 'def f(msg, zf):\n    zf.open("in.hl7")\n'),
+    ("tempfile_gettempdir", "import tempfile\n\ndef f(msg):\n    return tempfile.gettempdir()\n"),
+    ("os_path_join", 'import os\n\ndef f(msg):\n    return os.path.join("/tmp", "in.hl7")\n'),
+    (
+        "socket_readonly_from_import",
+        "from socket import gethostname\n\ndef f(msg):\n    return gethostname()\n",
+    ),
+    # The same slot-bug false positive for the other module openers, and tarfile's compression part.
+    ("gzip_open_read_path_with_a", 'import gzip\n\ndef f(msg):\n    gzip.open("/data/a.gz")\n'),
+    ("tarfile_read_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r:xz")\n'),
+    ("tarfile_read_stream_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r|xz")\n'),
+    (
+        "tarfile_read_xz_mode_keyword",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_read_xz_literal_path",
+        'import tarfile\n\ndef f(msg):\n    tarfile.open("/data/a.tar", "r:xz")\n',
+    ),
+    (
+        "tarfile_class_open_read_xz_mode_keyword",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.TarFile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_class_open_read_xz_literal_path",
+        'import tarfile\n\ndef f(msg):\n    tarfile.TarFile.open("/data/a.tar", "r:xz")\n',
+    ),
+    # A store that cannot replace an opener, or an opener store on another object, leaves the
+    # tarfile.open read split.
+    (
+        "tarfile_read_xz_after_extraction_filter",
+        "import tarfile\n\n"
+        "tarfile.TarFile.extraction_filter = staticmethod(tarfile.data_filter)\n\n"
+        'def f(msg, p):\n    tarfile.open(p, "r:xz")\n',
+    ),
+    (
+        "tarfile_read_xz_after_unrelated_open_store",
+        "import tarfile\n\ndef g(o, c):\n    o.open = c\n\n"
+        'def f(msg, p):\n    tarfile.open(p, "r:xz")\n',
+    ),
+    # A read mode given by keyword to a receiver not resolved as an opener is read whole: a read.
+    ("receiver_open_read_mode_keyword", 'def f(msg, x, p):\n    x.open(p, mode="rb")\n'),
+    # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
+    ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
+    ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
+    # Bindings that extend each other reach the expansion bound on every call through them; with no
+    # import, opener or write method among them, the unread names cannot be a write.
+    (
+        "linked_list_walk",
+        "def f(msg, head):\n    cur = head\n    nxt = cur.next\n    while nxt:\n        cur = nxt\n"
+        "        nxt = cur.next\n    return cur.value()\n",
+    ),
+    (
+        "generic_names_reused_across_functions",
+        "def a(msg, data):\n    resp = data.resp\n    return resp.get()\n\n"
+        "def b(msg, resp):\n    data = resp.data\n    return data.get()\n",
+    ),
+    # The optional-import fallback binds a constant, which has no .open: still the module.
+    (
+        "optional_import_fallback_to_none",
+        "try:\n    import lzma\nexcept ImportError:\n    lzma = None\n\ndef f(msg):\n"
+        '    lzma.open("/data/archive.xz")\n',
+    ),
+    # Default and read modes of the other openers, by slot.
+    ("receiver_open_read_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "r")\n'),
+    ("zipfile_read_default", "import zipfile\n\ndef f(msg, p):\n    zipfile.ZipFile(p)\n"),
+    ("os_fdopen_read_default", "import os\n\ndef f(msg):\n    os.fdopen(3)\n"),
+    ("io_fileio_read_default", "import io\n\ndef f(msg, p):\n    io.FileIO(p)\n"),
+    # Without a fileobj, GzipFile's default mode is a read; a read mode given with one stays a read.
+    ("gzipfile_read_default", "import gzip\n\ndef f(msg, p):\n    gzip.GzipFile(p)\n"),
+    (
+        "gzipfile_fileobj_bytesio",
+        "import gzip\nimport io\n\ndef f(msg):\n    gzip.GzipFile(fileobj=io.BytesIO(msg.raw)).read()\n",
+    ),
+    (
+        "gzipfile_fileobj_read_mode",
+        'import gzip\n\ndef f(msg, h):\n    gzip.GzipFile(fileobj=h, mode="rb")\n',
+    ),
+    # A non-string literal is not a mode, and os.open with read-only flags opens read-only.
+    (
+        "receiver_open_int_slot_one",
+        "import webbrowser\n\ndef f(msg, u):\n    webbrowser.open(u, 2)\n",
+    ),
+    (
+        "os_open_read_flags",
+        "import os\n\ndef f(msg, p):\n    os.open(p, os.O_RDONLY | os.O_CLOEXEC)\n",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "snippet"), FILE_EGRESS_FLAGGED, ids=[c[0] for c in FILE_EGRESS_FLAGGED]
+)
+def test_file_egress_is_flagged(tmp_path: Path, name: str, snippet: str) -> None:
+    # Every case ends on the call under test, and the finding must name that line, so a hit on
+    # another call in the snippet cannot stand in for it.
+    last_line = len(snippet.rstrip("\n").split("\n"))
+    result = _run(tmp_path, snippet)
+    assert f"feed.py:{last_line} [ambient-authority]" in result.detail, f"{name}: {result.detail!r}"
+
+
+@pytest.mark.parametrize(
+    ("name", "snippet"), FILE_EGRESS_CLEAN, ids=[c[0] for c in FILE_EGRESS_CLEAN]
+)
+def test_file_reads_are_not_flagged(tmp_path: Path, name: str, snippet: str) -> None:
+    result = _run(tmp_path, snippet)
+    assert result.skipped, f"{name}: expected no finding, got {result.detail!r}"
+
+
+@pytest.mark.timeout(30)
+def test_alias_lattice_resolves_in_linear_time(tmp_path: Path) -> None:
+    # Each name is bound from the two before it, so there are F(40), about 1.0e8, paths from a39 back
+    # to os.write. Walking every path would hang `messagefoundry check`; each name is expanded once.
+    lines = ["import os", "a0 = os.write", "a1 = a0"]
+    for i in range(2, 40):
+        lines += [f"a{i} = a{i - 1}", f"a{i} = a{i - 2}"]
+    lines += ["", "def f(msg):", "    a39(3, msg.raw)", ""]
+    result = _run(tmp_path, "\n".join(lines))
+    assert "[ambient-authority]" in result.detail
+
+
+def test_a_truncated_alias_expansion_is_flagged(tmp_path: Path) -> None:
+    # Padding a name with hundreds of bindings must not push the real one, os.write, past the bound
+    # unread: a call whose expansion was cut short is flagged.
+    lines = ["import os as o", "w = o.write"]
+    for i in range(180):
+        lines += [f"w = a{i}", f"a{i} = b{i}.c"]
+    lines += ["", "def f(msg):", "    w(3, msg.raw)"]
+    result = _run(tmp_path, "\n".join(lines) + "\n")
+    assert f"feed.py:{len(lines)} [ambient-authority]" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("name", "preamble", "last_binding", "call"),
+    [
+        # each reachable only past the bound, and each read by a different arm of cut_may_hit
+        ("write_method", "", "w = zz.write_text", "def f(msg, zz):\n    w(msg.raw)"),
+        (
+            "path_class",
+            "from pathlib import Path as zz",
+            "w = zz",
+            'def f(msg, m):\n    w("/q").open(m)',
+        ),
+        ("ambient_root", "import shutil as zz", "w = zz.copy", 'def f(msg):\n    w("/i", "/o")'),
+        ("opener_module", "import codecs as zz", "w = zz.open", 'def f(msg, m):\n    w("/i", m)'),
+    ],
+    ids=["write_method", "path_class", "ambient_root", "opener_module"],
+)
+def test_a_cut_expansion_that_reaches_a_hit_is_flagged(
+    tmp_path: Path, name: str, preamble: str, last_binding: str, call: str
+) -> None:
+    # 300 bindings that sort before the real one push it past the bound unread; the call is flagged
+    # because the bindings it follows reach a part or a head a name test reads.
+    lines = [preamble, *(f"w = a{i}" for i in range(300)), last_binding, "", *call.split("\n")]
+    result = _run(tmp_path, "\n".join(lines) + "\n")
+    assert f"feed.py:{len(lines)} [ambient-authority]" in result.detail, (
+        f"{name}: {result.detail!r}"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_bindings_that_lengthen_each_other_stay_bounded(tmp_path: Path) -> None:
+    # A tree walk rebinds a name from itself several ways, and two names that extend each other
+    # would grow without end; neither may make the expansion exponential.
+    snippet = (
+        "def walk(node, msg):\n"
+        "    node = node.left\n"
+        "    node = node.right\n"
+        "    node = node.parent\n"
+        "    a = b.x\n"
+        "    b = a.y\n"
+        "    b = a.z\n"
+        "    node.visit()\n"
+        "    node.visit()\n"
+        "    a.go()\n"
+        "    b.go()\n"
+        "    open(msg, mode)\n"
+    )
+    result = _run(tmp_path, snippet)
+    assert "[ambient-authority]" in result.detail
+
+
 def test_sibling_config_module_import_is_vetted(tmp_path: Path) -> None:
     # `from _sibling import x` where _sibling.py is a config-dir module is first-party, not third-party.
     (tmp_path / "_sibling.py").write_text("VALUE = 1\n", encoding="utf-8")
