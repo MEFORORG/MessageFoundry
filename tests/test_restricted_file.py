@@ -815,10 +815,14 @@ def test_a_walk_that_did_not_finish_is_refused_except_at_a_share() -> None:
 
 
 def _posix_link(
-    path: str, objects: dict[str, tuple[int, int]], links: dict[str, str]
+    path: str,
+    objects: dict[str, tuple[int, int]],
+    links: dict[str, str],
+    mounts: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """:func:`_posix_link_problem` over a stand-in file system: ``objects`` maps a path to its
-    ``(uid, mode)``, ``links`` a link to its target. The engine is :data:`_ENGINE_UID`."""
+    ``(uid, mode)``, ``links`` a link to its target, and ``mounts``, where given, is the mount
+    table. The engine is :data:`_ENGINE_UID`."""
 
     def lstat_fn(part: str) -> PosixStat:
         if part not in objects:
@@ -827,7 +831,12 @@ def _posix_link(
         return PosixStat(uid, mode)
 
     return restricted_file._posix_link_problem(
-        path, cwd="/", euid=_ENGINE_UID, lstat_fn=lstat_fn, readlink_fn=links.__getitem__
+        path,
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn=links.__getitem__,
+        mounts_fn=None if mounts is None else (lambda: mounts),
     )
 
 
@@ -1082,7 +1091,7 @@ def test_a_posix_mount_refusal_names_no_role_its_caller_does_not_hold() -> None:
     )
 
 
-@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "fuse.fuse-overlayfs", "drvfs"])
+@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "fuse", "fuse.fuse-overlayfs"])
 def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
     """A sandbox whose ``/`` is a 9p or virtiofs share would otherwise refuse every key file; a
     delegated mount below ``/`` on the same path is still refused. A network root is the next
@@ -1092,11 +1101,13 @@ def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
     assert "mount of type nfs," in str(_typed_link_problem("/private/tmp/keys/k.key", below))
 
 
-@pytest.mark.parametrize("fstype", ["nfs", "nfs4", "cifs", "smb3", "ceph", "glusterfs"])
-def test_a_posix_network_root_mount_is_refused(fstype: str) -> None:
+@pytest.mark.parametrize(
+    "fstype", ["nfs", "nfs4", "cifs", "smb3", "ceph", "glusterfs", "gfs2", "ocfs2", "drvfs"]
+)
+def test_a_posix_root_mount_of_a_type_no_sandbox_gives_is_refused(fstype: str) -> None:
     """Vault BACKLOG #5636 step 4: the ``/`` exemption, meant for a sandbox's 9p or virtiofs root,
     also passed a host whose root is an NFS export, where the server decides who reaches every
-    file. A network file system is refused at ``/`` too."""
+    file, or a cluster file system other hosts write. Only the sandbox types pass at ``/`` now."""
     problem = _typed_link_problem("/private/tmp/keys/k.key", [("/", fstype)])
     assert problem is not None and f"its path is on a mount of type {fstype}," in problem
     assert not isinstance(problem, restricted_file.UncheckedProblem)
@@ -1150,6 +1161,81 @@ def test_a_posix_path_under_an_automount_point_not_mounted_yet_is_unchecked() ->
     assert "mount of type nfs," in str(_typed_link_problem("/private/tmp/keys/k.key", nfs))
 
 
+def test_a_posix_indirect_automount_folder_is_judged_by_the_mount_below_it() -> None:
+    """An indirect automount map's own folder, such as ``/home``, stays ``autofs`` after the mount
+    below it is made, so the mount below decides: a local one passes, a refused one is refused.
+    With no mount below it, the path is not fully checked (the test above)."""
+    indirect = [("/", "ext4"), ("/private", "autofs"), ("/private/tmp", "ext4")]
+    assert _typed_link_problem("/private/tmp/keys/k.key", indirect) is None
+    nfs = [("/", "ext4"), ("/private", "autofs"), ("/private/tmp", "nfs")]
+    assert "mount of type nfs," in str(_typed_link_problem("/private/tmp/keys/k.key", nfs))
+
+
+def test_a_posix_mount_table_answering_none_judges_no_type() -> None:
+    """A ``mounts_fn`` that answers ``None``, as the host's does where the table cannot be read, is
+    no table: no type is judged, and the answer is not :data:`MOUNT_TABLE_INCOMPLETE`, which is for
+    a table that reads."""
+    problem = restricted_file._posix_link_problem(
+        "/private/tmp/keys/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lambda part: PosixStat(*_key_tree_entry(part)),
+        readlink_fn=lambda _part: "",
+        mounts_fn=lambda: None,
+    )
+    assert problem is None
+
+
+def test_a_posix_link_finding_is_answered_before_an_unchecked_mount_table() -> None:
+    """A link another account can change is a finding, answered in place of the not-fully-checked
+    answer a table holding no mount for the path gives, so a caller that only warns prints it."""
+    shared = {
+        **_KEY_TREE,
+        "/srv": (0, stat.S_IFDIR | 0o775),
+        "/srv/keys": (0, stat.S_IFLNK | 0o777),
+    }
+    problem = _posix_link(
+        "/srv/keys/k.key", shared, {"/srv/keys": "/private/tmp/keys"}, [("/no/such", "ext4")]
+    )
+    assert (
+        problem is not None and "can be changed by an account this check does not trust" in problem
+    )
+    assert not isinstance(problem, restricted_file.UncheckedProblem)
+
+
+def test_a_posix_automount_root_is_walked_again_once_mounted() -> None:
+    """Vault BACKLOG #5636 step 2: the walk's read of an automount point returns the placeholder
+    the automounter keeps there, and a read below it makes the mount. The tables before and after
+    the walk then place that folder on different mounts, so the walk runs again and reads the
+    mounted folder's own mode: here a group may write it, with a link in it, which is refused."""
+    mounted = {"made": False}
+    tree = {
+        **_KEY_TREE,
+        "/srv": _ROOT_DIR,
+        "/srv/auto/link": (0, stat.S_IFLNK | 0o777),
+    }
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part == "/srv/auto":
+            return PosixStat(0, stat.S_IFDIR | (0o775 if mounted["made"] else 0o755))
+        if part.startswith("/srv/auto/"):
+            mounted["made"] = True
+        if part not in tree:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        return PosixStat(*tree[part])
+
+    pending = [("/", "ext4"), ("/srv/auto", "autofs")]
+    problem = restricted_file._posix_link_problem(
+        "/srv/auto/link/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn={"/srv/auto/link": "/private/tmp/keys"}.__getitem__,
+        mounts_fn=lambda: [*pending, ("/srv/auto", "ext4")] if mounted["made"] else pending,
+    )
+    assert problem is not None and "a folder holding or above a junction or link" in problem
+
+
 def test_a_posix_finding_is_answered_before_an_unchecked_mount_table() -> None:
     """A part no mount holds leaves its type unjudged, not the rest: a refused type elsewhere on
     the path is a finding, answered in its place."""
@@ -1200,13 +1286,25 @@ _TREE_KEY = "/private/tmp/keys/k.key"
 def test_a_posix_mount_the_walk_itself_makes_is_judged(monkeypatch: pytest.MonkeyPatch) -> None:
     """Vault BACKLOG #5636 step 2: the table was read once, before the walk, so a mount the walk's
     own reads made, as reading below an automount point does, was not judged. The table is now
-    read after the walk. The control is the same walk making no mount."""
+    read after the walk too. The control is the same walk making no mount."""
     local = [("/", "ext4")]
     _fake_posix_host(monkeypatch, local, mounts=(_TREE_KEY, [*local, ("/private/tmp/keys", "nfs")]))
     problem = restricted_file._posix_host_link_problem(Path(_TREE_KEY))
     assert problem is not None and "mount of type nfs," in problem
     _fake_posix_host(monkeypatch, local)
     assert restricted_file._posix_host_link_problem(Path(_TREE_KEY)) is None
+
+
+def test_a_posix_mount_gone_by_the_end_of_the_walk_is_still_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #5636: the table is read before the walk as well as after it, so a mount on
+    the path while the walk ran, such as a FUSE mount unmounted before the second read, is judged
+    by the first."""
+    fuse = [("/", "ext4"), ("/private/tmp/keys", "fuse.sshfs")]
+    _fake_posix_host(monkeypatch, fuse, mounts=(_TREE_KEY, [("/", "ext4")]))
+    problem = restricted_file._posix_host_link_problem(Path(_TREE_KEY))
+    assert problem is not None and "mount of type fuse.sshfs," in problem
 
 
 def test_a_posix_automount_point_the_walk_mounts_is_judged_by_what_it_mounted(

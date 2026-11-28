@@ -498,8 +498,8 @@ than a path is not checked
   read, the path is refused. It does not judge mount types where it cannot read that file, for
   example on macOS and the BSDs, whose mount tables it does not read. The secrets directory's own
   check refuses such a mount on its path too, under either enforcement setting. The list of types
-  is open: it does not judge at least a type it does not name, the mount at `/` unless it is a
-  network file system such as NFS or CIFS, a network file system beneath an overlay mount, or a
+  is open: it does not judge at least a type it does not name, a `9p`, `virtiofs` or FUSE mount at
+  `/`, as a sandbox's root can be, a network file system beneath an overlay mount, or a
   file in the secrets directory that is a mount of its own. Where that file reads but lists no
   mount under a part of the path, as in a chroot whose root is not a mount, or lists one there
   only as an automount point not mounted yet, the path is answered as not fully checked, as where

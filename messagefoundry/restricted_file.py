@@ -74,6 +74,7 @@ from messagefoundry.auth.anchor_path import (
     SHARE_CAUSE,
     SYSTEM_SID,
     ChainFinding,
+    PathVerdict,
     PosixStat,
     WalkCause,
     WinHost,
@@ -98,6 +99,7 @@ __all__ = [
     "DELETE_ACCESS",
     "LINUX_CREDENTIAL_FILE_SYSTEMS",
     "LINUX_HOST_FILE_SYSTEMS",
+    "MOUNT_TABLE_INCOMPLETE",
     "MOUNT_TABLE_UNREAD",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
@@ -1123,16 +1125,27 @@ def _posix_parent(path: Path) -> Path:
     return path / ".." if path.name in {"", ".."} else path.parent
 
 
-#: Of the types below, those a server on another host serves. They are refused at ``/`` too (vault
-#: BACKLOG #5636): a host whose root is an NFS export, as a diskless one boots, leaves who may reach
-#: every file on it to that server.
-_POSIX_NETWORK_FILE_SYSTEMS = frozenset(
+#: The types in :data:`_POSIX_DELEGATED_FILE_SYSTEMS` not judged at ``/``: a sandbox whose root is
+#: a ``9p`` or ``virtiofs`` share, or a ``fuse`` overlay such as ``fuse.fuse-overlayfs``, as at
+#: least some container runtimes give, would otherwise refuse every key. Every other delegated type
+#: is refused at ``/`` too (vault BACKLOG #5636): a host whose root is an NFS export, as a diskless
+#: one boots, or a cluster file system other hosts write, leaves who may reach every file on it to
+#: them.
+_POSIX_SANDBOX_ROOT_FILE_SYSTEMS = frozenset({"9p", "virtiofs", "fuse"})
+#: At least these Linux file system types, and every subtype of one, such as ``fuse.sshfs``, leave
+#: who may read or replace a file to a server, another host or operating system, or a user-space
+#: program, so the owner and mode bits they report can look clean while another account can still
+#: reach the file (vault BACKLOG #5657 step 6 (f)). A type not named here is not judged by this
+#: rule. Unlike the closed lists elsewhere in this module, this list is open, so a type it misses
+#: passes.
+_POSIX_DELEGATED_FILE_SYSTEMS = _POSIX_SANDBOX_ROOT_FILE_SYSTEMS | frozenset(
     {
         "nfs",
         "nfs4",
         "cifs",
         "smb3",
         "smbfs",
+        "fuseblk",
         "ceph",
         "afs",
         "coda",
@@ -1142,24 +1155,8 @@ _POSIX_NETWORK_FILE_SYSTEMS = frozenset(
         "orangefs",
         "pvfs2",
         "glusterfs",
-    }
-)
-#: At least these Linux file system types, and every subtype of one, such as ``fuse.sshfs``, leave
-#: who may read or replace a file to a server, another host or operating system, or a user-space
-#: program, so the owner and mode bits they report can look clean while another account can still
-#: reach the file (vault BACKLOG #5657 step 6 (f)). A type not named here is not judged by this
-#: rule. Unlike the closed lists elsewhere in this module, this list is open, so a type it misses
-#: passes.
-_POSIX_DELEGATED_FILE_SYSTEMS = _POSIX_NETWORK_FILE_SYSTEMS | frozenset(
-    {
-        # Not judged at ``/``: a sandbox whose root is one of these, as at least some container
-        # runtimes give, would otherwise refuse every key.
-        "9p",
-        "fuse",
-        "fuseblk",
         "ocfs2",
         "gfs2",
-        "virtiofs",
         "vboxsf",
         "drvfs",
         "fakeowner",
@@ -1168,18 +1165,46 @@ _POSIX_DELEGATED_FILE_SYSTEMS = _POSIX_NETWORK_FILE_SYSTEMS | frozenset(
 #: The characters a type name the refusal quotes may hold. A FUSE subtype is chosen by whoever
 #: mounts it, so any other name is not quoted.
 _PRINTABLE_FILE_SYSTEM_TYPE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
-#: The type ``/proc/self/mountinfo`` gives an automount point an automounter has not mounted yet.
-#: The file system that will be mounted there is not named, so a path under one is not judged.
+#: The type ``/proc/self/mountinfo`` gives an automount point. Until the automounter mounts a file
+#: system on it, the type that file system will have is not named.
 _POSIX_AUTOMOUNT_TYPE = "autofs"
 
 
 def _posix_mount_refused(point: str, fstype: str) -> bool:
     """Whether a path on the mount at ``point`` of type ``fstype``, as ``/proc/self/mountinfo``
-    names it, is refused for its type: a type in :data:`_POSIX_DELEGATED_FILE_SYSTEMS`, at ``/``
-    only one in :data:`_POSIX_NETWORK_FILE_SYSTEMS`, or a subtype of one, such as ``fuse.sshfs`` or
-    ``fuseblk.ntfs-3g``."""
+    names it, is refused for its type: a type in :data:`_POSIX_DELEGATED_FILE_SYSTEMS`, or a
+    subtype of one, such as ``fuse.sshfs`` or ``fuseblk.ntfs-3g``, and at ``/`` not one in
+    :data:`_POSIX_SANDBOX_ROOT_FILE_SYSTEMS`."""
     base = fstype.split(".", 1)[0]
-    return base in (_POSIX_NETWORK_FILE_SYSTEMS if point == "/" else _POSIX_DELEGATED_FILE_SYSTEMS)
+    if base not in _POSIX_DELEGATED_FILE_SYSTEMS:
+        return False
+    return point != "/" or base not in _POSIX_SANDBOX_ROOT_FILE_SYSTEMS
+
+
+def _posix_mounts_judged(
+    visited: Sequence[str], table: list[tuple[str, str]]
+) -> tuple[str | None, bool]:
+    """The first refused type a ``table`` of ``(mount point, type)`` places a ``visited`` part on
+    (:func:`_posix_mount_refused`), and whether some part has no type judged: no mount in the table
+    holds it, as a table read inside a chroot whose root is not a mount can leave, or it is on an
+    ``autofs`` mount and no part visited below it is on another mount. An indirect automount map's
+    own folder, such as ``/home``, stays ``autofs`` once the mount below it is made, so the mount
+    below decides. Kept free of I/O."""
+    placed = [(part, mount_of(part, table)) for part in visited]
+    refused: str | None = None
+    unjudged = False
+    for part, mounted in placed:
+        if mounted is None:
+            unjudged = True
+        elif mounted[1] == _POSIX_AUTOMOUNT_TYPE:
+            below = part.rstrip("/") + "/"
+            unjudged = unjudged or not any(
+                other.startswith(below) and held is not None and held[1] != _POSIX_AUTOMOUNT_TYPE
+                for other, held in placed
+            )
+        elif refused is None and _posix_mount_refused(*mounted):
+            refused = mounted[1]
+    return refused, unjudged
 
 
 class UncheckedProblem(str):
@@ -1190,22 +1215,24 @@ class UncheckedProblem(str):
     clears it, so a caller says that ``path`` could not be fully checked and appends no
     owner-and-mode remedy of its own. Told apart from a finding by its type, never by its text.
     The type is lost by any operation that builds a new string, so a caller tests the answer as
-    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`) is answered this
+    returned. At least the unread Linux mount table (:data:`MOUNT_TABLE_UNREAD`) and one that
+    leaves a part of the path with no type judged (:data:`MOUNT_TABLE_INCOMPLETE`) are answered this
     way; other answers that the check could not be completed are still plain strings."""
 
     __slots__ = ()
 
+
+#: The sentence both not-fully-checked mount answers end with.
+_MOUNT_TABLE_NOT_CLEARED = (
+    "Changing the owner or mode of the checked path or of the folders above it, or replacing what "
+    "is at that path, does not clear it"
+)
 
 #: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
 #: ``/proc/self/mountinfo`` cannot be read and the rest of its POSIX check, the path walk and the
 #: holding folder's owner and mode, finds nothing; a finding there is answered in its place, and
 #: under ``holder_judged`` the walk, and so this answer, does not run. It is worded for a refusal
 #: and a warning alike, since a caller may give either.
-#: The sentence both not-fully-checked mount answers end with.
-_MOUNT_TABLE_NOT_CLEARED = (
-    "Changing the owner or mode of the checked path or of the folders above it, or replacing what "
-    "is at that path, does not clear it"
-)
 MOUNT_TABLE_UNREAD: Final = (
     "/proc/self/mountinfo could not be read, so the type of the file system under the checked "
     "path, and of the folders its path runs through, was not judged. This clears once the engine "
@@ -1216,14 +1243,16 @@ MOUNT_TABLE_UNREAD: Final = (
 #: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
 #: ``/proc/self/mountinfo`` reads but lists no mount holding a part of the checked path, as a table
 #: read inside a chroot whose root is not a mount can, or holds one there only as an automount
-#: point not mounted yet (vault BACKLOG #5636). Answered, like :data:`MOUNT_TABLE_UNREAD`, only
-#: where the rest of the POSIX check finds nothing, and worded for a refusal and a warning alike.
+#: point not mounted yet (:func:`_posix_mounts_judged`, vault BACKLOG #5636). Answered, like
+#: :data:`MOUNT_TABLE_UNREAD`, only where the rest of the POSIX check finds nothing, and worded for
+#: a refusal and a warning alike.
 MOUNT_TABLE_INCOMPLETE: Final = (
     "/proc/self/mountinfo lists no mount holding at least one folder or file on the checked path, "
     "or lists one there only as an automount point not mounted yet, so the type of the file system "
     "there was not judged. A mount table read inside a chroot whose root is not a mount can do "
     "this. This clears once the engine runs where /proc/self/mountinfo lists the mount under every "
-    "part of the checked path, for example outside such a chroot. " + _MOUNT_TABLE_NOT_CLEARED
+    "part of the checked path, for example outside such a chroot, or once an automount point the "
+    "checked path names is mounted before the engine starts. " + _MOUNT_TABLE_NOT_CLEARED
 )
 
 
@@ -1248,17 +1277,16 @@ def _posix_link_problem(
     can change passes, such as macOS ``/tmp`` or an ostree host's ``/home``.
 
     ``mounts_fn`` answers the mount table as ``(mount point, type)`` pairs, or ``None`` where it
-    cannot be read. It is called once, after the walk, since the walk's own reads can make a mount,
-    such as an automount below a folder it passes (vault BACKLOG #5636). Each file or folder the
-    walk visited is then placed on a mount by
-    :func:`~messagefoundry.auth.anchor_path.mount_of`, and one on a mount of a type
-    :func:`_posix_mount_refused` refuses is refused, since the owner and mode bits this whole check
-    reads are not what decides who reaches the file there (vault BACKLOG #5657 step 6 (f)). At
-    ``/`` only a network file system is refused (vault BACKLOG #5636). A type the rule does not
-    name is not judged, and no type is when ``mounts_fn`` is left out or answers ``None``. A
-    visited part no mount in the table holds, or one held only by an ``autofs`` mount the
-    automounter has not mounted, has no type judged, so where nothing else is found the answer is
-    :data:`MOUNT_TABLE_INCOMPLETE`, an :class:`UncheckedProblem` (vault BACKLOG #5636). A local
+    cannot be read; no type is judged when it is left out or every call answers ``None``. It is
+    called before the walk and again after it, since the walk's own reads can make a mount, such as
+    an automount below a folder it passes, and a mount can also go between the two reads (vault
+    BACKLOG #5636). Where the two tables place a visited part on different mounts, the walk runs
+    again, since the owner and mode it read at that point may be the ones from before the mount was
+    made. Each visited file or folder is then judged by :func:`_posix_mounts_judged`: one either
+    table places on a type :func:`_posix_mount_refused` refuses is refused, since the owner and mode
+    bits this whole check reads are not what decides who reaches the file there (vault BACKLOG
+    #5657 step 6 (f)); where a part has no type judged by the later table, and nothing else is
+    found, the answer is :data:`MOUNT_TABLE_INCOMPLETE`, an :class:`UncheckedProblem`. A local
     mount that a later mount on a folder above it hides is judged by that later mount, since the
     walk visits that folder, which ``mount_of`` places on it. Kept free of I/O so the decision is
     testable everywhere."""
@@ -1276,32 +1304,41 @@ def _posix_link_problem(
         # The walk's own type rule is not this one, so it is told every type is one it trusts.
         return ("/", "ext4")
 
-    verdict = posix_path_verdict(
-        path,
-        cwd=cwd,
-        euid=euid,
-        lstat_fn=recording,
-        readlink_fn=readlink_fn,
-        fstype_fn=typed,
-    )
-    table = None if mounts_fn is None else mounts_fn()
-    delegated: dict[str, str] = {}
+    def walk() -> PathVerdict:
+        links.clear()
+        visited.clear()
+        return posix_path_verdict(
+            path, cwd=cwd, euid=euid, lstat_fn=recording, readlink_fn=readlink_fn, fstype_fn=typed
+        )
+
+    before = None if mounts_fn is None else mounts_fn()
+    verdict = walk()
+    first = list(visited)
+    after = None if mounts_fn is None else mounts_fn()
+    if (
+        before is not None
+        and after is not None
+        and [mount_of(part, before) for part in first] != [mount_of(part, after) for part in first]
+    ):
+        verdict = walk()
+    refused: str | None = None
     unjudged = False
-    for mounted in [] if table is None else [mount_of(part, table) for part in visited]:
-        if mounted is None or mounted[1] == _POSIX_AUTOMOUNT_TYPE:
-            unjudged = True
-        elif _posix_mount_refused(*mounted):
-            delegated.setdefault(mounted[0], mounted[1])
+    if before is not None:
+        refused, unjudged = _posix_mounts_judged(first, before)
+    if after is not None:
+        # The later table decides what was not judged; either table's refusal stands.
+        found, unjudged = _posix_mounts_judged(visited, after)
+        refused = refused or found
 
     def above_a_link(folder: str) -> bool:
         prefix = folder.rstrip("/") + "/"
         return any(link.startswith(prefix) for link in links)
 
-    if delegated:
+    if refused is not None:
         # The mount point is a path; this text names none. "It" is whatever the caller names, a key
         # file, the secrets directory or the custody directory, so the remedy is the same for each
         # and names no role (vault BACKLOG #5657).
-        fstype = next(iter(delegated.values()))
+        fstype = refused
         shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
         return (
             f"its path is on a mount of type {shown}, where something other than the owner and "
@@ -1339,9 +1376,9 @@ def _posix_host_link_problem(path: Path) -> str | None:
     ``path`` or its folders does. Elsewhere, for example on macOS and the BSDs, which have mount
     tables this does not read, no type is judged. Where the table is read, a part of the path no
     mount it lists holds, as a table read inside a chroot whose root is not a mount can leave, is
-    answered as not judged (:data:`MOUNT_TABLE_INCOMPLETE`). The table is read after the walk,
-    whose own reads can make a mount, such as an automount below a folder it passes, so that mount
-    is judged too (vault BACKLOG #5636). A type the rule does not name is still not judged. ``docs/PHI.md`` lists at least these cases
+    answered as not judged (:data:`MOUNT_TABLE_INCOMPLETE`). The table is read before and after
+    the walk, as :func:`_posix_link_problem` says. A type the rule does not name is still not
+    judged. ``docs/PHI.md`` lists at least these cases
     too. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
@@ -1368,13 +1405,11 @@ def _posix_host_link_problem(path: Path) -> str | None:
             raise OSError(*failed)
         return target
 
-    unread = False
+    tables: list[list[tuple[str, str]] | None] = []
 
     def mounts_fn() -> list[tuple[str, str]] | None:
-        nonlocal unread
-        table = read_mounts()
-        unread = table is None
-        return table
+        tables.append(read_mounts())
+        return tables[-1]
 
     try:
         # With no table the walk still runs, judging links and folders with no type judged, so a
@@ -1389,7 +1424,11 @@ def _posix_host_link_problem(path: Path) -> str | None:
         )
     except OSError as exc:  # the working directory, which the walk does not guard
         return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
-    if problem is None and unread and sys.platform.startswith("linux"):
+    if (
+        problem is None
+        and all(table is None for table in tables)
+        and sys.platform.startswith("linux")
+    ):
         return UncheckedProblem(MOUNT_TABLE_UNREAD)
     return problem
 
@@ -1525,9 +1564,10 @@ def broad_access_problem(
     read, the walk below also refuses a path on a mount of at least the types
     :func:`_posix_mount_refused` refuses, since those owner and mode bits do not decide who
     reaches the file there; the list is open, so a type it does not name passes. That walk, and
-    with it the mount check, is skipped under ``holder_judged``. Its refusal where the table
-    cannot be read, and at least some of what it does not judge, are
-    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. That answer
+    with it the mount check, is skipped under ``holder_judged``. Its answers where the table
+    cannot be read (:data:`MOUNT_TABLE_UNREAD`) or reads but leaves a part of the path with no type
+    judged (:data:`MOUNT_TABLE_INCOMPLETE`), and at least some of what it does not judge, are
+    :func:`_posix_host_link_problem`'s, and ``docs/PHI.md`` lists at least those too. Each answer
     is an :class:`UncheckedProblem`, told apart by its type: the check was not completed, though the
     file's own owner and mode were judged first, and the text carries its own remedy. It is
     answered only where the walk, which still runs with no type judged, and the holding folder's
