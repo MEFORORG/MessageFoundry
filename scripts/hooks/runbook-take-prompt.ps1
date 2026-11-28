@@ -53,7 +53,8 @@ try {
     $raw = Read-CcxHookInput
     $session = Resolve-CcxHookSession -Text $raw -ReadOnly
     $sessionId = [string]$session.SessionId
-    if ($sessionId -notmatch '^[A-Za-z0-9_-]{1,100}$') { exit 0 }
+    # \z, not $: $ also matches before a final newline.
+    if ($sessionId -cnotmatch '\A[A-Za-z0-9_-]{1,100}\z') { exit 0 }
 
     # The resolver's answer only; the header's WHICH WORKTREE says why there is no fallback.
     $root = $session.Root
@@ -80,10 +81,12 @@ try {
         }
     }
 
-    # The seat marker seat.ps1 -Declare writes; a plain label or nothing.
+    # The seat marker seat.ps1 -Declare writes, read in wiki-write-prompt.ps1's Get-Seat order: the
+    # Codex state path when set, else .claude/, else $env:KORUS_SEAT. A plain label or nothing.
     $seat = ''
     try {
-        $marker = Join-Path $root '.claude/seat.local.txt'
+        $rel = if ($env:KORUS_AGENT -eq 'codex' -and $env:KORUS_STATE_REL) { "$env:KORUS_STATE_REL/seat.local.txt" } else { '.claude/seat.local.txt' }
+        $marker = Join-Path $root $rel
         if (Test-Path -LiteralPath $marker -PathType Leaf) { $seat = [string](Get-Content -LiteralPath $marker -Raw) }
     }
     catch { }

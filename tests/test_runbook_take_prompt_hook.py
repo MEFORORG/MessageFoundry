@@ -99,7 +99,7 @@ def test_a_holder_naming_this_session_id_is_ours_and_a_longer_worktree_name_is_n
 def test_session_names_match_what_holder_text_prints() -> None:
     names = rt.session_names("C:/wt/my wt+1", "0123456789")
     holder = rt.holder_text("manager", "my wt+1", "0123456789")
-    assert names == ("mywt1", "01234567") and rt.names_us(holder, names)
+    assert names == ("mywt1", "01234567", "0123456789") and rt.names_us(holder, names)
 
 
 @pytest.mark.parametrize(
@@ -135,6 +135,20 @@ def test_key_readings() -> None:
     assert rt.key_targets("batches-462-465") == (set(), {462, 463, 464, 465})
     assert rt.key_targets("2026-11-27-notes") == ({2026}, set())
     assert rt.key_targets("1719-items-22-35") == ({1719}, set())
+    assert rt.key_targets("batch-472-2026-11-27") == (set(), {472})
+
+
+def test_a_holder_cell_with_the_full_session_id_is_ours() -> None:
+    sid = "bb735675-ef99-4846-ae70-f3e56da8e810"
+    names = rt.session_names("C:/x/manager-wt", sid)
+    book = _book({510: ("TAKEN", "T", f"Manager {sid}")}, {9010: [(510, "")]})
+    assert rt.pending_batches(["9010"], book, names) == []
+
+
+def test_a_shared_row_held_under_our_batch_past_open_is_still_satisfied() -> None:
+    rows = {9006: [(507, "PR open in 3400"), (506, "Not started")]}
+    book = _book({506: ("FREE", "FREE", ""), 507: ("PR OPEN", "PR OPEN", f"M {WT} (s)")}, rows)
+    assert rt.pending_batches(["9006"], book, NAMES) == []
 
 
 def test_a_batch_key_names_its_batch() -> None:
@@ -234,20 +248,52 @@ def test_run_warns_once_per_cooldown_and_caches_the_workbook_read(
     assert rt.main(_args(tmp_path, wt, claims, workbook, 1000.0 + rt.COOLDOWN_SECONDS + 1)) == 0
     assert "--take 501" in capsys.readouterr().out
     assert len(reads) == 1
+    # A clock set back leaves a stamp in the future, which must not silence the warning.
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 10.0)) == 0
+    assert "--take 501" in capsys.readouterr().out
 
 
-def test_a_builder_seat_is_never_warned(
+def test_an_unreadable_claim_is_reported_and_not_cached(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """claim.ps1 creates a claim file before it writes it, and the write moves no directory
+    mtime, so a scan that met an empty file must not be cached against the directory."""
+    wt = tmp_path / WT
+    wt.mkdir()
+    workbook = tmp_path / "wb.xlsx"
+    workbook.write_bytes(b"x")
+    claims = _claims(tmp_path, wt)
+    (claims / "9001.json").write_text("", "utf-8")
+    monkeypatch.setattr(
+        rt, "read_book", lambda path: _book({501: ("FREE", "FREE", "")}, {9001: [(501, "")]})
+    )
+    mtime = claims.stat().st_mtime_ns
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0)) == 0
+    first = capsys.readouterr()
+    assert first.out == "" and "unreadable" in first.err
+    (claims / "9001.json").write_text(json.dumps({"key": "9001", "worktree": str(wt)}), "utf-8")
+    os.utime(claims, ns=(mtime, mtime))
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 2.0)) == 0
+    assert "--take 501" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("seat", ["builder", "lander", "watchdog"])
+def test_a_seat_that_never_takes_a_batch_is_never_warned(
+    seat: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     wt = tmp_path / WT
     wt.mkdir()
     workbook = tmp_path / "wb.xlsx"
     workbook.write_bytes(b"x")
     claims = _claims(tmp_path, wt, "9001")
-    monkeypatch.setattr(rt, "read_book", lambda path: _book({501: ("FREE", "FREE", "")}, {}))
-    args = _args(tmp_path, wt, claims, workbook, 1.0, "--seat", "builder")
-    assert rt.main(args) == 0
+    monkeypatch.setattr(
+        rt, "read_book", lambda path: _book({501: ("FREE", "FREE", "")}, {9001: [(501, "")]})
+    )
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0, "--seat", seat)) == 0
     assert capsys.readouterr().out == ""
+    # The control: the same state under a Manager warns.
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0, "--seat", "manager")) == 0
+    assert "--take 501" in capsys.readouterr().out
 
 
 def test_run_is_quiet_with_no_claims_for_this_worktree(
@@ -366,6 +412,26 @@ def _git_repo(path: Path) -> Path:
     return path
 
 
+def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A primary checkout and a linked worktree of it named WT, as a fleet session has. The claims
+    live in the primary's registry and name the linked worktree."""
+    primary = _git_repo(tmp_path / "primary")
+    wt = tmp_path / WT
+    subprocess.run(
+        ["git", "-C", str(primary), "worktree", "add", "-q", "--detach", str(wt)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    (primary / ".git" / "mefor-coord" / "claims").mkdir(parents=True)
+    return primary, wt
+
+
+def _claim(primary: Path, key: str, worktree: Path) -> None:
+    claims = primary / ".git" / "mefor-coord" / "claims"
+    (claims / f"{key}.json").write_text(
+        json.dumps({"key": key, "worktree": str(worktree)}), "utf-8"
+    )
+
+
 def _env(**extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("MEFOR_", "CLAUDE_", "KORUS_"))}
     env.update(extra)
@@ -376,7 +442,7 @@ def _hook(
     payload: str, env: dict[str, str], cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     # The hook answers only for a cwd inside the checkout it started in (_hookinput.ps1, rule 4),
-    # so a run that should warn starts in the fixture repository, as the shim starts in the session's.
+    # so a run that should warn starts in the fixture worktree, as the shim starts in the session's.
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
         input=payload, capture_output=True, text=True, timeout=TIMEOUT, env=env, check=False,
@@ -389,7 +455,9 @@ def _payload(cwd: Path, session: str = "sess-e2e-1") -> str:
 
 
 @needs_pwsh
-@pytest.mark.parametrize("stdin", ["", "not json", "[1,2]", '{"session_id": "../x"}'])
+@pytest.mark.parametrize(
+    "stdin", ["", "not json", "[1,2]", '{"session_id": "../x"}', '{"session_id": "abc\\n"}']
+)
 def test_the_hook_exits_0_and_prints_nothing_on_bad_input(stdin: str) -> None:
     proc = _hook(stdin, _env())
     assert proc.returncode == 0 and proc.stdout == ""
@@ -397,15 +465,25 @@ def test_the_hook_exits_0_and_prints_nothing_on_bad_input(stdin: str) -> None:
 
 @needs_pwsh
 def test_the_hook_is_quiet_when_the_workbook_is_missing(tmp_path: Path) -> None:
-    repo = _git_repo(tmp_path / WT)
-    claims = repo / ".git" / "mefor-coord" / "claims"
-    claims.mkdir(parents=True)
-    (claims / "9001.json").write_text(json.dumps({"key": "9001", "worktree": str(repo)}), "utf-8")
-    env = _env(
-        MEFOR_RUNBOOK_PYTHON=sys.executable, MEFOR_RUNBOOK_WORKBOOK=str(tmp_path / "no.xlsx")
+    """With a negative control: the same run with a workbook present reaches the helper, which
+    says on stderr why it printed nothing (this venv has no openpyxl, or the file is no xlsx)."""
+    primary, wt = _linked_worktree(tmp_path)
+    _claim(primary, "9001", wt)
+    present = tmp_path / "present.xlsx"
+    present.write_bytes(b"not a workbook")
+    reached = _hook(
+        _payload(wt),
+        _env(MEFOR_RUNBOOK_PYTHON=sys.executable, MEFOR_RUNBOOK_WORKBOOK=str(present)),
+        cwd=wt,
     )
-    proc = _hook(_payload(repo), env)
-    assert proc.returncode == 0 and proc.stdout == ""
+    assert reached.returncode == 0 and reached.stdout == ""
+    assert "runbook-take-prompt: nothing printed" in reached.stderr, reached.stderr
+    missing = _hook(
+        _payload(wt),
+        _env(MEFOR_RUNBOOK_PYTHON=sys.executable, MEFOR_RUNBOOK_WORKBOOK=str(tmp_path / "no.xlsx")),
+        cwd=wt,
+    )
+    assert missing.returncode == 0 and missing.stdout == "" and missing.stderr == ""
 
 
 def _openpyxl_python() -> str | None:
@@ -444,14 +522,13 @@ def test_the_hook_end_to_end_on_a_real_workbook(tmp_path: Path, key: str, warns:
     py = _openpyxl_python()
     if py is None:
         pytest.skip("no interpreter with openpyxl (set MEFOR_RUNBOOK_PYTHON)")
-    repo = _git_repo(tmp_path / WT)
+    primary, wt = _linked_worktree(tmp_path)
     workbook = tmp_path / "wb.xlsx"
     subprocess.run(
         [py, "-c", _FIXTURE, str(workbook), f"Manager {WT} (sess-e2e)"], check=True, timeout=TIMEOUT
     )
-    claims = repo / ".git" / "mefor-coord" / "claims"
-    claims.mkdir(parents=True)
-    (claims / f"{key}.json").write_text(json.dumps({"key": key, "worktree": str(repo)}), "utf-8")
+    _claim(primary, key, wt)
+    _claim(primary, "9001-primary", primary)
     env = _env(
         MEFOR_RUNBOOK_PYTHON=py,
         MEFOR_RUNBOOK_WORKBOOK=str(workbook),
@@ -459,9 +536,12 @@ def test_the_hook_end_to_end_on_a_real_workbook(tmp_path: Path, key: str, warns:
     )
     # Started in ANOTHER repository, the resolver refuses the cwd, and the hook must not follow it.
     elsewhere = _git_repo(tmp_path / "elsewhere")
-    refused = _hook(_payload(repo), env, cwd=elsewhere)
+    refused = _hook(_payload(wt), env, cwd=elsewhere)
     assert refused.returncode == 0 and refused.stdout == "", refused.stdout
-    proc = _hook(_payload(repo), env, cwd=repo)
+    # The primary checkout is shared by unrelated sessions, so its own claims prompt nobody.
+    in_primary = _hook(_payload(primary, "sess-primary"), env, cwd=primary)
+    assert in_primary.returncode == 0 and in_primary.stdout == "", in_primary.stdout
+    proc = _hook(_payload(wt), env, cwd=wt)
     assert proc.returncode == 0, proc.stderr
     if not warns:
         assert proc.stdout == "", proc.stdout
@@ -472,7 +552,7 @@ def test_the_hook_end_to_end_on_a_real_workbook(tmp_path: Path, key: str, warns:
         f'--holder "<seat> {WT} (sess-e2e)"'
     )
     assert want in msg, msg
-    again = _hook(_payload(repo), env, cwd=repo)
+    again = _hook(_payload(wt), env, cwd=wt)
     assert again.returncode == 0 and again.stdout == "", (
         "a second Stop inside the cooldown is quiet"
     )

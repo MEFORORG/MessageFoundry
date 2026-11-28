@@ -51,6 +51,10 @@ from types import ModuleType
 from typing import Any
 
 COOLDOWN_SECONDS = 30 * 60
+STATE_RETENTION_DAYS = 14
+# Seats that never take a batch: a Manager does. A Builder's claims sit under its Manager's hold,
+# and the Lander and Watchdog claim rows to land or watch them, not to build a batch.
+NEVER_TAKES = frozenset({"builder", "lander", "watchdog"})
 
 # Claim-key readings, built from read_batch.py's patterns but narrower, because here a false warning
 # costs more than a missed one. A key that mentions a batch names the batches it marks and every
@@ -61,6 +65,7 @@ _BATCH_MARK = re.compile(r"(?i)(?:batch(?:es)?[-_. ]?|(?<![a-z0-9])b[-_.]?)(\d+)
 _NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)")
 _RANGE = re.compile(r"(?<!\d)(\d{1,6})\s*[-–]\s*(\d{1,6})(?!\d)")
 _LEADING = re.compile(r"^(\d{1,6})(?!\d)")
+_DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
 RANGE_MAX = 100
 # read_batch.py's _FINISHED, applied to the upper-cased queue Status: a batch finished there is no
 # batch to take. Its State column is checked against the --done states that end a batch.
@@ -72,7 +77,7 @@ _ENDED_STATES = ("MERGED", "BUILT", "DONE")
 _OPEN_ROW = re.compile(r"^\s*(Not started|In progress)\b")
 _SAFE_LABEL = re.compile(r"[^A-Za-z0-9._-]")
 _SEAT = re.compile(r"[a-z][a-z0-9-]{0,39}")
-_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
+_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
 
 
 @dataclass(frozen=True)
@@ -123,7 +128,8 @@ def key_targets(key: str) -> tuple[set[int], set[int]]:
             lo, hi = int(a), int(b)
             if lo in batches and lo < hi <= lo + RANGE_MAX:
                 batches.update(range(lo, hi + 1))
-        return {int(x) for x in _NUMBER.findall(key)} - batches, batches
+        rows = {int(x) for x in _NUMBER.findall(_DATE.sub(" ", key))} - batches
+        return rows, batches
     m = _LEADING.match(key)
     return ({int(m.group(1))} if m else set()), set()
 
@@ -133,8 +139,10 @@ def safe_label(text: str) -> str:
 
 
 def session_names(worktree: str, session_id: str) -> tuple[str, ...]:
-    """The names a holder cell may know this session by, spelled as holder_text prints them."""
-    return tuple(n for n in (safe_label(Path(worktree).name), safe_label(session_id)[:8]) if n)
+    """The names a holder cell may know this session by: its worktree and its session id's first
+    eight characters, spelled as holder_text prints them, and the whole session id."""
+    sid = safe_label(session_id)
+    return tuple(n for n in (safe_label(Path(worktree).name), sid[:8], sid) if n)
 
 
 def names_us(holder: str, names: Iterable[str]) -> bool:
@@ -161,8 +169,8 @@ def pending_batches(keys: Iterable[str], book: Book, names: Iterable[str]) -> li
     """The live batches this worktree's claims hold that the queue tab does not record it holding.
 
     A claimed row counts only while its Rows tab Status leaves it open, and only under a batch the
-    queue tab does not show as finished. A row two live batches share is satisfied when either one
-    records this session; otherwise each is named."""
+    queue tab does not show as finished. A row two batches share is satisfied when either one
+    records this session, whatever the row's status there; otherwise each live one is named."""
     names = tuple(names)
     hits: dict[int, set[int]] = {}
     for key in keys:
@@ -179,7 +187,10 @@ def pending_batches(keys: Iterable[str], book: Book, names: Iterable[str]) -> li
                 and (e := book.queue.get(b)) is not None
                 and _live(e)
             ]
-            if not cands or any(_ours(book.queue[b], names) for b in cands):
+            held = any(
+                _ours(book.queue[b], names) for b, _st in book.rows.get(r, []) if b in book.queue
+            )
+            if not cands or held:
                 continue
             for b in cands:
                 hits.setdefault(b, set()).add(r)
@@ -256,19 +267,26 @@ def our_claim_keys(
     worktree: str,
     read_text: Callable[[Path], str],
     is_here: Callable[[object], bool],
-) -> list[str]:
-    """Keys of the claims this worktree holds on this machine. An unreadable claim is skipped: a
-    missed warning costs little, a wrong one gives the session a false instruction."""
+) -> tuple[list[str], int]:
+    """Keys of the claims this worktree holds on this machine, and how many claim files could not
+    be read. An unreadable claim is skipped, because a wrong warning gives the session a false
+    instruction; it may be one claim.ps1 has created and not yet written, so the caller does not
+    trust a scan that skipped one."""
     mine = _wt_key(worktree)
     out = []
+    unreadable = 0
     for entry in os.scandir(claims):
         if not entry.name.lower().endswith(".json"):
             continue
         try:
             rec = json.loads(read_text(Path(entry.path)))
         except (OSError, ValueError, RecursionError):
+            unreadable += 1
             continue
-        if not isinstance(rec, dict) or not is_here(rec):
+        if not isinstance(rec, dict):
+            unreadable += 1
+            continue
+        if not is_here(rec):
             continue
         wt = rec.get("worktree")
         try:
@@ -276,7 +294,7 @@ def our_claim_keys(
                 out.append(entry.name[: -len(".json")])
         except (OSError, ValueError):
             continue
-    return sorted(out)
+    return sorted(out), unreadable
 
 
 def _display(text: str, limit: int = 80) -> str:
@@ -355,6 +373,17 @@ def _save(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _prune(directory: Path) -> None:
+    """Drop state no session has touched for STATE_RETENTION_DAYS, and stray temp files, once per
+    new session, so the directory does not grow by one file per session forever."""
+    cutoff = time.time() - STATE_RETENTION_DAYS * 86400
+    with contextlib.suppress(OSError):
+        for entry in os.scandir(directory):
+            with contextlib.suppress(OSError):
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    os.remove(entry.path)
+
+
 def _cached_pending(state: dict[str, Any], key: list[Any]) -> list[Pending] | None:
     if state.get("key") != key:
         return None
@@ -369,7 +398,7 @@ def _cached_pending(state: dict[str, Any], key: list[Any]) -> list[Pending] | No
 
 def run(args: argparse.Namespace) -> str | None:
     """The systemMessage to print, or None. Raises on what it cannot read."""
-    if not _SESSION_ID.match(args.session) or args.seat == "builder":
+    if not _SESSION_ID.fullmatch(args.session) or args.seat in NEVER_TAKES:
         return None
     workbook = Path(args.workbook)
     wst = workbook.stat()
@@ -397,6 +426,10 @@ def run(args: argparse.Namespace) -> str | None:
             return str(cr.read_text(p, encoding="utf-8-sig"))
 
         is_here = cr.record_is_here
+        # claim.ps1 records the checkout of the copy it ran from, so the primary's claims belong to
+        # whichever sessions ran the primary's copy; they say nothing about a session there.
+        if _wt_key(str(Path(local_root).parent.parent)) == _wt_key(args.worktree):
+            return None
         local = Path(args.state_dir) if args.state_dir else Path(local_root) / "runbook-take"
     if local is None:
         return None
@@ -406,10 +439,18 @@ def run(args: argparse.Namespace) -> str | None:
     wt = _wt_key(args.worktree)
     # The claim files are re-read only when the directory changed; the workbook only when it, or
     # this worktree's own keys, did. On a shared root any session's claim moves the directory.
+    if not state:
+        _prune(local)
     claims_mtime = claims.stat().st_mtime_ns
+    stamp: list[Any] | None = [claims_mtime, wt]
     keys = state.get("keys")
-    if state.get("claims") != [claims_mtime, wt] or not isinstance(keys, list):
-        keys = our_claim_keys(claims, args.worktree, read_text, is_here)
+    fresh = isinstance(keys, list) and all(isinstance(k, str) for k in keys)
+    if state.get("claims") != stamp or not fresh:
+        keys, unreadable = our_claim_keys(claims, args.worktree, read_text, is_here)
+        if unreadable:
+            # Not cached against the directory: a claim being written moves no directory mtime.
+            stamp = None
+            print(f"runbook-take-prompt: {unreadable} claim file(s) unreadable", file=sys.stderr)
     key = [wst.st_mtime_ns, wst.st_size, wt, keys]
     names = session_names(args.worktree, args.session)
     pending = _cached_pending(state, key)
@@ -421,12 +462,13 @@ def run(args: argparse.Namespace) -> str | None:
     due = []
     for p in pending:
         last = warned.get(str(p.batch))
-        if isinstance(last, (int, float)) and now - last < COOLDOWN_SECONDS:
+        # A stamp in the future (a clock set back) never silences a warning.
+        if isinstance(last, (int, float)) and 0 <= now - last < COOLDOWN_SECONDS:
             continue
         due.append(p)
         warned[str(p.batch)] = now
     new = {
-        "claims": [claims_mtime, wt],
+        "claims": stamp,
         "keys": keys,
         "key": key,
         "pending": [[p.batch, p.holder, list(p.rows), p.named_us, p.state] for p in pending],

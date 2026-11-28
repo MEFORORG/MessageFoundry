@@ -321,8 +321,8 @@ $WIRING = @(
         Notice = "[wiki] scripts/hooks/wiki-write-prompt.ps1 is missing from this checkout -- the fleet wiki write prompt is wired but resolving nothing." }
     # The runbook take prompt (owner decision 2026-11-27, "Stop hook + Lander"). It never blocks: its
     # only output is a systemMessage naming the read_batch.py --take command for a batch this seat's
-    # claims hold while the workbook reads FREE or names someone else. Timeout 20: the script kills its
-    # openpyxl helper at 12 s, and an unchanged workbook and claims directory cost it no xlsx read.
+    # claims hold while the workbook reads FREE or names someone else. Timeout 20 sits above the
+    # script's own bound on its openpyxl helper ($HelperTimeoutMs in the script).
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/runbook-take-prompt.ps1"; Timeout = 20; Msg = "Checking the runbook for a held batch"; Marker = $RUNBOOK_MARKER; Shim = "notice"
         Notice = "[runbook] scripts/hooks/runbook-take-prompt.ps1 is missing from this checkout -- the runbook take prompt is wired but resolving nothing." }
 
