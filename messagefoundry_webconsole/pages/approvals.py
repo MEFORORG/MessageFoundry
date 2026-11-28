@@ -54,7 +54,6 @@ from .monitoring import _post_button, _ts
 
 __all__ = [
     "approval_approved",
-    "approval_interrupted",
     "approval_refused",
     "approvals_link",
     "approvals_page",
@@ -442,23 +441,6 @@ def approval_refused(status: int, detail: str, *, resolving: bool = False) -> Ma
     engine's own message verbatim. ``resolving`` selects the resolve's own guidance."""
     table = _RESOLVE_REFUSALS if resolving else _REFUSALS
     headline, guidance = table.get(status, _UNKNOWN_REFUSAL)
-    return _engine_message_page(headline, guidance, status, detail)
-
-
-def approval_interrupted(detail: str) -> Markup:
-    """The page for a release cut off before it answered (BACKLOG #5903). Not a refusal: the
-    operation may have run none, some or all of its effects. ``detail`` is the engine's fixed text
-    naming the operation's label, never a request value."""
-    return _engine_message_page(
-        "Outcome unknown",
-        "The released operation was interrupted before it answered, for example by an engine "
-        "shutdown, so it may have done none, some or all of its work.",
-        503,
-        detail,
-    )
-
-
-def _engine_message_page(headline: str, guidance: str, status: int, detail: str) -> Markup:
     body = el(
         "div",
         el("h1", headline),

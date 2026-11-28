@@ -542,12 +542,12 @@ class OperationInterrupted(Exception):
     none, some or all of its effects, so the approval gate records a release that raised it as
     ``interrupted``, never ``failed``. Deliberately not an ``HTTPException``: the ``/ui`` routes
     render an ``HTTPException`` 503 as a refusal where nothing ran, which this is not. The app's
-    own handler answers it (``_operation_interrupted`` in ``api/app.py``). At least the ``/ui``
-    approve and upload routes catch it first and render :attr:`operator_detail` as a page, and the
-    ``/ui`` upload delete answers it with a notice of its own.
+    own handler answers it (``_operation_interrupted`` in ``api/app.py``), with the web console's
+    page for a ``/ui`` path when the console is mounted, and JSON otherwise. A route that catches
+    it first answers it its own way.
 
-    ``released`` is set only by :meth:`ApprovalGate.approve`, on one raised out of a release, so
-    :attr:`operator_detail` names an approval only then."""
+    ``released`` is set only by :meth:`ApprovalGate.approve`, on one that leaves a release after
+    its claim landed, so :attr:`operator_detail` names an approval only then."""
 
     def __init__(self, label: str) -> None:
         super().__init__(f"{label} was interrupted before it answered, and its outcome is unknown")
@@ -556,8 +556,9 @@ class OperationInterrupted(Exception):
 
     @property
     def operator_detail(self) -> str:
-        """The text an operator is answered with. It carries the label and fixed text only. Not
-        "retry": the operation may have landed."""
+        """The text an operator is answered with: the label and fixed text. A label names the
+        operation, and the gate's labels also carry an approval id. Not "retry": the operation may
+        have landed."""
         detail = f"{self}. Check the audit log and the state it changes before running it again."
         if self.released:
             detail += (
@@ -671,7 +672,8 @@ class ApprovalGate:
         on its own. Once the caller is gone nothing would read the write's error, so ``orphaned``
         reads it when the write ends, and logs it once, with the approval id. :meth:`drain` waits
         for a write still running at shutdown. ``on_done`` runs when the write ends, however it
-        ends, even when the caller has gone."""
+        ends, even when the caller has gone. A write cancelled while the caller is not raises
+        :class:`OperationInterrupted`, and ``orphaned`` logs it then (BACKLOG #5903)."""
         task = asyncio.ensure_future(coro)
         self._inflight[task] = approval_id
         task.add_done_callback(self._forget)
@@ -681,6 +683,11 @@ class ApprovalGate:
             return await _outlive_caller(task, f"a write for approval {approval_id}")
         except asyncio.CancelledError:
             task.add_done_callback(lambda t: orphaned(t, approval_id))
+            raise
+        except OperationInterrupted:
+            # The write was cancelled under a caller that was not (BACKLOG #5903). It has ended, so
+            # ``orphaned`` logs it now, as it would have for a cancelled caller.
+            orphaned(task, approval_id)
             raise
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
@@ -1788,8 +1795,6 @@ class ApprovalGate:
         self._releasing[approval_id] += 1
         claimed = handed_off = False
         try:
-            # A claim cancelled under an approve that was not raises OperationInterrupted, which
-            # the store-fault arm below answers as the claim's own 503.
             claimed = await _outlive_caller(claim, f"the claim of approval {approval_id}")
         except RowSealError as exc:
             # The row changed outside the store after it was read, and the store refused the claim
@@ -1817,6 +1822,22 @@ class ApprovalGate:
                 on_done=lambda: self._release_done(approval_id),
             )
             raise
+        except OperationInterrupted as exc:
+            # The claim itself was cancelled while this approve was not (BACKLOG #5903), at least
+            # by a store closing under it. The executor never started. Its COMMIT may still have
+            # landed, so the row can read 'executing', and its audit row may be lost, so it is
+            # paged as a store fault is, under its own cause.
+            log.error(
+                "approval %s: the claim was cancelled before it answered; the operation did not "
+                "run, and if its COMMIT landed the request reads 'executing'",
+                approval_id,
+            )
+            self._alert_lost_audit(approval_id, attempted.action)
+            raise ApprovalError(
+                503,
+                "the claim of this release was interrupted before it answered. The operation did "
+                "not run. If the request still reads pending, approve it again",
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             # Mapped here rather than inside the claim's future: a cancelled claim's settle logs
             # its own fault, and the same fault must be logged once (BACKLOG #2087).
@@ -1836,102 +1857,106 @@ class ApprovalGate:
         if not claimed:
             raise ApprovalError(409, "request was already decided")
         handed_off = False
+        # Every OperationInterrupted that leaves the release from here on, the executor's or an
+        # outcome write's, is marked, so its answer names the approval (BACKLOG #5903).
         try:
-            # Encodable once, here, so the audit row and the caller's answer carry one form, and
-            # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
-            result = _encodable_result(await op.execute(params))
-        except (asyncio.CancelledError, OperationInterrupted) as exc:
-            if isinstance(exc, OperationInterrupted):
-                exc.released = True  # its answer names the approval (BACKLOG #5903)
-            # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
-            # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
-            # or all of its effects, so the outcome is UNKNOWN: record 'interrupted', never 'failed'
-            # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
-            # blind re-run of an operation that may already have run is worse than the stuck row.
-            # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
-            # OperationInterrupted is the same unknown outcome: the executor's operation was
-            # cancelled under an approve that was not (#5903).
-            handed_off = True
-            await self._shielded(
-                self._record_interrupted_execution(
-                    approval_id,
-                    operation=operation,
-                    approver=approver,
-                    requester=requester,
-                    client=client,
-                ),
-                approval_id,
-                on_done=lambda: self._release_done(approval_id),
-            )
-            raise
-        except Exception as exc:
-            # ASVS 2.3.3 COMPENSATING TRANSITION. The row was claimed BEFORE the executor ran (that
-            # ordering is load-bearing -- it guards the double-approve race -- and must stay). If the
-            # executor raises, the row would otherwise be stranded in 'executing' for an operation
-            # that did not complete, with no outcome recorded. Roll it to 'failed' and audit the
-            # failure against both identities, then re-raise so the caller still sees the error.
-            #
-            # `except Exception` is deliberate and is not a swallow: ANY executor failure has to
-            # compensate, and the original is re-raised below. CancelledError is handled above,
-            # because a cancelled approve has an unknown outcome and must not be recorded as a failure,
-            # and so is OperationInterrupted.
-            # Shielded for the same reason as the interrupted record above.
-            handed_off = True
-            await self._shielded(
-                self._compensate_failed_execution(
-                    approval_id,
-                    operation=operation,
-                    approver=approver,
-                    requester=requester,
-                    error=exc,
-                    client=client,
-                ),
-                approval_id,
-                on_done=lambda: self._release_done(approval_id),
-            )
-            raise
-        else:
-            # The executor returned, so the operation ran. Settled HERE, in `else`, because `else`
-            # runs before `finally`: a cancellation landing in the provenance write below must not
-            # skip it. Shielded (BACKLOG #1562): a cancellation that lands while the outcome is being
-            # written must not leave the row in 'executing' for an operation that completed. The
-            # caller still sees the cancellation; the record completes.
-            handed_off = True
-            await self._shielded(
-                self._record_approved_execution(
-                    approval_id,
-                    operation=operation,
-                    approver=approver,
-                    requester=requester,
-                    result=result,
-                    client=client,
-                ),
-                approval_id,
-                on_done=lambda: self._release_done(approval_id),
-            )
-        finally:
-            # An outcome write untracks the release when it ends; nothing else will.
-            if not handed_off:
-                self._release_done(approval_id)
-            # After the transition, so only a release that really happened is flagged, and in a
-            # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
-            # On success it now lands AFTER approval.approved (the settle is in `else`), so a
-            # stalled settle delays the flag; that is the price of the settle not being skipped.
-            # Shielded: a cancellation re-delivered here (a request timeout inside a middleware task
-            # group) would otherwise cancel the audit write too, on exactly the release it describes.
-            if changed:
+            try:
+                # Encodable once, here, so the audit row and the caller's answer carry one form, and
+                # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
+                result = _encodable_result(await op.execute(params))
+            except (asyncio.CancelledError, OperationInterrupted):
+                # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
+                # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
+                # or all of its effects, so the outcome is UNKNOWN: record 'interrupted', never 'failed'
+                # (which says the operation did not happen) and never 'approved'. Nothing retries it; a
+                # blind re-run of an operation that may already have run is worse than the stuck row.
+                # Shielded, so a cancellation re-delivered here cannot cancel the record of the first one.
+                # OperationInterrupted is the same unknown outcome: the executor's operation was
+                # cancelled under an approve that was not (#5903).
+                handed_off = True
                 await self._shielded(
-                    self._flag_approver_provenance(
+                    self._record_interrupted_execution(
                         approval_id,
                         operation=operation,
-                        actor=approver,
+                        approver=approver,
                         requester=requester,
-                        changed=changed,
                         client=client,
-                        act="release",
                     ),
                     approval_id,
+                    on_done=lambda: self._release_done(approval_id),
                 )
+                raise
+            except Exception as exc:
+                # ASVS 2.3.3 COMPENSATING TRANSITION. The row was claimed BEFORE the executor ran (that
+                # ordering is load-bearing -- it guards the double-approve race -- and must stay). If the
+                # executor raises, the row would otherwise be stranded in 'executing' for an operation
+                # that did not complete, with no outcome recorded. Roll it to 'failed' and audit the
+                # failure against both identities, then re-raise so the caller still sees the error.
+                #
+                # `except Exception` is deliberate and is not a swallow: ANY executor failure has to
+                # compensate, and the original is re-raised below. CancelledError is handled above,
+                # because a cancelled approve has an unknown outcome and must not be recorded as a failure,
+                # and so is OperationInterrupted.
+                # Shielded for the same reason as the interrupted record above.
+                handed_off = True
+                await self._shielded(
+                    self._compensate_failed_execution(
+                        approval_id,
+                        operation=operation,
+                        approver=approver,
+                        requester=requester,
+                        error=exc,
+                        client=client,
+                    ),
+                    approval_id,
+                    on_done=lambda: self._release_done(approval_id),
+                )
+                raise
+            else:
+                # The executor returned, so the operation ran. Settled HERE, in `else`, because `else`
+                # runs before `finally`: a cancellation landing in the provenance write below must not
+                # skip it. Shielded (BACKLOG #1562): a cancellation that lands while the outcome is being
+                # written must not leave the row in 'executing' for an operation that completed. The
+                # caller still sees the cancellation; the record completes.
+                handed_off = True
+                await self._shielded(
+                    self._record_approved_execution(
+                        approval_id,
+                        operation=operation,
+                        approver=approver,
+                        requester=requester,
+                        result=result,
+                        client=client,
+                    ),
+                    approval_id,
+                    on_done=lambda: self._release_done(approval_id),
+                )
+            finally:
+                # An outcome write untracks the release when it ends; nothing else will.
+                if not handed_off:
+                    self._release_done(approval_id)
+                # After the transition, so only a release that really happened is flagged, and in a
+                # `finally`, so the flag lands whether the executor succeeded, failed or was cancelled.
+                # On success it now lands AFTER approval.approved (the settle is in `else`), so a
+                # stalled settle delays the flag; that is the price of the settle not being skipped.
+                # Shielded: a cancellation re-delivered here (a request timeout inside a middleware task
+                # group) would otherwise cancel the audit write too, on exactly the release it describes.
+                if changed:
+                    await self._shielded(
+                        self._flag_approver_provenance(
+                            approval_id,
+                            operation=operation,
+                            actor=approver,
+                            requester=requester,
+                            changed=changed,
+                            client=client,
+                            act="release",
+                        ),
+                        approval_id,
+                    )
+        except OperationInterrupted as exc:
+            exc.released = True
+            raise
         return {
             "operation": operation,
             "requested_by": requester,

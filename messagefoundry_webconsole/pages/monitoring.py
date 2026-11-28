@@ -51,8 +51,30 @@ __all__ = [
     "flow_and_trends",
     "flow_and_trends_fragment",
     "integrity_result",
+    "operation_interrupted",
     "status",
 ]
+
+
+def operation_interrupted(detail: str) -> Markup:
+    """The page for any ``/ui`` request whose long operation was cut off before it answered, at
+    least by the engine's shutdown drain (BACKLOG #5903). Not a refusal: the outcome is unknown.
+    The engine's app installs it as ``app.state.ui_interrupted_render`` through ``mount_ui``.
+    ``detail`` is the engine's ``OperationInterrupted.operator_detail``, rendered escaped."""
+    headline = "Outcome unknown"
+    body = el(
+        "div",
+        el("h1", headline),
+        el(
+            "p",
+            "The engine was interrupted before it answered, for example by a shutdown, so what "
+            "this action changed is unknown. Its message below says what to check.",
+        ),
+        el("h2", "Engine message (status 503)"),
+        el("p", detail),
+        class_="card detail-card",
+    )
+    return page(headline, body)
 
 
 def _post_button(action: str, label: str) -> Markup:

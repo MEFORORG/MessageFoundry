@@ -691,6 +691,7 @@ _APP_STATE: dict[str, str] = {
     "public_origin": "KEEP: configuration, the same-origin check's origin",
     "ui_connections_render": "KEEP: a hook the console installs for /ws/stats",
     "ui_csp": "KEEP: a hook the console installs",
+    "ui_interrupted_render": "KEEP: a hook the console installs for the OperationInterrupted 503",
     "ui_ws_authorize": "KEEP: a hook the console installs; slice 6 shrinks authorize_ui_ws",
     "webauthn_rp_from_request": "KEEP: configuration the passkey legs read",
 }

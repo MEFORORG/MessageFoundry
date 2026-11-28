@@ -89,6 +89,9 @@ def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     app.state.ui_csp = _auth.UI_CSP
     app.state.ui_ws_authorize = _auth.authorize_ui_ws
     app.state.ui_connections_render = pages.connections_fragment
+    # BACKLOG #5903: the app's OperationInterrupted handler renders this for a /ui path, so no /ui
+    # route answers an interrupted operation with the engine's raw JSON.
+    app.state.ui_interrupted_render = pages.operation_interrupted
 
     # ASVS 13.4.7: the console's asset tier serves ONLY allow-listed extensions. A bare StaticFiles
     # serves any regular file under the directory, and this directory IS the working tree under the

@@ -199,7 +199,7 @@ moves the seam) and is captured by the snapshot gate.
 
 ### The `app.state` hooks
 
-`mount_ui` installs three always-on couplings as `app.state` hooks so the engine boots with the console
+`mount_ui` installs at least these always-on couplings as `app.state` hooks so the engine boots with the console
 absent and the default deployment stays byte-identical:
 
 | `app.state` hook | Installed value | Read by (engine) | Absent behaviour |
@@ -207,6 +207,7 @@ absent and the default deployment stays byte-identical:
 | `ui_csp` | the package-provided `UI_CSP` string (co-versioned with `app.js`/`app.css`) | the security-headers middleware, applied only when present | no `/ui` CSP (the `/ui` branch matches nothing) |
 | `ui_ws_authorize` | `authorize_ui_ws` (browser cookie/CSWSH auth) | `/ws/stats` handshake | native `Authorization`-header path |
 | `ui_connections_render` | `pages.connections_fragment` (server-rendered enrichment) | `/ws/stats` push | counts-only push |
+| `ui_interrupted_render` | `pages.operation_interrupted` (the "Outcome unknown" page) | the `OperationInterrupted` 503 handler, for a `/ui` path (BACKLOG #5903) | the JSON 503 |
 
 Because CSP moves with the client assets it governs, a CSP tweak for a new `app.js` source is a
 **package-only** change: it edits no engine code. It still ships in a release of every package

@@ -66,7 +66,7 @@ from fastapi import (
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
 from pydantic import PrivateAttr, TypeAdapter, ValidationError
 from starlette.datastructures import MutableHeaders
@@ -310,8 +310,9 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 # NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
 # (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
-# behavior is preserved via three seams the console installs: app.state.ui_csp,
-# app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
+# behavior is preserved via seams the console installs, at least app.state.ui_csp,
+# app.state.ui_ws_authorize, app.state.ui_connections_render and app.state.ui_interrupted_render
+# (read by the always-on middleware, routes and handlers).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
@@ -5276,15 +5277,21 @@ def create_app(
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
 
     @app.exception_handler(OperationInterrupted)
-    async def _operation_interrupted(request: Request, exc: OperationInterrupted) -> JSONResponse:
+    async def _operation_interrupted(request: Request, exc: OperationInterrupted) -> Response:
         # BACKLOG #5903: an outliving operation cancelled while its request still waited. The
-        # label only is logged and answered; the text names an approval only for a release.
+        # label and fixed text only are logged and answered; the text names an approval only for a
+        # release. A /ui path gets the console's page when the console installed one, so no /ui
+        # route has to catch it to keep the browser off raw JSON.
         _log.warning(
             "%s %s: %s",
             scrub_log_argument(request.method),
             scrub_log_argument(request.url.path),
-            exc,
+            scrub_log_argument(str(exc)),
         )
+        path = request.url.path
+        render = getattr(request.app.state, "ui_interrupted_render", None)
+        if render is not None and (path == "/ui" or path.startswith("/ui/")):
+            return HTMLResponse(render(exc.operator_detail), status_code=503)
         return JSONResponse({"detail": exc.operator_detail}, status_code=503)
 
     @app.exception_handler(RequestValidationError)
