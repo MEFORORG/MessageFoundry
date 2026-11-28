@@ -3,9 +3,14 @@
   now end the retention pass's orphan sweep with a logged error rather than a silent clean pass.
   A root deleted after its first save, and one under a POSIX mount point whose share dropped,
   still read as a folder no save has made yet. Once the root's own read has succeeded, a listing
-  that then answers absence is a logged error too. A temp leftover, and a body whose sidecar
-  reads as absent, are removed only while the uploads root still answers as the folder the sweep
-  listed, so a share remounted under it as another folder stops the sweep. A body whose sidecar exists can still be removed,
+  that then answers absence is a logged error too. A temp leftover, or a body whose sidecar reads
+  as absent, is removed only if the uploads root, checked once right before that unlink, answers
+  with the identity it had when the sweep read it before its listing, so a share remounted under
+  it as another folder stops the sweep. A remount that answers with the same identity, that flaps
+  back before that check, or that lands after it and before the unlink can still have a temp or
+  body removed from the folder then under the root's name. On a file system that mints
+  identities on the client, at least a CIFS mount with `noserverino`, the check can stop sound
+  passes, so orphans can stay past retention. A body whose sidecar exists can still be removed,
   with no audit row, in at least these cases: a stale client cache, a hidden name, a remount that
   answers with the same identity or that flaps back before the check, a root swapped after the
   check and before the unlink, and a sidecar that lands between its check and the unlink

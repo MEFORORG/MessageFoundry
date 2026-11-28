@@ -9,11 +9,12 @@ connection-decoupled, and **AES-256-GCM-encrypted at rest** through the *same* `
 cipher the message store uses (identity/plaintext-on-disk only when no key is configured — the same
 at-rest tier as the File-connector spill dirs, documented in ``docs/PHI.md`` §2).
 
-This is a **leaf** module. From this package it imports only the pure ``store.crypto`` cipher
-seam and ``store.content_search`` row matcher, the pure ``parsing.split``/``parsing.peek``/
-``parsing.sniff`` HL7 library, ``config.atomic_edit``'s cross-process file lock
-(:func:`_pair_lock`) and link test, and the leaf helpers ``controlchars``, ``path_reach`` and
-``redaction``. It never imports the store instance, a transport, a
+This is a **leaf** module. From this package it imports the pure ``store.crypto`` cipher seam and
+``store.content_search`` row matcher, the pure ``parsing.split``/``parsing.peek``/``parsing.sniff``
+HL7 library, ``config.atomic_edit``'s cross-process lock primitives (``edit_lock``,
+``lock_path_for`` and ``LOCK_FILE_NAME``, which :func:`_pair_lock` here builds on), its link test
+and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_reach`` and
+``redaction``; the import block is the list of record. It never imports the store instance, a transport, a
 connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
 cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so

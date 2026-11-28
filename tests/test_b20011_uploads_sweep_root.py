@@ -345,3 +345,38 @@ def test_a_root_swapped_after_the_listing_keeps_a_temp_leftover(
         assert removed == 0 and temp.exists(), "a temp was unlinked under a root that changed"
     else:
         assert removed == 1 and not temp.exists()
+
+
+@pytest.mark.parametrize("kind", ["temp", "body"])
+def test_a_root_that_stops_answering_before_an_unlink_keeps_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kind: str
+) -> None:
+    # The lost branch of the check right before the unlink: no entry error is raised, only the
+    # root's own stat after the pin fails, so the except-path check never runs and only the
+    # pre-unlink one can keep the file.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    fid = secrets.token_hex(16)
+    if kind == "temp":
+        leftover = store._root / f".{fid}{_BLOB_SUFFIX}.{secrets.token_hex(4)}.tmp"
+    else:
+        leftover = store._root / f"{fid}{_BLOB_SUFFIX}"
+    leftover.write_text("SYNTHETIC", encoding="utf-8")
+    _backdate(leftover)
+    real = Path.stat
+    root_stats: list[int] = []
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == store._root:
+            root_stats.append(1)
+            if len(root_stats) > 1:
+                raise OSError(errno.EIO, "Input/output error")
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        removed = store._sweep_orphans_sync(now=time.time())
+    assert removed == 0 and leftover.exists()
+    assert len(root_stats) == 2
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "stopped answering" in errors[0]
