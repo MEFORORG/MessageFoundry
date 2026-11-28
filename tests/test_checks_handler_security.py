@@ -988,9 +988,9 @@ def test_denylist_member_flags(tmp_path: Path, rule_id: str, name: str, snippet:
 
 # BACKLOG #5382, the lint half: file writes the ambient-authority lint used to miss. Every path below
 # is free of the letters w, a, x and +, so none is flagged by reading the PATH as the mode, which is
-# what the old `X.open` slot-0 reading did for codecs.open and io.open. The exceptions are the
-# `*_letters_after_colon` cases, which pin the slot-0 reading still made on a receiver not known to
-# be a path.
+# what the old `X.open` slot-0 reading did for codecs.open and io.open. The exceptions include at
+# least the `*_letters_after_colon` and `*_tarfile_*` slot-0 cases, which pin the slot-0 reading
+# still made on a receiver not known to be a path.
 FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("open_mode_variable", 'def f(msg, mode):\n    open("/tmp/in.hl7", mode)\n'),
     ("open_mode_keyword_variable", 'def f(msg, m):\n    open("/tmp/in.hl7", mode=m)\n'),
@@ -1156,12 +1156,29 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
     ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
     # On a receiver not known to be a path, a 1st-positional string is as likely a path or a URL as
-    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit unless the whole string is
-    # shaped like a tarfile mode. Each is flagged on the letters in its literal alone: the call
-    # itself (dbm creation, HTTP egress, a browser) is not detected.
+    # a mode, so it is read whole and a w, a, x or + after a ':' or '|' in it is still a hit, an
+    # exact tarfile mode ("r:xz") included. Each is flagged on the letters in its literal alone: the
+    # call itself (dbm creation, HTTP egress, a browser) is not detected.
     (
         "dbm_open_drive_path_letters_after_colon",
         'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
+    ),
+    ("dbm_open_tarfile_shaped_path", 'import dbm\n\ndef f(msg):\n    dbm.open("r:wal", "c")\n'),
+    ("dbm_open_tarfile_mode_path", 'import dbm\n\ndef f(msg):\n    dbm.open("r:xz", "c")\n'),
+    ("receiver_open_slot_zero_tarfile_mode", 'def f(msg, x):\n    x.open("r:xz")\n'),
+    (
+        "webbrowser_open_tarfile_shaped_url",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("r:w")\n',
+    ),
+    (
+        "webbrowser_open_tarfile_mode_url",
+        'import webbrowser\n\ndef f(msg):\n    webbrowser.open("r:xz")\n',
+    ),
+    # A name bound to a path somewhere in the file is only possibly that path, so its slot 0 is read
+    # whole too.
+    (
+        "path_name_open_slot_zero_tarfile_mode",
+        'from pathlib import Path\n\ndef f(msg):\n    p = Path("/tmp/i")\n    p.open("r:xz")\n',
     ),
     (
         "imported_opener_url_letters_after_colon",
@@ -1172,9 +1189,10 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "webbrowser_url_letters_after_colon",
         'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
     ),
-    # A receiver that reads as a path keeps that 1st-positional reading too, whether through
-    # a class named Path from any module, a name bound to one, an unbound Path, or a '/' join. Each
-    # is flagged on the letters in its literal alone, not on the body or data argument.
+    # A receiver that reads as a path reads a 1st-positional string that is not an exact tarfile
+    # mode whole too, whether through a class named Path from any module, a name bound to one, an
+    # unbound Path, or a '/' join. Each is flagged on the letters in its literal alone, not on the
+    # body or data argument.
     (
         "path_named_import_url_letters_after_colon",
         'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("https://example.org/a")\n',
@@ -1201,9 +1219,9 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "attribute_path_classmethod_drive_path_letters_after_colon",
         'import client\n\ndef f(msg):\n    client.Path.home().open("C:\\\\mefor\\\\cache", "c")\n',
     ),
-    # A mode string is split at ':' or '|' only when the whole string is mode-shaped, as a tarfile
-    # mode is; a URL in the 2nd positional or the mode= keyword is read unsplit, on a rebound or
-    # imported open and on any receiver.
+    # A mode string is split at ':' or '|' only when the whole string is an exact tarfile mode; a
+    # URL or any other string in the 2nd positional or the mode= keyword is read whole, on a
+    # rebound or imported open and on any receiver.
     (
         "rebound_open_url_in_mode_slot",
         'from _helpers import open\n\ndef f(msg):\n    open("f", "https://example.org/a")\n',
@@ -1216,6 +1234,10 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "path_named_import_mode_keyword_url",
         "from _helpers import Path\n\ndef f(msg):\n"
         '    Path("x").open(mode="https://example.org/a")\n',
+    ),
+    (
+        "path_named_import_mode_keyword_not_tarfile_mode",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open(mode="r|w")\n',
     ),
     (
         "receiver_open_mode_keyword_url",
@@ -1278,6 +1300,10 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     ("gzip_open_read_path_with_a", 'import gzip\n\ndef f(msg):\n    gzip.open("/data/a.gz")\n'),
     ("tarfile_read_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r:xz")\n'),
     ("tarfile_read_stream_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r|xz")\n'),
+    (
+        "tarfile_read_xz_mode_keyword",
+        'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
     ("receiver_open_mode_keyword_tarfile_read", 'def f(msg, x, p):\n    x.open(p, mode="r:gz")\n'),
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),

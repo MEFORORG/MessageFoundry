@@ -1283,29 +1283,30 @@ def _unsafe_lookup_hit(
     return query is not None and _is_dynamic_string(query, env)
 
 
-#: Every ``tarfile`` mode that names its access letter is this shape, its compression after the
-#: ``:`` or ``|`` (``"r:xz"``, ``"w|bz2"``, ``"r:*"``); one without it (``":xz"``) is not, and is
-#: read unsplit. A URL never is this shape; a path rarely is, such as ``"r:wal"``, and is then
-#: split like a mode (BACKLOG #5382).
-_TARFILE_MODE = re.compile(r"^[rwxa][bt+]?[:|][A-Za-z0-9*]*$")
+#: Only an exact tarfile mode is split; any other string, a URL or a path included, is read whole,
+#: and slot 0 is split only on a receiver read as pathlib.
+_TARFILE_MODE = re.compile(r"^[rwxa][:|](?:\*|gz|bz2|xz|zst)?$")
 
 
-def _is_write_mode(mode: str) -> bool:
+def _is_write_mode(mode: str, *, split: bool) -> bool:
     """True when an ``open(...)`` mode string requests write/append/create/update access.
 
-    The string is split at ``:`` or ``|`` only when the whole of it matches
-    :data:`_TARFILE_MODE`, so only the access part before the compression is read; every other
-    string is read unsplit, so any ``w``, ``a``, ``x`` or ``+`` in it is a hit."""
-    access = mode.split(":", 1)[0].split("|", 1)[0] if _TARFILE_MODE.fullmatch(mode) else mode
+    With ``split``, a string that wholly matches :data:`_TARFILE_MODE` is read by its access letter
+    alone, ahead of its ``:`` or ``|``; every other string, and every string read without
+    ``split``, is read whole, so any ``w``, ``a``, ``x`` or ``+`` in it is a hit (BACKLOG #5382).
+    The pattern is narrower and wider than ``tarfile``'s grammar: it does not split the read mode
+    ``"r:tar"``, which is then flagged, and splits some modes ``tarfile`` refuses, whose access
+    letter is a write anyway."""
+    access = mode[0] if split and _TARFILE_MODE.fullmatch(mode) else mode
     return any(c in access for c in ("w", "a", "x", "+"))
 
 
-def _is_write_mode_literal(node: ast.expr) -> bool:
+def _is_write_mode_literal(node: ast.expr, *, split: bool) -> bool:
     """``node`` is a string literal that :func:`_is_write_mode` reads as a write."""
     return (
         isinstance(node, ast.Constant)
         and isinstance(node.value, str)
-        and _is_write_mode(node.value)
+        and _is_write_mode(node.value, split=split)
     )
 
 
@@ -1319,7 +1320,7 @@ def _mode_may_write(call: ast.Call, index: int) -> bool:
     ``None`` one, which takes that fileobj's mode and which :func:`_open_write_hit` treats as a
     possible write (:func:`_takes_fileobj_mode`). A mode held in a name counts as a write even when
     every binding of the name is a read literal: stricter than it needs to be, which this advisory
-    lint accepts."""
+    lint accepts. A literal mode is read by :func:`_is_write_mode` with ``split``."""
     if any(isinstance(arg, ast.Starred) for arg in call.args[: index + 1]):
         return True
     modes: list[ast.expr] = call.args[index : index + 1]
@@ -1331,7 +1332,10 @@ def _mode_may_write(call: ast.Call, index: int) -> bool:
             modes.append(kw.value)
     if splat and not modes:
         return True
-    return any(_is_write_mode_literal(mode) or not isinstance(mode, ast.Constant) for mode in modes)
+    return any(
+        _is_write_mode_literal(mode, split=True) or not isinstance(mode, ast.Constant)
+        for mode in modes
+    )
 
 
 def _takes_fileobj_mode(call: ast.Call, resolver: _NameResolver) -> bool:
@@ -1659,25 +1663,25 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
       Builtin ``open`` bound no other way here, or an opener called through a module imported by
       its own name and bound no other way here, has that reading only.
     * ``os.open``: its flags, read by :func:`_os_open_may_write`. Its 1st positional is also read
-      as the last bullet reads one, so a literal path :func:`_is_write_mode` reads as a write flags
+      as the last bullet reads one, so a literal path holding a ``w``, ``a``, ``x`` or ``+`` flags
       even a read-only ``os.open``: a false positive this advisory lint accepts.
-    * ``.open`` on a ``pathlib`` path expression (``Path(p).open(mode)``): the mode is the 1st
-      positional; and every string read as a mode, in the 1st or 2nd positional or the ``mode=``
-      keyword, on any receiver and any rebound ``open``, is split at ``:`` or ``|`` only when the
-      whole string matches :data:`_TARFILE_MODE` and is otherwise read unsplit, so any ``w``,
-      ``a``, ``x`` or ``+`` in it is a hit, while ``builtins.open``, ``codecs.open``, ``io.open``,
-      ``gzip.open``, ``bz2.open``, ``lzma.open`` and ``tarfile.open``, each called through its
-      module imported by its own name and bound no other way here, have their mode slots read by
-      that rule and return before any 1st-positional ``.open`` reading.
-    * ``.open`` on any other receiver, an aliased opener among them: a 1st-positional string that
-      :func:`_is_write_mode` reads as a write, or a mode in the 2nd positional or the ``mode=``
+    * ``.open`` on an expression read as a ``pathlib`` path, as :meth:`_NameResolver.is_path_expr`
+      reads one with no names (``Path(p).open(mode)``, and at least any class with a pathlib
+      class's name, a ``/`` join, or a method or attribute on either): the mode is the 1st
+      positional or the ``mode=`` keyword.
+    * ``.open`` on any other receiver, an aliased opener among them: a 1st-positional string
+      holding a ``w``, ``a``, ``x`` or ``+``, or a mode in the 2nd positional or the ``mode=``
       keyword that is not provably read-only; and on a name bound to a path somewhere in the file,
       a 1st-positional mode that is not provably read-only too. Because a binding is only possibly
       the one in force, every reading it calls for is kept.
 
-    Any mode that is not a literal counts as a write (:func:`_mode_may_write`). A non-literal 1st
-    positional on a receiver not known to be a path is not flagged, because it is as likely a member
-    name as a mode."""
+    Only an exact ``tarfile`` mode (:data:`_TARFILE_MODE`) is split, so that only its access letter
+    is read, and only in the 2nd positional, in the ``mode=`` keyword, and in the 1st positional on
+    a receiver read as pathlib. Every other string, a URL or a path included, is read whole, and so
+    is a 1st positional wherever it is read on any other receiver or on a module opener, so any
+    ``w``, ``a``, ``x`` or ``+`` in it is a hit. Any mode that is not a literal counts as a write
+    (:func:`_mode_may_write`). A non-literal 1st positional on a receiver not known to be a path is
+    not flagged, because it is as likely a member name as a mode."""
     hit = False
     as_written = _dotted_call_name(call.func)
     head = as_written.partition(".")[0] if as_written is not None else ""
@@ -1696,14 +1700,12 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
     func = call.func
     if not (isinstance(func, ast.Attribute) and func.attr == "open"):
         return hit
-    # On a receiver that may not be a pathlib path, a 1st-positional string is as likely a path or
-    # URL as a mode. It is split at ':' or '|' only when the whole string is shaped like a tarfile
-    # mode (:data:`_TARFILE_MODE`), which a URL never is, so any w/a/x/+ in a URL is a hit; a path
-    # of that shape, such as "r:wal", is split and can pass (BACKLOG #5382).
-    if call.args and _is_write_mode_literal(call.args[0]):
-        return True
+    # Only an exact tarfile mode is split; any other string, a URL or a path included, is read
+    # whole, and slot 0 is split only on a receiver read as pathlib.
     if resolver.is_path_expr(func.value, frozenset()):
         return hit or _mode_may_write(call, 0)
+    if call.args and _is_write_mode_literal(call.args[0], split=False):
+        return True
     if resolver.is_path_expr(func.value, resolver.path_names) and _mode_may_write(call, 0):
         return True
     return hit or (not os_open and _mode_may_write(call, 1))
@@ -1741,11 +1743,17 @@ def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
     cannot tell is a path; a write through a handle passed in, or by ``json.dump``/``csv.writer``;
     an opener not in :data:`_MODULE_OPENERS` (``dbm.open``) or an archive extraction; an ``.open``
     on a receiver it cannot resolve that sends or launches (a ``urllib`` opener's
-    ``.open(url, data=...)``, ``webbrowser.open(url)``), flagged only when the 1st positional is a
-    string :func:`_is_write_mode` reads as a write; a 1st positional on such a receiver that is
-    shaped like a ``tarfile`` mode, its only ``w``, ``a``, ``x`` or ``+`` after its ``:`` or ``|``,
-    such as the path in ``dbm.open("r:wal", "c")``, which is split like a mode; and any ``os`` call
-    not named in :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
+    ``.open(url, data=...)``, ``webbrowser.open(url)``), flagged only on a mode it reads (a
+    1st-positional string holding a ``w``, ``a``, ``x`` or ``+``, or a 2nd positional or ``mode=``
+    keyword that is not provably read-only), never for the send itself; an exact ``tarfile`` mode
+    on a call that is not ``tarfile`` or ``pathlib``, which is split in the 2nd positional or the
+    ``mode=`` keyword of any opener, so ``x.open(p, mode="r:xz")`` is not flagged, though an ``x``
+    there is a create on at least paramiko's SFTP ``open``; the 1st positional of an ``.open`` on a
+    receiver :meth:`_NameResolver.is_path_expr` reads as pathlib that is not one, at least a class
+    from another module with a pathlib class's name, a ``/`` join of other objects, or a method or
+    attribute on either, where an exact ``tarfile`` mode is split and the 2nd positional is not
+    read, so ``(a / b).open("r:xz", "w")`` is not flagged; and any ``os`` call not named in
+    :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
     :meth:`_NameResolver.expand` is flagged when a name it left unread could still be a hit, since
     what it stands for was not all read. The other rules in this check follow no alias."""
     func = call.func

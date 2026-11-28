@@ -9,8 +9,13 @@
   `from` import, a plain assignment or a constant `getattr` (`import shutil as sh`,
   `from os import write`, `opener = open`). Some readings it made before were false positives and
   are gone, at least: a read through a module opener called by its own name whose path held a
-  `w`, `a`, `x` or `+`, and a string shaped like a `tarfile` mode whose only such letters come
-  after a `:` or `|`, such as a compression suffix (`"r:xz"`), in an opener's mode slot or in the
-  1st positional of an `.open`. It is still a filter with known gaps, listed in the
-  `_ambient_authority_hit` docstring in [checks.py](../messagefoundry/checks.py), and it stays
-  advisory unless `--strict-handler-security` is set. (`BACKLOG #5382`)
+  `w`, `a`, `x` or `+`, and an exact `tarfile` mode whose only such letter is in its compression
+  given to `tarfile.open` as `mode="r:xz"`. Only an exact `tarfile` mode (`r`, `w`, `x` or `a`,
+  then `:` or `|`, then at most one of `*`, `gz`, `bz2`, `xz` or `zst`) is split, and only in the
+  2nd positional, the `mode=` keyword, or the 1st positional of an `.open` on what the lint reads
+  as a `pathlib` path; any other string, a URL or a path included, is read whole. That split is
+  not limited to `tarfile` or to real `pathlib` paths, so it also drops some writes the lint
+  flagged before, at least `sftp.open(p, mode="r:xz")` on paramiko, where an `x` creates the file,
+  and `(a / b).open("r:xz", "w")`. It is still a filter with known gaps,
+  listed in the `_ambient_authority_hit` docstring in [checks.py](../messagefoundry/checks.py),
+  and it stays advisory unless `--strict-handler-security` is set. (`BACKLOG #5382`)
