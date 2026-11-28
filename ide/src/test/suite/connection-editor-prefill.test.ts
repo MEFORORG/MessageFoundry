@@ -187,11 +187,20 @@ function load(opts: {
     window,
     posted,
     deliver(data): void {
+      // A "fields" reply echoes the page id, request id, transport and direction of the request it
+      // answers, as both hosts do (fieldsReply in connectionEditor.ts); one given none answers the
+      // latest request.
+      let message = data;
+      if (data.command === "fields" && data.seq === undefined) {
+        const asked = posted.filter((m) => m.command === "fields");
+        const last = asked[asked.length - 1] ?? { seq: 0, page: "", transport: "mllp", direction: "outbound" };
+        message = { seq: last.seq, page: last.page, transport: last.transport, direction: last.direction, ...data };
+      }
       window.dispatchEvent(
         new window.MessageEvent("message", {
           origin: window.origin,
           source: null,
-          data: { ...data, [CHANNEL_FIELD]: TOKEN },
+          data: { ...message, [CHANNEL_FIELD]: TOKEN },
         }),
       );
       assert.deepStrictEqual(errors.map(String), [], "the editor script threw handling a message");
@@ -226,6 +235,27 @@ function switchTransport(p: Page, to: string): void {
   transport.dispatchEvent(new p.window.Event("change"));
   const asked = p.posted.filter((m) => m.command === "fields");
   p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+}
+
+/** Answer the page's latest fields request, and each one it sends in its place, until it sends no
+ *  more: a page whose form changed while a request was in flight asks again rather than drawing. */
+function answerLatest(p: Page): void {
+  for (let round = 0; round < 10; round++) {
+    const asked = p.posted.filter((m) => m.command === "fields");
+    const last = asked[asked.length - 1];
+    p.deliver({ command: "fields", groups: buildForm(SCHEMA, last.transport, last.direction, last.settings) });
+    if (p.posted.filter((m) => m.command === "fields").length === asked.length) {
+      return;
+    }
+  }
+  assert.fail("the page kept asking for its fields");
+}
+
+/** Click Save and return how many save posts that click made: none while a request is in flight. */
+function saveClicks(p: Page): number {
+  const before = p.posted.filter((m) => m.command === "save").length;
+  p.window.document.getElementById("save").click();
+  return p.posted.filter((m) => m.command === "save").length - before;
 }
 
 suite("connection editor — edit and clone use the schema-driven fields (BACKLOG #5565)", () => {
@@ -375,12 +405,16 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
       const transport = doc.getElementById("transport");
       transport.value = "file";
       transport.dispatchEvent(new p.window.Event("change"));
-      // No reply arrives; the user keeps the setting again and saves.
+      // Before any reply arrives, the user keeps the setting again. Save waits for the fields of
+      // the transport the picker shows, then the setting is saved.
       drop.click();
       if (!clone) {
         doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW2";
       }
-      const written = saved(p, clone).db_password;
+      doc.getElementById("name").value = "OB_SYNTH_ADT_COPY";
+      assert.strictEqual(saveClicks(p), 0, "a save went out while the fields were still loading");
+      answerLatest(p);
+      const written = saved(p, false).db_password;
       assert.ok(!JSON.stringify(written).includes(INLINE_DEFAULT), `${clone ? "clone" : "edit"} wrote the raw credential`);
     }
   });
@@ -443,8 +477,10 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     const transport = doc.getElementById("transport");
     transport.value = "file";
     transport.dispatchEvent(new p.window.Event("change"));
-    // Kept again before any reply arrives, then saved with the key untouched.
+    // Kept again before any reply arrives, then saved with the key untouched once the fields show.
     drop.click();
+    assert.strictEqual(saveClicks(p), 0, "a save went out while the fields were still loading");
+    answerLatest(p);
     assert.deepStrictEqual(saved(p, false).db_password, RECORD.settings.db_password, "the kept setting lost its default");
   });
 
@@ -463,12 +499,17 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.deepStrictEqual(saved(p, false).host, initial.settings.host, "a round trip rewrote the key");
   });
 
-  test("edit: a recorded env key holding a line break is saved trimmed, as before, so it can be repaired", () => {
-    // The box cannot show a CR or LF, so leaving it and retyping what it shows look the same; the
-    // trimmed text is written, as origin/main wrote it, and the inline default stays with it.
+  test("edit: a recorded env key holding a line break is saved as recorded when untouched, and can be repaired by typing", () => {
+    // The box cannot show a CR or LF. Leaving it writes the recorded key back exactly (BACKLOG #8243
+    // item 19); typing what it shows is the repair, and the inline default stays with the key.
     const initial = { ...RECORD, settings: { ...RECORD.settings, db_password: { env: "DB_\r\nPW", default: INLINE_DEFAULT } } };
     const p = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
-    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the line break was written back");
+    assert.deepStrictEqual(saved(p, false).db_password, initial.settings.db_password, "the untouched key was rewritten");
+    const q = load({ groups: buildForm(SCHEMA, "mllp", "outbound", initial.settings), initial });
+    const box = q.window.document.querySelector('#settings [data-key="db_password"]');
+    box.value = "DB_PW";
+    box.dispatchEvent(new q.window.Event("input"));
+    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW", default: INLINE_DEFAULT }, "the typed repair was not saved");
   });
 
   test("edit: a default dropped by switching to a literal on another transport does not come back (BACKLOG #8243 item 20)", () => {
@@ -719,7 +760,8 @@ suite("connection editor: create mode shows the transport whose fields are drawn
       const p = load({ clone, groups: [] });
       assert.ok(filled(p) > 0, `the settings area is empty: ${clone ? "clone" : "edit"} with no fields`);
     }
-    // A rebuild that draws nothing, for a create and an edit page.
+    // A rebuild that draws nothing, for a create and an edit page. The reply answers the page's
+    // latest request (deliver echoes its id), so it is drawn whatever settings it carries.
     const pages: Array<Parameters<typeof load>[0]> = [
       { initial: null, groups: buildForm(SCHEMA, "mllp", "inbound", {}), fieldGroupsFor: { transport: "mllp", direction: "inbound" } },
       { groups: buildForm(SCHEMA, "mllp", "outbound", RECORD.settings) },
@@ -730,7 +772,12 @@ suite("connection editor: create mode shows the transport whose fields are drawn
       transport.value = "file";
       transport.dispatchEvent(new p.window.Event("change"));
       p.deliver({ command: "fields", groups: [] });
-      assert.ok(filled(p) > 0, `an empty fields reply emptied the settings area: ${opts.initial === null ? "create" : "edit"}`);
+      const label = opts.initial === null ? "create" : "edit";
+      assert.ok(filled(p) > 0, `an empty fields reply emptied the settings area: ${label}`);
+      // The reply was drawn: the free-text row replaced the schema controls.
+      const doc = p.window.document;
+      assert.ok(doc.querySelector("#settings .setting"), `the empty reply drew no free-text row: ${label}`);
+      assert.strictEqual(doc.querySelector("#settings [data-key]"), null, `the empty reply was not drawn: ${label}`);
     }
   });
 });
