@@ -1,8 +1,7 @@
-- **The uploads store classes a share that goes away as unreachable at every step of a read.** A
-  stale NFS handle or a dropped Windows share at an upload part's first check, at its open, at the
-  Windows check after the open, or during its read now raises the store's storage-unreachable
-  error, which the routes answer as they answer any other storage outage, rather than a server
-  error. Where the store reads a missing file as absence, an unreachable share is told apart: the
-  prune keeps the pair and logs a sidecar it could not remove, a cancelled save's discard logs it
-  as not removed, the class check does not call the body lost, and `rotate-key` skips it rather
-  than count it lost. (`BACKLOG #5388`)
+- **The uploads store classes a lost share as unreachable at every step of a read.** This covers
+  a stale NFS handle and a dropped Windows share. It applies at a part's first check, its open,
+  the checks after the open, and the read itself. The store raises its storage-unreachable error
+  there, not a server error, and the routes answer it as any other storage outage. Where the
+  store reads a missing file as absence, it now tells an outage apart. The prune keeps the pair
+  and logs a sidecar it could not remove. A cancelled save's removal is not called done. The
+  class check does not call the body lost, and `rotate-key` skips it. (`BACKLOG #5388`)

@@ -318,6 +318,80 @@ async def test_an_open_that_says_absent_of_a_file_still_there_is_not_absence(
         await _call(store, op, fid)
 
 
+@pytest.mark.parametrize("op", ["get_meta", "read_bytes"])
+async def test_an_open_that_says_absent_of_a_file_that_is_gone_is_still_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """Control: the part really went between the lstat and the open, so the answer is a missing
+    upload, not a storage outage."""
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    target = blob if op == "read_bytes" else sidecar
+
+    def _open(path: Any, flags: int, *args: Any) -> int:
+        if Path(path) == target:
+            target.unlink()
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        return os.open(path, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_open))
+    with pytest.raises(uploads.UploadNotFoundError):
+        await _call(store, op, fid)
+
+
+@pytest.mark.parametrize("fault", list(_NOT_FNF))
+async def test_an_outage_at_the_fstat_after_the_open_answers_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    store, fid, _blob, _sidecar = await _saved(tmp_path)
+
+    class _OsFstatFails:
+        """The ``os`` the uploads module reads, with only its ``fstat`` failing."""
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+        @staticmethod
+        def fstat(fd: int) -> os.stat_result:
+            raise _NOT_FNF[fault](None)
+
+    monkeypatch.setattr(uploads, "os", _OsFstatFails())
+    with pytest.raises(UploadStorageUnreachableError):
+        await store.get_meta(fid)
+
+
+async def test_a_cancelled_saves_removal_is_not_called_done_while_the_share_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Path.exists answers False for any OSError, so an unreachable pair read as removed and the
+    # WARNING withdrew the ERROR that it may still be stored with no audit row.
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    _unlink_fails(monkeypatch, blob, _share_down)
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def _down(real: Callable[..., os.stat_result]) -> Callable[..., os.stat_result]:
+        def _call_it(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if Path(path) in (blob, sidecar):
+                raise _share_down(Path(path))
+            return real(path, *args, **kwargs)
+
+        return _call_it
+
+    monkeypatch.setattr(os, "lstat", _down(real_lstat))
+    monkeypatch.setattr(os, "stat", _down(real_stat))
+    real_exists = os.path.exists
+
+    def _exists(path: Any) -> bool:
+        # What os.path.exists answers for a path whose stat fails; on Windows it does not call
+        # os.stat, so the patch above would not reach it.
+        return False if Path(path) in (blob, sidecar) else real_exists(path)
+
+    monkeypatch.setattr(os.path, "exists", _exists)
+    entry = uploads._PendingRemoval(file_id=fid, deadline=0.0, flagged=True)
+    with caplog.at_level(logging.WARNING, logger=uploads.__name__):
+        assert store._remove_and_report_sync(entry) is False
+    assert not any("no longer applies" in r.getMessage() for r in caplog.records)
+
+
 async def test_the_prune_keeps_the_sidecar_when_the_share_hides_the_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -397,4 +471,18 @@ async def test_rotate_keys_replace_raises_an_outage_rather_than_call_the_file_re
     _lstat_fails(monkeypatch, blob, _share_down)
     with pytest.raises(uploads._UnreachableError):
         uploads._replace_if_unchanged(tmp, blob, seen)
-    assert not uploads._root_gone(uploads._unreached(blob, "synthetic"), blob.parent / "gone")
+
+
+async def test_the_prune_logs_a_leftover_sidecar_it_could_not_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The body was already gone, and the leftover sidecar's unlink was suppressed with no log.
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    meta = await store.get_meta(fid)
+    blob.unlink()
+    _unlink_fails(monkeypatch, sidecar, _share_down)
+    with caplog.at_level(logging.WARNING, logger=uploads.__name__):
+        assert store._prune_pair_sync(meta) is False
+    monkeypatch.undo()
+    assert sidecar.exists()
+    assert any("leftover sidecar" in r.getMessage() for r in caplog.records)

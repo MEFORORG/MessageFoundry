@@ -321,6 +321,20 @@ def _plain_refusal(info: os.stat_result) -> str | None:
     return None
 
 
+def _known_absent(path: Path) -> bool:
+    """Whether an ``lstat`` shows nothing at ``path``
+    (:func:`~messagefoundry.path_reach.is_absent`). ``False`` when something is there, and when
+    the ``lstat`` fails for any other reason, such as a share that cannot be reached, which is
+    logged (BACKLOG #5388)."""
+    try:
+        os.lstat(path)
+    except OSError as exc:
+        if is_absent(exc):
+            return True
+        _log.warning("uploaded-file part %s could not be checked: %s", path.name, exc)
+    return False
+
+
 def _sidecar_is_absent(sidecar: Path) -> bool:
     """Whether an ``lstat`` reports ``sidecar`` as not there, by
     :func:`~messagefoundry.path_reach.is_name_absent`, whose limits apply to a ``True``. ``False``
@@ -462,14 +476,11 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # A refusal is converted when the name is now not plain, is gone and the open met
         # something other than absence, or cannot be reached; anything else is re-raised.
         absent = is_absent(exc)
-        # An open that said absent of a name a fresh lstat finds as a plain file is not absence:
+        # An open's FileNotFoundError is absence only when a fresh lstat agrees the name is gone:
         # Windows maps a dropped share to ENOENT with no winerror on an open, so a share that came
-        # back for the lstat would otherwise read as an upload that is gone (BACKLOG #5388).
-        if (
-            seen != "unplain"
-            and isinstance(exc, FileNotFoundError)
-            and (not absent or seen == "plain")
-        ):
+        # back for the lstat, or one the lstat could not check, would otherwise read as an upload
+        # that is gone (BACKLOG #5388).
+        if isinstance(exc, FileNotFoundError) and seen not in ("gone", "unplain"):
             seen = "unreachable"
         if seen not in ("unplain", "unreachable") and not (seen == "gone" and not absent):
             # The caller classes it; it reads this verdict rather than checking, and logging a
@@ -650,13 +661,19 @@ def _read_fault(path: Path, exc: OSError) -> str | None:
     be reached, else ``None`` (BACKLOG #5388). A read's error names no path, and on Windows it
     carries no ``winerror`` either, so :func:`_unreachable_fault` alone misses a dropped share
     there: the name is checked again (:func:`_recheck`). A ``FileNotFoundError`` is never absence,
-    since the file was open; Windows maps a dropped share to ``ENOENT``."""
+    since the file was open; Windows maps a dropped share to ``ENOENT``. Any other verdict is set
+    on ``exc`` as :func:`_open_plain` sets one, so :func:`_refused_read` reads it rather than
+    checking a read's error, which names no path, as ``"unnamed"``."""
     fault = _unreachable_fault(exc)
-    if fault is None and (
-        isinstance(exc, FileNotFoundError) or _recheck(path, exc) == "unreachable"
-    ):
+    if fault is None and isinstance(exc, FileNotFoundError):
         fault = codec_safe_str(exc)
-    return fault
+    if fault is not None:
+        return fault
+    seen = _recheck(path, exc)
+    if seen == "unreachable":
+        return codec_safe_str(exc)
+    setattr(exc, _RECHECKED, seen)
+    return None
 
 
 def _recheck(name: object, cause: OSError) -> _Recheck:
@@ -2899,7 +2916,9 @@ class UploadStore:
         may have by then at shutdown. Reading ``entry.flagged`` from this thread races the loop
         setting it, so a removal that lands just as it is named may leave the ERROR standing."""
         self._discard_cancelled_sync(entry.file_id)
-        gone = not any(path.exists() for path in self._paths(entry.file_id))
+        # Not Path.exists, which answers False for any OSError, so a share that cannot be reached
+        # would read as a pair removed and withdraw the ERROR (BACKLOG #5388).
+        gone = all(_known_absent(path) for path in self._paths(entry.file_id))
         if gone and entry.flagged:
             _log.warning(
                 "upload %s: its removal finished after it was named at ERROR, so the earlier "
@@ -3808,7 +3827,12 @@ class UploadStore:
             # cannot be reached raises a FileNotFoundError too on Windows, with no winerror on a
             # read, and that body may still be under the OLD key, so it is a skip below, never a
             # lost one a re-run would not count (BACKLOG #5388).
-            missing = isinstance(exc, OSError) and is_absent(exc) and _recheck(path, exc) == "gone"
+            missing = (
+                kind == "body"
+                and isinstance(exc, OSError)
+                and is_absent(exc)
+                and (getattr(exc, _RECHECKED, None) or _recheck(path, exc)) == "gone"
+            )
             if kind == "body" and (missing or isinstance(exc, UnicodeDecodeError)):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
                 # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
@@ -4248,6 +4272,7 @@ class UploadStore:
             # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
             # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
             # can overlap), so only its leftover sidecar is cleared, with no second report.
+            removed_before = False
             try:
                 blob_path.unlink()
             except OSError as exc:
@@ -4258,8 +4283,18 @@ class UploadStore:
                         "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
                     )
                     return False
-                with contextlib.suppress(OSError):
-                    meta_path.unlink(missing_ok=True)
+                removed_before = True
+            if removed_before:
+                try:
+                    _unlink_retrying(meta_path)
+                except OSError as exc:
+                    # Logged, never swallowed; the next pass finds the body gone again.
+                    _log.warning(
+                        "uploaded-logs prune could not clear the leftover sidecar of %s; the next "
+                        "pass will try again: %s",
+                        meta.file_id,
+                        exc,
+                    )
                 return False
             # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
             # body gone and clears the sidecar without reporting the pair again.
@@ -5249,13 +5284,15 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
         unreached: str | None = None
         try:
             now = path.lstat()
-        except FileNotFoundError as exc:
-            # Only an absent file was removed. One whose share cannot be reached raises
-            # _UnreachableError, so the caller skips it, never counts a body as lost, and never
-            # logs it as the uploads directory gone (BACKLOG #5388).
+        except OSError as exc:
+            # Only an absent file was removed. One whose share cannot be reached, whatever class
+            # it arrives as, raises _UnreachableError, so the caller skips it, never counts a body
+            # as lost, and never logs it as the uploads directory gone (BACKLOG #5388).
             if is_absent(exc):
                 raise _ChangedUnderReseal(gone=True) from exc
-            unreached = codec_safe_str(exc)
+            unreached = _unreachable_fault(exc)
+            if unreached is None:
+                raise
         if unreached is not None:
             raise _unreached(path, unreached)
         if not _same_file(now, seen):
