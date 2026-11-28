@@ -80,6 +80,7 @@ import sys
 import traceback
 import weakref
 from abc import ABCMeta
+from bisect import bisect_left
 from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
@@ -1938,7 +1939,9 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
 _XML_STRUCTURE_NAMES = frozenset({*_PHI_LEAF_KEYS, *_PHI_VALUE_KEYS, _VALUE_MEMBER})
 
 
-def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool, *, noted: bool) -> str:
+def _stray_end_tag_name(
+    text: str, tag: re.Match[str], mask: bool, *, noted: bool, taken: _StartTagNames
+) -> str:
     """An end tag inside a leaf element that names no open element, with its local name masked in
     place (BACKLOG #5925 item 13). Its name is text of the element, not markup: ``</family:Zqxdoe>``
     reads as a qualified name whose local part is the value, and it printed. Masked only where
@@ -1951,11 +1954,25 @@ def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool, *, noted: boo
     follows** (``noted`` False), the stripped answer ends on the name and a caller's text can be
     glued to it, so the name keeps its glue head, as an end tag's rest ending the text keeps it
     (:func:`_mask_keeping_glue_head`: ``</family:ZqxM `` masks to ``</family:XxxM``, ``</ns:ZqMSH``
-    to ``</ns:XxMSH``), and is kept whole where that mask refuses it. **Everywhere else**, the
-    end of a bounded head included, where the head's whitespace is dropped and the note follows
-    (``noted`` True), the local name is masked whole where :func:`_rest_words` and
-    :func:`_ends_in_unbounded_word` allow it as they allow a rest the tag's ``>`` ends, and kept
-    as it stood where they refuse it.
+    to ``</ns:XxMSH``), and is kept whole where that mask refuses it. **Where the name ends the
+    text behind a bound note** (``noted`` True), the end of a bounded head included, where the
+    head's whitespace is dropped and the note follows, the local name is masked whole where
+    :func:`_rest_words` allows it, as for an end tag's rest there (``</ns:ZqMSH`` masks to
+    ``</ns:XxXXX``). **Everywhere else**, the tag's ``>`` or whitespace and more text after the
+    name, it is masked whole where :func:`_rest_words` and :func:`_ends_in_unbounded_word` allow
+    it as they allow a rest the tag's ``>`` ends. Where they refuse it, it is kept as it stood.
+
+    **A mask that a later call could read as closing an element is refused** (``taken``,
+    :class:`_StartTagNames`), and the tag kept as it stood: ``</ns:Q>`` masked to ``</ns:X>``
+    in ``<identifier><ns:A><ns:X><value>123</ns:Q>`` let a later call read it as closing
+    ``ns:X``, so text a caller glued after the answer was read outside the leaf and printed.
+    Refused: a mask spelling the name of an element a start tag before the tag opens, and, where
+    no bound note follows a name that ends the text, a mask that glued name characters could
+    complete into the name of an element a start tag in the text opens (``</ns:Abc`` masked to
+    ``</ns:Xxx``, then ``x>``, against ``<ns:Xxxx>``). That leaves at least this case, where the
+    answer hides less than the tag kept as it stood: text a caller puts *before* the answer, a
+    second redacted fragment joined into one message included, can open an element this text
+    never names, and the mask can then close it.
 
     With ``mask`` False the tag is kept as it stood, and so, at least, is an unprefixed
     ``</Zqxdoe>``. The prefix is never masked (``</Zqxdoe:x>`` prints ``Zqxdoe``), and only a leaf
@@ -1973,22 +1990,80 @@ def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool, *, noted: boo
     ):
         return whole
     rest = " " + local
-    head = whole[: len(whole) - len(local)]
+    prefix = tag.group(2)[: len(tag.group(2)) - len(local)]
     if at_end and not noted:
         # The stripped answer ends on the name and a caller's text can be glued to it: keep the
         # glue head, as an end tag's rest ending the text keeps it.
         masked = _mask_keeping_glue_head(rest)
-        return whole if masked is None else head + masked[1:]
-    if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
-        return whole
-    return head + local.translate(_SHAPE)
+        if masked is None:
+            return whole
+        qname = prefix + masked[1:]
+        # Glued name characters can complete the masked name, and every start tag precedes it.
+        taken_here = taken.any_starting_with(qname)
+    else:
+        # Behind a bound note only whitespace and the note follow the name, so, as for an end
+        # tag's rest there (:func:`_end_tag_rest`), the whole-word rule is not applied.
+        if _rest_words(rest, camel=True) is None or (not at_end and _ends_in_unbounded_word(rest)):
+            return whole
+        qname = prefix + local.translate(_SHAPE)
+        taken_here = taken.opened_before(qname, tag.start())
+    return whole if taken_here else "</" + qname
+
+
+class _StartTagNames:
+    """The qualified names start tags in ``text`` carry (:data:`_XML_TAG`), read on the first
+    lookup, so a text with no stray end tag to mask never pays for the scan: what a stray end
+    tag's mask must not spell (:func:`_stray_end_tag_name`, BACKLOG #5925 item 13).
+
+    **Not only the elements the walk has open where the tag stands.** An element the walk did not
+    reach, such as one inside an element read as prose (``<identifier> <ns:A><ns:X><telecom>``), is
+    walked by a later call once a caller's text closes the outer element, and a masked tag
+    spelling ``ns:X`` then closes it there. A start tag after the stray tag cannot be closed by it
+    in any reading, so a mask the tag's ``>`` or more text ends is refused only for a start tag
+    before it. At least these are read as start tags here and refuse a mask they could never
+    take: one that closes itself or closes before the tag, and one inside a comment or an
+    attribute value. Each keeps the tag as main kept it."""
+
+    __slots__ = ("_first", "_sorted", "_text")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._first: dict[str, int] | None = None
+        self._sorted: list[str] | None = None
+
+    def _names(self) -> dict[str, int]:
+        """Each name, with where its first start tag starts."""
+        if self._first is None:
+            first: dict[str, int] = {}
+            for tag in _XML_TAG.finditer(self._text):
+                if not tag.group(1):
+                    first.setdefault(tag.group(2), tag.start())
+            self._first = first
+        return self._first
+
+    def opened_before(self, qname: str, pos: int) -> bool:
+        """Whether a start tag naming ``qname`` starts before ``pos``."""
+        return self._names().get(qname, pos) < pos
+
+    def any_starting_with(self, head: str) -> bool:
+        """Whether a start tag's name starts with ``head``, ``head`` itself included."""
+        if self._sorted is None:
+            self._sorted = sorted(self._names())
+        i = bisect_left(self._sorted, head)
+        return i < len(self._sorted) and self._sorted[i].startswith(head)
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int], mask: bool, *, noted: bool
+    text: str,
+    match: re.Match[str],
+    last_close: dict[str, int],
+    mask: bool,
+    *,
+    noted: bool,
+    taken: _StartTagNames,
 ) -> tuple[str, int]:
     """``(replacement, end)`` for the vocabulary element starting at ``match``; ``mask`` and
-    ``noted`` are :func:`_end_tag_rest`'s."""
+    ``noted`` are :func:`_end_tag_rest`'s, and ``taken`` is :func:`_stray_end_tag_name`'s."""
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -2017,7 +2092,11 @@ def _scrub_xml_element(
             pos = rest.end() if rest is not None else tag.end()
             is_open = open_names.get(qname)
             stray = not is_open and stack[-1][1] == _LEAF
-            out.append(_stray_end_tag_name(text, tag, mask, noted=noted) if stray else tag.group())
+            out.append(
+                _stray_end_tag_name(text, tag, mask, noted=noted, taken=taken)
+                if stray
+                else tag.group()
+            )
             out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
             if is_open:
                 while stack:
@@ -2070,11 +2149,15 @@ def _redact_xml_elements(text: str, *, masks: bool = True, noted: bool = False) 
     #: Whether end-tag rests may be masked: not beside the backstop's opener (:func:`_end_tag_rest`).
     #: Tested once per text, and only once a tag needs it.
     mask = False
+    #: The names a stray end tag's mask must not spell, scanned only once one is masked.
+    taken = _StartTagNames(text)
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
             mask = masks and _USERINFO_OPENER not in text
-        replacement, end = _scrub_xml_element(text, match, last_close, mask, noted=noted)
+        replacement, end = _scrub_xml_element(
+            text, match, last_close, mask, noted=noted, taken=taken
+        )
         out.append(_mask_stray_end_tags(text, pos, match.start(), mask, noted=noted))
         out.append(replacement)
         pos = end

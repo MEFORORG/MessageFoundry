@@ -9,8 +9,8 @@
   took the end tag's name (`a|b|<family>Smith</family Kim`). A short last word before a closing
   line break, as in `</family Li` then a line break, is now masked too. Some words after a
   malformed end tag still print, at least these: every word of a rest whose last word holds a
-  digit at the end of the text, as in `</family Zqx 4455`, where `Zqx` prints too; a rest that a
-  tab, a form feed, a vertical tab, a next-line or a line-separator character ends, as in
+  digit at the end of the text, as in `</family Zqx 4455`, where `Zqx` prints too; a rest ended by
+  at least a tab, a form feed, a vertical tab, a next-line or a line-separator character, as in
   `</family Kim` then a tab, since only a space, carriage return or line feed is read as the
   text's end there; and the shapes the docstring
   of `_end_tag_rest` in `messagefoundry/redaction.py` lists. (`BACKLOG #5925`)
