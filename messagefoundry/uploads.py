@@ -9,9 +9,11 @@ connection-decoupled, and **AES-256-GCM-encrypted at rest** through the *same* `
 cipher the message store uses (identity/plaintext-on-disk only when no key is configured — the same
 at-rest tier as the File-connector spill dirs, documented in ``docs/PHI.md`` §2).
 
-This is a **leaf** module: it imports only the pure ``store.crypto`` cipher seam + the pure
-``parsing.split``/``parsing.peek`` HL7 library, and ``config.atomic_edit``'s cross-process file lock
-(:func:`_pair_lock`). It never imports the store instance, a transport, a
+This is a **leaf** module. From this package it imports only the pure ``store.crypto`` cipher
+seam and ``store.content_search`` row matcher, the pure ``parsing.split``/``parsing.peek``/
+``parsing.sniff`` HL7 library, ``config.atomic_edit``'s cross-process file lock
+(:func:`_pair_lock`) and link test, and the leaf helpers ``controlchars``, ``path_reach`` and
+``redaction``. It never imports the store instance, a transport, a
 connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
 cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
@@ -4330,16 +4332,20 @@ class UploadStore:
         rotated-away key can no more destroy data here than it can in the age pass.
 
         **A fault whose code does not mean a missing name keeps the body (BACKLOG #6575).** The root
-        is listed once, whole, before anything is removed, and its ``stat`` is taken first. A
-        ``stat`` or listing error :func:`~messagefoundry.path_reach.is_absent` reads as absence is
-        an empty pass only when :func:`_root_never_made` reads the root as one no save has made yet,
-        under a folder that answers (BACKLOG #8341 item 4); any other raises with nothing removed,
-        and :meth:`prune_expired` logs it, so at least a drive letter that is no longer mapped, and a
-        linked root whose target is lost, are not a clean pass; :func:`_root_never_made` names what
-        still is. A body the listing
-        shows with no sidecar goes only once it is past the floor, :func:`_sidecar_is_absent`, asked
-        right before the unlink, reports the sidecar not there, and the root still answers as the
-        folder the sweep listed (:func:`_root_fault`, BACKLOG #8341 item 2).
+        is listed once, whole, before anything is removed, and its ``stat``, the pin, is taken
+        first. A pin error :func:`~messagefoundry.path_reach.is_absent` reads as absence is an
+        empty pass, returning 0 with no log, in exactly two cases: :func:`_root_never_made` reads
+        the root as one no save has made yet, under a folder that answers (BACKLOG #8341 item 4),
+        or ``Path.is_dir`` then reads the root as a folder, as when a save makes it between the pin
+        and that check, which a root that flaps back as a folder in that gap passes too. Any other
+        pin error raises with nothing removed, and :meth:`prune_expired` logs it, so at least a
+        drive letter that is no longer mapped, and a linked root whose target is lost, are not a
+        clean pass while they stay lost; :func:`_root_never_made` names what still is. Once the pin
+        has succeeded, every listing error raises, absence included. A temp or body goes only
+        once it is past the floor and the root still answers as the folder the sweep listed,
+        checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a body the
+        listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just before
+        that check, also reports the sidecar not there.
 
         **That report is the file system's answer, not proof that no sidecar exists.**
         :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
@@ -4358,9 +4364,13 @@ class UploadStore:
         the stamp the file system recorded, and it is compared with this host's clock. Which clock
         stamped it can differ by file system and is not asserted here.
 
-        A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
-        too, or, before a body's unlink, answers as another folder (:func:`_root_fault`), the pass
-        stops and returns what it removed, logged at ERROR with that reason.
+        A fault on one entry leaves that entry for the next pass. The pass stops and returns what
+        it removed, logged at ERROR with the reason, when :func:`_root_fault` reports the root
+        lost or swapped at either of two points: right before an entry's unlink, or after an
+        entry's own ``stat``, sidecar check or unlink raised. An entry skipped before
+        that, as a live write, inside the floor, or with a sidecar that reads as there, triggers
+        no root check. A fault on the
+        pin or the listing raises instead, as above.
         :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
         interval is as long, so a lasting fault can log on every scheduled pass.
 
@@ -4396,20 +4406,21 @@ class UploadStore:
         if stop.is_set():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
-        # The one listing, read whole before anything goes, so a failure at any point removes
-        # nothing. The root's identity is pinned first, so a body goes only while the root is still
-        # this folder. An error is_absent reads as no root ends the pass at 0 only under a folder
-        # that answers; any other raises, and prune_expired logs that and keeps its result
-        # (BACKLOG #6575, #8341 item 4).
+        # The root's identity is pinned first, so a file goes only while the root is still this
+        # folder. A pin error is_absent reads as no root ends the pass at 0 only when the root
+        # reads as never made, or is a folder by now; any other raises, and prune_expired logs
+        # that and keeps its result (BACKLOG #6575, #8341 item 4).
         try:
             listed = root.stat()
-            entries = list(root.iterdir())
         except OSError as exc:
-            # A save may make the root between the failed read and the walk, so a root that is now
-            # a folder is an empty pass too, and the next one lists it.
+            # A save may make the root between the failed pin and this check, so a root that is
+            # now a folder is an empty pass too, and the next one lists it.
             if is_absent(exc) and (_root_never_made(root) or root.is_dir()):
-                return 0  # no save had made the root yet
+                return 0  # no root answered the pin, and none was there or a save just made it
             raise
+        # The one listing, read whole before anything goes, so a failure at any point removes
+        # nothing. The pin proved a root answered, so any error here, absence included, raises.
+        entries = list(root.iterdir())
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
         names = {entry.name for entry in entries}
         removed = 0
@@ -4455,14 +4466,13 @@ class UploadStore:
                     continue  # inside the floor; being past it does not prove it abandoned
                 # The listing is a snapshot and a share can return a short one with no error, so
                 # ask again, last, before the unlink.
-                if sidecar is not None:
-                    if not _sidecar_is_absent(sidecar):
-                        continue
-                    # An absent answer is about a name in whatever folder answers for the root
-                    # now, so a body goes only while that is the folder listed (BACKLOG #8341
-                    # item 2).
-                    if _root_lost(name):
-                        break
+                if sidecar is not None and not _sidecar_is_absent(sidecar):
+                    continue
+                # The unlink acts on a name in whatever folder answers for the root now, and an
+                # absent sidecar answer is about a name there too, so a temp or a body goes only
+                # while that is the folder listed (BACKLOG #8341 item 2).
+                if _root_lost(name):
+                    break
                 entry.unlink()
             except OSError as exc:
                 if _root_lost(name):

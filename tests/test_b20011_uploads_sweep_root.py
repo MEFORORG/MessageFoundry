@@ -9,7 +9,8 @@ a folder that answers, is an empty pass; anything else raises, and ``prune_expir
 
 Item 2, in part: a sidecar the file system reports absent sent its body to the unlink even when the
 uploads root was no longer the folder the sweep listed, as after a share remounted under it. The
-root's identity is now pinned at the listing and checked before each body goes."""
+root's identity is now pinned before the listing and checked before each temp or body goes, and
+a listing that answers absence after that pin succeeded raises."""
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import errno
 import logging
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -255,3 +257,91 @@ def test_an_ancestor_that_is_a_dangling_link_is_not_a_root_never_made(tmp_path: 
     target.rmdir()
     with pytest.raises(FileNotFoundError):
         _store(mount / "uploads")._sweep_orphans_sync(now=time.time())
+
+
+# --- the repair round: a pinned root, a raced root, and a temp under a swapped root --------------
+
+
+def _listing_answers_absence(monkeypatch: pytest.MonkeyPatch, store: UploadStore) -> None:
+    """The root's ``stat`` is real and succeeds, and only its listing then answers a missing path,
+    as a share that drops between the two reads does. Only the sweep's own listing answers so, so
+    the age pass before it in ``prune_expired`` still runs."""
+    real_iterdir = Path.iterdir
+
+    def _iterdir(self: Path) -> Any:
+        if self == store._root and sys._getframe(1).f_code.co_name == "_sweep_orphans_sync":
+            raise FileNotFoundError(errno.ENOENT, "The system cannot find the path specified")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+
+
+def test_an_absent_listing_after_the_pin_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Before the repair the pin's success was not used: the root was still a folder, so the
+    # root.is_dir() fallback read the listing's absence as an empty pass and returned a silent 0.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    _listing_answers_absence(monkeypatch, store)
+    with pytest.raises(FileNotFoundError):
+        store._sweep_orphans_sync(now=time.time())
+
+
+async def test_an_absent_listing_after_the_pin_is_logged_by_the_retention_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    _listing_answers_absence(monkeypatch, store)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = await store.prune_expired()
+    assert result.orphans_removed == 0
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == ["uploaded-logs orphan sweep failed; will retry next pass"]
+
+
+def test_a_root_a_save_makes_after_a_failed_pin_is_a_quiet_empty_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Pins the root.is_dir() fallback: the pin answers absence because no root exists yet, and a
+    # save makes it before the sweep reads it again, so _root_never_made answers False (the name is
+    # there now) and only the fallback keeps this from a false ERROR. The next pass lists it.
+    store = _store(tmp_path / "uploads")
+    real = Path.stat
+    made: list[int] = []
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == store._root and not made:
+            made.append(1)
+            self.mkdir(mode=0o700)  # the racing save's mkdir lands after this stat missed
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 0
+    assert made == [1] and store._root.is_dir()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("swapped", [False, True], ids=["control", "root-swapped"])
+def test_a_root_swapped_after_the_listing_keeps_a_temp_leftover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swapped: bool
+) -> None:
+    # Before the repair a temp went to the unlink with no root-identity check, so it went in both
+    # cases; a body already had the check.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    temp = store._root / f".{secrets.token_hex(16)}{_BLOB_SUFFIX}.{secrets.token_hex(4)}.tmp"
+    temp.write_text("SYNTHETIC", encoding="utf-8")
+    _backdate(temp)
+    other = tmp_path / "another-folder"
+    other.mkdir()
+    root_stats = _swap_root_after_listing(monkeypatch, store, other, swapped=swapped)
+    removed = store._sweep_orphans_sync(now=time.time())
+    assert len(root_stats) == 2, "the temp's unlink was not preceded by a root-identity check"
+    if swapped:
+        assert removed == 0 and temp.exists(), "a temp was unlinked under a root that changed"
+    else:
+        assert removed == 1 and not temp.exists()
