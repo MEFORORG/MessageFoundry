@@ -481,6 +481,105 @@ def test_convert_case_title_reads_case_across_an_escape() -> None:
     assert m["PID-5"] == "O\\S\\Brien \\X41\\bc"
 
 
+@pytest.mark.parametrize(
+    ("sent", "path", "mode", "expected"),
+    [
+        # BACKLOG #5928 step 1's own case: upper case leaves the hex escape, so the letter it
+        # carries keeps the case the sender sent.
+        ("jos\\XE9\\", "PID-5.1", "upper", "JOS\\XE9\\"),
+        # Lower-case hex digits tell "kept as sent" from upper-casing the wire text, on every path.
+        # Literal text after the escape is still cased, and the field keeps its components.
+        ("jos\\Xe9\\", "PID-5.1.1", "upper", "JOS\\Xe9\\"),
+        ("jos\\Xe9\\", "PID-5", "upper", "JOS\\Xe9\\"),
+        ("jos\\Xe9\\ab^x", "PID-5", "upper", "JOS\\Xe9\\AB^X"),
+        # e-acute is two bytes in UTF-8 (C3 A9). The decoder reads each byte as its own
+        # character, so casing that text byte by byte would write different bytes ("\xc3"
+        # lower-cased is "\xe3"). Kept as sent, the bytes stay intact.
+        ("ren\\Xc3a9\\", "PID-5.1", "upper", "REN\\Xc3a9\\"),
+        ("JOS\\XC389\\", "PID-5", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "lower", "jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5", "title", "Jos\\XC389\\"),
+        ("JOS\\XC389\\", "PID-5.1", "title", "Jos\\XC389\\"),
+    ],
+)
+def test_convert_case_keeps_a_hex_escape_as_the_bytes_sent(
+    sent: str, path: str, mode: Literal["upper", "lower", "title"], expected: str
+) -> None:
+    # Pins the "escapes kept as sent" rule (engine PR 2936) that BACKLOG #5928 step 1 questions.
+    # What a hex escape's bytes mean is ADR 0205's, *The hex escape's meaning*; the decoder maps
+    # each byte to one character and reads no MSH-18, so casing the letter would mean guessing its
+    # character set. Keeping the escape as sent writes no byte the sender did not send.
+    # NEGATIVE CONTROL: on 17f42069782^, which cased the wire text or wrote a decoded value back,
+    # every row here fails.
+    m = _with_pid(sent)
+    convert_case(m, path, mode)
+    assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize("path", ["PID-5", "PID-5.1", "PID-5.1.1"])
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        # The last byte of UTF-8 e-acute, A9, decodes on its own to an uncased character, so a
+        # per-byte read capitalized the "e" after it mid-word.
+        ("ren\\XC3A9\\e", "Ren\\XC3A9\\e"),
+        ("REN\\Xc3a9\\E", "Ren\\Xc3a9\\e"),
+        # The mirror: AA, the last byte of the new shekel sign (E2 82 AA), decodes on its own to a
+        # cased character, so a per-byte read kept the next word's first letter lower case.
+        ("a \\XE282AA\\b", "A \\XE282AA\\B"),
+        # The run's bytes are read together, however the sender split them into escapes, and a
+        # stray byte before the last character does not hide it.
+        ("ren\\XC3\\\\XA9\\e", "Ren\\XC3\\\\XA9\\e"),
+        ("ren\\XFFC3A9\\e", "Ren\\XFFC3A9\\e"),
+        # Any other unit ends the run, so a byte after it starts afresh: literal text, a
+        # charset switch, an escape that decodes to nothing and a malformed hex escape.
+        ("a\\XC3\\b\\XA9\\c", "A\\XC3\\b\\XA9\\C"),
+        ("ren\\XC3\\\\C2842\\\\XA9\\e", "Ren\\XC3\\\\C2842\\\\XA9\\E"),
+        ("ren\\XC3\\\\.fi\\\\XA9\\e", "Ren\\XC3\\\\.fi\\\\XA9\\E"),
+        ("ren\\XC3\\\\XZZ\\\\XA9\\e", "Ren\\XC3\\\\XZZ\\\\XA9\\E"),
+        # Not valid UTF-8, so each byte is its own character: E9 is a Latin-1 e-acute, cased.
+        ("jos\\XE9\\e", "Jos\\XE9\\e"),
+        # An ASCII byte reads the same either way.
+        ("o\\X41\\b", "O\\X41\\b"),
+    ],
+)
+def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
+    sent: str, expected: str, path: str
+) -> None:
+    # BACKLOG #5928: title case decides whether a letter starts a word from the character before
+    # it, and a run of hex escapes is read as UTF-8 where its bytes end in a UTF-8 character.
+    # NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character, the first five
+    # rows fail on every path.
+    m = _with_pid(sent)
+    convert_case(m, path, "title")
+    assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize(
+    ("charset", "expected"),
+    [
+        # ISO 8859-1 maps each byte to the character unescape decodes it to, so C3 A9 is two
+        # characters, the last one uncased, and the "e" after it starts a word.
+        ("8859/1", "Ren\\XC3A9\\E"),
+        # Another declared set is read per byte too, as unescape reads it.
+        ("ISO IR87", "Ren\\XC3A9\\E"),
+        ("UNICODE UTF-8", "Ren\\XC3A9\\e"),
+        ("", "Ren\\XC3A9\\e"),
+    ],
+)
+def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
+    charset: str, expected: str
+) -> None:
+    # BACKLOG #5928: the UTF-8 reading of a hex escape's bytes is taken only where MSH-18 is empty
+    # or names UTF-8. NEGATIVE CONTROL: on 630846bffc5, which read no MSH-18, the first two rows
+    # fail.
+    msh = _MSH.replace("2.5.1\r", f"2.5.1||||||{charset}\r")
+    m = Message.parse(msh + "PID|1||1||ren\\XC3A9\\e\r")
+    assert m["MSH-18"] == (charset or None)
+    convert_case(m, "PID-5", "title")
+    assert m["PID-5"] == expected
+
+
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
     m = _with_pid("doe", pid4="A\\S\\BC")
     substring_field(m, "PID-4", 2)
@@ -939,9 +1038,9 @@ def test_date_diff_field_still_refuses_a_code_beside_a_subcomponent(start: str) 
 
 
 def test_date_diff_field_shares_timezones_time_precisions() -> None:
-    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"). It pins
-    # behaviour already on origin/main, with no negative control: the
-    # helper reads the one tuple timezone.py defines rather than keeping its own copy.
+    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"): the
+    # helper reads the one tuple timezone.py defines rather than keeping its own copy. NEGATIVE
+    # CONTROL: this fails on 3681393c4ac^, where actions.py defined its own copy.
     import messagefoundry.timezone as timezone_mod
 
     assert vars(actions_mod)["_TIME_PRECISIONS"] is timezone_mod._TIME_PRECISIONS
