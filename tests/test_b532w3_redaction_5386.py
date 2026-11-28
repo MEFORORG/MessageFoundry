@@ -302,6 +302,30 @@ def test_a_lead_is_followed_by_the_empty_users_segment() -> None:
         assert wide.search(line) is None, line
 
 
+def test_the_batch_20010_readings_refuse_an_mfb64_password() -> None:
+    """A user holding a second "@", and a password after user@host opening with "@", read a line
+    whose password opens with ``mfb64:`` as ``origin/main`` did, not at all; the comment on
+    ``_WIDE_DSN_PASSWORD`` says why. The reading ``origin/main`` already had still takes it."""
+    wide = scrub_mod._WIDE_DSN_PASSWORD
+    for line in (
+        "postgres://ops@corp.example@srv:mfb64:v1:x@corp.example",
+        "postgres://ops@srv:@mfb64:v1:x@corp.example",
+    ):
+        assert wide.search(line) is None, line
+    assert wide.search("postgres://ops@srv:mfb64:v1:x@corp.example") is not None
+
+
+def test_the_member_tail_head_is_the_narrow_head_and_its_key_qualifier_the_member_passs() -> None:
+    """``_DSN_MEMBER_TAIL`` hides what the narrow pass would at the same start, so its head must be
+    the narrow pattern's, possessive; and the new readings' run stop reads the qualifier the member pass reads, where the run ``origin/main`` had does not."""
+    narrow_head = scrub_mod._DSN_PASSWORD.pattern.split("):", 1)[0] + "):"
+    tail_head = scrub_mod._DSN_MEMBER_TAIL.pattern.split("):", 1)[0] + "):"
+    assert tail_head.replace("++", "+") == narrow_head
+    assert scrub_mod._DSN_KEY_QUALIFIER in scrub_mod._MEMBER_KEY_RUN
+    assert scrub_mod._DSN_KEY_QUALIFIER in scrub_mod._DSN_QUALIFIED_RUN_STOP
+    assert scrub_mod._DSN_KEY_QUALIFIER not in scrub_mod._DSN_RUN_STOP
+
+
 @pytest.mark.parametrize("call", [redact_log_line, _chain_then_bundle], ids=_IDS[2:])
 def test_the_bundle_still_hides_a_camelcase_value_after_a_jdbc_member(
     call: Callable[[str], str],

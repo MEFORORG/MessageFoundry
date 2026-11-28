@@ -575,7 +575,10 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading
+# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". One pass before
+# it reads past that "@": secretscrub's ``_DSN_MEMBER_TAIL``, on a password span holding a
+# credential member, masks the run after the "@" word by word, before the PHI pass; the comment on
+# that pattern says why it masks rather than deletes. The widened reading
 # (BACKLOG #5386), which reads at least an empty user and a password holding an "@", is secretscrub's
 # ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it last of the credential passes, after the
 # member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
@@ -692,7 +695,8 @@ def redact_log_line(line: str) -> str:
 
     Two layers: (1) on a line holding "-----", secretscrub's PRIVATE KEY block pattern (BACKLOG
     #5550), then the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
-    bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
+    bearer/session tokens) the engine redactor does not carry, among them secretscrub's JDBC
+    member-tail pass and then the narrow DSN pass; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the

@@ -1768,10 +1768,28 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # The cost, at least: a password the narrow pass did not read, because it held whitespace or a "/"
 # before its "@", is not read here either once a later pass has put a placeholder or a label inside
 # its first segment, and it prints, as it did on ``origin/main``.
+#: The qualifier a member key may carry after its word, as :data:`_MEMBER_KEY_RUN` reads it, so
+#: :data:`_DSN_QUALIFIED_RUN` stops at ``Pwd2=`` and ``Password_old=`` as at ``pwd=`` (code review of
+#: BACKLOG #5386, batch 20010). A test holds it inside :data:`_MEMBER_KEY_RUN`.
+_DSN_KEY_QUALIFIER = (
+    r"(?:_?(?:secondary|plaintext|previous|primary|current|string|value|plain|next|prev|text|old"
+    r"|new|raw|[0-9]++))?"
+)
 _DSN_RUN_STOP = (
     r"(?!(?:"
     + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
     + r")[:=]|(?-i:"
+    + re.escape(_ENV_PREFIX)
+    + r"))"
+)
+#: The run stop of the two readings batch 20010 added: :data:_DSN_RUN_STOP, and a key word with
+#: a qualifier before its ":" or "=" too (:data:_DSN_KEY_QUALIFIER).
+_DSN_QUALIFIED_RUN_STOP = (
+    r"(?!(?:"
+    + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
+    + r")"
+    + _DSN_KEY_QUALIFIER
+    + r"[:=]|(?-i:"
     + re.escape(_ENV_PREFIX)
     + r"))"
 )
@@ -1787,6 +1805,12 @@ _DSN_RUN_STOPS = r"\s/;?#&,()|^~{}<>\[\]%\x27\x22"
 #: One character of the run, which :data:`_DSN_MEMBER_TAIL`'s tail takes too.
 _DSN_RUN_CHAR = _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"]"
 _DSN_RUN = r"(?:" + _DSN_RUN_CHAR + r")*"
+#: The run after the two readings batch 20010 added, which stops at a qualified key too: those
+#: readings matched nothing on `origin/main`, so the member pass read every key after them, and
+#: a run crossing `Pwd2=` or `Password_old=` left it none (code review). The readings
+#: `origin/main` had keep :data:_DSN_RUN: given this stop, they hid less where no later pass
+#: reads the key, and a differential fuzz measured 2,663 of 600,000 line and surface pairs worse.
+_DSN_QUALIFIED_RUN = r"(?:" + _DSN_QUALIFIED_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*"
 # One character of a tail group after a user's placeholder (BACKLOG #5386, the
 # ``svc:Kv9x@Zq7;w@db`` shape): a ";", or a character of the run's class but ".", ":", "=" or "@",
 # so a group holding a host's dot, a port or a ``key=`` member is not taken. The comment above says
@@ -1825,7 +1849,13 @@ _DSN_EMPTY_USER_SEGMENT = (
 # One that opens with "@" is read since batch 20010: the "@" signs are group ``host_lead``, which
 # :func:`_dsn_password_repl` writes back as it writes ``lead``, then the empty user's segment, so
 # ``ops@srv:@<placeholder>@`` keeps them. With no "@" signs the "@" is still refused there, so
-# ``smtp://u@h:@x``, an empty password, matches nothing.
+# ``smtp://u@h:@x``, an empty password, matches nothing. The two readings batch 20010 added, a user
+# holding a second "@" (group ``more_at``) and ``host_lead``, refuse a password that opens with
+# ``mfb64:``, so they read such a line as ``origin/main`` did, not at all: read, the write-time
+# chain hid the blob the bundle's ``_MFB64`` keys on, and the bundle reading that chain line printed
+# a camelCase value later in it, ``userPwd='Sec9;PWD='``, that ``origin/main`` hid there (code
+# review). The readings ``origin/main`` already had print that value on the same path; that is
+# the residual ``tests/test_b532r_redaction_segments.py`` pins for a value after a DSN label.
 # After a password's leading "@" signs the segment is the empty user's too, for the reason the
 # comment above gives. The lead keeps its "@" signs before the placeholder, so
 # ``svc:@<placeholder>@`` is no ``user:password@`` the URL arm of
@@ -1841,10 +1871,20 @@ _DSN_EMPTY_USER_SEGMENT = (
 # user's does. Only a placeholder the "@" follows is read, so the segment still crosses none.
 _DSN_PLACEHOLDER_WORD = r"(?:\[[a-z]+\]|<[a-z]+>)"
 _DSN_WIDE_SEGMENT = r"(?>" + _DSN_PLACEHOLDER_WORD + r"(?=@)|" + _DSN_EMPTY_USER_SEGMENT + ")"
+#: The segment of the two readings batch 20010 added: the same, with :data:`_DSN_QUALIFIED_RUN`'s
+#: stop, for the reason given there.
+_DSN_QUALIFIED_WIDE_SEGMENT = _DSN_WIDE_SEGMENT.replace(_DSN_RUN_STOP, _DSN_QUALIFIED_RUN_STOP)
 _WIDE_DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)*+):"
-    r"(?(2)(?:(?P<host_lead>@++)|(?![0-9]++(?![a-z0-9_])|@))"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+"
+    r"(?:(@)[a-z0-9.\-]++(?:(?P<more_at>@)[a-z0-9.\-]++)*+)?):"
+    r"(?(2)(?:(?P<host_lead>@++)(?!mfb64:)|(?![0-9]++(?![a-z0-9_])|@)(?(more_at)(?!mfb64:)))"
+    + r"(?(more_at)"
+    + _DSN_QUALIFIED_WIDE_SEGMENT
+    + r"|(?(host_lead)"
+    + _DSN_QUALIFIED_WIDE_SEGMENT
+    + r"|"
     + _DSN_WIDE_SEGMENT
+    + r"))"
     + r"|(?:(?<=//:)"
     + _DSN_WIDE_SEGMENT
     + r"|(?<!//:)(?:(?P<lead>@++)"
@@ -1852,7 +1892,13 @@ _WIDE_DSN_PASSWORD = re.compile(
     + r"|"
     + _DSN_USER_FIRST_SEGMENT
     + r")))"
+    + r"(?(more_at)"
+    + _DSN_QUALIFIED_RUN
+    + r"|(?(host_lead)"
+    + _DSN_QUALIFIED_RUN
+    + r"|"
     + _DSN_RUN
+    + r"))"
     + _DSN_TAIL
     + r"@"
 )
@@ -2315,14 +2361,20 @@ def _mask_member(m: re.Match[str]) -> str:
 # the same text is redacted again, and the PHI pass reads what is left. Deleted, the run took the
 # first word of a name, ``P@Jane Doe;``, and the bundle printed ``Doe`` where ``origin/main`` hid
 # both (code review). It never writes the key back (:func:`_dsn_password_repl` says why that was
-# declined). The run takes only characters the widened run takes (:data:`_DSN_RUN_CHAR`), so it
-# holds no label a later pass reads, no "/" a DSN needs, no quote and no separator; where it would
-# end at anything else, nothing matches, and the narrow pass reads the line as before. A quote does
+# declined). The run takes only characters the widened run takes (:data:`_DSN_RUN_CHAR`): it stops
+# before a credential or query key, qualified or not, and before a ``MEFOR_`` name, and holds no "/"
+# a DSN needs, no quote and no separator. It may still hold a word another pass reads, such as a
+# PHI label (``name=``, ``MRN:``); what keeps that word is :func:`_mask_member_value`'s kept-word
+# rule, as in a member value, not the run's class. Where the run would end at anything but a ";",
+# whitespace or the end, nothing matches, and the narrow pass reads the line as before. A quote does
 # not end it: tried, a differential fuzz found a value ``origin/main`` hid printed in 56 of 600,000
 # line and surface pairs, at least on the store error path after a camelCase label, as in
-# ``cfg accessToken=jdbc:sqlserver://svc:1433;sslpassword=P@Sec'q@p%40Kv9@h;...``. The cost: a DSN
+# ``cfg accessToken=jdbc:sqlserver://svc:1433;sslpassword=P@Sec'q@p%40Kv9@h;...``. The cost is that
+# whatever follows the first "@" up to the next ";" is masked, which is at least: the host of a DSN
 # with a real user whose password holds such a member, ``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``,
-# has its host masked too. What it leaves, at least: a run that ends at a quote, a "/" or a
+# and the server of a ``user=login@server`` member after a credential member, as in
+# ``jdbc:sqlserver://srv.invalid:1433;password=Kv9;user=admin@srv;encrypt=true``, so an operator no
+# longer reads which server that login named. What it leaves, at least: a run that ends at a quote, a "/" or a
 # separator prints, as it did before, and so does a tail after a key-material member, such as
 # ``;encryptionKey=P@ss_Sec9;``, on ``support.redact.redact_log_line``, whose key no word here
 # names.

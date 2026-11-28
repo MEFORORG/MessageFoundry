@@ -821,7 +821,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # (BACKLOG #5386) the user's host words repeat, a possessive ``*+`` over an "@" and the possessive
     # host word, which holds no "@", so the repeats tile the user; and after user@host a password
     # may open with a possessive run of "@" (group ``host_lead``), which the segment cannot start
-    # with. ``_DSN_MEMBER_TAIL`` splices ``_DSN_RUN_CHAR`` (``_DSN_RUN_STOP`` and one class) and
+    # with. Those two readings take ``_DSN_QUALIFIED_WIDE_SEGMENT`` and ``_DSN_QUALIFIED_RUN``
+    # instead, chosen by conditionals: the same shapes, with a stop lookahead that also tries
+    # ``_DSN_KEY_QUALIFIER``, an optional "_" and one word or a possessive digit run, after a
+    # matched word only, so the cost per character stays bounded. ``_DSN_MEMBER_TAIL`` splices ``_DSN_RUN_CHAR`` (``_DSN_RUN_STOP`` and one class) and
     # ``_MEMBER_KEY_RUN``. Its key lookahead is a lazy run to each ";", where ``_MEMBER_KEY_RUN``
     # reads the key: a lazy run that tries the word alternation, and a bounded qualifier, at each
     # offset of the key, so a key character is read about as many times as the longest word is long,
@@ -851,7 +854,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])|' + _MEFOR_GLUED_BRANCH + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)' + _MEFOR_TAILS",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')' + _KV_TAILS",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')' + _KV_TAILS",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)*+):(?(2)(?:(?P<host_lead>@++)|(?![0-9]++(?![a-z0-9_])|@))' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++(?:(?P<more_at>@)[a-z0-9.\\\\-]++)*+)?):(?(2)(?:(?P<host_lead>@++)(?!mfb64:)|(?![0-9]++(?![a-z0-9_])|@)(?(more_at)(?!mfb64:)))' + '(?(more_at)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|(?(host_lead)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|' + _DSN_WIDE_SEGMENT + '))' + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + '(?(more_at)' + _DSN_QUALIFIED_RUN + '|(?(host_lead)' + _DSN_QUALIFIED_RUN + '|' + _DSN_RUN + '))' + _DSN_TAIL + '@'",
         "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]++://[^\\\\s:/@]++):(?=[^\\\\s/@]*?;' + _MEMBER_KEY_RUN + '=)[^\\\\s/@]++@(?P<dsn_member_tail>(?:' + _DSN_RUN_CHAR + ')++)(?=[;\\\\s]|\\\\Z)'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",

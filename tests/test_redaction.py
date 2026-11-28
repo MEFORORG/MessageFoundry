@@ -4024,7 +4024,7 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     # read neither before the rewrite nor after it, which keeps the "@" signs; the behaviour arm
     # below each assert holds that.
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
-    assert r"://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)*+):" in wide
+    assert r"://[^\s:/@]*+(?:(@)[a-z0-9.\-]++(?:(?P<more_at>@)[a-z0-9.\-]++)*+)?):" in wide
     for before in (
         "x postgres://us@er:Kv9x@db",
         "x postgres://svc:@Kv9x@db",
@@ -4055,7 +4055,22 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     )
     shipped_tail = secretscrub._DSN_TAIL
     assert shipped_tail == expected_tail, shipped_tail
-    assert tail == run + secretscrub._DSN_TAIL + "@", tail
+    # The two readings batch 20010 added take a run whose stop also reads a qualified key; every
+    # other branch takes the run above.
+    qualified = secretscrub._DSN_QUALIFIED_RUN
+    assert qualified.startswith("(?:" + secretscrub._DSN_QUALIFIED_RUN_STOP + r"[^\s/"), qualified
+    assert qualified.endswith("])*"), qualified
+    assert tail == (
+        "(?(more_at)"
+        + qualified
+        + "|(?(host_lead)"
+        + qualified
+        + "|"
+        + run
+        + "))"
+        + secretscrub._DSN_TAIL
+        + "@"
+    ), tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:

@@ -96,9 +96,17 @@ _THIS_CHANGE_SHAPES: tuple[_Shape, ...] = (
     ("x postgres://ops@srv:@Kv9x@db.invalid", ("Kv9x",), "://ops@srv:@"),
     ("x postgres://ops@srv:@@Kv9x_Lead@db.invalid", ("Kv9x_Lead",), "://ops@srv:@@"),
     # The JDBC no-user member tail: the narrow match took the member's key, and the tail printed.
-    ("jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;", ("ss_Sec9",), "jdbc:"),
+    (
+        "jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;",
+        ("ss_Sec9",),
+        "jdbc:sqlserver://db.invalid:",
+    ),
     ("jdbc:sqlserver://db.invalid:1433;dbpwd=Kv9@Zq7_Sec failed", ("Kv9", "Zq7_Sec"), " failed"),
-    ("jdbc:sqlserver://db.invalid:1433;AccessToken=T@Zq7_Sec", ("Zq7_Sec",), "jdbc:"),
+    (
+        "jdbc:sqlserver://db.invalid:1433;AccessToken=T@Zq7_Sec",
+        ("Zq7_Sec",),
+        "jdbc:sqlserver://db.invalid",
+    ),
 )
 
 _GROUPS = (
@@ -126,9 +134,6 @@ def test_the_dsn_password_is_hidden_on_every_entry_point(
     assert kept in out, out
 
 
-#: Lines with no password the new readings may take, each printing whole on every entry point: a
-#: port after user@host, a user@host list with no password, a JDBC string with no "@", and a JDBC
-#: member that names no credential.
 #: Lines the JDBC member-tail pass reads, each with what the PHI surfaces must not print: the tail
 #: is the first word of a name, which the PHI pass must still read as one with the next word. A
 #: draft that deleted the tail printed ``Doe`` and ``JANE`` here (code review).
@@ -148,6 +153,26 @@ def test_a_name_after_a_member_tail_stays_hidden_on_the_phi_surfaces(
         assert name not in out, out
 
 
+#: Controls, not fail-befores: each value is hidden on ``origin/main`` by the member pass, which
+#: reads a qualified key (``Pwd2=``, ``Password_old=``). A widened match that ran across the key
+#: left that pass nothing to read, and the value printed (code review).
+_QUALIFIED_KEY_AFTER_A_NEW_READING = (
+    ("x postgres://ops@srv:@x@Password_old=Kv9@Sec_77;UID=u", ("Kv9", "Sec_77")),
+    ("x postgres://a@b@srv:x@Pwd2=Kv9@Sec_77;UID=u", ("Kv9", "Sec_77")),
+    ("x postgres://a@b@srv:x@token_next=Kv9@Sec_77;UID=u", ("Kv9", "Sec_77")),
+)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+@pytest.mark.parametrize(("line", "secrets"), _QUALIFIED_KEY_AFTER_A_NEW_READING)
+def test_a_qualified_member_key_after_a_new_reading_keeps_its_value_hidden(
+    line: str, secrets: tuple[str, ...], call: Callable[[str], str]
+) -> None:
+    out = call(line)
+    for secret in secrets:
+        assert secret not in out, out
+
+
 #: A member whose key does not END in a credential word is no key the member pass reads, so the
 #: tail pass declines it and the host after the "@" stays as the narrow pass leaves it.
 _NOT_A_KEY = (
@@ -165,6 +190,9 @@ def test_a_member_whose_key_names_no_credential_keeps_the_host(
     assert out.endswith("@corp.example;") and "ops" not in out, out
 
 
+#: Lines with no password the new readings may take, each printing whole on every entry point: a
+#: port after user@host, a user holding two "@" with a port and no password, and a JDBC string
+#: with no "@". A JDBC member that names no credential is `_NOT_A_KEY`'s.
 _PRINTS_WHOLE = (
     "connect http://user@host:8080,admin@corp.example failed",
     "connect postgres://ops@corp.example@srv:5432/x failed",
