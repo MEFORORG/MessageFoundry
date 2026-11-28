@@ -487,12 +487,14 @@ line carried `?`. The escape holds for every line the guard writes: the stdout s
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
 least these. A stream with no `encoding` is written as the line came. One whose `encoding`
-cannot be read, because reading it raises, is written with everything outside ASCII escaped,
-and that is said on the same stderr line. One whose `encoding` names
+is there but cannot be read, because reading it raises, is written with everything outside
+ASCII escaped, and each line that lands so is counted, naming the exception's type, on the
+stderr format-fault line described below; a stream that refuses even that line, as cp864
+refuses `%`, fails the write, which the two stages decide. One whose `encoding` names
 a codec other than the one it uses is written escaped for the named codec, so it escapes more
 than it needs to where the named codec is the narrower, and too little where it is the
-wider, leaving the rest to the ASCII fallback below. Either
-way, only when the write raises `UnicodeEncodeError` is the line written again with everything
+wider, leaving the rest to the ASCII fallback below. For a stream
+with no `encoding` or a misnamed one, only when the write raises `UnicodeEncodeError` is the line written again with everything
 outside ASCII escaped, and such a stream that writes in chunks can then hold the line's prefix
 twice. An `encoding` that is unknown or not a text encoding escapes
 everything outside ASCII. The stream's own `errors` is never read, so a `surrogateescape` stream

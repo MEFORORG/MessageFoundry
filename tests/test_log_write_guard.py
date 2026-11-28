@@ -1241,17 +1241,28 @@ def test_a_codec_whose_round_trip_maps_a_character_is_not_rewritten(
     # U+FFE0. The line encodes, so it is written as it came and no escape is counted.
     # NEGATIVE CONTROL: with the strict encode check removed, so every non-ASCII line goes
     # through _encodable, the line was rewritten and an escape counted on stderr.
+    # The bytes cannot tell (U+FFE0 encodes to the same cp932 bytes), so the count is read where
+    # it is made, and an emoji, which cp932 has no byte for, is the positive control.
+    counted: list[str] = []
+    real = logging_guard._GuardedSinkMixin._note_format_fault
+
+    def spy(self: logging_guard._GuardedSinkMixin, detail: str) -> None:
+        counted.append(detail)
+        real(self, detail)
+
+    monkeypatch.setattr(logging_guard._GuardedSinkMixin, "_note_format_fault", spy)
     raw = io.BytesIO()
     stream = io.TextIOWrapper(raw, encoding="cp932", errors="strict", write_through=True)
     monkeypatch.setattr(sys, "stdout", stream)
     handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
     handler.setFormatter(logging.Formatter("%(message)s"))
-    capsys.readouterr()
 
     handler.emit(_record("price 5\xa2"))
+    assert counted == []
+    handler.emit(_record("smile \U0001f600"))
 
-    assert raw.getvalue().splitlines() == ["price 5\xa2".encode("cp932")]
-    assert logging_guard._ESCAPED_FAULT not in capsys.readouterr().err
+    assert counted == [logging_guard._ESCAPED_FAULT]
+    assert raw.getvalue().splitlines()[0] == "price 5\xa2".encode("cp932")
 
 
 def test_an_ascii_line_a_codec_cannot_encode_is_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1366,14 +1377,53 @@ def test_a_stream_whose_encoding_cannot_be_read_gets_ascii_escapes_and_a_signal(
 
     assert events == []
     assert stream.text == "order caf\\u00e9 \\u4e2d \\ud83d\\ude00\n"
-    assert logging_guard._ENCODING_UNREADABLE_FAULT in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('RuntimeError')" in err
+    assert logging_guard._ESCAPED_FAULT not in err
 
 
-def test_a_falsy_stream_with_no_lock_is_still_written_and_flushed() -> None:
-    # The guard's write flushes the stream it wrote to whatever the stream's truthiness, and
-    # needs no handler lock, since a caller can hold none (lock is None after createLock fails).
-    # NEGATIVE CONTROL: with _write_raw calling logging.StreamHandler.flush(self), a stream whose
-    # __len__ is 0 was never flushed, and a None lock raised TypeError.
+def test_an_encoding_property_raising_attribute_error_is_unreadable_not_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A delegating proxy whose target is gone raises AttributeError from its property, which a
+    # plain getattr default would read as "no encoding": the line would go raw to a replacing
+    # stream as "?". It is read as unreadable instead.
+    # NEGATIVE CONTROL: with AttributeError read as a missing encoding, the line was written raw,
+    # with "?" for the CJK character, and nothing was said.
+    raw, inner = _strict_cp1252()
+    inner.reconfigure(errors="replace")
+
+    class _Proxy:
+        @property
+        def encoding(self) -> str:
+            # What ``self._target.encoding`` raises once the target is None.
+            raise AttributeError("'NoneType' object has no attribute 'encoding'")
+
+        def write(self, text: str) -> int:
+            return inner.write(text)
+
+        def flush(self) -> None:
+            inner.flush()
+
+    stream = _Proxy()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("order %s", "caf\xe9 \u4e2d"))
+
+    assert raw.getvalue().decode("cp1252").splitlines() == ["order caf\\u00e9 \\u4e2d"]
+    assert (
+        f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('AttributeError')" in capsys.readouterr().err
+    )
+
+
+def test_a_falsy_stream_is_still_flushed() -> None:
+    # The guard's write and the handler's own flush both flush the stream whatever its
+    # truthiness: a stream's __bool__ is not a liveness test.
+    # NEGATIVE CONTROL: with _flush_stream testing the stream's truthiness as
+    # StreamHandler.flush does, a stream whose __len__ is 0 was never flushed.
     class _Falsy(io.StringIO):
         flushes = 0
 
@@ -1386,12 +1436,13 @@ def test_a_falsy_stream_with_no_lock_is_still_written_and_flushed() -> None:
     stream = _Falsy()
     handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
     handler.setFormatter(logging.Formatter("%(message)s"))
-    handler.lock = None
 
     handler._write_line("hello\n")
+    assert _Falsy.flushes == 1
+    handler.flush()
 
     assert stream.getvalue() == "hello\n"
-    assert _Falsy.flushes >= 1
+    assert _Falsy.flushes == 2
 
 
 def test_a_roll_notice_whose_reason_the_stream_cannot_encode_is_escaped(
