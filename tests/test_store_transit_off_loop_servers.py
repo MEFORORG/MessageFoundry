@@ -6,7 +6,7 @@ Under the ``vault_transit`` cipher every cell encrypt and decrypt is a Transit H
 Before BACKLOG #3929 at least the Postgres and SQL Server reference read and state cache load, and
 the SQL Server claim decode and reference write, made those calls inline on the event loop, so a
 large reference set or a claim sweep held it for one round trip per row. These tests pin the paths
-they name, not every cipher call in either store. Each drives its path through a real
+they name, not every cipher call in either store. Each Transit test drives its path through a real
 :class:`TransitCipher` over a fake Transit client that blocks every call, with the database faked,
 and checks that no Transit call ran on the loop's thread, that the loop kept ticking, and, on every
 path but SQL Server's ``reload_state_cache``, that each call ran on a Transit pool thread, named so
@@ -22,6 +22,7 @@ import json
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -39,13 +40,14 @@ _KEY = "mefor-store"
 #: How long each Transit call holds its thread once armed: long against a loop tick. A call made
 #: inline stalls the loop for at least this long, so a gap under it is the pass bound, which leaves
 #: the whole of it as headroom for a slow runner. Every call blocks, not only the first: the stall
-#: check is then the one check that sees a later call wait on the loop (BACKLOG #5757 item 4 kept).
+#: check is then the one check that sees a later call wait on the loop. So BACKLOG #5757 item 4's
+#: cut to one sleep per test is not taken.
 _BLOCK = 0.3
 #: Every Transit pool thread's name starts with this, which ``row_seal._transit_pool`` passes as a
 #: literal; there is no constant to import.
 _POOL_PREFIX = "mefor-transit-seal"
-#: Synthetic rows only, never PHI. Every test uses one row per key, two in all, so a path that
-#: hops once per row and one that hops once for the whole read both make a blocked call.
+#: Synthetic rows only, never PHI. Every test uses one row per key, two in all, so a per-row path
+#: makes a second call, which the stall check also covers because every call blocks.
 _KEYS = ("k1", "k2")
 _RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\r"
 _BACKENDS = [PostgresStore, SqlServerStore]
@@ -53,9 +55,9 @@ _BACKENDS = [PostgresStore, SqlServerStore]
 
 class _RecordingTransit(_FakeTransit):
     """A fake Transit that records the thread and its name for each call, and blocks each once
-    armed. Its own copy
-    rather than the SQLite test's, which imports a name BACKLOG #3929 added, so this file still
-    imports on the tree before that fix and its failing run there can be shown again."""
+    armed. Its own copy rather than the SQLite test's, which imports a name BACKLOG #3929 added, so
+    this file still imports on the tree before that fix and its failing run there can be shown
+    again."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -123,6 +125,8 @@ def _assert_reference_written(
         if sql.startswith("INSERT INTO reference (")
     }
     assert set(inserted) == set(_KEYS)
+    inserts = [sql for sql, _ in executed if sql.startswith("INSERT INTO reference (")]
+    assert len(inserts) == len(_KEYS), inserts
     for key, sealed in inserted.items():
         aad = cell_aad("reference", "value", "codes", "v1", key)
         assert json.loads(cipher.decrypt(sealed, aad=aad)) == f"value-{key}"
@@ -208,14 +212,16 @@ async def _measure(
 
 async def test_the_stall_check_fires_on_a_hop_that_blocks_the_loop() -> None:
     """Negative control for :func:`_measure`'s stall check: a call that runs on a Transit pool
-    thread but waits for it synchronously passes the thread and pool checks, so only the stall
-    check can catch it."""
+    thread name but waits for it synchronously would pass the thread and pool checks, so only the
+    stall check, which runs before the pool check, can catch it."""
     transit, cipher = _transit()
     sealed = cipher.encrypt('"x"', aad=cell_aad("t", "c", "1"))
 
     async def blocking_hop() -> str:
-        pool = row_seal._transit_pool()
-        return pool.submit(cipher.decrypt, sealed, aad=cell_aad("t", "c", "1")).result()
+        # A private pool whose threads carry the Transit pool's name, so the shared pool is left
+        # alone and the name check would pass too.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix=_POOL_PREFIX) as pool:
+            return pool.submit(cipher.decrypt, sealed, aad=cell_aad("t", "c", "1")).result()
 
     with pytest.raises(AssertionError, match="the loop stalled"):
         await _measure(transit, blocking_hop)
@@ -359,7 +365,10 @@ async def test_a_sql_server_reference_write_encrypts_off_the_loop() -> None:
     _assert_reference_written(cipher, store, executed)
 
 
-# --- BACKLOG #5757 added item 1: paths PR 3241 fixed but did not pin --------------------------
+# --- BACKLOG #5757 added item 1: paths PR 3156 (BACKLOG #3929) fixed and PR 3241 did not pin ---
+# Still not pinned here: at least SQL Server's claim_next_fifo, claim_next_fifo_batch and
+# _open_claimed_heads, its pre-ACK record_received encrypt, and the Postgres claim_ready decode.
+# Each needs a fake of its whole statement sequence, which this file does not have yet.
 
 
 @pytest.mark.parametrize("cls", _BACKENDS)
