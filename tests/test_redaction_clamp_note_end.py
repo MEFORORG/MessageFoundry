@@ -81,7 +81,8 @@ def _main() -> Iterator[None]:
         field_run: re.Pattern[str],
         *,
         noted: bool = False,
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
+        # Returns the arm's (rest, mask) pair, as the head's _glued_value does.
         token, end = run.group(), run.end()
         note_follows = len(body) < len(text) and text.startswith("\n", len(body))
         stop = redaction._glued_phi_value_end(text, body, token, end)
@@ -89,17 +90,18 @@ def _main() -> Iterator[None]:
             judged = body if note_follows and stop == len(body) else text
             rest = maskable(judged, end, stop, field_run, credential=False)
             if rest is not None:
-                return rest
-        rest = glued_end_tag(body, token, end, field_run, **end_tag_kwargs)
-        if rest is not None:
-            return rest
+                return rest, rest.translate(redaction._SHAPE)
+        tag_rest = glued_end_tag(body, token, end, field_run, **end_tag_kwargs)
+        if tag_rest is not None:
+            return tag_rest
         if not redaction._ends_in_credential_label(token):
             return None
         bare = redaction._GLUED_BARE_VALUE.match(body, end)
         if bare is None:
             return None
         judged = body if note_follows and bare.end() == len(body) else text
-        return maskable(judged, end, bare.end(), field_run, credential=True)
+        rest = maskable(judged, end, bare.end(), field_run, credential=True)
+        return None if rest is None else (rest, rest.translate(redaction._SHAPE))
 
     def last_note_only(text: str) -> str:
         note = redaction._TRAILING_NOTES.search(text)
@@ -116,6 +118,10 @@ def _main() -> Iterator[None]:
         patch.setattr(redaction, "_glued_value", main_glued_value)
         patch.setattr(redaction, "_maskable_rest", maskable_off)
         patch.setattr(redaction, "_end_tag_rest", end_tag_off)
+        # Main refused a rest ending the text whole; the glue-head mask (#5925 closing step 1) came
+        # after the root fix this stand-in measures.
+        if hasattr(redaction, "_mask_keeping_glue_head"):
+            patch.setattr(redaction, "_mask_keeping_glue_head", lambda rest: None)
         yield
 
 
@@ -333,8 +339,10 @@ def test_a_value_before_an_earlier_of_stacked_notes() -> None:
 
 
 def test_a_rest_with_no_note_after_it_keeps_the_end_of_text_rules() -> None:
-    """Without a note, a rest ending the text is still one a caller can glue text onto."""
-    assert "Kim" in redact("<family>Smith</family Kim")
+    """Without a note, a rest ending the text is still one a caller can glue text onto: the end of
+    its last word that glued text could complete is kept (BACKLOG #5925 closing step 1), and a
+    last word holding a digit keeps the rest whole."""
+    assert redact("<family>Smith</family Kim") == "<family>[redacted]</family Xxm"
     assert "4455" in redact("<family>Smith</family Zqx 4455")
 
 
@@ -364,17 +372,20 @@ def test_each_end_tag_vocabulary_copy_matches_the_named_sets(name: str) -> None:
 
 def test_the_line_break_rule_after_a_rest_is_pinned() -> None:
     """Added item 18: the ``later-line`` kept shape returns before the line-break rule, so nothing
-    exercised it. A rest followed only by a line break is judged as glued to it: a longer word is
-    masked, and a last word of two letters or fewer is kept (item 15's over-refusal)."""
+    exercised it. A rest followed only by a line break is judged as ending the text, since a line
+    break before the end is read as the text's end, so a last word of two letters is masked too.
+    Before item 15 was fixed it was judged as glued to the line break and kept."""
     assert redact("<family>Smith</family Zqxdoe\n") == "<family>[redacted]</family Xxxxxx\n"
-    assert redact("<family>Smith</family Li\n") == "<family>[redacted]</family Li\n"
+    assert redact("<family>Smith</family Li\n") == "<family>[redacted]</family Xx\n"
+    assert redact("<family>Smith</family Li\r\n") == "<family>[redacted]</family Xx\r\n"
 
 
-def test_the_audit_tee_detail_keeps_one_answer_on_both_paths() -> None:
-    """Round-2 review: telling only the tee's unscrubbed bound about its note made it disagree with
-    the C0-scrubbed path, whose head the handler chain read with no note, so the line shipped the
-    whole detail hidden. Both paths keep main's answer, a named residual (``_bounded_detail``).
-    Red on the round-1 head: the shipped detail was the placeholder and the note alone."""
+def test_the_audit_tee_detail_prints_no_value_the_cut_left_last() -> None:
+    """Both of the tee's detail paths are told the note follows the head (BACKLOG #5925 closing
+    step 5), so neither prints the value the cut left last. The C0-scrubbed path's head was read
+    by the handler chain with no note, so its answer can still show that value; the line check
+    then ships the detail hidden whole, with its note (``_bounded_detail``). Before step 5 this
+    pinned main's answer, the scrubbed detail with ``12345`` in it."""
     import json
 
     from messagefoundry.store import audit_tee
@@ -402,4 +413,5 @@ def test_the_audit_tee_detail_keeps_one_answer_on_both_paths() -> None:
     finally:
         logger.removeHandler(handler)
     shipped = json.loads(lines[-1])["detail"]
-    assert shipped.startswith("\x01 [redacted] "), shipped  # scrubbed, not hidden whole
+    assert "12345" not in shipped, shipped
+    assert shipped.endswith(" [redaction bound: dropped 70_001 more chars unscanned]"), shipped

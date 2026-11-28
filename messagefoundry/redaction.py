@@ -1782,9 +1782,13 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where only whitespace follows the line, :func:`_maskable_rest` decides with its
     rules for an answer's end, and also with its rules for a value glued to what follows where that
-    whitespace opens with a line break, the only whitespace the line leaves after it (``</family
-    Li`` then a line break, and no bound note, keeps ``Li``); :func:`_ends_in_camel_head` can refuse
-    the last word too, except behind a bound note (``noted``, below). Where
+    whitespace opens with a line break, the only whitespace the line leaves after it;
+    :func:`_ends_in_camel_head` can refuse the last word too, except behind a bound note
+    (``noted``, below). Where those refuse it with no bound note,
+    :func:`_mask_keeping_glue_head` masks it but for the end of its last word that, at least, the
+    passes :func:`_glue_head_start` models could complete with glued text (``</family Kim`` masks
+    to ``</family Xxm``), and reads a line break there as the text's end (``</family Li`` then a
+    line break masks ``Li``). Where
     the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
     word is refused too, and a surname such as ``Johnson`` is masked there.
 
@@ -1803,10 +1807,16 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     no backstop opener when that run read it, so it keeps at least what these rules refuse on that
     text, while a run that took the
     name of an end tag outside the vocabulary leaves its rest as it stood, even inside a vocabulary
-    element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text with no
-    bound note after it, every refusal :func:`_maskable_rest` makes there, a last word with a digit
-    or ending in ``m``, ``b``, ``f`` or ``n`` among them, and every last word
-    :func:`_ends_in_camel_head` refuses (``</family zqxP``).
+    element (``<name>a|b|<b>c</b Zqxdoe></name>``); where the rest ends the text with no bound
+    note after it, a last word holding a digit, which keeps the whole rest (``</family Zqx
+    4455``), and the end of a last word that glued text could complete, which stays while the
+    words before it are masked (``</family zqxP`` masks to ``</family xxxP``, and ``shared``
+    stays whole); a value written as an end tag's name, which is kept as it stood, prefixed or not
+    (``<family>Smith</family:Zqxdoe>`` prints ``Zqxdoe``: a masked name can spell an element that
+    text a caller puts before the answer opens, and a later call then reads the tag as closing it,
+    BACKLOG #5925 item 13); and the text of an element that only a
+    malformed end tag closes and whose text opens with whitespace (``<family> Smith</family
+    Kim``), which is read as prose.
 
     **A rest this module's trailing bound note follows does not end the text** (``noted``, BACKLOG
     #5925): the XML pass reads the text with the note set aside, but no caller's text can be glued
@@ -1833,6 +1843,9 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
             or _holds_camel_label(_GLUED_WORD.findall(rest.lower()))
         ):
             rest = None
+        if rest is None and not noted:
+            masked = _mask_keeping_glue_head(text[start:end])
+            return text[start:stop] if masked is None else masked + text[end:stop]
     else:
         rest = text[start:end]
         if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
@@ -1874,13 +1887,72 @@ def _ends_in_camel_head(rest: str) -> bool:
     """Whether ``rest``'s last word ends on the head of a credential label word a caller's text could
     complete: from the word's start, which the filters read case-insensitively after a boundary
     (``shared`` and a caller's ``accesskey=``), or from a camelCase capital after a lower-case
-    letter or a digit (``zqxP`` and ``assword: x``)."""
+    letter or a digit (``zqxP`` and ``assword: x``). A caller's text can also complete a member
+    key's head at any index (:data:`_MEMBER_KEY_HEADS`), and this test does not refuse a rest for
+    that position: where a rest is refused for another reason, :func:`_glue_head_start` keeps such
+    a head, and a rest no rule refuses is masked whole, so a member key a caller's text completes
+    there is not read (``</family Zqtok`` then ``en=hunter2zz;Server=x``), a residual the glue-head
+    mask does not change."""
     last = _GLUED_WORD.findall(rest)[-1]
-    return any(
-        (i == 0 or (last[i].isupper() and not last[i - 1].isupper()))
-        and any(label.startswith(last[i:].lower()) for label in _CAMEL_LABEL_WORDS)
-        for i in range(len(last))
+    return any(_camel_head_at(last, last.lower(), i) for i in range(len(last)))
+
+
+def _camel_head_at(word: str, lower: str, i: int) -> bool:
+    """Whether ``word`` (``lower`` is it lower-cased) ends, from ``i``, on the head of a credential
+    label word: from the word's start, or from a camelCase capital after a lower-case letter or a
+    digit, as :func:`_ends_in_camel_head` reads one."""
+    return (i == 0 or (word[i].isupper() and not word[i - 1].isupper())) and any(
+        label.startswith(lower[i:]) for label in _CAMEL_LABEL_WORDS
     )
+
+
+def _glue_head_start(word: str) -> int:
+    """Where the end of ``word`` that text glued after it could complete starts: the first index
+    from which ``word`` ends on a head of a word some pass reads with no boundary before it
+    (:data:`_UNBOUNDED_HEADS`, compared lower-cased), on a head of a credential label word
+    (:func:`_camel_head_at`), or on a member key's head (:data:`_MEMBER_KEY_HEADS`, compared
+    lower-cased). ``len(word)`` where it ends on none."""
+    lower = word.lower()
+    for i in range(max(0, len(word) - _GLUE_HEAD_MAX), len(word)):
+        if (
+            lower[i:] in _UNBOUNDED_HEAD_SET
+            or _camel_head_at(word, lower, i)
+            or lower[i:] in _MEMBER_KEY_HEADS
+        ):
+            return i
+    return len(word)
+
+
+def _mask_keeping_glue_head(rest: str) -> str | None:
+    """``rest``, an end tag's rest that only whitespace follows to the text's end, masked but for
+    the end of its last word that a caller's text glued after it could complete
+    (:func:`_glue_head_start`), which is kept as it stood (BACKLOG #5925 closing step 1:
+    ``</family Kim`` masks to ``</family Xxm``, since ``m`` opens ``MSH`` and ``mfb``). That end
+    starts at the first index :func:`_glue_head_start` finds, and the characters it keeps are the
+    ones the passes it models need as they stood: the passes that read a word with no boundary
+    before it (:data:`_UNBOUNDED_HEADS`), the credential filters' label-word starts
+    (:func:`_camel_head_at`) and the connection-string member key reader in ``secretscrub``
+    (:data:`_MEMBER_KEY_HEADS`). Some reads also rest on the masked characters' shape, not on what
+    is kept, at least these: the member reader takes the masked letters before a kept head as part
+    of its key, and the credential filters' camelCase start needs the masked letter before a kept
+    capital to be lower-case. Both hold because :data:`_SHAPE` masks a letter to a letter of its
+    case. A line break before the end is read as the text's end: where an answer keeps its closing
+    line break, as :func:`redact` does, glued text follows the break and cannot complete the word,
+    and where an answer is stripped, as :func:`safe_text` strips it, the word ends the text and
+    these rules read it there. (``</family Li`` then a line break masks ``Li``). ``None`` keeps the
+    rest as it stood where those rules refuse it for another reason: :func:`_rest_words` refuses it,
+    its last word holds a digit, or the mask would leave nothing changed or a last word some pass
+    reads literally."""
+    if _rest_words(rest, camel=True) is None:
+        return None
+    last = list(_GLUED_WORD.finditer(rest))[-1]  # a rest _rest_words accepts holds a word
+    if not last.group().isalpha():
+        return None
+    cut = last.start() + _glue_head_start(last.group())
+    masked = rest[:cut].translate(_SHAPE) + rest[cut:]
+    if masked == rest or masked[last.start() : last.end()].lower() in _ANCHOR_PREFIXES:
+        return None
+    return masked
 
 
 def _scrub_xml_element(
@@ -1914,6 +1986,9 @@ def _scrub_xml_element(
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
+            # The name is kept, even one naming no open element. That is a residual, and the
+            # residual list in :func:`_end_tag_rest` says why a mask in place was dropped
+            # (BACKLOG #5925 item 13).
             out.append(tag.group())
             out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
             if open_names.get(qname):
@@ -2460,11 +2535,12 @@ _UNBOUNDED_WORDS = (
 _UNBOUNDED_HEADS = tuple(
     sorted({word[:end] for word in _UNBOUNDED_WORDS for end in range(1, len(word) + 1)})
 )
+_UNBOUNDED_HEAD_SET = frozenset(_UNBOUNDED_HEADS)
 #: The credential label words a camelCase start opens on, which the credential filters read inside
 #: a longer word (``userPwd=``, ``clientSecret=``), lower-cased: the glued-label words and the
-#: compound key words. That module imports this one, so they are spelled here; a test holds this set
-#: to its ``_CAMEL_WORDS``. Read for end-tag rests, at least by :func:`_holds_camel_label` and
-#: :func:`_ends_in_camel_head`.
+#: compound key words. This module is pure stdlib, so they are spelled here; a test holds this set
+#: to ``secretscrub._CAMEL_WORDS``. Read for end-tag rests, at least by :func:`_holds_camel_label`
+#: and :func:`_ends_in_camel_head`.
 _CAMEL_LABEL_WORDS = (
     *_GLUED_CREDENTIAL_WORDS,
     "sharedaccesskey",
@@ -2478,6 +2554,56 @@ _CAMEL_LABEL_WORDS = (
     "secretkey",
     "authkey",
 )
+#: The key words and the ``_?<suffix>`` qualifier words the connection-string member reader reads
+#: (``secretscrub._MEMBER_KEY_RUN``). That reader can read word characters before a key word as part
+#: of the key, so a caller's text glued after a masked word may complete one from any index
+#: (``Zqcreden`` and a caller's ``tial=``). This module is pure stdlib, so they are spelled here; a
+#: test holds them to that module's word tuples, which
+#: ``tests/test_connection_string_member_scrub.py`` holds to the reader's pattern.
+_MEMBER_KEY_WORDS = (
+    "passphrase",
+    "credential",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "pass",
+    "pwd",
+)
+_MEMBER_KEY_SUFFIXES = (
+    "secondary",
+    "plaintext",
+    "previous",
+    "primary",
+    "current",
+    "string",
+    "value",
+    "plain",
+    "next",
+    "prev",
+    "text",
+    "old",
+    "new",
+    "raw",
+)
+#: Every head of each key word, lower-cased, alone or followed by a qualifier, which
+#: :func:`_glue_head_start` reads at any index. It reads only a letters-only last word, so the heads
+#: holding the reader's ``_`` or its digit-run suffix are left out: none could match. A head holding
+#: a whole key word is not reached today either, since every key word is a label word and
+#: :func:`_holds_camel_label` refuses such a rest first; those heads are kept so the set follows
+#: the reader, not that refusal.
+_MEMBER_KEY_HEADS = frozenset(
+    key[:end]
+    for word in _MEMBER_KEY_WORDS
+    for key in (word, *(word + suffix for suffix in _MEMBER_KEY_SUFFIXES))
+    for end in range(1, len(key) + 1)
+)
+#: The longest head :func:`_glue_head_start` can find: no longer end of a word can open one.
+_GLUE_HEAD_MAX = max(
+    len(word) for word in (*_UNBOUNDED_WORDS, *_CAMEL_LABEL_WORDS, *_MEMBER_KEY_HEADS)
+)
+
+
 #: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's
 #: heads that hold digits. A PHI last word that ends the answer is letters only, so it cannot end in
 #: these; a credential's may (code review round 2, #2968). They are not added above, since a quoted
@@ -2490,10 +2616,11 @@ _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 def _glued_value(
     text: str, body: str, run: re.Match[str], field_run: re.Pattern[str], *, noted: bool = False
-) -> str | None:
-    """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
-    to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
-    scrub. ``body`` is ``text`` with this module's trailing bound note and its joiner set aside
+) -> tuple[str, str] | None:
+    """``(rest, mask)``: the rest of a PHI or credential value that the field run ``run`` cut
+    through, when it is safe to mask, and what replaces it, of the same length. The rest is the
+    text after the token, up to the value's terminator. ``None`` leaves the plain scrub. ``body``
+    is ``text`` with this module's trailing bound note and its joiner set aside
     (:func:`_without_trailing_note`). The end-tag arm reads only ``body``. The unquoted PHI arm and
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
@@ -2530,25 +2657,27 @@ def _glued_value(
             body if on_body else text, end, stop, field_run, credential=False, noted=on_body
         )
         if rest is not None:
-            return rest
-    rest = _glued_end_tag_rest(body, token, end, field_run, noted=noted)
-    if rest is not None:
-        return rest
+            return rest, rest.translate(_SHAPE)
+    tag_rest = _glued_end_tag_rest(body, token, end, field_run, noted=noted)
+    if tag_rest is not None:
+        return tag_rest
     if not _ends_in_credential_label(token):
         return None
     bare = _GLUED_BARE_VALUE.match(body, end)
     if bare is None:
         return None
     on_body = noted and bare.end() == len(body)
-    return _maskable_rest(
+    rest = _maskable_rest(
         body if on_body else text, end, bare.end(), field_run, credential=True, noted=on_body
     )
+    return None if rest is None else (rest, rest.translate(_SHAPE))
 
 
 def _glued_end_tag_rest(
     body: str, token: str, end: int, field_run: re.Pattern[str], *, noted: bool
-) -> str | None:
-    """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
+) -> tuple[str, str] | None:
+    """``(rest, mask)`` for the rest of a vocabulary end tag a field run cut through, when its
+    ``token`` ends on
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
     these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text with this module's
     trailing bound note set aside as the XML pass sets it aside (:func:`_without_trailing_note`);
@@ -2567,9 +2696,10 @@ def _glued_end_tag_rest(
     every rest here (:func:`_scrub_field_runs`), where the walk can still mask one once the JSON
     pass has scrubbed the opener. The #3318 rule refusing a last word of two letters or fewer
     glued to what follows is not applied by this arm itself: it guards a string prefix before a
-    quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). :func:`_end_tag_rest`
-    still applies it where only whitespace follows the rest and that whitespace opens with a line
-    break, short of a bound note (``a|b|</family Li`` then a line break keeps ``Li``).
+    quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). Where only
+    whitespace follows the rest and that whitespace opens with a line break, short of a bound note,
+    :func:`_end_tag_rest` reads the line break as the text's end and masks the word but for its glue
+    head (:func:`_mask_keeping_glue_head`: ``a|b|</family Li`` then a line break masks ``Li``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
     read on ``text`` ran into the note, took its punctuation, and was refused where the walk masks
@@ -2580,9 +2710,9 @@ def _glued_end_tag_rest(
     :func:`_scrub_field_runs` call. Finding it once per token, as an earlier attempt did, made the
     cost grow with the square of the text's tokens.
 
-    **The arm masks only where :func:`_end_tag_rest` masks the whole rest**, which is the only mask
-    it makes; any other answer from it keeps the rest as it stood, so the two cannot drift apart
-    unseen.
+    **The arm takes :func:`_end_tag_rest`'s answer only where it is a mask in place**, of the whole
+    rest or of all but a glue head (:func:`_mask_keeping_glue_head`); any other answer from it
+    keeps the rest as it stood, so the two cannot drift apart unseen.
 
     Only a vocabulary end tag is read, as :func:`_mask_stray_end_tags` reads one outside a walked
     element. This arm tracks no open elements, so the rest of any other end tag a run took stays as
@@ -2598,13 +2728,17 @@ def _glued_end_tag_rest(
     assert line is not None  # the pattern matches the empty string
     stop = line.end()
     rest = body[end:stop]
-    masked = rest.translate(_SHAPE)
-    if masked == rest or _end_tag_rest(body, end, stop, True, noted=noted) != masked:
+    shape = rest.translate(_SHAPE)
+    if shape == rest:  # no letter or digit to mask
+        return None
+    masked = _end_tag_rest(body, end, stop, True, noted=noted)
+    # Only a mask in place is taken; the docstring says why.
+    if masked == rest or masked.translate(_SHAPE) != shape:
         return None
     last = _GLUED_WORD.findall(rest)[-1]  # a rest the mask changed holds a word
     if not rest.endswith(" ") and field_run.match(body, stop - len(last)) is not None:
         return None
-    return rest
+    return rest, masked
 
 
 def _without_trailing_note(text: str) -> str:
@@ -2723,13 +2857,14 @@ def _scrub_field_runs(
         pos = run.end()
         # Every value it masks opens with a space, and its token holds a hint, so most runs skip it.
         candidate = text.startswith(" ", pos) and _GLUED_HINT.search(text, run.start(), pos)
-        rest = None
+        glued = None
         if candidate:
             if body is None:
                 body = _without_trailing_note(text)
-            rest = _glued_value(text, body, run, field_run, noted=noted)
-        if rest is not None:
-            out.append(rest.translate(_SHAPE))
+            glued = _glued_value(text, body, run, field_run, noted=noted)
+        if glued is not None:
+            rest, mask = glued
+            out.append(mask)
             pos += len(rest)
     if not out:
         return text
@@ -2879,7 +3014,7 @@ def _held_back(message: str, limit: int) -> str:
     return f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
 
 
-def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
+def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT, follows: str = "") -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
@@ -2928,9 +3063,13 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     out of band (:func:`_redact_noted`), not written into the head: a stand-in note in the text let
     a whole-text gate in :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which
     switched off a scrub the answer without it made. A text that fits the window has no note, and
-    is redacted as before. :func:`redact_bounded_head` holds this part."""
+    is redacted as before. :func:`redact_bounded_head` holds this part.
+
+    ``follows`` is a bound note the CALLER appends after the result, as the off-box audit tee
+    appends the note its own window cut off; the text is then redacted knowing a note follows it,
+    as with its own. It is not appended here."""
     head, note = safe_text_bound(text)
-    return f"{_held_back(redact_bounded_head(head, note), limit)}{note}"
+    return f"{_held_back(redact_bounded_head(head, note or follows), limit)}{note}"
 
 
 def redact_bounded_head(head: str, note: str) -> str:
@@ -2938,9 +3077,8 @@ def redact_bounded_head(head: str, note: str) -> str:
     note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
     was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
 
-    One place for what :func:`safe_text` and ``verify_leaf.safe_detail_text`` each do with a head
-    they bound, so the two answer alike (the off-box audit tee does not use it; its
-    ``_bounded_detail`` says why):
+    One place for what :func:`safe_text`, ``verify_leaf.safe_detail_text`` and the off-box audit
+    tee's detail each do with a head they bound, so they answer alike:
     ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
     for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
     dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,
@@ -2961,8 +3099,9 @@ def safe_text_bound(text: str) -> tuple[str, str]:
     audit tee does (BACKLOG #3045). A scrub that lengthens ``head`` past the window makes
     :func:`safe_text` cut it again and append a second bound note. ``safe_text(head) + note`` is
     not ``safe_text(text)``: :func:`safe_text` on the head alone sees no note after it, so a value
-    the cut left last is judged as ending the text (BACKLOG #5925). :func:`redact_bounded_head`
-    gives the head's answer as :func:`safe_text` gives it."""
+    the cut left last is judged as ending the text (BACKLOG #5925). ``safe_text(head,
+    follows=note) + note`` tells it, as the off-box audit tee does, and
+    :func:`redact_bounded_head` gives the head's answer as :func:`safe_text` gives it."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     return head, (f" {_clamp_marker(dropped)}" if dropped else "")
 
