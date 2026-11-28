@@ -3,7 +3,11 @@
   now end the retention pass's orphan sweep with a logged error rather than a silent clean pass.
   Once the root's own read has succeeded, a listing that then answers absence is a logged error
   too. Right before it removes a temp leftover, or a body whose sidecar reads as absent, the sweep
-  checks that the root still answers with the identity it read before its listing. A share
+  checks that the root still answers with the identity it read before its listing, and removes it
+  only when the root does, with one exception: when both reads give no identity (an inode and a
+  device of 0), the check cannot tell a swap from the same folder and the removal proceeds. That
+  is a residual, one of at least those below. When only one of the two reads gives no identity,
+  the sweep stops with a logged warning. A share
   remounted under the root with another identity stops the sweep with a logged error only when the
   remount lands after that first read and before one of these checks, while a temp leftover or a
   body whose sidecar reads as absent, past the age floor, is still to come, or before the root

@@ -347,36 +347,45 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
 def _root_fault(
     root: Path, pinned: os.stat_result, memo: _OncePerInterval | None = None
 ) -> str | None:
-    """Why the uploads root no longer reads as the folder the sweep pinned, whose ``stat`` was
-    ``pinned``, taken before the listing, or ``None`` when it still does. Its own ``stat`` failed,
+    """Why the uploads root does not read as the folder the sweep pinned, whose ``stat`` was
+    ``pinned``, taken before the listing, or ``None`` when it does. Its own ``stat`` failed,
     which is read as the root being lost, since an entry's own error cannot show that: a dangling
     link can raise the codes a lost share does. Or it answers with another identity
     (``os.path.samestat``), as a share remounted, or a folder swapped in, under the root's name does
     when that lands after the pin and before this call (BACKLOG #8341 item 2). It sees nothing that
     lands at another time, at least before the pin or after this call. An answer proves nothing
     about the entries under it. A file system that reports no stable identity, such as one that
-    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``. A read that
-    answers both ``st_ino`` and ``st_dev`` as 0, as a Windows ``stat`` that falls back to reading the
-    parent's directory entry can, carries no identity, so when either the pin or this read does,
-    this call gives no swap verdict: it returns ``None``, the pass goes on, and no swap is logged,
-    only a DEBUG line at most once per interval of ``memo``, when one is given. So a fallback on
-    one read only does not stop a sound pass, and one on both shows no swap at all. One that mints an identity on the client, at
-    least a CIFS mount with ``noserverino`` or a FUSE mount without stable inode numbers, can stop a
-    sound pass, which then removes nothing more, and can do so pass after pass, leaving orphans past
-    retention. Text and not the exception, whose traceback would hold the sweep's frame, and so its
-    whole listing, until a cyclic collection."""
+    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``.
+
+    A read that answers both ``st_ino`` and ``st_dev`` as 0, as a Windows ``stat`` that falls back
+    to reading the parent's directory entry can, carries no identity. When exactly one of the pin
+    and this read does, the two cannot be compared, and this call returns
+    :data:`_ROOT_UNCOMPARED`, which stops the pass as a swap does, so a folder swapped in whose
+    attributes the service account cannot read does not pass. When both do, this call cannot tell
+    a swap from the same folder and returns ``None``, logging a DEBUG line at most once per
+    interval of ``memo`` when one is given, so the removal proceeds: that is a residual. A file
+    system that mints an identity on the client, at least a CIFS mount with ``noserverino`` or a
+    FUSE mount without stable inode numbers, can stop a sound pass, which then removes nothing
+    more, and can do so pass after pass, leaving orphans past retention; so can a one-sided
+    identity of 0 that recurs. Text and not the exception, whose traceback would hold the sweep's
+    frame, and so its whole listing, until a cyclic collection."""
     try:
         now = root.stat()
     except OSError as exc:
         return f"stopped answering ({exc.strerror or type(exc).__name__})"
-    if _no_identity(now) or _no_identity(pinned):
-        # A one-sided fallback would make samestat False for the same folder, a false swap.
+    now_none, pinned_none = _no_identity(now), _no_identity(pinned)
+    if now_none and pinned_none:
+        # Neither read carries an identity, so there is nothing to compare: the residual.
         if memo is not None and memo.first("orphan sweep root identity 0"):
             _log.debug(
-                "uploaded-logs orphan sweep: the uploads root answered a file identity of 0, so "
-                "its identity check gives no swap verdict"
+                "uploaded-logs orphan sweep: both reads of the uploads root answered a file "
+                "identity of 0, so its identity check gives no swap verdict"
             )
         return None
+    if now_none or pinned_none:
+        # samestat would be False even for the same folder, so this is no proven swap; but it
+        # cannot show the root is the folder pinned either, so the pass stops under a true reason.
+        return _ROOT_UNCOMPARED
     if not os.path.samestat(now, pinned):
         return _ROOT_SWAPPED
     return None
@@ -394,6 +403,14 @@ def _no_identity(st: os.stat_result) -> bool:
 #: identities on the client may answer the same folder under a new one.
 _ROOT_SWAPPED = (
     "now answers with a different file identity than the one the sweep read before its listing"
+)
+
+#: :func:`_root_fault`'s reason for a root whose identity could not be compared on this read:
+#: exactly one of the pin and the check answered ``st_ino`` and ``st_dev`` as 0. It claims no swap,
+#: only that the check could not show the root is still the folder pinned.
+_ROOT_UNCOMPARED = (
+    "could not have its file identity compared on this read, because exactly one of this read "
+    "and the one before the listing answered no identity (st_ino and st_dev 0)"
 )
 
 
@@ -4377,8 +4394,12 @@ class UploadStore:
         is itself a POSIX mount point whose share dropped, whose empty listing is a pass that
         removes nothing and logs nothing. Once the pin has succeeded, every listing error raises,
         absence included. A temp or body goes only
-        once it is past the floor and the root still answers with the identity the pin read before
-        the listing, checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a
+        once it is past the floor and the root, checked right before its unlink, answers with the
+        identity the pin read before the listing (:func:`_root_fault`, BACKLOG #8341 item 2), with
+        one exception: when both the pin and that check answer no identity, ``st_ino`` and
+        ``st_dev`` both 0, the check cannot tell a swap from the same folder and the unlink
+        proceeds. That is a residual, one of at least those named below. When only one of the two
+        answers no identity, the pass stops. A
         body the listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just
         before that check, also reports the sidecar not there.
 
@@ -4407,8 +4428,9 @@ class UploadStore:
         stamped it can differ by file system and is not asserted here.
 
         A fault on one entry leaves that entry for the next pass. The pass stops and returns what
-        it removed, logged at ERROR with the reason, when :func:`_root_fault` reports the root
-        lost or swapped at either of two points: right before an entry's unlink, or after an
+        it removed, logged with the reason, at ERROR when :func:`_root_fault` reports the root lost
+        or swapped and at WARNING when it reports the root's identity could not be compared, at
+        either of two points: right before an entry's unlink, or after an
         entry's own ``stat``, sidecar check or unlink raised. An entry skipped before
         that, as a live write, inside the floor, or with a sidecar that reads as there, triggers
         no root check. A fault on the
@@ -4476,9 +4498,11 @@ class UploadStore:
             if why is None:
                 return False
             # One memo key per cause, so a swap after a lost root inside the interval still logs.
-            cause = "swapped" if why == _ROOT_SWAPPED else "lost"
+            cause = {_ROOT_SWAPPED: "swapped", _ROOT_UNCOMPARED: "uncompared"}.get(why, "lost")
+            # An uncompared root is no proven fault, so it is a WARNING rather than an ERROR.
+            level = logging.WARNING if why == _ROOT_UNCOMPARED else logging.ERROR
             _log.log(
-                logging.ERROR
+                level
                 if self._link_logged.first(f"orphan sweep stopped {cause}")
                 else logging.DEBUG,
                 "uploaded-logs orphan sweep stopped at %s: the uploads root %s; no further file "

@@ -466,14 +466,14 @@ def _zero_identity(st: os.stat_result) -> os.stat_result:
 
 
 @pytest.mark.parametrize("zero_on", ["check", "pin", "both"])
-def test_a_root_identity_of_zero_on_either_read_is_no_swap(
+def test_a_root_identity_of_zero_stops_one_sided_and_is_a_residual_on_both(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     zero_on: str,
 ) -> None:
-    # BACKLOG #6575: before the fix, a pin with real ids and a check answering 0 made samestat
-    # False, so a sound pass stopped with a false swap ERROR and kept the orphan.
+    # BACKLOG #6575: a one-sided identity of 0 cannot be compared, so the pass stops before the
+    # unlink with a true WARNING and no swap ERROR; both reads at 0 is the documented residual.
     store = _store(tmp_path / "uploads")
     store._root.mkdir(mode=0o700, parents=True)
     body = store._root / f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
@@ -496,8 +496,25 @@ def test_a_root_identity_of_zero_on_either_read_is_no_swap(
         removed = store._sweep_orphans_sync(now=time.time())
 
     assert len(root_stats) == 2, "the unlink was not preceded by a root-identity check"
-    assert removed == 1 and not body.exists(), "a sound pass stopped on an identity of 0"
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert not any("different file identity" in r.getMessage() for r in caplog.records)
-    notes = [r for r in caplog.records if "a file identity of 0" in r.getMessage()]
-    assert len(notes) == 1 and notes[0].levelno == logging.DEBUG
+    if zero_on == "both":
+        assert removed == 1 and not body.exists(), "the both-zero residual stopped the pass"
+        notes = [r for r in caplog.records if "a file identity of 0" in r.getMessage()]
+        assert len(notes) == 1 and notes[0].levelno == logging.DEBUG
+        return
+    assert removed == 0 and body.exists(), "a one-sided identity of 0 let the unlink through"
+    warned = [
+        r for r in caplog.records if "could not have its file identity compared" in r.getMessage()
+    ]
+    assert len(warned) == 1 and warned[0].levelno == logging.WARNING
+    # The memo damps a repeat inside its interval to DEBUG.
+    root_stats.clear()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 0
+    assert body.exists()
+    again = [
+        r for r in caplog.records if "could not have its file identity compared" in r.getMessage()
+    ]
+    assert len(again) == 1 and again[0].levelno == logging.DEBUG
