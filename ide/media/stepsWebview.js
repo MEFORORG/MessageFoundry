@@ -209,6 +209,43 @@
       const n = Number(meta ? meta.getAttribute('content') : NaN);
       return Number.isSafeInteger(n) ? n : undefined;
     }
+    // The version of its row an element shows: set only by a row-source acknowledgement (below), and
+    // absent while the row is as projected. Every edit and pick echoes it as rowVer (BACKLOG #5943).
+    function rowVerOf(el) {
+      const raw = el && el.dataset ? el.dataset.rowVer : undefined;
+      const n = raw === undefined ? NaN : Number(raw);
+      return Number.isSafeInteger(n) ? n : undefined;
+    }
+    // THE PAGE'S ONE RECEIVER (BACKLOG #5943): the provider's acknowledgement that a typed write on a row
+    // landed. This page already shows the typed value, so every element of that row that still reads
+    // `from` takes the row's new source as data-expect-src and the write's version as data-row-ver, and so
+    // does the selection. One for another projection, or a row that no longer reads `from`, changes
+    // nothing. The guard and the shape helpers come from the inline script the provider renders before
+    // this file (webviewMessaging.ts guardScript and SHAPE_HELPERS); the message is untrusted data.
+    const SHAPES = {
+      rowSource: (d) => mfInt(d.projection) && mfStr(d.handler) && mfInt(d.lineStart) && mfInt(d.lineEnd) &&
+        mfStr(d.from) && mfStr(d.to) && mfInt(d.version),
+    };
+    function applyRowSource(d) {
+      const sameRow = (handler, lineStart, lineEnd) =>
+        handler === d.handler && lineStart === d.lineStart && lineEnd === d.lineEnd;
+      for (const el of document.querySelectorAll('[data-expect-src]')) {
+        if (sameRow(el.dataset.handler, Number(el.dataset.lineStart), Number(el.dataset.lineEnd)) &&
+            el.dataset.expectSrc === d.from) {
+          el.dataset.expectSrc = d.to;
+          el.dataset.rowVer = String(d.version);
+        }
+      }
+      if (selected && sameRow(selected.handler, selected.lineStart, selected.lineEnd) && selected.expectSrc === d.from) {
+        selected.expectSrc = d.to;
+      }
+    }
+    // Origin, source, channel token and payload shape are checked — see webviewMessaging.ts.
+    window.addEventListener('message', (ev) => {
+      const d = typeof mfTrusted === 'function' ? mfTrusted(ev) : null;
+      if (!d || !mfShapeOk(d, 'command', SHAPES, 'Steps')) { return; }
+      if (d.command === 'rowSource' && d.projection === projectionId()) { applyRowSource(d); }
+    });
     // A multi-line Comment's textarea (BACKLOG #5841) keeps its line count, so a line break is never a
     // valid keystroke there: plain Enter commits the field (blur fires its change), as it does in a
     // one-line input.
@@ -265,6 +302,7 @@
           // stale coordinate (a shift in a dirty split view) is REFUSED, not silently mis-edited (F7).
           expectSrc: inp.dataset.expectSrc,
           projection: projectionId(),
+          rowVer: rowVerOf(inp),
         });
       });
     }
@@ -288,6 +326,8 @@
           value: inp ? inp.value : '',
           expectSrc: b.dataset.expectSrc,
           mode: b.dataset.mode,
+          projection: projectionId(),
+          rowVer: rowVerOf(b),
         });
       });
     }
@@ -309,7 +349,8 @@
     // its refusal would re-project the page and throw the pass away. The template a pick request carries
     // is not written again by the blur the picker itself causes, because the pick's own write carries
     // it; a pick that is cancelled leaves that pass to the next change. The engine still checks every
-    // template it is sent. Nothing here listens for a message from the provider.
+    // template it is sent. The editor's only message from the provider is the row-source
+    // acknowledgement above, which changes the box's data-expect-src and data-row-ver, never its parts.
     // Wrapped like the context menu, so a throw here can never kill the wiring around it.
     try {
       (function wireModedArguments() {
@@ -328,6 +369,8 @@
             lineEnd: Number(box.dataset.lineEnd),
             name: box.dataset.name,
             expectSrc: box.dataset.expectSrc,
+            projection: projectionId(),
+            rowVer: rowVerOf(box),
           };
         }
         function setHint(box, shown) {
@@ -347,7 +390,7 @@
           if (!fieldsReady(parts)) { setHint(box, true); return; }
           setHint(box, false);
           box.dataset.lastParts = json;
-          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts }, projection: projectionId() }));
+          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts } }));
         }
         // Ask the provider to pick a field into part `index`. The request carries every chip, typing
         // included, and the pick's write carries that pass, so `flush` does not write the same parts.

@@ -47,9 +47,9 @@ function productionSources(): { file: string; rel: string; text: string }[] {
  *
  * They are the same kind of code as the receivers and nonces scanned below — `media/stepsWebview.js`
  * is loaded into a real webview via `localResourceRoots` — so a scan restricted to `src/**` has a
- * blind spot exactly where the next occurrence could land. Measured at the time of writing: zero
- * `Math.random` call sites and zero message receivers there, so widening the corpus changes no count
- * today; it is what makes tomorrow's addition visible.
+ * blind spot exactly where the next occurrence could land. Measured when it was written: zero
+ * `Math.random` call sites and zero message receivers there. The Steps page's row-source receiver
+ * (BACKLOG #5943) is now one, and this half of the corpus is what makes the receiver count see it.
  */
 function webviewAssetSources(): { file: string; rel: string; text: string }[] {
   const root = path.join(IDE_ROOT, "media");
@@ -361,8 +361,8 @@ suite("webview message receivers check origin, source and the channel token", ()
     const scanned = webviewCodeSources().length;
     assert.strictEqual(
       found.length,
-      8,
-      `expected the 8 known webview message receivers; found ${found.length} across ${scanned} files — ` +
+      9,
+      `expected the 9 known webview message receivers; found ${found.length} across ${scanned} files — ` +
         "a new one must be reviewed and this count updated deliberately",
     );
     const silent = found.filter(
@@ -432,8 +432,8 @@ suite("webview message receivers check origin, source and the channel token", ()
     const sources = productionSources().filter((s) => s.rel !== "webviewMessaging.ts");
     const count = (needle: RegExp): number =>
       sources.reduce((acc, s) => acc + (s.text.match(needle)?.length ?? 0), 0);
-    assert.strictEqual(count(/guardScript\(token\)/g), 8, "one embedded guard per receiver");
-    assert.strictEqual(count(/openChannel\(/g), 8, "one channel opened per receiver-bearing render");
+    assert.strictEqual(count(/guardScript\(token\)/g), 9, "one embedded guard per receiver");
+    assert.strictEqual(count(/openChannel\(/g), 9, "one channel opened per receiver-bearing render");
   });
 
   test("every webview message receiver still discriminates on a message shape", () => {
@@ -448,7 +448,7 @@ suite("webview message receivers check origin, source and the channel token", ()
   test("every webview message receiver checks the payload's shape before acting on it", () => {
     // ASVS 3.5.5, the syntax half (BACKLOG #1123). The discriminator above bounds what a message can
     // ask for; this is the check that its required fields are there with the right types. Test Bench
-    // runs its own shapeOk(); the other seven share mfShapeOk() from webviewMessaging.ts. What each
+    // runs its own shapeOk(); the other eight share mfShapeOk() from webviewMessaging.ts. What each
     // one accepts and discards is pinned behaviourally in webview-receivers.test.ts.
     // Matched as the guard of an early return, `if (!d || !mfShapeOk(` or `if (!shapeOk(`, so a
     // bare mention of the name does not satisfy it. Still text: the behavioural suite is the proof.
@@ -469,7 +469,7 @@ suite("webview message receivers check origin, source and the channel token", ()
       .filter(({ args }) => !/^\w+, '\w+', SHAPES, '[\w ]+'$/.test(args))
       .map(({ rel, args }) => `${rel}: mfShapeOk(${args})`);
     assert.deepStrictEqual(offenders, [], "a panel name is not a string literal, so the message could choose it");
-    assert.ok(calls.length >= 7, `expected at least the 7 shared-helper receivers; found ${calls.length}`);
+    assert.ok(calls.length >= 8, `expected at least the 8 shared-helper receivers; found ${calls.length}`);
   });
 
   test("the shared rationale says what the checks are and what they rest on", () => {

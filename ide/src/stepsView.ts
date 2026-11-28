@@ -68,12 +68,14 @@ import {
   buildPasteRequest,
   buildToolbarInsertRequest,
   drainEdits,
+  drainHeldEdits,
   errorText,
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
   pickPartSeed,
   readEditMessage,
+  readEditStamp,
   readPickPartMessage,
   releaseEdit,
   renderHandlersHtml,
@@ -88,6 +90,7 @@ import {
   QueuedEditRebaser,
   type AppliedRewrite,
   type EditMessage,
+  type EditRebase,
   type HandlerViewModel,
   type LensParseResult,
   type LiveInlineValue,
@@ -103,8 +106,13 @@ import {
 } from "./hl7schema";
 import { buildSegmentScope, sampleSegments } from "./hl7scope";
 import { pickHl7Path, type PickScope } from "./hl7Picker";
-import { nonce } from "./cspNonce";
-import { STARTUP_BANNERS } from "./webviewMessaging";
+import {
+  SHAPE_HELPERS,
+  STARTUP_BANNERS,
+  guardScript,
+  openChannel,
+  postToWebview,
+} from "./webviewMessaging";
 import { StepsPanelProjection, type AnchorMessage, type HandlerType } from "./stepsPanel";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
@@ -387,6 +395,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       // view-models keeps every row's `expectSrc` aligned with the projected buffer (F7). Static parse —
       // never imports/executes the module (a module whose top level would raise still parses, §5).
       const source = document.getText();
+      // Where the rebaser's chain stood when this buffer was read: a write can land while the parse is
+      // awaited, and the page this render sets still shows `source`, not the write (BACKLOG #5943).
+      const at = rebaser.mark(source);
       let parse: LensParseResult | null = null;
       let error: string | null = null;
       try {
@@ -444,7 +455,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         projection,
       );
       // The new rows carry `source`, which decides whether the recorded rewrites still apply (#5943).
-      rebaser.project(projection, source);
+      rebaser.project(projection, source, at);
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -509,6 +520,21 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // The drain is delegated to the pure `drainEdits` so an UNEXPECTED applyEdit rejection (NOT the
     // CLI-refusal path, which `applyOne` handles inline) releases the slot AND keeps draining the queue
     // rather than stranding a pending second edit until the user types again.
+    // Lets an edit on a row rewritten since the last projection carry its expectSrc over, and tells the
+    // page a row's new source after a typed write it already shows (#5943). The acknowledgement goes
+    // only to the page still showing the projection it names; the page checks the id again.
+    const rebase: EditRebase = {
+      rebaser,
+      readSource: () => document.getText(),
+      log: (text) => console.warn(text),
+      onAck: (ack) => {
+        if (!disposed && ack.projection === projectionId) {
+          void postToWebview(panel.webview, { ...ack }).then(undefined, (err: unknown) =>
+            console.warn(`Steps row-source acknowledgement failed: ${errorText(err)}`),
+          );
+        }
+      },
+    };
     const applyEdit = (msg: EditMessage): Promise<void> =>
       drainEdits(
         guard,
@@ -521,8 +547,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           void render(); // revert the optimistic webview change to the true projection
         },
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
-        // Lets an edit on a row rewritten since the last projection carry its expectSrc over (#5943).
-        { rebaser, readSource: () => document.getText(), log: (text) => console.warn(text) },
+        rebase,
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
@@ -601,16 +626,22 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         );
         return;
       }
-      try {
-        let current: EditMessage | undefined = msg;
-        while (current) {
-          await applyOne(current); // applyOne handles its own error + revert-render
-          current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
-        }
-      } finally {
-        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#1759).
-        releaseEdit(guard, scheduleRerender);
-      }
+      // The SAME drain a typed edit takes, with the slot already claimed: it drains a raced typed edit
+      // (F5, never clearPending, which drops it), carries the pick's and each queued edit's expectSrc
+      // over the writes since their page was projected, and records the pick so a typed edit behind it
+      // is checked against it (#5943). It releases the slot through releaseEdit, never a bare endEdit,
+      // so a save suppressed during the pick is deferred (#1759).
+      await drainHeldEdits(
+        guard,
+        msg,
+        "pick",
+        applyOne, // applyOne handles its own refusal + revert-render
+        (err) => {
+          void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${errorText(err)}`);
+        },
+        scheduleRerender,
+        rebase,
+      );
       if (disposed) {
         return;
       }
@@ -793,6 +824,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             lineEnd: m.lineEnd,
             name: m.name,
             expectSrc: m.expectSrc,
+            ...readEditStamp(m),
           };
           const seed = typeof m.value === "string" ? m.value : "";
           void pickThenApply(coords, m.mode === "segment" ? "segment" : "path", seed, (picked) => picked);
@@ -1062,9 +1094,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     //
     // BACKLOG #5845: running the panel.active check first would stop the re-render that follows a
     // param edit typed in the focused webview, and that re-render is load-bearing today. The page
-    // never refreshes a row's data-expect-src itself, so without it a later structural op on the
-    // edited row is refused as stale, Copy/Cut capture the pre-edit source, and the rebaser chain is
-    // never pruned. Dropping the re-render needs a row-source refresh the page can apply in place.
+    // refreshes a row's data-expect-src in place only from the row-source acknowledgement (#5943),
+    // which the host sends only for some typed writes, so without the re-render any row it does not
+    // cover keeps a stale source, and the rebaser's writes are never pruned.
     const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
       if (e.document.uri.toString() !== document.uri.toString()) {
         return;
@@ -1114,7 +1146,9 @@ function pageHtml(
   schema: OpSchema | undefined,
   projection: number,
 ): string {
-  const n = nonce();
+  // This render's CSP nonce and channel token (webviewMessaging.ts): the page's one receiver takes the
+  // host's row-source acknowledgements (BACKLOG #5943), through the guard the inline script defines.
+  const { nonce: n, token } = openChannel(webview);
   const body = renderHandlersHtml(handlers, schema);
   // The insert-toolbar dropdown: a leading "[select item]" placeholder (value ""), then one option per
   // insertable item, built from the single-source-of-truth ADD_MENU_CATALOG (ADR 0106), grouped into
@@ -1364,6 +1398,8 @@ function pageHtml(
        positions, greys, and dismisses it, then posts the SAME insert/delete/move messages the toolbar and
        row buttons post — no second execution path. -->
   ${renderStepsContextMenuHtml()}
+  <script nonce="${n}">${guardScript(token)}
+${SHAPE_HELPERS}</script>
   <script nonce="${n}" src="${scriptUri}"></script>
 </body>
 </html>`;

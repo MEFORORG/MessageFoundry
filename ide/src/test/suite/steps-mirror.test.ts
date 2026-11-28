@@ -1407,6 +1407,8 @@ const NOT_A_MIRROR: Record<string, string> = {
   selectRow: "DOM: applies the .selected class and records the toolbar's insert anchor",
   numberEditValue: "DOM: reads a number <input>; steps-modes-webview.test.ts drives it (BACKLOG #5942)",
   projectionId: "DOM: reads the page's projection id meta; steps-queued-rebase.test.ts pins it (BACKLOG #5943)",
+  rowVerOf: "DOM: reads an element's data-row-ver; steps-rowsource-rebase.test.ts pins it (BACKLOG #5943)",
+  applyRowSource: "DOM: applies a row-source acknowledgement; steps-rowsource-rebase.test.ts drives it (#5943)",
   updateAddState: "DOM: greys the toolbar Add button from the <select> + selection",
   getClipboard: "storage: reads the webview's vscode.getState() clipboard slot",
   setClipboard: "storage: writes the webview's vscode.setState() clipboard slot",

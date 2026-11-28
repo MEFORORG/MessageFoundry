@@ -3,7 +3,7 @@
 //
 // The trust boundary at every webview `message` receiver in this extension: what each receiver
 // checks, what evidence each check rests on, and what it still does not cover. Stated once so the
-// eight receivers do not each carry a different half-answer.
+// nine receivers do not each carry a different half-answer.
 //
 // SHAPE VALIDATION IS NOT ORIGIN VALIDATION. Every receiver dispatches on a discriminator (`command`
 // or `type`) and ignores anything it does not recognise. That bounds WHAT a message can ask for; it
@@ -69,10 +69,13 @@
 //     one of these receivers: some panels run a nonced script and embed no receiver at all. Each such
 //     document is served a `<meta>` CSP of `default-src 'none'` with `script-src 'nonce-<n>'` and a
 //     fresh cryptographically random nonce (see cspNonce.ts), so no injected or third-party script
-//     executes in it. The one CSP variation is stepsView.ts's page, which has no receiver of this
-//     kind: its `script-src` also names `webview.cspSource`, because it loads
-//     `media/stepsWebview.js` (itself nonced), and `localResourceRoots` bounds that source to
-//     `media/`. This is a real enforcement
+//     executes in it. The one CSP variation is stepsView.ts's page: its `script-src` also names
+//     `webview.cspSource`, because it loads `media/stepsWebview.js` (itself nonced), and
+//     `localResourceRoots` bounds that source to `media/`. That page's receiver, the row-source
+//     acknowledgement (BACKLOG #5943), lives in the static file, and runs the guard and the shape
+//     helpers this module renders into the page's nonced inline script ahead of it. Both scripts are
+//     classic scripts, so the file reaches the inline script's functions as globals. This is a real
+//     enforcement
 //     property of the browser, not an assertion about it — but it is scoped to THIS document, and it
 //     is the reason both the nonce and the token being unguessable is load-bearing rather than
 //     cosmetic.
@@ -86,7 +89,7 @@
 //     frames fall back to `default-src 'none'`.
 //   * The discriminator check at each receiver, which is what makes an unexpected message a no-op.
 //   * The payload shape check at each receiver: every message it handles must carry its required
-//     fields with the right JS types, or it is discarded. Seven receivers use `SHAPE_HELPERS` below;
+//     fields with the right JS types, or it is discarded. Eight receivers use `SHAPE_HELPERS` below;
 //     Test Bench keeps its own `shapeOk()`. Types only: value ranges are not checked here.
 //
 // WHAT THIS DOES NOT COVER, stated so a reviewer does not have to infer it. The token authenticates

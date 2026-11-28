@@ -424,14 +424,14 @@ suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
     const render = src.slice(src.indexOf("const render = async"), src.indexOf("const applyOne = async"));
     const id = render.indexOf("const projection = ++projectionId;");
     const html = render.indexOf("panel.webview.html = pageHtml(");
-    const project = render.indexOf("rebaser.project(projection, source);");
+    const project = render.indexOf("rebaser.project(projection, source, at);");
     assert.ok(id >= 0 && html > id && project > html, "the id is minted, stamped, then reported");
     assert.ok(src.includes('<meta name="mf-projection" content="${projection}" />'));
-    assert.ok(/readSource: \(\) => document\.getText\(\)/.test(src.slice(src.indexOf("const applyEdit = (msg"))));
+    // The drains' rebase is defined once, between applyOne and applyEdit, and reads the live buffer.
+    const rebase = src.slice(src.indexOf("const rebase: EditRebase = {"), src.indexOf("const applyEdit = (msg"));
+    assert.ok(/readSource: \(\) => document\.getText\(\)/.test(rebase));
   });
 
-  test("both edit posts in the page echo the projection id", () => {
-    const js = read("media", "stepsWebview.js");
-    assert.strictEqual((js.match(/projection: projectionId\(\)/g) ?? []).length, 2);
-  });
+  // Every post that writes a row now echoes the id: both edit posts and the pickPath request, so the
+  // count moved from 2 to 3 with BACKLOG #5943's remainder (steps-rowsource-rebase.test.ts pins it).
 });

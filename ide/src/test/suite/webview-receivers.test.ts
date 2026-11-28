@@ -18,11 +18,12 @@ import { ELEMENT_KINDS, type Graph } from "../../graphModel";
 import { homeScript } from "../../homeWebview";
 import { FIELDS, securityEditorScript } from "../../securityEditorWebview";
 import { sourceControlScript } from "../../sourceControlWebview";
+import { STEPS_RECEIVER_SOURCE, stepsReceiverBody, stepsReceiverScript } from "./steps-receiver-page";
 import { CHANNEL_FIELD, SHAPE_HELPERS } from "../../webviewMessaging";
 import { MAP_PROVENANCES, wiringMapPayload } from "../../wiringMapModel";
 import { wiringMapScript } from "../../wiringMapWebview";
 
-// ASVS 3.5.5 (BACKLOG #1123), the syntax half at the seven receivers other than Test Bench.
+// ASVS 3.5.5 (BACKLOG #1123), the syntax half at the eight receivers other than Test Bench.
 //
 // mfTrusted() decides WHO sent a message. This suite pins the next step at each receiver: a message
 // that is correctly stamped and carries a known discriminator, but whose payload is missing a
@@ -824,7 +825,45 @@ const wiringMap: Receiver = {
   },
 };
 
-const RECEIVERS: Receiver[] = [alertRules, codeSet, connection, home, security, sourceControl, wiringMap];
+// --- Steps ---------------------------------------------------------------------------------------
+
+/** What stepsView.ts posts after a typed write the page already shows (BACKLOG #5943): the record
+ *  QueuedEditRebaser.record() returns, for the row the page renders at line 2 of projection 1. */
+const ROW_SOURCE_OK: Payload = {
+  command: "rowSource",
+  projection: 1,
+  handler: "h",
+  lineStart: 2,
+  lineEnd: 2,
+  from: STEPS_RECEIVER_SOURCE.split("\n")[1],
+  to: '    msg.set_field("PID-3", "B")',
+  version: 4,
+};
+
+const steps: Receiver = {
+  panel: "Steps",
+  key: "command",
+  load: () => page(stepsReceiverScript(TOKEN), stepsReceiverBody()),
+  wellFormed: { rowSource: [ROW_SOURCE_OK] },
+  malformed: {
+    rowSource: [
+      ["no projection", variant(ROW_SOURCE_OK, (c) => delete c.projection)],
+      ["projection is a string", variant(ROW_SOURCE_OK, (c) => (c.projection = "1"))],
+      ["projection is a fraction", variant(ROW_SOURCE_OK, (c) => (c.projection = 1.5))],
+      ["no handler", variant(ROW_SOURCE_OK, (c) => delete c.handler)],
+      ["handler is a number", variant(ROW_SOURCE_OK, (c) => (c.handler = 1))],
+      ["lineStart is a string", variant(ROW_SOURCE_OK, (c) => (c.lineStart = "2"))],
+      ["no lineEnd", variant(ROW_SOURCE_OK, (c) => delete c.lineEnd)],
+      ["from is null", variant(ROW_SOURCE_OK, (c) => (c.from = null))],
+      ["no to", variant(ROW_SOURCE_OK, (c) => delete c.to)],
+      ["to is an array", variant(ROW_SOURCE_OK, (c) => (c.to = ["x"]))],
+      ["version is a string", variant(ROW_SOURCE_OK, (c) => (c.version = "4"))],
+      ["no version", variant(ROW_SOURCE_OK, (c) => delete c.version)],
+    ],
+  },
+};
+
+const RECEIVERS: Receiver[] = [alertRules, codeSet, connection, home, security, sourceControl, steps, wiringMap];
 
 // Discriminants no receiver handles. Each is message text, so a discard warning reports it with a
 // fixed phrase and never echoes it (BACKLOG #1123). The hostile one would show quoting or markup if
@@ -845,9 +884,9 @@ const RULES_WARNING = discardWarning(alertRules.panel);
 suite("webview receivers discard a malformed payload and render a well-formed one", () => {
   teardown(closeWindows);
 
-  test("the suite covers seven receivers, and each covers every type it has a fixture for", () => {
-    // Test Bench is the eighth receiver and has its own suite (test-bench-webview.test.ts).
-    assert.strictEqual(RECEIVERS.length, 7);
+  test("the suite covers eight receivers, and each covers every type it has a fixture for", () => {
+    // Test Bench is the ninth receiver and has its own suite (test-bench-webview.test.ts).
+    assert.strictEqual(RECEIVERS.length, 8);
     for (const r of RECEIVERS) {
       assert.deepStrictEqual(
         Object.keys(r.malformed).sort(),
