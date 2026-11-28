@@ -350,12 +350,13 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
     which is read as the root being lost, since an entry's own error cannot show that: a dangling
     link can raise the codes a lost share does. Or it answers with another identity
     (``os.path.samestat``), as a share remounted, or a folder swapped in, under the root's name does
-    (BACKLOG #8341 item 2). An answer proves nothing about the entries under it. A file system that
-    reports no stable identity, such as one that answers every ``st_ino`` as 0, cannot show a swap
-    that keeps the same ``st_dev``, and one that mints an identity on the client, at least a CIFS
-    mount with ``noserverino`` or a FUSE mount without stable inode numbers, can stop a sound pass,
-    which then removes nothing more. Text and not the exception, whose traceback would hold the
-    sweep's frame, and so its whole listing, until a cyclic collection."""
+    when that lands after the pin and before this call (BACKLOG #8341 item 2). It sees nothing that
+    lands at another time, at least before the pin or after this call. An answer proves nothing
+    about the entries under it. A file system that reports no stable identity, such as one that
+    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``, and one that
+    mints an identity on the client, at least a CIFS mount with ``noserverino`` or a FUSE mount
+    without stable inode numbers, can stop a sound pass, which then removes nothing more. Text and
+    not the exception, whose traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
     try:
         now = root.stat()
     except OSError as exc:
@@ -4361,13 +4362,19 @@ class UploadStore:
         **That report is the file system's answer, not proof that no sidecar exists.**
         :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
         missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. The
-        root's identity check covers only a root that is another folder at the moment it is checked,
-        after the sidecar check, such as a share remounted under its name; one that flaps back
-        before that check passes it. A stale cache, a hidden name, or a share that answers the same
-        identity can still send a body whose sidecar exists to the unlink, which writes no audit
-        row, only the WARNING below. The check narrows the
-        race with a sidecar landing after the listing and does not close it: one can land between
-        that check and the unlink. Neither that check nor the unlink holds :func:`_pair_lock`.
+        root's identity check covers only a root that answers with another identity at the moment
+        it is checked, after the sidecar check, so it catches a share remounted under its name only
+        when the remount lands after the pin and before that check, while a temp leftover or a body
+        whose sidecar reads as absent, past the floor, is still to come. At least these are not
+        caught: a remount before the pass, which the pin reads as the root; one during the pass
+        with no such entry left to check; one between that check and the unlink; and one that
+        flaps back before that check. A stale cache, a hidden
+        name, or a share that answers the same identity can still send a body whose sidecar exists
+        to the unlink, which writes no audit row, only the WARNING below. The check narrows the race
+        with a sidecar landing after the listing and does not close it: one can land between that
+        check and the unlink, and the root ``stat`` :func:`_root_fault` takes between the two widens
+        that window by as long as that ``stat`` takes. Neither that check nor the unlink holds
+        :func:`_pair_lock`.
 
         **The floor reads an mtime, which proves less than "abandoned".** ``stat`` follows a link,
         so a new link to an old file is past the floor the moment it appears, as is a body restored
@@ -4405,9 +4412,10 @@ class UploadStore:
         success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
         and not how long it can stall, so an hour is a margin against this and not a bar to it.
 
-        ``abort`` is :meth:`prune_expired`'s. It is checked before the listing and before each entry
-        once the listing has been read, so a slow sweep over a large dir does not hold a stop past
-        its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
+        ``abort`` is :meth:`prune_expired`'s. It is checked before the pin, again between the pin
+        and the listing, so a stop set while a slow pin ``stat`` hangs skips the listing, and before
+        each entry once the listing has been read, so a slow sweep over a large dir does not hold a
+        stop past its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
         ``Path.iterdir`` reads the whole directory before it returns on this Python, so a stop set
         meanwhile takes effect when that read ends. The pass's audit rows are already written when
         this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the next one
@@ -4429,6 +4437,8 @@ class UploadStore:
             if is_absent(exc) and (_root_never_made(root) or root.is_dir()):
                 return 0  # no root answered the pin, and none was there or a save just made it
             raise
+        if stop.is_set():
+            return 0  # a stop set while the pin hung; the listing could take as long again
         # The one listing, read whole before anything goes, so a failure at any point removes
         # nothing. The pin proved a root answered, so any error here, absence included, raises.
         entries = list(root.iterdir())

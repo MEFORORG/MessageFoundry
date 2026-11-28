@@ -20,6 +20,7 @@ import logging
 import os
 import secrets
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -42,8 +43,9 @@ def _backdate(path: Path) -> None:
 
 
 class _NameNotFound(FileNotFoundError):
-    """A missing name as both platforms report one: Windows ERROR_FILE_NOT_FOUND (2), which POSIX
-    ignores, so ``is_name_absent`` answers True on either."""
+    """A missing name as both platforms report one: ENOENT with Windows ERROR_FILE_NOT_FOUND (2).
+    ``is_name_absent`` reads ``winerror`` wherever it is set, on POSIX too, and 2 answers True, so
+    it answers True on either platform; ENOENT with no ``winerror`` would answer False on Windows."""
 
     winerror = 2
 
@@ -423,3 +425,34 @@ def test_a_root_swapped_between_the_pin_and_the_listing_logs_a_true_reason(
     assert len(errors) == 1 and "now answers with a different file identity" in errors[0]
     assert "the one the sweep listed" not in errors[0]
     assert "read before its listing" in errors[0]
+
+
+def test_a_stop_set_while_the_pin_hangs_skips_the_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stop is set during the pin, as prune_expired's bound would while a slow share's stat
+    # hangs. The sweep must not then start the listing, which can take as long again.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    name = f".{secrets.token_hex(16)}{_BLOB_SUFFIX}.{secrets.token_hex(4)}.tmp"
+    (store._root / name).write_text("SYNTHETIC", encoding="utf-8")
+    _backdate(store._root / name)
+    abort = threading.Event()
+    real_stat = Path.stat
+    real_iterdir = Path.iterdir
+    listed: list[Path] = []
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == store._root and not abort.is_set():
+            abort.set()  # the stop arrives while the pin is still running
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    def _iterdir(self: Path) -> Any:
+        listed.append(self)
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+    removed = store._sweep_orphans_sync(now=time.time(), abort=abort)
+
+    assert removed == 0 and listed == [] and (store._root / name).exists()
