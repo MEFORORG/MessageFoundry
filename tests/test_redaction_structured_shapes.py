@@ -765,10 +765,17 @@ def test_the_first_stage_terminator_spells_the_1711_keywords() -> None:
     )
 
 
-def test_a_widened_label_swallowed_by_another_widened_scrub_is_a_stated_residual() -> None:
-    """The stages protect #1711's labels, not each other's. #1711 read neither label, so this is no
-    worse than it; pinned so a fix is noticed."""
-    assert "4411 zendway" in redact('{"name": OtherPatientIDs= "4411 zendway"')
+def test_a_widened_label_swallowed_by_another_widened_scrub_is_scrubbed_as_a_run_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stages protect #1711's labels, not each other's: the ``name`` value swallows the
+    ``OtherPatientIDs=`` label. Its value runs on after the swallowed one on the same line, so the
+    JSON run-on rule (BACKLOG #5814), which runs after both stages, scrubs it; with that rule off it
+    is the residual it was."""
+    text = '{"name": OtherPatientIDs= "4411 zendway"'
+    assert "4411 zendway" not in redact(text)
+    monkeypatch.setattr(redaction, "_json_run_on", lambda text, pos: None)
+    assert "4411 zendway" in redact(text)
 
 
 def test_a_clamp_inside_a_bare_address_strands_no_street_number() -> None:
