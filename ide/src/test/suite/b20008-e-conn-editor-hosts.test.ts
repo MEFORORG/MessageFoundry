@@ -248,7 +248,16 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
       const error = posts.find((p) => p.command === "error");
       assert.ok(error, `the failed request got no answer; posts: ${JSON.stringify(posts)}`);
       assert.strictEqual(error.seq, 4, "the error does not name the request it answers");
-      assert.match(String(error.message), /file transport/);
+      assert.match(String(error.message), /file transport: synthetic schema failure/, "the error does not say why");
+    });
+
+    test(`${name}: a request with no valid id gets no reply, since the page would discard it`, async () => {
+      const token = await open();
+      posts = [];
+      for (const seq of [undefined, "1", 1.5]) {
+        await handler!({ command: "fields", seq, transport: "file", direction: "inbound", settings: {}, __mfChannel: token });
+      }
+      assert.deepStrictEqual(posts, [], "a request with no valid id was answered");
     });
   }
 });

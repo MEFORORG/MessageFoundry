@@ -46,25 +46,37 @@ export async function formSchemaFor(
     const transports = Object.keys(schema.transports).sort();
     return { transports, groups: buildForm(schema, transport, direction, settings), transport, direction };
   } catch {
-    return undefined; // logged by the caller's status surface; the form still opens
+    // The form still opens, on the free-text rows. The cause is not logged here; a rebuild's
+    // request gets it in its error reply (fieldsReply).
+    return undefined;
   }
 }
 
 /** The reply to the connection form's "fields" request, for both hosts (this file and
  *  configEditors.ts). It echoes the request's id (seq) with the transport and direction the groups
  *  were built for, so the page draws only the answer to its latest request (BACKLOG #8243 item 18).
- *  When the engine cannot describe the fields, an "error" naming the same id, so the page stops
- *  waiting for an answer instead of holding Save back for good. */
+ *  When the engine cannot describe the fields, an "error" naming the same id and the cause, so the
+ *  page stops waiting for an answer instead of holding Save back. A request with no valid id gets
+ *  no reply (undefined): the page discards a reply without one, so building it would be wasted. */
 export async function fieldsReply(
   cwd: string,
   m: { transport: string; direction: "inbound" | "outbound"; settings?: Record<string, unknown>; seq?: unknown },
-): Promise<Record<string, unknown>> {
-  const seq = Number.isSafeInteger(m.seq) ? { seq: m.seq } : {};
-  const rebuilt = await formSchemaFor(cwd, m.transport, m.direction, m.settings ?? {});
-  if (!rebuilt) {
-    return { command: "error", message: `could not read the engine's fields for the ${m.transport} transport`, ...seq };
+): Promise<Record<string, unknown> | undefined> {
+  if (!Number.isSafeInteger(m.seq)) {
+    return undefined;
   }
-  return { command: "fields", groups: rebuilt.groups, transport: m.transport, direction: m.direction, ...seq };
+  let schema;
+  try {
+    schema = await connectionSchema(cwd);
+  } catch (e) {
+    return {
+      command: "error",
+      message: `could not read the engine's fields for the ${m.transport} transport: ${e instanceof Error ? e.message : String(e)}`,
+      seq: m.seq,
+    };
+  }
+  const groups = buildForm(schema, m.transport, m.direction, m.settings ?? {});
+  return { command: "fields", groups, transport: m.transport, direction: m.direction, seq: m.seq };
 }
 
 /** Sibling connections in the same connections.toml, for the customEditor's picker (#221b). When
@@ -174,7 +186,9 @@ export async function openConnectionEditor(
         // The reply echoes the request's id, so the page draws only its latest request's answer.
         const asked = requestToken(m);
         const reply = await fieldsReply(ws, { transport: m.transport, direction: m.direction, settings: m.settings, seq: m.seq });
-        void postToSameRender(current.webview, asked, reply);
+        if (reply) {
+          void postToSameRender(current.webview, asked, reply);
+        }
       }
     },
   );

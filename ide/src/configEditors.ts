@@ -244,7 +244,9 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // The reply echoes the request's id, so the page draws only its latest request's answer.
           const asked = requestToken(m);
           const reply = await fieldsReply(ws, { transport: m.transport, direction: m.direction, settings: m.settings, seq: m.seq });
-          void postToSameRender(panel.webview, asked, reply);
+          if (reply) {
+            void postToSameRender(panel.webview, asked, reply);
+          }
         } else if (m?.command === "save" && m.conn) {
           // #234: the ONE save policy, shared with the command-opened form (connectionEditor.ts
           // save()) via planSave — merge the posted (rendered-fields-only) object over a save-time

@@ -113,7 +113,14 @@ function closeWindows(): void {
   }
 }
 
-function load(opts: { schema?: ConnectionSchema; initial?: typeof RECORD | Payload; transports?: string[] } = {}): Page {
+interface Timer {
+  fn: () => void;
+  ms: number;
+}
+
+function load(
+  opts: { schema?: ConnectionSchema; initial?: typeof RECORD | Payload; transports?: string[]; timers?: Timer[] } = {},
+): Page {
   const schema = opts.schema ?? SCHEMA;
   const initial = (opts.initial ?? RECORD) as Payload;
   const errors: unknown[] = [];
@@ -142,6 +149,11 @@ function load(opts: { schema?: ConnectionSchema; initial?: typeof RECORD | Paylo
     setState: () => undefined,
     postMessage: (m: Payload) => void posted.push(m),
   });
+  const timers = opts.timers;
+  if (timers) {
+    // The page's timers are held here and run by the test, so a wait is measured, not slept.
+    window.setTimeout = (fn: () => void, ms: number): number => timers.push({ fn, ms });
+  }
   const el = window.document.createElement("script");
   el.textContent = connectionEditorScript(TOKEN, {
     initial,
@@ -482,10 +494,63 @@ suite("connection editor: only the reply to the latest fields request is drawn (
     const [asked] = fieldsRequests(p);
     p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: asked.seq });
     assert.strictEqual(p.window.document.getElementById("transport").value, "mllp", "the picker still names file");
-    assert.match(String(p.window.document.getElementById("error").textContent), /mllp outbound fields again/);
+    assert.match(String(p.window.document.getElementById("error").textContent), /file transport\. The transport and direction are back/);
     const conn = savedConn(p);
     assert.strictEqual(conn.transport, "mllp");
     assert.deepStrictEqual(conn.settings, RECORD.settings);
+  });
+
+  test("a request that gets no usable answer stops holding Save back once its wait runs out", () => {
+    const timers: Timer[] = [];
+    const p = load({ timers });
+    pick(p, "file");
+    assert.strictEqual(saveClicks(p), 0);
+    // A reply the page discards as malformed is no answer: Save still waits.
+    p.deliver({ command: "fields", seq: fieldsRequests(p)[0].seq, transport: "file", direction: "outbound", groups: 5 });
+    assert.strictEqual(saveClicks(p), 0);
+    const waits = timers.filter((t) => t.ms > 0);
+    assert.strictEqual(waits.length, 1, "the request set no wait");
+    waits[0].fn();
+    assert.strictEqual(p.window.document.getElementById("transport").value, "mllp", "the picker still names file");
+    assert.match(String(p.window.document.getElementById("error").textContent), /No answer came for the file fields/);
+    assert.strictEqual(savedConn(p).transport, "mllp");
+  });
+
+  test("a wait that runs out after its request was answered changes nothing", () => {
+    const timers: Timer[] = [];
+    const p = load({ timers });
+    pick(p, "file");
+    answerLatest(p);
+    for (const t of timers) t.fn();
+    assert.strictEqual(p.window.document.getElementById("transport").value, "file");
+    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "");
+  });
+
+  test("the still-loading message clears when the fields are drawn", () => {
+    const p = load();
+    pick(p, "file");
+    assert.strictEqual(saveClicks(p), 0);
+    answerLatest(p);
+    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "the page still says the fields are loading");
+  });
+
+  test("a reply whose transport is not the picker's is not drawn, even with a live id", () => {
+    const p = load();
+    pick(p, "file");
+    const [asked] = fieldsRequests(p);
+    // A reply meant for an earlier page instance, which restarted its ids at the same number.
+    p.deliver({ command: "fields", seq: asked.seq, transport: "mllp", direction: "outbound", groups: buildForm(SCHEMA, "mllp", "outbound", {}) });
+    assert.strictEqual(saveClicks(p), 0, "the mismatched reply was taken as the answer");
+    replyTo(p, asked);
+    assert.ok(control(p, "path"), "the matching reply was not drawn");
+  });
+
+  test("a reply or an error naming no request in flight is ignored", () => {
+    const p = load();
+    p.deliver({ command: "fields", seq: 0, transport: "mllp", direction: "outbound", groups: [] });
+    assert.ok(control(p, "port"), "an unsolicited reply was drawn");
+    p.deliver({ command: "error", message: "synthetic", seq: 0 });
+    assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "an unsolicited error was shown");
   });
 
   test("an error for a request a newer one replaced changes nothing", () => {
@@ -517,6 +582,16 @@ suite("connection editor: an untouched env key is written back exactly (BACKLOG 
   test("an untouched non-secret key of only spaces is saved as recorded", () => {
     const initial = { ...RECORD, settings: { ...RECORD.settings, host: { env: "  ", default: "localhost" } } };
     assert.deepStrictEqual(saved(load({ initial })).host, initial.settings.host);
+  });
+
+  test("a key the box cannot show as recorded says so beside the box", () => {
+    for (const env of ["DB_\r\nPW", "   "]) {
+      const p = withDbPassword(env);
+      const hint = p.window.document.querySelector("#settings [data-key-hint]");
+      assert.ok(hint, `no hint for ${JSON.stringify(env)}`);
+      assert.match(String(hint.textContent), /saved as recorded unless you type a key here/);
+    }
+    assert.strictEqual(load().window.document.querySelector("#settings [data-key-hint]"), null, "a plain key got the hint");
   });
 
   test("a key with surrounding spaces typed in and put back as it was is saved as recorded", () => {

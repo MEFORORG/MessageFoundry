@@ -248,6 +248,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       SHOWN.set(control, control.value);
       control.disabled = REMOVED_KEYS.has(f.key);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
+      // An untouched key is saved exactly as recorded (collectSettings), including what the box
+      // cannot show, so say so where the box shows something other than the saved key.
+      if (useEnv && typeof f.envKey === 'string' && (/[\\r\\n]/.test(f.envKey) || f.envKey.trim() === '')) {
+        hint.dataset.keyHint = '1';
+        hint.textContent = (hint.textContent ? hint.textContent + ' ' : '') +
+          'The recorded environment key holds line breaks or only spaces, which this box cannot show; it is saved as recorded unless you type a key here.';
+      }
       wrap.append(lab, control);
       // Switch between a literal and env(), as the legacy row's env() box did. Not for a secret: the
       // form must not be what writes a literal credential into the file (secretOnlyEnv).
@@ -353,6 +360,23 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // so a request the host could not answer puts the pickers back where the fields are.
     let DRAWN_FOR = null;
     function fieldsPending() { return FIELDS_SEQ !== FIELDS_ANSWERED; }
+    // How long a request waits for its answer before it counts as failed. A reply the page
+    // discards as malformed, or a host that does not answer, would otherwise hold Save back for good.
+    const FIELDS_WAIT_MS = 20000;
+    // The "still loading" text Save showed, so a drawn reply can clear it.
+    let LOADING_TEXT = null;
+
+    /** The latest request will get no usable answer: the pickers go back to the transport and
+     *  direction the drawn fields belong to, and Save works again. */
+    function fieldsFailed(reason) {
+      FIELDS_ANSWERED = FIELDS_SEQ;
+      $('transport').value = DRAWN_FOR.transport;
+      $('direction').value = DRAWN_FOR.direction;
+      refreshVisibility();
+      LOADING_TEXT = null;
+      errorEl.textContent = reason + '. The transport and direction are back to what the form showed before.';
+      errorEl.style.display = '';
+    }
 
     /** Ask the extension to rebuild the descriptors when the transport or direction changes.
      *  settings: what collectSettings(true) returns, when the caller already has it. */
@@ -363,6 +387,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (settings === undefined) settings = collectSettings(true);
       FIELDS_SEQ += 1;
       ASKED_SETTINGS = JSON.stringify(settings);
+      const seq = FIELDS_SEQ;
+      setTimeout(() => {
+        if (seq === FIELDS_SEQ && fieldsPending()) fieldsFailed('No answer came for the ' + $('transport').value + ' fields');
+      }, FIELDS_WAIT_MS);
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
@@ -666,7 +694,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // The drawn fields belong to the transport and direction of the last answered request; until
       // the latest one is answered, saving would post those fields under the pickers' transport.
       if (fieldsPending()) {
-        errorEl.textContent = 'The fields for the ' + $('transport').value + ' transport are still loading; save once they show.';
+        LOADING_TEXT = 'The fields for the ' + $('transport').value + ' transport are still loading; save once they show.';
+        errorEl.textContent = LOADING_TEXT;
         errorEl.style.display = '';
         return;
       }
@@ -713,35 +742,31 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       const d = mfTrusted(e);
       if (!d || !mfShapeOk(d, 'command', SHAPES, 'connection editor')) { return; }
       if (d.command === 'error') {
-        let message = d.message;
-        if (d.seq !== undefined) {
-          // A newer request is still waiting for its answer: this one's failure no longer matters.
-          if (d.seq !== FIELDS_SEQ) return;
-          // The latest request could not be answered, so no reply will come: the pickers go back
-          // to the transport and direction the drawn fields belong to, and Save works again.
-          FIELDS_ANSWERED = FIELDS_SEQ;
-          $('transport').value = DRAWN_FOR.transport;
-          $('direction').value = DRAWN_FOR.direction;
-          refreshVisibility();
-          message += '. The form shows the ' + DRAWN_FOR.transport + ' ' + DRAWN_FOR.direction + ' fields again.';
-        }
-        errorEl.textContent = message; errorEl.style.display = '';
+        if (d.seq === undefined) { errorEl.textContent = d.message; errorEl.style.display = ''; }
+        // An error naming a request is that request's answer. Only the latest unanswered request's
+        // counts: an older one's failure no longer matters, and one naming no request in flight
+        // (the page never sends id 0) is not an answer at all.
+        else if (fieldsPending() && d.seq === FIELDS_SEQ) fieldsFailed(d.message);
       }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
-        // Only the reply to the latest request is drawn: a reply to an older one would drop or
-        // change a setting the latest request carries, or bring back one it left out.
-        if (d.seq !== FIELDS_SEQ) return;
+        // Only the reply to the latest unanswered request is drawn: a reply to an older one would
+        // drop or change a setting the latest request carries, or bring back one it left out. The
+        // echoed transport and direction must be the pickers' too: a page VS Code rebuilt from the
+        // same html restarts its ids, so a reply meant for the page before it can carry a live id.
+        if (!fieldsPending() || d.seq !== FIELDS_SEQ) return;
+        if (d.transport !== $('transport').value || d.direction !== $('direction').value) return;
         // The form changed since the latest request (a setting removed, kept again, emptied,
         // retyped or switched between a literal and env()): drawing its reply would undo that, so
         // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends at
         // most one request, and the form does not change until a reply is drawn, so this stops once
-        // the user stops editing. Save waits meanwhile (fieldsPending).
-        if (ASKED_SETTINGS !== null) {
-          const now = collectSettings(true);
-          if (JSON.stringify(now) !== ASKED_SETTINGS) { requestFields(now); return; }
-        }
+        // the user stops editing. Save waits meanwhile (fieldsPending). An edit collectSettings does
+        // not record (a value in a row with no key yet) is still lost when the reply is drawn.
+        const now = collectSettings(true);
+        if (JSON.stringify(now) !== ASKED_SETTINGS) { requestFields(now); return; }
+        if (LOADING_TEXT !== null && errorEl.textContent === LOADING_TEXT) { errorEl.textContent = ''; errorEl.style.display = 'none'; }
+        LOADING_TEXT = null;
         FIELDS_ANSWERED = d.seq;
         DRAWN_FOR = { transport: d.transport, direction: d.direction };
         FIELD_GROUPS = d.groups;
