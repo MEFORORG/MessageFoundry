@@ -6,4 +6,4 @@
   `\uXXXX` escape, taken before the write for the stream's encoding, so the escape wins on both.
   The escape is counted on the rate-limited stderr format-fault line only: it raises no alert and
   shows nothing on `GET /status`. A sink that refuses the escaped line too is handled as any
-  failed write, and still reaches the stop. (`BACKLOG #5813`)
+  failed write, and can still reach the stop. (`BACKLOG #5813`)

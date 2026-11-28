@@ -824,9 +824,9 @@ _ALL_ASCII = "".join(map(chr, range(128)))
 
 @functools.lru_cache(maxsize=32)
 def _encodes_ascii(encoding: str) -> bool:
-    """Whether ``encoding`` encodes every ASCII character as itself, so an ASCII line needs no
-    escape for it: :func:`_encodable`'s hot-path shortcut. Not cp864, which has no byte for
-    ``%``."""
+    """Whether :func:`_encodable` leaves every ASCII character unchanged for ``encoding``, so
+    an ASCII line needs no escape check: the hot-path shortcut. True for an unknown name, which
+    :func:`_encodable` reads as ASCII; not for cp864, which has no byte for ``%``."""
     return _encodable(_ALL_ASCII, encoding) == _ALL_ASCII
 
 
@@ -896,9 +896,6 @@ class _GuardedSinkMixin(_SinkBase):
     _guard: LogWriteGuard
     _sink_label: str
     _reentry: threading.local
-    #: Whether this sink's emit writes through :meth:`_write_line`, so a record line is
-    #: escaped before the write and handleError has no escaped retry left to make.
-    _emit_escapes = False
 
     def _init_guard(self, guard: LogWriteGuard, sink: str) -> None:
         self._guard = guard
@@ -979,14 +976,15 @@ class _GuardedSinkMixin(_SinkBase):
             elif (
                 isinstance(failure, UnicodeEncodeError)
                 and formatted is not None
-                and not self._emit_escapes
+                and not getattr(self._reentry, "escape_tried", False)
             ):
                 # The record formats, and the stream has no byte for a character in the line (a
                 # strict UTF-8 file and a lone surrogate, say). That is the line's fault, not the
                 # sink's, so the line already formatted is written again escaped, and neither
                 # stage runs. A roll would only re-resolve to the same stream and fail the same way
-                # (BACKLOG #5813). Not for a sink whose emit already wrote through _write_line: its
-                # escape and ASCII fallback both failed, and a retry would only repeat them.
+                # (BACKLOG #5813). Not when the failed write was already _write_line's (the
+                # stdout sink's emit marks it): its escape and ASCII fallback both failed, and a
+                # retry would only repeat them.
                 try:
                     self._write_line(formatted + self.terminator)
                     return
@@ -1189,16 +1187,26 @@ class _GuardedSinkMixin(_SinkBase):
         names its ``encoding``, each character that codec cannot encode is escaped
         (:func:`_encodable`) BEFORE the write, so the escape wins over a stream that would replace
         the character itself, as serve's hardened stdout does (``errors="replace"``,
-        ``console_streams.harden_console_streams``), and a stream that writes in chunks never takes
-        a prefix twice. When the write still raises ``UnicodeEncodeError``, as a stream with no
+        ``console_streams.harden_console_streams``), and a stream that writes in chunks does not
+        take a prefix twice unless its ``encoding`` names a codec wider than the one it uses. The
+        line is escaped only when that codec refuses it, so a codec whose round trip maps one
+        character to another is never rewritten. When the write still raises
+        ``UnicodeEncodeError``, as a stream with no
         ``encoding`` or one that does not name the encoder it uses can, the line is written again
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
         propagates. A write whose line was escaped is counted for the stderr format-fault line.
         Called under the handler's lock, which that count needs."""
-        encoding = getattr(self.stream, "encoding", None)
+        try:
+            encoding = getattr(self.stream, "encoding", None)
+        except Exception:  # a proxy whose property raises: read as no encoding, not a failed write
+            encoding = None
         written = line
         if isinstance(encoding, str) and not (line.isascii() and _encodes_ascii(encoding)):
-            written = _encodable(line, encoding)
+            try:
+                line.encode(encoding)
+            except (LookupError, ValueError, TypeError):
+                # ValueError covers UnicodeEncodeError; the rest are a name codecs refuses.
+                written = _encodable(line, encoding)
         try:
             self._write_raw(written)
         except UnicodeEncodeError:
@@ -1209,13 +1217,15 @@ class _GuardedSinkMixin(_SinkBase):
             written = ascii_only
         if written != line:
             self._note_format_fault(_ESCAPED_FAULT)
-            self._report_format_faults()
+        # After the count, so an escape made now is said with any whose interval has passed.
+        self._report_format_faults()
 
     def _write_raw(self, line: str) -> None:
-        # self.flush(), as StreamHandler.emit ends: it says format faults whose interval has
-        # passed, and skips a stream with no flush rather than failing a write that landed.
+        # StreamHandler.flush, as StreamHandler.emit ends: it skips a stream with no flush rather
+        # than failing a write that landed. Not self.flush(), which would say the format faults
+        # before _write_line counts this line's escape.
         self.stream.write(line)
-        self.flush()
+        logging.StreamHandler.flush(self)
 
 
 class GuardedStreamHandler(_GuardedSinkMixin, logging.StreamHandler[TextIO]):
@@ -1245,20 +1255,26 @@ class GuardedStreamHandler(_GuardedSinkMixin, logging.StreamHandler[TextIO]):
         super().__init__(stream)
         self._init_guard(guard, sink)
 
-    _emit_escapes = True
-
     def emit(self, record: logging.LogRecord) -> None:
         """:meth:`logging.StreamHandler.emit` with the write routed through :meth:`_write_line`,
         so the record's own line is escaped before the stream sees it (BACKLOG #5813). serve sets
         its stdout to ``errors="replace"``, which never raises, so an escape made only after a
         failed write would never run there and the line would carry ``?``. A failure still reaches
-        :meth:`handleError`, which is this control."""
+        :meth:`handleError`, which is this control. A failure of the write itself, as opposed
+        to the format, is marked for :meth:`handleError`, which then makes no escaped retry."""
         try:
-            self._emit_direct(record)
+            line = self.format(record) + self.terminator
+            try:
+                self._write_line(line)
+            except Exception:
+                self._reentry.escape_tried = True
+                raise
         except RecursionError:  # as the stdlib does: see CPython issue 36272
             raise
         except Exception:
             self.handleError(record)
+        finally:
+            self._reentry.escape_tried = False
 
     def _roll(self) -> str | None:
         # No rename: nothing here is the engine's file. Rebind to the CURRENT sys.stdout, which is a

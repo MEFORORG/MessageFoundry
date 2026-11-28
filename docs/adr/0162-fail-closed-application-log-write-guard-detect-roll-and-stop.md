@@ -488,7 +488,8 @@ writes, a file sink record the strict UTF-8 stream refused, the stand-in notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
 least these. A stream with no `encoding` is written as the line came. One whose `encoding` names
 a codec other than the one it uses is written escaped for the named codec, so it escapes more
-than it needs to where the named codec is the narrower, and nothing where it is the wider. Either
+than it needs to where the named codec is the narrower, and too little where it is the
+wider, leaving the rest to the ASCII fallback below. Either
 way, only when the write raises `UnicodeEncodeError` is the line written again with everything
 outside ASCII escaped, and such a stream that writes in chunks can then hold the line's prefix
 twice. An `encoding` that is unknown or not a text encoding escapes
@@ -507,8 +508,7 @@ on serve's hardened stdout it was written with `?` and nothing counted. Now the 
 escaped, and the engine keeps processing. The record is still logged, so the count-and-log
 invariant this guard enforces still holds for it; what is lost is the stop and the alert for a
 line that did land. No owner ruling covers this change; it is the row's own remedy, and BACKLOG
-#5813 records it as defect, not as a decision. The owner sent the first form back on 2026-11-27
-so that the escape also covers serve's default stdout.
+#5813 records it as defect, not as a decision.
 `_GuardedSinkMixin._write_line` is where the escape is made and counted, and
 `GuardedStreamHandler.emit` routes the stdout sink's record writes through it.
 `_GuardedSinkMixin.handleError` and `_report_format_faults` in

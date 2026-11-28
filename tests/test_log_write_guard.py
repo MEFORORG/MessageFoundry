@@ -1210,9 +1210,7 @@ def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
     # every write raises UnicodeEncodeError for this line, as cp1252 would, and then refuses the
     # escaped line, which cp1252 can encode, for the sink's own reason. So the two stages decide
     # as for any write failure, and the stop is asked for.
-    class _Refuses(io.StringIO):
-        encoding = "cp1252"
-
+    class _Refuses(io.StringIO):  # no encoding, so the line reaches write() unescaped
         def write(self, text: str) -> int:
             text.encode("cp1252")  # UnicodeEncodeError for what cp1252 has no byte for
             raise OSError(28, "No space left on device")
@@ -1351,8 +1349,8 @@ def test_serves_hardened_stdout_writes_the_escape_not_a_question_mark(
     # escaped only on UnicodeEncodeError wrote "?" there. The escape is taken before the stream's
     # own replace, so the escaped form wins on serve's default stdout too.
     # NEGATIVE CONTROL: with _write_line restored to try the raw write first and escape only on
-    # UnicodeEncodeError, and GuardedStreamHandler.emit removed, the line read "order caf? ? ?"
-    # (the e-acute kept, the two others replaced) and nothing was counted.
+    # UnicodeEncodeError, and GuardedStreamHandler.emit removed, the line read "order caf",
+    # the e-acute, then " ? ?" (the e-acute kept, the two others replaced) and nothing was counted.
     raw, stream = _strict_cp1252()
     real_err = sys.stderr
     monkeypatch.setattr(sys, "stdout", stream)
