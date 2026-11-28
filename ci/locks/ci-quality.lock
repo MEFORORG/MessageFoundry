@@ -44,9 +44,9 @@ coverage==7.15.2 ; (python_full_version < '3.15' and platform_python_implementat
     # via
     #   mutmut
     #   pytest-cov
-diff-cover==11.0.3 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
-    --hash=sha256:64319dae259dc860eef89ce05cc4f27c0fd69f6fc69cbbd7fb7d4fc2e5a219a3 \
-    --hash=sha256:f97cfe094567922e4d7fd063262c5fca36d6325296813dc5814d7439e1c3a733
+diff-cover==11.0.4 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
+    --hash=sha256:41555d73bc237dc35e42927feb70729dc2fb0a6d2ece8c14cfb10d5f4a48b551 \
+    --hash=sha256:595b03ab755c49bce82c0dd9572e3d3466dd25e32bf19856e8d101991a536921
 iniconfig==2.3.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730 \
     --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
@@ -161,22 +161,36 @@ pytest-cov==7.1.0 ; (python_full_version < '3.15' and platform_python_implementa
 pytest-timeout==2.4.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:7e68e90b01f9eff71332b25001f85c75495fc4e3a836701876183c4bcfd0540a \
     --hash=sha256:c42667e5cdadb151aeb5b26d114aff6bdf5a907f176a007a30b940d3d865b5c2
-pyyaml==6.0.3 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
-    --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
-    --hash=sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65 \
-    --hash=sha256:4a2e8cebe2ff6ab7d1050ecd59c25d4c8bd7e6f400f5f82b96557ac0abafd0ac \
-    --hash=sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9 \
-    --hash=sha256:501a031947e3a9025ed4405a168e6ef5ae3126c59f90ce0cd6f2bfc477be31b7 \
-    --hash=sha256:5190d403f121660ce8d1d2c1bb2ef1bd05b5f68533fc5c2ea899bd15f4399b35 \
-    --hash=sha256:66e1674c3ef6f541c35191caae2d429b967b99e02040f5ba928632d9a7f0f065 \
-    --hash=sha256:6adc77889b628398debc7b65c073bcb99c4a0237b248cacaf3fe8a557563ef6c \
-    --hash=sha256:7c6610def4f163542a622a73fb39f534f8c101d690126992300bf3207eab9764 \
-    --hash=sha256:93dda82c9c22deb0a405ea4dc5f2d0cda384168e466364dec6255b293923b2f3 \
-    --hash=sha256:a80cb027f6b349846a3bf6d73b5e95e782175e52f22108cfa17876aaeff93702 \
-    --hash=sha256:b3bc83488de33889877a0f2543ade9f70c67d66d9ebb4ac959502e12de895788 \
-    --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5 \
-    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f \
-    --hash=sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b
+pyyaml==6.0.4 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
+    --hash=sha256:132c3c7c37a8e6f334921b05cfea5d26e241d792dcbb4db0462129d25ca53b43 \
+    --hash=sha256:15c52bb238a15bb4fd7e6342a5ac71d594507667c7fe0e5a5abbc0f6875d1e91 \
+    --hash=sha256:1d2f08c122727c86f8303bb1dd45159ca1de1f2d68798e671ec46974e321008e \
+    --hash=sha256:2018fda285d1289527a389e1b4ace1e2d3af410930f949136b55ecb0747744d1 \
+    --hash=sha256:2c11be5ab4d9f603a598b5ce93a2064ae38087bdf1b384c5397170054cda4e36 \
+    --hash=sha256:33506a2620f0e7c49858f09cb44e99f144878d03af3d9c10aa136e9a1d103bcd \
+    --hash=sha256:3c7129bcee5c88c1450802cc6a95b690ee7c51bfcc7a9b60bbd9549a7a4fcbe6 \
+    --hash=sha256:4a2a8f27d24d4cdc05aa11df5f4c08e13f30d9e6674809b6a5ddcfcba49a653a \
+    --hash=sha256:573debb9fe3075423d4f823795a678580e597218c25baef178d532b124a25a25 \
+    --hash=sha256:609e8efaffa5662da16b7d53eef76fc4eedbbe56fce5829b67ba808a6e35d399 \
+    --hash=sha256:62c5b5669b05dabf991a705f3a3601f57b65e95121a1d3e3a4ae4446c8632865 \
+    --hash=sha256:67da066ca12eb60114ea87f2ecbcca622fff0c205c743cc900437127564fabf6 \
+    --hash=sha256:6ac167ebebc0c387290406a337b9b5c8c343fa5f7928d5941e45a94b8ba3aa39 \
+    --hash=sha256:8708f6ab9c2581ffa05f66dae3206bb0385949650537d7295fc7ab0d6454dd70 \
+    --hash=sha256:872d2a592289061c1b987e335b3568a2616b474be02bd0608d8f551a385441cd \
+    --hash=sha256:8e0cd755ce5e9009fd95f9c553e5942478feb8f7dffa19435641fcdc3c20e8ca \
+    --hash=sha256:914b19e17814315fbcca52031bf79b68237f3d87a948c584a667b18b468e4df7 \
+    --hash=sha256:a266cf55ee5cf63c1803432a61c6386e750e0012ca49d12d26ccb0ffd80b343a \
+    --hash=sha256:a3cc63af3d639d1609143711837b926183418260aae89ed95193c07b25b99d33 \
+    --hash=sha256:a65339c24f2fb8d4419e06ceec1bda98bdcff727b3b533a81d5af6bb2dd34520 \
+    --hash=sha256:ab874ebcc5c12c31c859a9e9fe159d688df1f7a099818ef8a35906264a8f5d6b \
+    --hash=sha256:b525488d5addf5d59ff4610cd8b1deab9dc97fe0fb3fb74533d7f65e9792bd92 \
+    --hash=sha256:c57e40928738c4a202852759f9e1ee2c7063429a9469ee1ac15651bbf7d69963 \
+    --hash=sha256:c604dc2613c417130479cdd6e55c2faa691b6365aa82b3dafddfcecc2eaf1ac7 \
+    --hash=sha256:d276f23e2371deb5ee68dd252cc9c2402b806b54d8d2cc7efbb6c34c3a78d886 \
+    --hash=sha256:e24bf71af8a432d7808fabff134d38dfe16d3cbb41f2873bb4b1e42422de0a1a \
+    --hash=sha256:e956541cc7a3fff2bb5b17aeb6c5bb42c86c8e6dafb5ebdd41a05e72e702076b \
+    --hash=sha256:ed9b957abb12f6ffcd92d5db32fa3ffd4e4a8423d80ddd51b4efa63b42f6a76b \
+    --hash=sha256:f1a4a85b419f5cb6470dd4be5f766bc59532f11b9c22c076b58a0348f05dca5f
     # via libcst
 rich==15.0.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb \
