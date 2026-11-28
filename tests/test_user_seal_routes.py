@@ -527,7 +527,7 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
         "the single-use `admin_reset_password` grant, so its 423, its 404 and the 503",
-        "the single-use `admin_reset_mfa` grant, at the same cost",
+        "the same answers from `POST /users/{user_id}/reset-mfa` cost its single-use `admin_reset_mfa` grant",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
     ):
         assert fact in body, fact

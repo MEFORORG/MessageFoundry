@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5520 items 4 and 12: a lookup by a key other than the id that is refused is read
-again rather than refused on one check.
+"""BACKLOG #5520 items 4 and 12: a lookup by a key other than the id whose check raced a write is
+read again rather than refused.
 
 ``_lookup_by_username`` and ``_lookup_by_directory_object_id`` back at least provision-admin, the
 AD sign-in, the local sign-in's read by name and the directory rename refresh, and
 ``_load_user_by_federated_subject`` the federated sign-in. Each took one check and dropped whether
 it had established anything, so a check that raced a delete, rename or re-key read as a record
 that fails its seal (``refused``): the honest race refused the caller. They now read again while
-refused, up to ``_CHECKED_READ_PASSES`` reads, as ``_lookup_user_settled`` does for the id. Each
-test stands a raced or failed check in for the contention by stubbing ``_verified``. Synthetic
-accounts only.
+the check raced, up to ``_CHECKED_READ_PASSES`` checks, and fail closed as ``_checked_by_id``
+does. Each test stands a raced or failed check in for the contention by stubbing ``_verified``.
+Synthetic accounts only.
 """
 
 from __future__ import annotations
@@ -21,7 +21,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth import service as service_module
-from messagefoundry.auth.service import AuthService, _SealCheck, _UserLookup
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AuthService,
+    _SealCheck,
+    _UserLookup,
+)
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 
@@ -136,14 +141,17 @@ async def test_a_raced_check_is_read_again_not_refused(
 async def test_a_check_that_races_every_pass_fails_closed(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Control: a row still there after every check raced is refused, never read as passing or
-    gone, so a writer that keeps racing the read cannot buy the account a pass."""
+    """Control: a row still there after every check raced is refused and reported, as
+    ``_checked_by_id`` reports it, never read as passing or gone, so a writer that keeps racing the
+    read cannot buy the account a pass or hide it from the integrity report."""
     await _account(store)
     service = AuthService(store, AuthSettings())
     calls = _race_first(service, monkeypatch, races=_PASSES)
     found = await _lookup(service, key)
     assert found.refused
     assert calls[0] == _PASSES
+    rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=100)
+    assert any("u1" in str(row["detail"]) for row in rows), rows
 
 
 @pytest.mark.parametrize("key", _HELD_KEYS)
@@ -161,29 +169,19 @@ async def test_a_row_gone_after_every_pass_raced_is_not_held(
 
 
 @pytest.mark.parametrize("key", _HELD_KEYS)
-async def test_a_failing_check_is_read_again(
+async def test_a_failing_record_is_refused_on_its_first_check(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Two honest role writes committing across one check's reads fail it, so a failed check is
-    read again, as the id's settled read does; one that then passes is served."""
-    await _account(store)
-    service = AuthService(store, AuthSettings())
-    _stub_verified(service, monkeypatch, lambda n: _SealCheck(failed=True) if n == 1 else None)
-    found = await _lookup(service, key)
-    assert found.user is not None and not found.refused
-
-
-@pytest.mark.parametrize("key", _HELD_KEYS)
-async def test_a_record_failing_every_check_is_refused(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
-) -> None:
-    """Control: a record that fails on every read is refused after ``_CHECKED_READ_PASSES``."""
+    """Control: a check that established a failing record is refused at once, not read again, so
+    a row moved off the key after a failed check cannot read as gone and have a second row minted
+    beside it."""
     await _account(store)
     service = AuthService(store, AuthSettings())
     calls = _stub_verified(service, monkeypatch, lambda n: _SealCheck(failed=True))
+    _wrap_reader(store, monkeypatch, key, gone_after=1)
     found = await _lookup(service, key)
     assert found.refused
-    assert calls[0] == _PASSES
+    assert calls[0] == 1
 
 
 @pytest.mark.parametrize("key", _KEYS)
