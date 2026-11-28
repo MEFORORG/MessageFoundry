@@ -13970,6 +13970,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
+        StoreAcquireTimeout,
         StoreNotFoundError,
         audit_chain_read_errors,
         build_store_cipher,
@@ -14084,13 +14085,18 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         # SQLite's, and a server statement runs under [store].command_timeout instead.
         label = _store_label(store)
         walk_errors = audit_chain_read_errors()
-        probe_errors: tuple[type[Exception], ...] = (*walk_errors, RuntimeError, ValueError)
+        # A link or a store refusal, never a defect: a bug in the probe is raised, not read as a
+        # store that could not be read.
+        probe_errors: tuple[type[Exception], ...] = (*walk_errors, StoreAcquireTimeout)
 
-        async def keyed_behind_the_refusal(posture: HopPosture | None) -> str | None:
+        async def keyed_behind_the_refusal(posture: HopPosture | None) -> CipherAudit | None:
             # A read-only walk under the identity cipher, on the probe handle, which writes
-            # nothing and starts no chain (`open_cipher_walk_probe`): the key-mismatch line its
-            # `keyed_surface` row or first sealed value gives, or None. A probe that fails says
-            # nothing, so the refusal is reported as it is.
+            # nothing and starts no chain (`open_cipher_walk_probe`): its audit when its
+            # `keyed_surface` row or first sealed value found the key mismatch, with the cells
+            # and tables its catalog read could not cover, or None. A probe that fails before
+            # finding one says nothing, so the refusal is reported as it is. A close that fails
+            # after the walk found one keeps it, as `check-privileges` keeps an observed grant.
+            found: CipherAudit | None = None
             try:
                 async with open_cipher_walk_probe(store, posture=posture) as probe:
                     found = await audit_server_cipher_cells(
@@ -14101,8 +14107,15 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     "cipher-audit: could not read whether the refused store holds keyed cells (%s)",
                     type(exc).__name__,
                 )
+            if found is None or found.key_mismatch is None:
                 return None
-            return found.key_mismatch
+            if store.encryption_key or store.encryption_key_file:
+                # The refusal's own sentence for this cause, which KEY_MISMATCH would drop.
+                found.key_mismatch += (
+                    ". A store key is configured, but [store].key_provider resolved no key in "
+                    "this environment"
+                )
+            return found
 
         async def run_server() -> tuple[bool, CipherAudit, str | None] | None:
             _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
@@ -14130,10 +14143,10 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # The #1916 guard refused, and stands. Only why is asked: a store holding keyed
                 # cells is the key's mistake, KEY_MISMATCH as SQLite says it, and a fresh one
                 # stays could not start (BACKLOG #1719 item 22).
-                mismatch = await keyed_behind_the_refusal(posture)
-                if mismatch is None:
+                keyed_audit = await keyed_behind_the_refusal(posture)
+                if keyed_audit is None:
                     raise
-                return False, CipherAudit(key_mismatch=mismatch), None
+                return False, keyed_audit, None
             except (RuntimeError, ValueError) as exc:
                 # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
                 # least a missing driver extra, or an engine refusal of this open. Could not start.
@@ -14309,7 +14322,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     if audit.hidden:
         # On every verdict whose run read the catalog, so a key or a lost connection fixed first
         # does not hide a grant gap until a second run. An open the store refused as keyless
-        # read no catalog, so that KEY_MISMATCH names none.
+        # read no catalog, so that KEY_MISMATCH names none; the probe behind the keyless-chain
+        # refusal read one, so its KEY_MISMATCH names what it saw.
         reason += (
             f"; {len(audit.hidden)} expected cipher table(s) or cell(s) are not visible in the "
             f"catalog of {_store_label(store)} and were not read: {', '.join(audit.hidden)}. At "
@@ -14319,11 +14333,12 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     if audit.row_filtered:
         # Beside the hidden cells, on every verdict whose run read the catalog, for the same reason.
         reason += (
-            f"; {len(audit.row_filtered)} table(s) of {_store_label(store)} have row-level "
-            f"security that may hide rows from this login, so values in them may not have been "
-            f"read: {', '.join(audit.row_filtered)}. Run it as a role that reads every row: a "
-            "superuser, a role with BYPASSRLS, or the table's owner where the table does not "
-            "force row-level security"
+            f"; {len(audit.row_filtered)} table(s) of {_store_label(store)} may hide rows from "
+            "this login, through row-level security or because the catalog read of it was "
+            "refused or incomplete, so values in them may not have been read: "
+            f"{', '.join(audit.row_filtered)}. Run it as a role that reads every row: a "
+            "superuser, a role with BYPASSRLS, or the role that directly owns the table where "
+            "the table does not force row-level security"
         )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted

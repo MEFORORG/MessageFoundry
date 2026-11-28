@@ -87,14 +87,19 @@ class _ProbeRecord:
     def __init__(self) -> None:
         self.entered = 0
         self.closed = 0
-        self.ciphers: list[Cipher] = []
 
 
 def _probe_from(
-    monkeypatch: pytest.MonkeyPatch, db: Path, *, error: Exception | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    db: Path,
+    *,
+    error: Exception | None = None,
+    close_error: Exception | None = None,
+    filtered: frozenset[str] = frozenset(),
 ) -> _ProbeRecord:
     """Make the probe a SQLite-backed source over ``db``, recording that it was entered and closed;
-    ``error`` makes the probe's open raise it instead."""
+    ``error`` makes the probe's open raise it instead, ``close_error`` its close, and ``filtered``
+    the tables it reports as row-filtered."""
     record = _ProbeRecord()
 
     @asynccontextmanager
@@ -105,11 +110,15 @@ def _probe_from(
             raise error
         conn = connect_readonly(db, busy_timeout=5.0)
         record.entered += 1
+        source = _SqliteSource(conn)
+        source.row_filtered = filtered
         try:
-            yield cast(CipherCellSource, _SqliteSource(conn))
+            yield cast(CipherCellSource, source)
         finally:
             conn.close()
             record.closed += 1
+        if close_error is not None:
+            raise close_error
 
     monkeypatch.setattr(store_base, "open_cipher_walk_probe", fake_probe)
     return record
@@ -154,6 +163,37 @@ def test_sealed_values_alone_are_enough_for_key_mismatch(
     _probe_from(monkeypatch, db)
     rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, backend)
     assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+
+
+def test_a_close_failure_after_the_probe_found_the_mismatch_keeps_it(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The walk finished and found the key mismatch, so a failed close does not turn exit 4 into
+    the guard's exit 2."""
+    db, _settings = _copy(_template, tmp_path)
+    _serve_an_empty_log(monkeypatch, db, build_store_cipher(StoreSettings(path=str(db))))
+    _probe_from(monkeypatch, db, close_error=ConnectionResetError("synthetic: close"))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+
+
+def test_the_probe_s_key_mismatch_names_what_its_catalog_read_could_not_cover(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A row filter the probe read is named beside its KEY_MISMATCH, so fixing the key first
+    does not hide it until a second run."""
+    db, _settings = _copy(_template, tmp_path)
+    _serve_an_empty_log(monkeypatch, db, build_store_cipher(StoreSettings(path=str(db))))
+    _probe_from(monkeypatch, db, filtered=frozenset({"messages"}))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+    assert "row-level security" in payload["reason"] and "messages" in payload["reason"], out
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
@@ -394,10 +434,10 @@ def test_the_postgres_read_names_each_table_the_rule_names() -> None:
 
 
 def test_a_table_the_catalog_read_did_not_return_is_named() -> None:
-    """A table with no row, or a name met twice, is a doubt, and a doubt names it."""
-    store = _pg_reading([_row("messages"), _row("queue"), _row("queue")])
+    """A table with no row is a doubt, and a doubt names it."""
+    store = _pg_reading([_row("messages"), _row("queue")])
     got = asyncio.run(store.cipher_walk_row_filtered(["messages", "state", "queue"]))
-    assert got == {"state", "queue"}
+    assert got == {"state"}
 
 
 def test_a_refused_catalog_read_names_every_table() -> None:
@@ -408,9 +448,20 @@ def test_a_refused_catalog_read_names_every_table() -> None:
     }
 
 
-def test_a_lost_connection_is_raised_for_the_walk_to_report() -> None:
-    store = _pg_reading(_Lost("synthetic: lost"))
-    with pytest.raises(_Lost):
+class _TimedOut(sqlite3.DatabaseError):
+    """A server driver's statement timeout."""
+
+    sqlstate = "57014"
+
+
+@pytest.mark.parametrize("error", [_Lost("synthetic: lost"), _TimedOut("synthetic: timeout")])
+def test_a_failure_that_is_not_a_refusal_is_raised_for_the_walk_to_report(
+    error: Exception,
+) -> None:
+    """A lost link or a timeout is not a reading of row security, so it is raised, as every other
+    walk read raises it, rather than named as row-level security."""
+    store = _pg_reading(error)
+    with pytest.raises(type(error)):
         asyncio.run(store.cipher_walk_row_filtered(["messages"]))
 
 

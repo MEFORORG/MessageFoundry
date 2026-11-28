@@ -875,8 +875,10 @@ class CipherCellSource(Protocol):
 
     async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
         """Those of ``tables`` whose rows a server row filter may hide from this login, each one
-        the catalog read shows. Any doubt, a refused read of the catalog included, names the table:
-        a table named here is read as not audited whole, so the safe answer is to name it."""
+        the catalog read shows. Where a backend reads its row filter, any doubt, a refused read of
+        the catalog included, names the table: a table named here is read as not audited whole,
+        so the safe answer is to name it. SQL Server does not read its security policies yet, so
+        it names none (BACKLOG #1719 item 35)."""
         ...
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None: ...

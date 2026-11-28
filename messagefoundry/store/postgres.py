@@ -118,8 +118,9 @@ from messagefoundry.store.base import (
     acquire_pooled,
     check_walk_identifiers,
     driver_sqlstate,
+    is_store_shape_error,
     seed_filter_clause,
-    store_driver_errors,
+    store_call_errors,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -4107,12 +4108,13 @@ class PostgresStore(ServerCipherWalk):
         """Those of ``tables`` whose rows row-level security may hide from this login (BACKLOG
         #1719 item 35): :func:`row_security_hides_rows` over ``pg_class`` and ``pg_roles``, read in
         the schema :meth:`cipher_walk_columns` reads. A table with no row there, or a flag read as
-        NULL, is named, and a read the server refused names every table: a doubt reads as not
-        audited whole, never as covered.
+        NULL, is named, and a read a grant or access rule refused names every table: a doubt
+        reads as not audited whole, never as covered.
 
         A member of the owning role is read as not the owner, though PostgreSQL exempts one that
-        inherits the role's privileges: that errs toward naming the table. A lost connection is
-        raised, as every other walk read raises it."""
+        inherits the role's privileges: that errs toward naming the table. Any other failure, a
+        lost connection or a statement timeout among them, is raised, as every other walk read
+        raises it."""
         names = list(dict.fromkeys(tables))
         if not names:
             return frozenset()
@@ -4127,27 +4129,29 @@ class PostgresStore(ServerCipherWalk):
                 " LEFT JOIN pg_catalog.pg_roles r ON r.rolname = current_user",
                 names,
             )
-        except store_driver_errors() as exc:
-            state = driver_sqlstate(exc)
-            if state is None or state.startswith("08"):
-                raise  # not the server refusing this read: the link, which the walk reports
+        except store_call_errors() as exc:
+            if not is_store_shape_error(exc):
+                raise  # a link, a timeout or a server fault, which the walk reports as any read's
+            # A grant or access rule refused the catalog read: a doubt over every table.
+            log.warning(
+                "cipher-audit: the row-level security catalog read was refused (%s, SQLSTATE %s)",
+                type(exc).__name__,
+                driver_sqlstate(exc),
+            )
             return frozenset(names)
-        returned: set[str] = set()
-        filtered: set[str] = set()
-        for r in rows:
-            name = str(r["table_name"])
-            # A name met twice is a catalog this read did not expect: the doubt names it.
-            if name in returned or row_security_hides_rows(
+        # pg_class is unique on name and schema, so each table has at most one row.
+        hides = {
+            str(r["table_name"]): row_security_hides_rows(
                 enabled=r["relrowsecurity"],
                 forced=r["relforcerowsecurity"],
                 owned=r["owned"],
                 superuser=r["rolsuper"],
                 bypass=r["rolbypassrls"],
-            ):
-                filtered.add(name)
-            returned.add(name)
+            )
+            for r in rows
+        }
         # A table the read did not return is a doubt too.
-        return frozenset(t for t in names if t in filtered or t not in returned)
+        return frozenset(t for t in names if hides.get(t, True))
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the catalog

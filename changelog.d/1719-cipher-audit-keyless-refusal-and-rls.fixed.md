@@ -12,5 +12,6 @@
   where no FAIL or KEY_MISMATCH leads, and every verdict names the table. The exceptions are a
   login that is a superuser, has BYPASSRLS, or is itself the table's owner while the table does
   not force row-level security; a member of the owning role is read as not the owner. A catalog
-  read the server refuses names every table. SQL Server security policies are not read
+  read that a grant or access rule refuses names every table; any other failure of that read
+  stops the audit as any failed read does. SQL Server security policies are not read
   yet, so a SQL Server store's verdict is unchanged. (`BACKLOG #1719`)
