@@ -4505,8 +4505,8 @@ def test_a_re_mint_caused_only_by_a_trailing_dot_keeps_the_old_pair(
     ``<cert>.replaced``, name both in its WARNING, and skip a later such re-mint rather than
     overwrite a key it kept.
 
-    Mutation: replace the old key without the copy. Red: no ``<key>.replaced``. Mutation: remove
-    the prior certificate. Red: no ``<cert>.replaced``. Mutation: drop the skip. Red: the second
+    Mutation: replace the old key without the copy. Red: no ``<key>.replaced``. Mutation: drop the
+    write of ``<cert>.replaced``. Red: no ``<cert>.replaced``. Mutation: drop the skip. Red: the second
     start re-mints and its events are not empty."""
     cert, key = _plant_engine_shaped_pair(tmp_path, old_names)
     old = _snapshot(cert, key)
@@ -4520,7 +4520,7 @@ def test_a_re_mint_caused_only_by_a_trailing_dot_keeps_the_old_pair(
     assert [e.reason for e in events] == ["bind_changed"]
     assert key.read_bytes() != old[key]  # the live key is new
     assert kept_key.read_bytes() == old[key]  # the old key survives, byte for byte
-    assert kept_cert.read_bytes() == old[cert]  # the old certificate is moved, not removed
+    assert kept_cert.read_bytes() == old[cert]  # the old certificate is kept too
     _load_pair(kept_cert, kept_key)  # and the two still load as one pair
     if sys.platform != "win32":
         assert kept_key.stat().st_mode & 0o077 == 0
@@ -4570,13 +4570,14 @@ def test_a_dot_only_re_mint_skips_when_either_kept_file_exists(
     assert sorted(p.name for p in tmp_path.glob("*.replaced")) == [kept.name]
 
 
+@pytest.mark.parametrize("refused", ["cert", "key"])
 def test_a_failed_dot_only_re_mint_removes_the_kept_pair_it_wrote(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    refused: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A key replace refused and rolled back leaves the old pair live, so the kept copies go too,
     or every later start would skip the re-mint over copies nothing needs.
 
-    Mutation: drop ``*written`` from the rollback's cleanup. Red: ``.replaced`` files remain."""
+    Mutation: drop ``*written`` from either cleanup. Red: that row's ``.replaced`` files remain."""
     import messagefoundry.api.tls as tls
 
     cert, key = _plant_engine_shaped_pair(tmp_path, ["localhost", "127.0.0.1", "::1"])
@@ -4584,7 +4585,7 @@ def test_a_failed_dot_only_re_mint_removes_the_kept_pair_it_wrote(
     real = tls._replace_generated
 
     def refuse_the_key(staged: Path, live: Path) -> None:
-        if live == key:
+        if live == (cert if refused == "cert" else key):
             raise PermissionError(13, "simulated refusal of the key replace")
         real(staged, live)
 

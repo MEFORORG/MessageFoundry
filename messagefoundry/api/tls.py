@@ -1104,9 +1104,10 @@ def _renew_generated_pair(
     **A re-mint caused only by a trailing dot keeps the old pair** (#8291 item 1): one the check
     before that item, which ignored the dot, finds nothing missing for. That check reused the pair
     and kept its key, so this one writes the old key to ``<key>.replaced`` with
-    :func:`_write_private_key`, and the old certificate to ``<cert>.replaced``, both before the
-    first replace, so a failure or a crash after it never leaves one without the other. If either
-    file already exists, it serves the old pair as found on every start and logs why, rather than
+    :func:`_write_private_key`, and the old certificate to ``<cert>.replaced`` with the grant the
+    live one carries, both before the first replace. A failure that leaves the old pair live
+    removes them again; a crash, a double failure or a failed removal can leave them, or one of
+    them, behind. If either file already exists, it serves the old pair as found on every start and logs why, rather than
     overwrite a kept key or the certificate that belongs with it.
     """
     from messagefoundry import pki
@@ -1118,17 +1119,17 @@ def _renew_generated_pair(
         api.host, old_pem, ignore_trailing_dot=True
     )
     kept_cert, kept_key = _replaced_files(cert_path, key_path)
-    if keep_old and any(p.exists(follow_symlinks=False) for p in (kept_cert, kept_key)):
+    present = [p for p in (kept_key, kept_cert) if p.exists(follow_symlinks=False)]
+    if keep_old and present:
         log.warning(
             "not re-minting the generated TLS certificate at %s for the bind %r: it names that "
             "host only with the trailing dot the bind lacks, or only without the one it has, and "
-            "%s or %s already exists, where a re-mint would keep the old pair. Serving the old "
-            "pair; clients that dial %r will fail hostname verification until both files are "
-            "moved away or [api].tls_cert_file is set.",
+            "%s already exists where a re-mint would keep the old pair. Serving the old pair; "
+            "clients that dial %r will fail hostname verification until it is moved away or "
+            "[api].tls_cert_file is set.",
             cert_path,
             api.host,
-            kept_key,
-            kept_cert,
+            " and ".join(str(p) for p in present),
             api.host,
         )
         return
@@ -1162,6 +1163,7 @@ def _renew_generated_pair(
             with kept_cert.open("xb") as kept_file:  # never over a certificate already kept
                 written.append(kept_cert)
                 kept_file.write(old_pem)
+            _let_local_users_read_cert(kept_cert)
         _write_private_key(staged_key, key_pem)
         staged_cert.write_bytes(cert_pem)
         _let_local_users_read_cert(staged_cert)
