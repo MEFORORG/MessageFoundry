@@ -471,14 +471,69 @@ delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
 for any write failure. When the formatter cannot format the notice either, the sink is recorded
 unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
 stage 2 then decides the stop as for any other stage-2 failure. (Added 2026-11-25.) A line
-holding a character a strict stream has no byte for is not handled (BACKLOG #5813, open), whether
-it is a record that formats or the stand-in notice, whose logger name can hold one: the write
-raises `UnicodeEncodeError`, and when the roll re-resolves to the same stream the re-write fails
-too, so the sink is recorded unwritable as for a broken sink, and stage 2 decides the stop. The
-stage-1 roll notice is still written to that sink first. `serve` sets its stdout and stderr to
-replace such a character where the stream allows it (`console_streams.harden_console_streams`);
-a stream left strict is not covered. `tests/test_remote_debug_guard.py` pins the unwritable
-outcome for a strict cp1252 stdout.
+holding a character the sink's stream has no byte for is written with each such character as a
+JSON `\uXXXX` escape, a surrogate pair outside the BMP, so a JSON line still parses back to the
+text, except a lone surrogate, which is spelled as the log spells one and parses back to the six
+characters naming it (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that called the
+case open). On a text sink an escape reads the same as the six characters typed, since a
+backslash in the text is not doubled, the ambiguity the log's own escape accepts. The escape is
+taken for the codec the stream's `encoding` names. `serve` sets its stdout and stderr to
+`errors="replace"` (`console_streams.harden_console_streams`), so on serve's default stdout the
+line carries the escape, not `?`. **CORRECTED 2026-11-27:** the first form of this paragraph
+escaped only after the stream raised `UnicodeEncodeError`, and called a stream left strict the
+case; a replacing stream never raises, so on serve's default stdout that escape never ran and the
+line carried `?`. The escape holds for at least these lines the guard writes: the stdout sink's record
+writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
+the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
+least these. A stream whose `encoding` reads as a string is escaped for that codec. A stream whose
+`encoding` is missing or `None` is written as the line came; on a replacing stream such a line can
+carry `?` with nothing said, except where classifying failed, below. That covers a stream with no
+`encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
+`__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose class inherits no
+`encoding` definition, when its target has none or is gone. An `io.TextIOBase` subclass proxy inherits an `encoding` property that returns `None`, so one
+forwarding through `__getattr__` is written raw whatever its target's encoding, a target that
+names a codec included; for one forwarding through `__getattribute__`, the proxy is
+classified by whatever its forwarded read returns or raises. A read
+that raises `AttributeError` counts as missing, unless a class on the stream's MRO defines
+`encoding` as something other than a member descriptor. A member descriptor is a `__slots__` member
+or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything else, raises
+`AttributeError` from such a definition, or reads back as anything but a string or `None` (bytes, a
+mock standing in for a stream) is unreadable. An unreadable stream is
+written with everything outside ASCII escaped. Each line to it is counted on the stderr
+format-fault line described below, naming the exception's type or the type read back, whether
+or not the write lands; where that type's name cannot be rendered, the entry names no type but a placeholder, and
+the unrendered name is counted on the same line under an entry of its own. If
+classifying the stream's class fails, the stream is read as having no `encoding`, and that failure
+is counted on the same line. Each time the sink goes into stage 2 from another state, that line is
+said at once, inside
+the report interval too. Later records keep the rated line, a sink that goes on rolling past the
+flap bound included. A stream that refuses even the ASCII line, as cp864 refuses `%`, fails the
+write, and the two stages decide. A stream whose `encoding` names
+a codec other than the one it uses is written escaped for the named codec, so it escapes more
+than it needs to where the named codec is the narrower, and too little where it is the
+wider, leaving the rest to the ASCII fallback below. For a stream
+with no `encoding` or a misnamed one, only when the write raises `UnicodeEncodeError` is the line
+written again with everything
+outside ASCII escaped, and such a stream that writes in chunks can then hold the line's prefix
+twice. An `encoding` that is unknown or not a text encoding escapes
+everything outside ASCII. The stream's own `errors` is never read, so a `surrogateescape` stream
+gets the log's spelling of a lone surrogate, not the byte it stood for. Where a line was escaped
+and landed, neither stage runs: the escape is counted on the rate-limited stderr format-fault
+line, no alert is raised, and nothing shows on `GET /status`. Where a roll ran for another
+failure, stage 1 is recorded as for any roll. When the sink refuses the escaped line too, or
+refuses an ASCII line with `UnicodeEncodeError`, the stream's own error goes to the two stages as
+for any write failure, so a stream that cannot be written still reaches stage 2.
+`tests/test_remote_debug_guard.py` pins the escaped line for a strict cp1252 stdout, and
+`tests/test_log_write_guard.py` pins it for serve's hardened stdout.
+**This changes when the fail-closed stop fires**: on `main` such a line on a strict stream went
+to stage 2, showed `unwritable` on `GET /status`, raised the alert and could ask for the stop, and
+on serve's hardened stdout it was written with `?` and nothing counted. Now the line is written,
+escaped, and the engine keeps processing. The record is still logged, so the count-and-log
+invariant this guard enforces still holds for it; what is lost is the stop and the alert for a
+line that did land. No owner ruling covers this change; it is the row's own remedy, and BACKLOG
+#5813 records it as defect, not as a decision.
+`_GuardedSinkMixin._write_line` is where the escape is made and counted, and
+`GuardedStreamHandler.emit` routes the stdout sink's record writes through it.
 `_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 
