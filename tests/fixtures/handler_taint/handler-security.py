@@ -51,7 +51,8 @@ def h_log_method(msg):
     return Send("OB", msg)  # noqa: F821
 
 
-# (2) aliased-import evasion — Semgrep resolves the alias; the name-literal AST scan misses it.
+# (2) aliased-import evasion — Semgrep resolves the alias; of the AST lint's rules, only
+# ambient-authority follows one (BACKLOG #5382).
 @handler("h_aliased")  # noqa: F821
 def h_aliased(msg):
     # ruleid: mf-handler-ambient-subprocess
@@ -186,9 +187,9 @@ def h_sqli_forms(msg):
     return Send("OB", msg)  # noqa: F821
 
 
-# (7) BACKLOG #5382: file egress through forms the ambient-authority lint misses -- a non-literal mode,
-# codecs.open (whose mode it reads from the wrong slot), an import-aliased and a name-aliased open,
-# os.write and tempfile -- and through shutil, which that lint does flag by name.
+# (7) BACKLOG #5382: file egress through a non-literal mode, codecs.open, an import-aliased and a
+# name-aliased open, os.write, tempfile and shutil. The ambient-authority lint flags these calls but
+# not the data; what it misses is in its docstrings in messagefoundry/checks.py.
 @handler("h_file_forms")  # noqa: F821
 def h_file_forms(msg, mode):
     body = msg.encode()

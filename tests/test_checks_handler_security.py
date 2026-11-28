@@ -1079,6 +1079,31 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("os_sendfile", "import os\n\ndef f(msg):\n    os.sendfile(3, 4, 0, 10)\n"),
     ("zipfile_write", 'import zipfile\n\ndef f(msg):\n    zipfile.ZipFile("/tmp/i.zip", "w")\n'),
     ("tarfile_write_stream", 'import tarfile\n\ndef f(msg):\n    tarfile.open("/tmp/i", "w|gz")\n'),
+    # A name spelt like an opener module is that module only when imported and bound no other way.
+    (
+        "opener_module_name_bound_to_path",
+        'from pathlib import Path\n\ngzip = Path("/tmp/q")\n\ndef f(msg):\n    gzip.open("w")\n',
+    ),
+    ("opener_module_name_is_a_param", 'def g(msg, codecs):\n    codecs.open("w")\n'),
+    # A binding from the bound name itself is still followed, once.
+    (
+        "self_binding_on_import_alias",
+        "import os as o\n\ndef f(msg):\n    o = o.write\n    o(3, msg.raw)\n",
+    ),
+    ("self_binding_on_method", "def f(msg, out):\n    out = out.write_text\n    out(msg.raw)\n"),
+    (
+        "constant_getattr_bound",
+        'import os\n\ndef f(msg):\n    w = getattr(os, "write")\n    w(3, msg.raw)\n',
+    ),
+    ("gzipfile_write", 'import gzip\n\ndef f(msg):\n    gzip.GzipFile("/tmp/q", "wb")\n'),
+    (
+        "path_classmethod_open_mode",
+        "from pathlib import Path\n\ndef f(msg, m):\n    Path.home().open(m)\n",
+    ),
+    (
+        "os_open_write_flags",
+        "import os\n\ndef f(msg, p):\n    os.open(p, os.O_WRONLY | os.O_CREAT)\n",
+    ),
     # Already flagged before #5382; pinned so the widening cannot have lost them.
     ("open_literal_write", 'def f(msg):\n    open("/tmp/in.hl7", "w")\n'),
     ("open_keyword_write", 'def f(msg):\n    open("/tmp/in.hl7", mode="ab")\n'),
@@ -1121,6 +1146,20 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
     ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
+    # Default and read modes of the other openers, by slot.
+    ("receiver_open_read_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "r")\n'),
+    ("zipfile_read_default", "import zipfile\n\ndef f(msg, p):\n    zipfile.ZipFile(p)\n"),
+    ("os_fdopen_read_default", "import os\n\ndef f(msg):\n    os.fdopen(3)\n"),
+    ("io_fileio_read_default", "import io\n\ndef f(msg, p):\n    io.FileIO(p)\n"),
+    # A non-string literal is not a mode, and os.open with read-only flags opens read-only.
+    (
+        "receiver_open_int_slot_one",
+        "import webbrowser\n\ndef f(msg, u):\n    webbrowser.open(u, 2)\n",
+    ),
+    (
+        "os_open_read_flags",
+        "import os\n\ndef f(msg, p):\n    os.open(p, os.O_RDONLY | os.O_CLOEXEC)\n",
+    ),
 ]
 
 
@@ -1128,8 +1167,11 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     ("name", "snippet"), FILE_EGRESS_FLAGGED, ids=[c[0] for c in FILE_EGRESS_FLAGGED]
 )
 def test_file_egress_is_flagged(tmp_path: Path, name: str, snippet: str) -> None:
+    # Every case ends on the call under test, and the finding must name that line, so a hit on
+    # another call in the snippet cannot stand in for it.
+    last_line = len(snippet.rstrip("\n").split("\n"))
     result = _run(tmp_path, snippet)
-    assert "[ambient-authority]" in result.detail, f"{name}: {result.detail!r}"
+    assert f"feed.py:{last_line} [ambient-authority]" in result.detail, f"{name}: {result.detail!r}"
 
 
 @pytest.mark.parametrize(
@@ -1150,6 +1192,17 @@ def test_alias_lattice_resolves_in_linear_time(tmp_path: Path) -> None:
     lines += ["", "def f(msg):", "    a39(3, msg.raw)", ""]
     result = _run(tmp_path, "\n".join(lines))
     assert "[ambient-authority]" in result.detail
+
+
+def test_a_truncated_alias_expansion_is_flagged(tmp_path: Path) -> None:
+    # Padding a name with hundreds of bindings must not push the real one, os.write, past the bound
+    # unread: a call whose expansion was cut short is flagged.
+    lines = ["import os as o", "w = o.write"]
+    for i in range(180):
+        lines += [f"w = a{i}", f"a{i} = b{i}.c"]
+    lines += ["", "def f(msg):", "    w(3, msg.raw)"]
+    result = _run(tmp_path, "\n".join(lines) + "\n")
+    assert f"feed.py:{len(lines)} [ambient-authority]" in result.detail
 
 
 @pytest.mark.timeout(30)
