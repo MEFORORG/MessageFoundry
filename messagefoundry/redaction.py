@@ -1316,8 +1316,7 @@ _DICOM_JSON_PHI_TAG = re.compile(r"0010[0-9A-Fa-f]{4}")
 #: as an array holding that word, and must leave alone.
 _JSON_LITERALS = frozenset({"true", "false", "null", "True", "False", "None", "redacted"})
 #: A bare run continuing a top-level value on the same line: ``"birthDate": 5 May 1980``. It stops
-#: before a callable's name, so ``"given": x frozenset({..})`` still walks the call. The run-on rule
-#: (:func:`_redact_json_run_ons`) later scrubs that call as more of the key's value.
+#: before a callable's name, so ``"given": x frozenset({..})`` still walks the call.
 _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+""")
 
 #: The bound note :func:`_clamp_marker` writes, joined by a newline (:func:`clamp_untrusted`) or a
@@ -1407,9 +1406,7 @@ class _MismatchedJsonCloser(Exception):
     catches it and returns the placeholder, followed by any trailing bound note (BACKLOG #5814)."""
 
 
-def _scrub_json_value(
-    text: str, pos: int, policy: int, widened: bool, endpos: int | None = None
-) -> tuple[str, int]:
+def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[str, int]:
     """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
@@ -1419,19 +1416,16 @@ def _scrub_json_value(
 
     **Object KEYS are always kept**, which is what keeps the output legible, so a structure that uses
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
-    callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value.
-
-    ``endpos`` reads the text as if it ended there, as :meth:`re.Pattern.match` does, so the run-on
-    rule's walk stops before the next PHI key (:func:`_scrub_json_run_on`)."""
+    callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
     #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
     #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
     #: one delimiter that ends the frame.
     frames: list[tuple[bool, int, str]] = []
     pending = policy
-    n = len(text) if endpos is None else endpos
+    n = len(text)
     while pos < n:
-        match = _JSON_TOKEN.match(text, pos, n)
+        match = _JSON_TOKEN.match(text, pos)
         if match is None:  # unreachable: every character starts one alternative
             break
         token = match.group()
@@ -1467,10 +1461,10 @@ def _scrub_json_value(
             continue
         pos = match.end()
         bare = match.group("bare") is not None
-        if bare and text.startswith("(", pos, n):
+        if bare and text.startswith("(", pos):
             out.append(token)  # a callable's name; the call's parentheses hold the value
             continue
-        if not bare and frames and frames[-1][0] and _JSON_COLON_AHEAD.match(text, pos, n):
+        if not bare and frames and frames[-1][0] and _JSON_COLON_AHEAD.match(text, pos):
             out.append(token)  # a key: kept, and it decides how its value is treated
             leaf = frames[-1][1] == _LEAF
             pending = _LEAF if leaf else _vocabulary_policy(_string_body(match), widened)
@@ -1478,7 +1472,7 @@ def _scrub_json_value(
         if bare and not frames:
             # A top-level bare value can be prose running on after a key-shaped label, such as
             # `"birthDate": 5 May 1980`, so the rest of the run on its line goes with it.
-            run = _JSON_BARE_CONTINUATION.match(text, pos, n)
+            run = _JSON_BARE_CONTINUATION.match(text, pos)
             if run is not None and run.end() > pos:
                 # Under name/address the whole run goes, even after an operator-shaped first token:
                 # `"address": 4411 qorvelway` opens with one. `"name": IB_ACME_ADT refused` loses its
@@ -1492,93 +1486,6 @@ def _scrub_json_value(
         if not frames:
             return "".join(out), pos
     return "".join(out), pos
-
-
-#: A colon straight after a token, past horizontal whitespace only: what follows a key, or a label
-#: such as ``PatientID:``, ``password:`` or a URL's ``https:``.
-_JSON_LABEL_COLON = re.compile(r"[^\S\r\n]*+:")
-
-
-def _json_run_on(text: str, pos: int) -> int | None:
-    """Where a value that ended at ``pos`` runs on, or ``None`` when it does not (BACKLOG #5814).
-
-    It runs on when the next token on its line is a value rather than a delimiter (``,`` ``:`` or a
-    closer), a line end, the end of the text, :func:`safe_text`'s ``…(+N chars)`` count, or a token
-    a colon follows: well-formed JSON never puts one value straight after another, so
-    ``{"given": [Jane] Doe]}`` holds a stray closer of the value's own kind, which the walk cannot
-    tell from its real close."""
-    match = _JSON_TOKEN.match(text, pos)
-    if match is not None and (space := match.group("ws")) is not None:
-        if "\n" in space or "\r" in space:
-            return None
-        match = _JSON_TOKEN.match(text, match.end())
-    if match is None or match.group("ws") is not None:
-        return None
-    punct = match.group("punct")
-    if punct is not None:
-        return match.start() if punct in "{[(" else None
-    if _JSON_LABEL_COLON.match(text, match.end()) or text.startswith(_COUNT_OPENER, match.start()):
-        return None
-    return match.start()
-
-
-def _scrub_json_run_on(text: str, end: int, out: list[str]) -> int:
-    """Scrub what runs on after a PHI key's value that ended at ``end`` (:func:`_json_run_on`),
-    appending it to ``out``, and return where it ends.
-
-    The run is read one token at a time, or one container or call at a time, under the leaf policy,
-    so a JSON literal is all it keeps. It stops before a token a colon follows, so a label such as
-    ``password:`` or a URL's ``https:`` stays for the pass that reads it, the credential scrubs the
-    log chain runs after :func:`redact` among them; a label with no colon, such as ``password=``,
-    goes into the run with any value glued to it. It stops before the next PHI key, which
-    :func:`_redact_json_run_ons` reads next, and a container's walk is bounded there, so the rule
-    stays linear. A run that is scrubbed at all becomes one placeholder, so the output grows by at
-    most one per key and a second pass reads it as an array holding a literal (the fixed point
-    :func:`safe_text` relies on)."""
-    if (start := _json_run_on(text, end)) is None:
-        return end
-    next_key = _JSON_PHI_KEY.search(text, start)
-    limit = len(text) if next_key is None else next_key.start()
-    run_start = start
-    run_end = end
-    masked = False
-    while start is not None and start < limit:
-        token = _JSON_TOKEN.match(text, start, limit)
-        if token is None:
-            break
-        if token.group("punct") is None and not text.startswith("(", token.end(), limit):
-            replacement, stop = _json_scalar(token, _LEAF, True), token.end()
-        else:
-            replacement, stop = _scrub_json_value(text, start, _LEAF, True, limit)
-        masked = masked or replacement != text[start:stop]
-        run_end = stop
-        start = _json_run_on(text, run_end)
-    if run_end == end:
-        return end
-    out.append(text[end:run_start])
-    out.append(_REDACTED if masked else text[run_start:run_end])
-    return run_end
-
-
-def _redact_json_run_ons(text: str) -> str:
-    """The run-on rule (BACKLOG #5814): ``text``, the stages' output, with every run after a PHI
-    key's value scrubbed (:func:`_scrub_json_run_on`). It runs after every pass in :func:`redact`
-    and only adds placeholders, so no pass in :func:`redact` loses a label it read; a pass that runs
-    after :func:`redact` keeps a label only where :func:`_scrub_json_run_on` says it stops. A value
-    is kept as the stages left it: the walk only finds where it ends, and raises
-    :class:`_MismatchedJsonCloser` on a mismatched closer, there or in a run. The key search is
-    textual, so a key-shaped string can start a walk, and a mismatched closer after it then makes
-    :func:`redact` return the placeholder for the whole text."""
-    out: list[str] = []
-    pos = 0
-    while (match := _JSON_PHI_KEY.search(text, pos)) is not None:
-        _, end = _scrub_json_value(text, match.end(), _LEAF, True)
-        out.append(text[pos:end])
-        pos = _scrub_json_run_on(text, end, out)
-    if not out:
-        return text
-    out.append(text[pos:])
-    return "".join(out)
 
 
 def _redact_json_fields(text: str, *, widened: bool) -> str:
@@ -2155,13 +2062,11 @@ def redact(text: str) -> str:
     their output. Every step only ever replaces text with the placeholder, so nothing the #1711
     redactor removed can survive -- by construction, with ONE deliberate difference: the first stage
     keeps an ``MRN`` label that ends a name run (:data:`_MRN_LABEL_SPELLINGS`), which is not PHI and
-    is what lets the second stage read the number after it. The run-on rule (BACKLOG #5814) runs
-    after both stages, on their output (:func:`_redact_json_run_ons`), and only adds placeholders.
+    is what lets the second stage read the number after it.
 
     **The two stages protect #1711's labels, not each other's.** Inside the widened stage one widened
-    scrub can still swallow another widened label. ``{"name": OtherPatientIDs= "x"}`` kept ``"x"``
-    that way until the run-on rule scrubbed it after the stages; the residual stands where the
-    swallowed label's value is not on such a run, and is no worse than #1711, which read neither.
+    scrub can still swallow another widened label: ``{"name": OtherPatientIDs= "x"}`` keeps ``"x"``.
+    That is no worse than #1711, which read neither, and it is a residual.
 
     **The second stage runs only when its triggers are present** (:func:`_needs_widened_stage`). On
     text without them it would re-run the #1711 passes over their own fixed point and change nothing
@@ -2194,10 +2099,7 @@ def redact(text: str) -> str:
     value, including some balanced inputs, and it misses some shapes. The code from
     :func:`_redact_noted` down is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
     ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
-    list. A value that runs on after a PHI key's value on the same line, with no delimiter between,
-    is scrubbed as more of that value (:func:`_json_run_on`), which catches at least some stray
-    closers of the value's own kind; that file's ``RUN_ON`` list pins examples, and ``MISSED`` pins
-    some it does not catch."""
+    list."""
     return _redact_noted(text, noted=False)
 
 
@@ -2224,15 +2126,13 @@ def _redact_noted(text: str, *, noted: bool) -> str:
         return _REDACTED + text[len(body) :]
     try:
         out = _redact_unguarded(text, noted=noted)
-        out_body = _without_trailing_note(out)
-        note = out[len(out_body) :]
-        out_body = _redact_json_run_ons(out_body)
     except _MismatchedJsonCloser:
         return _REDACTED + text[len(body) :]
     # The output is read too: a scrub can leave a closer stray that was inside a string as received,
     # or one whose opener a flat pass consumed, and a second call reads that output as received, so
     # without this the rule broke the fixed point.
-    return _REDACTED + note if _stray_json_closer(out_body) else out_body + note
+    out_body = _without_trailing_note(out)
+    return _REDACTED + out[len(out_body) :] if _stray_json_closer(out_body) else out
 
 
 def _stray_json_closer(text: str) -> bool:
@@ -3019,10 +2919,7 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
     (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
-    and loses how much was cut. The JSON run-on rule (BACKLOG #5814, :func:`_scrub_json_run_on`)
-    can scrub more on a further pass, at least such a count after any PHI key's value where a token
-    glued to the count carries it into the run, and a fragment a first pass left beside a
-    placeholder in key-shaped text. Before BACKLOG #1797 the limit cut the kept string itself and left it
+    and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way.
 
     **The head is redacted knowing the bound note this call appends after it** (BACKLOG #5925), so

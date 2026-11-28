@@ -231,9 +231,7 @@ def test_the_mask_keeps_main_length_and_class(
     text: str, value: str, limit: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """THE POSITIVE CONTROL for the mask: taking the rest instead of masking it shortens the answer,
-    so a limit keeps text main cut, and splits a name run main read whole. Masked, neither prints.
-    The JSON run-on rule (BACKLOG #5814) also scrubs the first, so it is off throughout."""
-    monkeypatch.setattr(redaction, "_json_run_on", lambda text, pos: None)
+    so a limit keeps text main cut, and splits a name run main read whole. Masked, neither prints."""
     assert value not in safe_text(text, limit=limit)
     with _rule_off():
         assert value not in safe_text(text, limit=limit)

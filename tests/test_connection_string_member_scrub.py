@@ -653,10 +653,8 @@ def test_each_mask_rule_is_needed(
     redaction; with every rule on, it does not.
 
     The log chain's carriage pass (BACKLOG #5378) is off throughout. It reaches some marker shapes
-    below on its own, so with it on these controls would no longer see a mask rule deleted. The
-    JSON run-on rule (BACKLOG #5814) is off for the same reason."""
+    below on its own, so with it on these controls would no longer see a mask rule deleted."""
     monkeypatch.setattr(redaction, "_BINARY_CARRIAGE", re.compile(r"(?!)()"))
-    monkeypatch.setattr(redaction, "_json_run_on", lambda text, pos: None)
     on = getattr(secretscrub, attr)
     if isinstance(off, re.Pattern):
         assert on.pattern != off.pattern  # the switch is not a no-op
