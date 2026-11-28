@@ -1215,8 +1215,16 @@ async def test_a_sealed_criteria_cell_on_a_keyless_store_answers_423_not_malform
         caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     assert r.status_code == 423, r.text
-    assert "malformed" not in r.json()["detail"]
+    assert r.json()["detail"] == (
+        f"preset {pid} is sealed, but this engine's store opened with no encryption key, so it "
+        "cannot be used"
+    )
     [(level, text)] = [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)]
-    assert level == logging.ERROR and text.startswith(f"layered search refused preset {pid}: ")
-    [audit] = await _refusal_audits(engine)
-    assert audit["status"] == 423 and audit["cause"] != "malformed"
+    assert level == logging.ERROR
+    assert text.startswith(f"layered search refused preset {pid}: KeylessSealedCellError; ")
+    assert "MEFOR_STORE_ENCRYPTION_KEY" in text  # the remedy, in the log only
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 423, "cause": "KeylessSealedCellError"}
+    ]
+    # Not drift: the store writes no tag-failed row for it.
+    assert await engine.store.list_audit(action=PRESET_TAG_FAILED_ACTION) == []

@@ -85,7 +85,9 @@ async def test_events_and_alerts_withhold_a_foreign_key_reason(
         assert alerts.status_code == 200, alerts.text
         by_conn = {a["connection"]: a["reason"] for a in alerts.json()["alerts"]}
         assert by_conn[planted] is None and by_conn[kept]
+    # Neither the plaintext, which no held key opens, nor the stored ciphertext is echoed.
     assert "SYNTH-FOREIGN" not in events.text + alerts.text
+    assert foreign not in events.text + alerts.text
 
 
 async def test_dead_letters_and_messages_withhold_a_foreign_key_cell(
@@ -131,3 +133,4 @@ async def test_dead_letters_and_messages_withhold_a_foreign_key_cell(
         assert summaries[planted_msg] is None
         assert summaries[kept_msg] == listed[1]["summary"]  # control
     assert "SYNTH-FOREIGN" not in after.text + page.text
+    assert foreign not in after.text + page.text

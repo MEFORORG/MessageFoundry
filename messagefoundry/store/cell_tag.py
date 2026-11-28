@@ -78,6 +78,7 @@ __all__ = [
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "KeylessSealedCellError",
     "NonTextCellError",
     "NonTextListedCellError",
     "SealedBlankCellError",

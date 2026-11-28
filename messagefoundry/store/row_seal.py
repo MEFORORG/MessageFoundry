@@ -229,8 +229,8 @@ SEAL_FAILURE_TRACK_MAX: Final = 1024
 
 class SealFailureThrottle:
     """Decides when a row that failed its seal is reported again (BACKLOG #2592): at most once per
-    ``interval`` seconds per key, remembering at most ``track_max`` keys, the oldest forgotten
-    first. The defaults are :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` and
+    ``interval`` seconds per key, remembering at most ``track_max`` keys, the one asked about
+    least recently forgotten first, so a key refused on every call stays suppressed. The defaults are :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` and
     :data:`SEAL_FAILURE_TRACK_MAX`. One per reporter: the auth service and the approval gate each
     hold one, so both follow one policy. The layered search's refusal log holds one with its own
     interval and bound (BACKLOG #5523 item 27)."""
@@ -243,6 +243,8 @@ class SealFailureThrottle:
         interval: float = SEAL_FAILURE_REPORT_INTERVAL_SECONDS,
         track_max: int = SEAL_FAILURE_TRACK_MAX,
     ) -> None:
+        if interval < 0 or track_max < 1:
+            raise ValueError("a report throttle needs an interval of 0 or more and track_max >= 1")
         self._interval = interval
         self._track_max = track_max
         self._last: dict[Hashable, float] = {}
@@ -250,10 +252,10 @@ class SealFailureThrottle:
     def due(self, key: Hashable) -> bool:
         """Whether ``key`` should be reported now; if so, records that it was."""
         now = time.monotonic()
-        last = self._last.get(key)
+        last = self._last.pop(key, None)
         if last is not None and now - last < self._interval:
+            self._last[key] = last  # back at the newest end: asked about just now
             return False
-        self._last.pop(key, None)
         if len(self._last) >= self._track_max:
             self._last.pop(next(iter(self._last)))
         self._last[key] = now
