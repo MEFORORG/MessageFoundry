@@ -132,7 +132,7 @@ from messagefoundry.store.cell_tag import (
     message_cell_aad,
     open_listed_cell,
     open_message_cell,
-    open_message_record,
+    open_message_record_off_loop,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
@@ -9413,7 +9413,7 @@ class PostgresStore(ServerCipherWalk):
             return None
         d = dict(record)
         # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
-        await asyncio.to_thread(open_message_record, self._cipher, d)
+        await open_message_record_off_loop(self._cipher, d)
         return d
 
     async def message_channel_id(self, message_id: str) -> str | None:

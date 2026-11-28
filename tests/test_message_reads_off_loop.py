@@ -3,18 +3,19 @@
 """BACKLOG #5981, #5969: the message reads behind the API's message routes.
 
 Two halves. First, under the ``vault_transit`` cipher every cell decrypt is a Transit HTTP round
-trip, so the message list and the per-message sub-reads (``events_for``, ``outbox_for``,
-``outbox_payloads_for``), as well as ``get_message``, make their Transit calls off the event loop on
-all three backends. The SQLite store is driven for real; the Postgres and SQL Server stores have
-their database calls faked, as in ``tests/test_store_transit_off_loop_servers.py``, whose measuring
-helper and its negative controls these reuse. ``get_message`` hands its opens to
-:func:`asyncio.to_thread` rather than the Transit pool, so its pool check is off.
+trip. So the message list, ``get_message`` and the per-message sub-reads make their Transit calls
+on the Transit pool, never on the event loop. The sub-reads are ``events_for``, ``outbox_for`` and
+``outbox_payloads_for``. All three backends are pinned. The SQLite store is driven for real. The
+Postgres and SQL Server stores have their database calls faked, as in
+``tests/test_store_transit_off_loop_servers.py``. That file holds the measuring helper these reuse,
+and the negative controls that show its three checks fire; they run there, not here.
 
-Second, through a real keyed SQLite store, an out-of-scope by-id read decrypts no cell at all and
-answers the audited uniform 404, while an in-scope read whose cells the key service could not open
-answers 503 with Retry-After, never a 500. A key-service outage is the plain :class:`CipherError`
-the store passes up as itself rather than as a tag failure. ``tests/test_cell_tag.py`` pins the
-same order against a faked store, for the other plain refusals too.
+Second, a real keyed SQLite store pins the order of the by-id read. Out of scope it opens no cell
+and answers the audited uniform 404, the same answer as a missing id. In scope, cells the key
+service could not open answer 503 with Retry-After, never a 500. A key-service outage is a plain
+:class:`CipherError`, which the store passes up as itself, not as a tag failure.
+``tests/test_cell_tag.py`` pins the same order against a faked store, for the other plain refusals
+too.
 
 Synthetic data only.
 """
@@ -58,6 +59,7 @@ _BACKENDS = [PostgresStore, SqlServerStore]
 _CHANNEL = "IB_TEST"
 #: Two rows per read, so a per-row path makes a second call while the loop is watched.
 _IDS = ("m1", "m2")
+_DESTINATIONS = ("OB_1", "OB_2")
 
 
 def _message_row(cipher: TransitCipher, mid: str) -> dict[str, Any]:
@@ -121,11 +123,15 @@ def _prepare(cls: type[Any], cipher: TransitCipher, rows: list[dict[str, Any]]) 
 @pytest.mark.parametrize("cls", _BACKENDS)
 async def test_a_server_message_list_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit, cipher = _transit()
-    store = _prepare(cls, cipher, [_message_row(cipher, mid) for mid in _IDS])
+    rows = [_message_row(cipher, mid) for mid in _IDS]
+    store = _prepare(cls, cipher, rows)
     listed = await _measure(transit, lambda: store.list_messages(allowed_channels=None))
     assert [(r["id"], r["error"], r["summary"], r["metadata"]) for r in listed] == [
         (mid, "boom", "S", "{}") for mid in _IDS
     ]
+    # The list is metadata only. The real query selects no body; the fake serves the sealed one
+    # anyway, so a list that opened it would show here.
+    assert [r["raw"] for r in listed] == [r["raw"] for r in rows]
 
 
 @pytest.mark.parametrize("cls", _BACKENDS)
@@ -139,9 +145,12 @@ async def test_a_server_message_event_read_decrypts_off_the_loop(cls: type[Any])
 @pytest.mark.parametrize("cls", _BACKENDS)
 async def test_a_server_outbox_read_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit, cipher = _transit()
-    store = _prepare(cls, cipher, [_queue_row(cipher, n) for n in (1, 2)])
+    queued = [_queue_row(cipher, n) for n in (1, 2)]
+    store = _prepare(cls, cipher, queued)
     rows = await _measure(transit, lambda: store.outbox_for("m1"))
     assert [r["last_error"] for r in rows] == ["refused", "refused"]
+    # The metadata read leaves each body sealed; outbox_payloads_for is the gated body read.
+    assert [r["payload"] for r in rows] == [q["payload"] for q in queued]
 
 
 @pytest.mark.parametrize("cls", _BACKENDS)
@@ -156,8 +165,7 @@ async def test_a_server_outbox_payload_read_decrypts_off_the_loop(cls: type[Any]
 async def test_a_server_get_message_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit, cipher = _transit()
     store = _prepare(cls, cipher, [_message_row(cipher, "m1")])
-    # get_message hands its opens to asyncio.to_thread, not the Transit pool.
-    row = await _measure(transit, lambda: store.get_message("m1"), pool=False)
+    row = await _measure(transit, lambda: store.get_message("m1"))
     assert (row["raw"], row["error"], row["summary"], row["metadata"]) == (_RAW, "boom", "S", "{}")
 
 
@@ -165,39 +173,52 @@ async def test_the_sqlite_message_reads_decrypt_off_the_loop(tmp_path: Path) -> 
     transit, cipher = _transit()
     store = await MessageStore.open(tmp_path / "reads.db", cipher=cipher)
     try:
-        mid = await store.enqueue_message(
-            channel_id=_CHANNEL,
-            raw=_RAW,
-            deliveries=[("OB_1", _OUT)],
-            control_id="M1",
-            source_type="file",
-            summary="S",
-            metadata="{}",
-        )
-        [delivery] = await store.outbox_for(mid)
-        # A failed attempt gives the outbound row a sealed last_error and the message an event
-        # with a sealed detail, so each sub-read below has a cell to open.
-        await store.mark_failed(delivery["id"], "refused", RetryPolicy(max_attempts=None))
-        reads: list[tuple[Callable[[], Awaitable[Any]], bool]] = [
-            (lambda: store.list_messages(allowed_channels=None), True),
-            (lambda: store.events_for(mid), True),
-            (lambda: store.outbox_for(mid), True),
-            (lambda: store.outbox_payloads_for(mid), True),
-            (lambda: store.get_message(mid), False),
+        mids = [
+            await store.enqueue_message(
+                channel_id=_CHANNEL,
+                raw=_RAW,
+                deliveries=[(name, _OUT) for name in _DESTINATIONS],
+                control_id=f"M{n}",
+                source_type="file",
+                summary="S",
+                metadata="{}",
+                now=float(n),
+            )
+            for n in (1, 2)
         ]
-        results = [await _measure(transit, read, pool=pool) for read, pool in reads]
+        mid = mids[0]
+        # A failed attempt gives each outbound row a sealed last_error and the message an event
+        # with a sealed detail, so each sub-read below has a cell to open on every row.
+        for delivery in await store.outbox_for(mid):
+            await store.mark_failed(delivery["id"], "refused", RetryPolicy(max_attempts=None))
+        reads: dict[str, Callable[[], Awaitable[Any]]] = {
+            "list": lambda: store.list_messages(allowed_channels=None),
+            "events": lambda: store.events_for(mid),
+            "outbox": lambda: store.outbox_for(mid),
+            "payloads": lambda: store.outbox_payloads_for(mid),
+            "message": lambda: store.get_message(mid),
+        }
+        got = {name: await _measure(transit, read) for name, read in reads.items()}
         # The list is metadata only: it fetches no body, so it opens none.
-        [listed] = results[0]
-        assert "raw" not in listed and listed["summary"] == "S"
-        [payload] = results[3]
-        assert payload["payload"] == _OUT and payload["last_error"] == "refused"
+        assert sorted(r["id"] for r in got["list"]) == sorted(mids)
+        assert all("raw" not in r and r["summary"] == "S" for r in got["list"])
+        assert [e["detail"] for e in got["events"] if e["event"] == "failed"] == [
+            "attempt 0: refused"
+        ] * len(_DESTINATIONS)
+        assert [r["last_error"] for r in got["outbox"]] == ["refused"] * len(_DESTINATIONS)
+        assert [(r["payload"], r["last_error"]) for r in got["payloads"]] == [
+            (_OUT, "refused")
+        ] * len(_DESTINATIONS)
+        assert (got["message"]["raw"], got["message"]["summary"]) == (_RAW, "S")
     finally:
         await store.close()
 
 
 class _RefusingCipher:
-    """The store's real cipher, except that every decrypt is recorded and refused as a key service
-    that gave no verdict: a plain :class:`CipherError` the store does not read as a tag failure."""
+    """The store's real cipher, except that each decrypt is counted and refused as an outage.
+
+    An outage is a key service that gave no verdict. The store raises it as itself, a plain
+    :class:`CipherError`, not as a tag failure."""
 
     def __init__(self, real: Any) -> None:
         self._real = real
@@ -211,10 +232,19 @@ class _RefusingCipher:
         raise CipherUnavailableError("synthetic outage")
 
 
+async def _denials(store: MessageStore) -> list[dict[str, Any]]:
+    async with store._read() as db:
+        cur = await db.execute(
+            "SELECT actor, channel_id, detail FROM audit_log WHERE action=?",
+            ("auth.channel_denied",),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def test_an_out_of_scope_read_of_a_real_store_decrypts_nothing(tmp_path: Path) -> None:
-    """BACKLOG #5969, #5981 through a real keyed store: out of scope the read opens no cell, the
-    raw body included, and answers the uniform 404 with the denial audited, the same answer as a
-    missing id. In scope the refused cells answer 503, never a 500."""
+    """BACKLOG #5969, #5981 through a real keyed store. Out of scope the read opens no cell, the
+    raw body included. It answers the uniform 404 with the denial audited, and a missing id gets
+    the same answer. In scope the refused cells answer 503, never a 500."""
     store = await MessageStore.open(
         tmp_path / "scope.db", cipher=make_cipher(generate_key(), write_v2=True)
     )
@@ -236,26 +266,19 @@ async def test_an_out_of_scope_read_of_a_real_store_decrypts_nothing(tmp_path: P
             await get_scoped_message(engine, outsider, mid, request)
         assert (hidden.value.status_code, hidden.value.detail) == (404, f"no such message: {mid}")
         assert refusing.decrypts == 0, "an out-of-scope read opened a cell"
+        # The same caller asking for an id that does not exist gets the same answer.
         with pytest.raises(HTTPException) as absent:
-            await get_scoped_message(engine, insider, "no-such-id", request)
+            await get_scoped_message(engine, outsider, "no-such-id", request)
         assert (absent.value.status_code, absent.value.detail) == (
             404,
             "no such message: no-such-id",
         )
         assert refusing.decrypts == 0
-
-        store._cipher = real
-        async with store._read() as db:
-            cur = await db.execute(
-                "SELECT actor, channel_id, detail FROM audit_log WHERE action=?",
-                ("auth.channel_denied",),
-            )
-            denied = [dict(r) for r in await cur.fetchall()]
+        denied = await _denials(store)
         assert [(d["actor"], d["channel_id"]) for d in denied] == [("outsider", "IB_SECRET")]
         assert json.loads(denied[0]["detail"]) == {"channel": "IB_SECRET"}
 
         # Control: in scope the same cells are opened, refused, and answered 503, never 500.
-        store._cipher = refusing
         with pytest.raises(HTTPException) as refused:
             await get_scoped_message(engine, insider, mid, request)
         assert refused.value.status_code == 503
@@ -263,6 +286,8 @@ async def test_an_out_of_scope_read_of_a_real_store_decrypts_nothing(tmp_path: P
         assert refusing.decrypts, (
             "the in-scope read opened no cell, so the control measured nothing"
         )
+        # An in-scope outage is not a channel denial.
+        assert await _denials(store) == denied
     finally:
         store._cipher = real
         await store.close()
