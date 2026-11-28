@@ -80,6 +80,7 @@ from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
 from messagefoundry.pipeline.dr import (
     DrCoordinator,
+    DrProfileGraphStopped,
     DrProfileNotLeading,
     warn_unset_pass_environment,
 )
@@ -1431,6 +1432,11 @@ class Engine:
                 # lease without importing the runner. A graph stopped on a node that still leads
                 # keeps the runner's own refusal.
                 raise _dr_profile_not_leading() from exc
+            if isinstance(exc, RunnerNotRunningError):
+                # Nothing tried to bind, so the abort must not say a bind failed (BACKLOG #5906).
+                raise DrProfileGraphStopped(
+                    "this engine's graph is not running, so the DR profile step applied nothing"
+                ) from exc
             raise
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).

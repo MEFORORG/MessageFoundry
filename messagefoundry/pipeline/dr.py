@@ -74,7 +74,13 @@ from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
 
-__all__ = ["DrCoordinator", "DrActivationError", "DrProfileNotLeading", "DrResult"]
+__all__ = [
+    "DrCoordinator",
+    "DrActivationError",
+    "DrProfileGraphStopped",
+    "DrProfileNotLeading",
+    "DrResult",
+]
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +168,13 @@ class DrProfileNotLeading(RuntimeError):
     read before the preflight and from the runner's refusals of the reload, the lease read and the
     stopped-graph read, so this module does not import the runner. Its abort keeps kind
     ``profile``, the step that refused."""
+
+
+class DrProfileGraphStopped(RuntimeError):
+    """The ``activate_profile`` callback refused because the engine's graph stopped before the
+    profile's reload changed any lane, on a node that still leads (BACKLOG #5906). The engine
+    raises it from the runner's stopped-graph refusal, so this module does not import the runner.
+    Nothing tried to bind, so its abort must not say a bind failed. Kind ``profile``."""
 
 
 class DrActivationError(RuntimeError):
@@ -693,6 +706,11 @@ class DrCoordinator:
                     "DR run-profile activation refused: this node no longer holds the cluster "
                     "lease, so the profile step bound no listener and the box stays passive; "
                     f"{_RUN_ON_THE_LEASE_HOLDER}"
+                )
+            elif isinstance(exc, DrProfileGraphStopped):
+                reason = (
+                    "DR run-profile activation refused: this engine's graph is not running, so "
+                    "the profile step bound no listener and the box stays passive"
                 )
             else:
                 reason = (
