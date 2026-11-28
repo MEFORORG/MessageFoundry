@@ -374,7 +374,7 @@ windowsSuite("b20008 F: every name on a user-set path is checked before any read
   });
 });
 
-suite("b20008 F: a .code-workspace file cannot choose the folder a path is read against (#8237 item 57)", () => {
+suite("b20008 F: in a .code-workspace window, a path inside a workspace folder outside the file's folder is refused, and the file's folder is checked (#8237 item 57)", () => {
   let base: string;
 
   setup(() => {
@@ -489,6 +489,28 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     assert.deepStrictEqual(securityConfigTarget(chosen, plain, inWindow(user, workspaceFile), real), { ok: true, path: plain });
     const mine = path.join(base, "mine.toml");
     assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
+  });
+
+  test("known open limit: a `..` or driveless rooted user value is read against the chosen folder or its drive, and accepted as written", () => {
+    // Pins the open limit the securityConfigTarget docblock states: the .code-workspace file still
+    // chooses the folder a relative value is read against, so `..` lands beside the chosen folder.
+    const repo = path.join(base, "repo");
+    const chosen = path.join(base, "chosen");
+    fs.mkdirSync(repo);
+    fs.mkdirSync(chosen);
+    const workspaceFile = path.join(repo, "project.code-workspace");
+    const climbed = securityConfigTarget(chosen, `..${path.sep}mine.toml`, inWindow(user, workspaceFile), real);
+    assert.deepStrictEqual(climbed, { ok: true, path: path.join(base, "mine.toml") });
+    if (process.platform === "win32") {
+      // A rooted value with no drive, in each spelling the docs list, is read on the chosen folder's drive.
+      const name = `mf-b20008-${path.basename(base)}.toml`;
+      for (const lead of ["\\", "/", "\\\\", "\\\\\\", "//"]) {
+        const rooted = `${lead}${name}`;
+        const onDrive = path.win32.resolve(chosen, rooted);
+        assert.strictEqual(onDrive.toUpperCase(), `${chosen.slice(0, 2)}\\${name}`.toUpperCase(), rooted);
+        assert.deepStrictEqual(securityConfigTarget(chosen, rooted, inWindow(user, workspaceFile), real), { ok: true, path: onDrive }, rooted);
+      }
+    }
   });
 
   (process.platform === "win32" ? test : test.skip)("the name checks still run first, with no file-system call", () => {

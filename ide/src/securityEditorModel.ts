@@ -165,8 +165,8 @@ function prefixOf(head: string, segments: readonly string[], n: number): string 
  * of `\\localhost\C$\ws` is that spelling and not `C:\ws`, while the device and file id are the same
  * (measured 2026-11-27 on Windows 11 with standalone Node v24.20.0, not the editor's Electron
  * runtime, through `\\localhost\D$` and `\\127.0.0.1\D$`). An entry with no file id ({@link NO_FILE_ID}), the workspace folder's own
- * included, is placed by real path only, so where the workspace folder has none a UNC alias of it
- * is not placed (an open limit below). False when no folder on `target` is inside, the walk
+ * included, is placed by real path only, so where the workspace folder, or a folder on an alias's
+ * real path, has none, a UNC alias of it is not placed (an open limit below). False when no folder on `target` is inside, the walk
  * stopping at the first that does not exist; undefined when the workspace folder cannot be read,
  * a folder on `target` is a dangling link, any other read fails, a spelling cannot be split into
  * its folders ({@link rootAndSegments}), or there is no `fileId`.
@@ -380,8 +380,9 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * UNC loopback admin share (by file id), and nothing else: at least a subst or mapped drive, an
  * 8.3 short name, a bind mount and a macOS firmlink are UNMEASURED, and may be accepted as written
  * with no link check. Where the
- * workspace folder reports no file id ({@link NO_FILE_ID}), a UNC alias of it is accepted as
- * written with no link check: a fail-open, though no looser than before #8237 item 16, when every
+ * workspace folder, or a folder on an alias's real path, reports no file id ({@link NO_FILE_ID}),
+ * an alias only a file id would place, a UNC alias among them, is accepted as written with no
+ * link check: a fail-open, though no looser than before #8237 item 16, when every
  * user-set path outside the folder was. A real path follows every link at once, so an alias whose
  * target passes through a link the repository holds, at any depth, is placed where that link
  * leads and the repository's link is not checked: measured for an alias onto `ws\linked\deeper`,
@@ -390,8 +391,11 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * native realpath fails, at least with EISDIR on some RAM disks and virtual drives, every user-set
  * path refuses, as every rule 2 path already did. Its reads are synchronous, so a user-set path on a slow share holds the extension host while they
  * run. In a `.code-workspace` window a relative user value that leaves the workspace folder by
- * `..` is read against the folder the file chose, and is accepted as written when no folder on it
- * is inside. Nor does this check cover the files the CLI creates beside the target, or a link made or a
+ * `..`, or on Windows a rooted value with no drive, at least `\x.toml`, `/x.toml`, `\\x.toml`,
+ * `\\\x.toml` and `//x.toml` (path.win32.resolve reads each on the folder's drive, measured; a
+ * `\\server\share\` value is a UNC path instead), is read against the
+ * folder the file chose, or its drive, and is accepted as written when no folder on it is inside.
+ * Nor does this check cover the files the CLI creates beside the target, or a link made or a
  * folder renamed between this check and the CLI's write, since the CLI opens the path itself, later.
  */
 export function securityConfigTarget(
