@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import logging
 import random
 import re
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import messagefoundry.redaction as redaction
+from messagefoundry.logging_setup import _shipped_filters
 from messagefoundry.redaction import (
     _JSON_PHI_KEY,
     _JSON_STRUCTURE,
@@ -105,8 +107,14 @@ MISSED = [
     f'"given": a|b|c {SECRET}\u2026(+12 chars)',
     # A comma ends the value, as it does with no field run (`"given": Doe, Jane`).
     f'"given": a|b|c x, {SECRET}',
-    # A container after a scalar value.
+    # A container after a scalar value, or after the field run's placeholder.
     f'"given": x [{SECRET}]',
+    f'"given": a|b|c [{SECRET}]',
+    # A line break after the token with more text following, a credential word in the run, and a
+    # run longer than _PLAIN_RUN_TOKENS: the read-on leaves each as it was.
+    f'"given": a|b|c {SECRET}\nnext line',
+    f'"given": a|b|c bearer {SECRET}',
+    f'"given": a|b|c {SECRET}' + " w" * 16,
     # A run that reaches a label or a quote: the read-on stops at the placeholder rather than take
     # a label another pass reads (`_placeholder_runs_on`).
     f"\"given\": a|b|c {SECRET} <given value='x'",
@@ -153,9 +161,17 @@ def test_a_token_after_a_field_run_is_hidden(scrub: Callable[[str], str], text: 
     assert scrub(once) == once
 
 
-#: The FIELD_RUN texts origin/main 4ad697da713 kept the token of. The others are pinned because
-#: the same change reaches them, and main hid them already.
-FIELD_RUN_MAIN_KEPT = [text for text in FIELD_RUN if "Jane" not in text]
+#: The FIELD_RUN texts 4ad697da713 hid the token of already, with its name passes. They are
+#: pinned because the same change reaches them; every other FIELD_RUN text kept its token there.
+FIELD_RUN_MAIN_HID = {
+    f'"given": a|b|c Jane Doe {SECRET}',
+    f'"given": a|b|c {SECRET}, Jane',
+}
+FIELD_RUN_MAIN_KEPT = [text for text in FIELD_RUN if text not in FIELD_RUN_MAIN_HID]
+
+
+def test_the_main_hid_set_is_in_field_run() -> None:
+    assert set(FIELD_RUN) >= FIELD_RUN_MAIN_HID
 
 
 @pytest.mark.parametrize("text", FIELD_RUN_MAIN_KEPT)
@@ -214,11 +230,83 @@ def test_a_cut_shift_text_prints_no_word_the_rules_off_answer_hid(
 FIELD_RUN_KEPT = [
     ('"given": a|b|c\nstep 2 done', '"given": [redacted]\nstep 2 done'),
     ('{"given": a|b|c, "status": "ok"}', '{"given": [redacted] "status": "ok"}'),
-    ('"given": a|b|c token=x', None),
+    # A label after the placeholder is left for the credential passes.
+    ('"given": a|b|c token=x', '"given": [redacted] token=x'),
+    # A run longer than _PLAIN_RUN_TOKENS is not read on into.
+    ('"given": a|b|c ' + "w " * 17, '"given": [redacted]' + " w" * 17),
+    # Under name/address the first stage keeps a scalar, and the widened stage judges its shape.
+    ('{"name": a|b|c 10.1.2.3}', '{"name": [redacted] 10.1.2.3}'),
     ('{"system": [redacted] ok}', '{"system": [redacted] ok}'),
     ('"given": ["x"]\u2026(+12 chars)', '"given": ["[redacted]"]\u2026(+12 chars)'),
     ('"given": a|b|c\u2026(+12 chars)', None),
 ]
+
+
+#: Review round-9b28b256be: trailing whitespace the answer's strip removes, which a first call
+#: read as more text and a second as the end, so the read-on took the value only on the second.
+TRAILING_SPACE = [
+    f'"given": a|b|c {SECRET}\u2028',
+    f'"given": a|b|c {SECRET}\x0b',
+    f'"given": a|b|c {SECRET}\x85',
+    f'"given": a|b|c {SECRET}\u3000',
+    f'{{"identifier": {{"value": a|b|c {SECRET}\n',
+    f'{{"identifier": {{"value": a|b|c {SECRET}\n}}}}',
+]
+
+
+@pytest.mark.parametrize("text", TRAILING_SPACE)
+def test_trailing_whitespace_reads_as_the_end_on_both_calls(text: str) -> None:
+    once = safe_text(text)
+    assert SECRET not in once, once
+    assert safe_text(once) == once
+
+
+def _log_chain(text: str) -> str:
+    """``text`` through the filters a shipped log handler runs: the redactor, then the credential
+    filters after it."""
+    record = logging.LogRecord("b5814", logging.WARNING, __file__, 0, "%s", (text,), None)
+    for log_filter in _shipped_filters():
+        log_filter.filter(record)
+    return record.getMessage()
+
+
+#: Review round-9b28b256be: the shipped log chain printed each secret, because the read-on wrote
+#: a credential label as the placeholder and left its separator and value on the next line, or
+#: took a bare ``bearer`` the whole-text gate reads.
+LOG_CHAIN = [
+    '"given": a|b|c token\n= QzorvexSecret1',
+    '"given": a|b|c bearer\nQzorvexSecret1',
+    '"given": a|b|c password\n: QzorvexSecret1',
+    '"given": a|b|c api_key\n=QzorvexSecret1',
+    '"given": a|b|c session\n=QzorvexSecret1',
+    '"given": a|b|c MEFOR_DB_PASSWORD\n= QzorvexSecret1',
+    '{"given": a|b|c x api_key\n= QzorvexSecret1, "k": 1}',
+    'ValueError: bad PID: "family": DOE^JANE^Q session\n= QzorvexSecret1',
+    '"given": a|b|c bearer abcd1234, a%7Cb%7Cc;sslpassword=x qzorvexpw',
+]
+
+
+@pytest.mark.parametrize("text", LOG_CHAIN)
+def test_the_log_chain_prints_no_credential(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    ours = _log_chain(text)
+    assert "QzorvexSecret1" not in ours and "qzorvexpw" not in ours, ours
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        theirs = _log_chain(text)
+    assert not _words(ours) - _words(theirs) - _NOTE_WORDS, (ours, theirs)
+
+
+def test_the_log_chain_differential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped log chain runs the redactor before the credential filters, which none of
+    ``_DIFF_SCRUBBERS`` does, so it is compared here too, over this file's own fuzz."""
+    texts = [t for t in [*LOG_CHAIN, *_differential_fuzz(1_500)] if _JSON_PHI_KEY.search(t)]
+    ours = [[_log_chain(text)] for text in texts]
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        theirs = [[_log_chain(text)] for text in texts]
+    leaks, changed = _words_main_hid(texts, ours, theirs)
+    assert not leaks, leaks[:5]
+    assert changed > 20, changed
 
 
 @pytest.mark.parametrize(("text", "expected"), FIELD_RUN_KEPT)
@@ -537,6 +625,7 @@ def _differential_fuzz(count: int) -> list[str]:
     parts += ["PatientID: ", "PatientName=", "MRN 123456", "DOE^JANE", "PID|1||", PLACEHOLDER]
     parts += ["\u2026(+3 chars)", "frozenset(", "date(", "1980-05-05", "Doe, Jane", "<given value="]
     parts += [" a|b|c ", "DOE^JANE^Q ", "123-45-6789", "\t", "x a|b|c "]
+    parts += ["\n= ", "bearer ", "bearer\n", "\u2028", "\x0b", "\x85", " api_key", "session"]
     return ["".join(rng.choices(parts, k=rng.randint(1, 30))) for _ in range(count)]
 
 
@@ -575,9 +664,14 @@ def _words_main_hid(
 
 
 def _words(answer: str) -> set[str]:
-    """The words of ``answer`` past its count notes. A note's number counts what a cut dropped, so a
-    scrub that hides more moves it, and it is not text the answer printed."""
-    return set(_WORD.findall(redaction._COUNT_NOTE.sub("", answer)))
+    """The words of ``answer`` past its count notes and the log chain's escapes. A note's number
+    counts what a cut dropped, so a scrub that hides more moves it, and it is not text the answer
+    printed; an escape such as ``\\u0085`` is the chain's spelling of one character, which would
+    otherwise join the word after it."""
+    return set(_WORD.findall(_ESCAPE.sub(" ", redaction._COUNT_NOTE.sub("", answer))))
+
+
+_ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[nrt])")
 
 
 def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.MonkeyPatch) -> None:

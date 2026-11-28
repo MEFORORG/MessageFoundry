@@ -1410,7 +1410,8 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     """``(replacement, end)`` for the JSON value starting at ``pos``, scrubbed under ``policy``.
 
     An explicit stack rather than recursion, because the nesting depth is the peer's choice. The walk
-    visits each character once. A structure that never closes runs to the end of the text, so a cut
+    visits each character once, apart from the bounded lookahead past a placeholder
+    (:func:`_placeholder_runs_on`). A structure that never closes runs to the end of the text, so a cut
     inside it strands nothing (the fail-closed rule on the section comment above). A container ends
     only on its own closer; a closer of another kind raises :class:`_MismatchedJsonCloser`.
 
@@ -1418,10 +1419,10 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     PHI as its keys (``{"name": {"DOE": 1}}``) is a residual. A bare token straight before ``(`` is a
     callable's name (``date(``, ``frozenset(``) and is kept too; its arguments are the value."""
     out: list[str] = []
-    #: One frame per open container: ``(is_object, policy, closer)``. An object's policy is LEAF or
-    #: INHERIT (searched); an array's or a call's is the policy its elements take. ``closer`` is the
-    #: one delimiter that ends the frame.
-    frames: list[tuple[bool, int, str]] = []
+    #: One frame per open container: ``(is_object, policy, closer, opened)``. An object's policy is
+    #: LEAF or INHERIT (searched); an array's or a call's is the policy its elements take. ``closer``
+    #: is the one delimiter that ends the frame, and ``opened`` the policy it was opened under.
+    frames: list[tuple[bool, int, str, int]] = []
     pending = policy
     #: Whether ``pending`` scrubs only because the walk read on past a placeholder (BACKLOG #5814),
     #: where a token it scrubs is written at its own length at least (:func:`_padded`).
@@ -1447,32 +1448,35 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
             read_on = False
             if punct == "{":
                 leaf = pending in (_LEAF, _STRUCTURE_ONLY)
-                frames.append((True, _LEAF if leaf else _INHERIT, "}"))
+                frames.append((True, _LEAF if leaf else _INHERIT, "}", pending))
                 pending = frames[-1][1]
             elif punct in "[(":
                 closer = "]" if punct == "[" else ")"
-                frames.append((False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer))
+                frames.append(
+                    (False, _LEAF if pending == _STRUCTURE_ONLY else pending, closer, pending)
+                )
                 pending = frames[-1][1]
             elif punct in "}])":
                 if punct != frames[-1][2]:
                     raise _MismatchedJsonCloser
-                closed = frames.pop()[1]
+                _, closed, _, opened = frames.pop()
                 # Only where the parent would keep the value: a leaf or value frame scrubs it.
                 if (not frames or frames[-1][1] == _INHERIT) and _json_value_runs_on(
                     text, pos, nested=bool(frames)
                 ):
                     raise _MismatchedJsonCloser
+                on = _read_on_policy(closed, opened, widened)
                 if not frames:
-                    scrubbed = closed != _INHERIT and text.endswith(_REDACTED, 0, pos)
+                    scrubbed = on is not None and text.endswith(_REDACTED, 0, pos)
                     resume = _placeholder_runs_on(text, pos, bare_ok=True) if scrubbed else None
-                    if resume is None:
+                    if on is None or resume is None:
                         return "".join(out), pos
                     out.append(text[pos:resume])
                     pos = resume
-                    pending = closed
+                    pending = on
                     read_on = True
                     continue
-                pending = _policy_after_close(text, pos, closed, frames[-1][1])
+                pending = _policy_after_close(text, pos, on, frames[-1][1])
                 read_on = pending != frames[-1][1]
             elif punct == ",":
                 pending = frames[-1][1]
@@ -1526,14 +1530,15 @@ def _padded(value: str) -> str:
     """``value``, which only the read-on past a placeholder scrubs (BACKLOG #5814), with each of its
     tokens written as the placeholder, repeated until it is at least as long as the token.
 
-    origin/main printed that value, or scrubbed some of its tokens with a later pass, so an answer
-    shorter there would let a downstream length bound, such as :func:`safe_text`'s, keep text it cut
-    on main: the differential against origin/main found words printed that way, from one
-    placeholder written for a whole run and from a long token. Padding with spaces split a token
-    main's whole-token cut dropped, and the differential found words printed that way too. So the
-    placeholder repeats, glued: no new whitespace, no new character, at least the token's length,
-    and a second pass reads the repeats as placeholders and leaves them. The answer is expected to
-    cut no later than main's; that is measured, not proved."""
+    Before the read-on (4ad697da713) that value printed, or some of its tokens were scrubbed by a
+    later pass, so an answer shorter there would let a downstream length bound, such as
+    :func:`safe_text`'s, keep text that bound cut before: a differential against 4ad697da713 found
+    words printed that way, from one placeholder written for a whole run and from a long token.
+    Padding with spaces split a token the whole-token cut dropped, and the differential found
+    words printed that way too. So the placeholder repeats, glued: no new whitespace, no new
+    character, at least the token's length, and a second pass reads the repeats as placeholders
+    and leaves them. The answer is expected to cut no later than before; that is measured, not
+    proved. :data:`_PLAIN_RUN_TOKENS` bounds the growth."""
     return _NON_SPACE.sub(_padded_token, value)
 
 
@@ -1581,9 +1586,11 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     a container, where the scrubbed container's own policy now holds after it
     (:func:`_policy_after_close`) rather than the enclosing object's. So ``x`` is hidden in some
     of those shapes and the text keeps its keys. **Some still keep ``x``,** at least: a line break
-    before it, a string, a token glued to a count note (read as a callable's name), a run that
-    reaches a label, a quote or anything else :data:`_PLAIN_RUN` refuses before the value ends,
-    and anything after a comma. The ``MISSED`` list pins examples, not a complete list.
+    before it, a line break after it with more text following, a string, a container, a token
+    glued to a count note (read as a callable's name), a run that reaches a label, a quote or
+    anything else :data:`_PLAIN_RUN` refuses before the value ends, a run holding a credential word
+    (:data:`_CREDENTIAL_WORD`), a run of more than :data:`_PLAIN_RUN_TOKENS` tokens, and anything
+    after a comma. The ``MISSED`` list pins examples, not a complete list.
 
     **Only a container's end is read, by choice.** A token after a scalar (``"family": "Doe"
     failed``) is far more often prose after a diagnostic's value than a stray closer, and blanking
@@ -1602,22 +1609,33 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     return True
 
 
-def _policy_after_close(text: str, pos: int, closed: int, parent: int) -> int:
-    """The policy for what follows a container of policy ``closed`` that just closed at ``pos``
-    inside a frame of policy ``parent`` (BACKLOG #5814).
+def _read_on_policy(closed: int, opened: int, widened: bool) -> int | None:
+    """The policy the read-on past a placeholder scrubs under, for a container of policy ``closed``
+    opened under ``opened``, or ``None`` where it does not read on (BACKLOG #5814). Not after an
+    INHERIT container, which scrubs nothing. Under ``name``/``address`` it is that key's own rule:
+    the first stage keeps a scalar there, as BACKLOG #1711 shipped, so it does not read on, and the
+    widened stage judges the shape (:func:`_kept_under_structure_only`)."""
+    if closed == _INHERIT:
+        return None
+    if opened == _STRUCTURE_ONLY:
+        return _STRUCTURE_ONLY if widened else None
+    return closed
 
-    The parent's, as before, except after exactly the placeholder ``[redacted]`` under a policy that
-    scrubs, where :func:`_placeholder_runs_on` reads on (nested): there the placeholder's own policy
-    holds, so ``{"given": a|b|c Doe}``, which a field-run pass writes as
-    ``{"given": [redacted] Doe}``, loses ``Doe`` rather than keep it under the enclosing object.
-    The same gate as the top level, so a label after the placeholder is not taken: under a policy
-    that scrubs, a callable's name and an object's key are kept, so a label scrubbed there could
-    leave its own value as one of those, which the differential against origin/main found."""
-    if closed in (_INHERIT, parent) or not text.endswith(_REDACTED, 0, pos):
+
+def _policy_after_close(text: str, pos: int, on: int | None, parent: int) -> int:
+    """The policy for what follows a container that just closed at ``pos`` inside a frame of policy
+    ``parent``, where ``on`` is :func:`_read_on_policy`'s answer for it (BACKLOG #5814).
+
+    The parent's, as before, except after exactly the placeholder ``[redacted]`` where
+    :func:`_placeholder_runs_on` reads on (nested): there ``on`` holds, so ``{"given": a|b|c Doe}``,
+    which a field-run pass writes as ``{"given": [redacted] Doe}``, loses ``Doe`` rather than keep
+    it under the enclosing object. The same gate as the top level, so a label after the
+    placeholder is not taken: under a policy that scrubs, a callable's name and an object's key are
+    kept, so a label scrubbed there could leave its own value as one of those, which a differential
+    against 4ad697da713 found on an earlier form of this rule."""
+    if on is None or on == parent or not text.endswith(_REDACTED, 0, pos):
         return parent
-    return (
-        closed if _placeholder_runs_on(text, pos, bare_ok=True, nested=True) is not None else parent
-    )
+    return on if _placeholder_runs_on(text, pos, bare_ok=True, nested=True) is not None else parent
 
 
 def _placeholder_runs_on(text: str, pos: int, *, bare_ok: bool, nested: bool = False) -> int | None:
@@ -1636,15 +1654,23 @@ def _placeholder_runs_on(text: str, pos: int, *, bare_ok: bool, nested: bool = F
     :func:`_policy_after_close`'s reading inside a container, where the run must end at a
     delimiter (:data:`_PLAIN_RUN_END_NESTED`).
 
-    **Only a plain run that ends the value is read, so the walk does not take a label spelled
-    with ``=``, ``:``, ``<`` or a quote.** A run that reaches one, such as ``token=``,
-    ``PatientID:`` or ``<given value=``, ends the value at the placeholder, as before: an earlier
-    form of this rule wrote such a label as the placeholder and left the label's own value for no
-    pass to read, which the differential against origin/main found on fuzzed text. That is a
-    measurement, not a proof that no pass reads a label made of plain words. **Anything else ends
-    the value, as before,** at least: a string, any other container, a callable's name, a line
-    break, the end of the text, and a count note glued to a token. A container that is not the
-    placeholder is :func:`_json_value_runs_on`'s to read."""
+    **Only a short plain run that ends the value on its line is read, and none holding a
+    credential word.** A run that reaches a label spelled with ``=``, ``:``, ``<`` or a quote, such
+    as ``token=``, ``PatientID:`` or ``<given value=``, ends the value at the placeholder, as
+    before: an earlier form of this rule wrote such a label as the placeholder and left the label's
+    own value for no pass to read, which a differential against 4ad697da713 found on fuzzed text.
+    A line break ends a value only where nothing but whitespace follows it, since a credential
+    filter reads a label's separator on the next line (``token\n= x``). A run holding a credential
+    word (:data:`_CREDENTIAL_WORD`) is not read either: the label filters, and the whole-text gate
+    :data:`_CREDENTIAL_AHEAD` feeds, read such words where this walk would write the placeholder. A
+    run of more than :data:`_PLAIN_RUN_TOKENS` tokens is not read, which bounds what
+    :func:`_padded` writes. These are measurements, not a proof that no pass reads a label made of
+    plain words.
+
+    **Anything else ends the value, as before,** at least: a string, any other container, a
+    callable's name, a line break with more text after it, and a count note glued to a token. **A
+    container after the placeholder is read by nothing**: :func:`_json_value_runs_on` exempts a
+    container that is the placeholder, so ``"given": a|b|c [x]`` keeps ``x``."""
     note = _COUNT_NOTE.match(text, pos)
     resume = pos if note is None else note.end()
     ahead = _next_json_token(text, resume, False)
@@ -1658,18 +1684,31 @@ def _placeholder_runs_on(text: str, pos: int, *, bare_ok: bool, nested: bool = F
     end = _PLAIN_RUN_END_NESTED if nested else _PLAIN_RUN_END
     if run is None or end.match(text, run.end()) is None:
         return None
+    if _CREDENTIAL_WORD.search(run.group()) is not None:
+        return None
     return resume
 
 
+#: The most tokens a plain run :func:`_placeholder_runs_on` reads on into may hold.
+_PLAIN_RUN_TOKENS = 16
 #: A run of plain value tokens on one line, as :func:`_placeholder_runs_on` reads on into: words,
-#: numbers, dates and HL7 components. No ``=``, ``:``, ``<``, ``>``, quote or bracket, so no label.
-_PLAIN_RUN = re.compile(r"[\w.\-/^&~#+]++(?:[ \t]++[\w.\-/^&~#+]++)*+")
-#: Where a plain run ends a value: the end of the text or its line, a delimiter that ends a JSON
-#: value, or the placeholder, which the walk then reads on past.
-_PLAIN_RUN_END = re.compile(rf"[ \t]*+(?:\Z|[\r\n,}}\])]|{re.escape(_REDACTED)})")
-#: The same inside a container, less a line break: the policy :func:`_policy_after_close` keeps
-#: holds until a delimiter, so a run there must end at one.
-_PLAIN_RUN_END_NESTED = re.compile(rf"[ \t]*+(?:\Z|[,}}\])]|{re.escape(_REDACTED)})")
+#: numbers, dates and HL7 components, at most :data:`_PLAIN_RUN_TOKENS` of them. No ``=``, ``:``,
+#: ``<``, ``>``, quote or bracket, so no label spelled with one.
+_PLAIN_RUN = re.compile(r"[\w.\-/^&~#+]++(?:[ \t]++[\w.\-/^&~#+]++){0,15}+")
+#: Where a plain run ends a value at the top level: a delimiter that ends a JSON value or the
+#: placeholder, on its line, or nothing but whitespace to the end of the text. A line break with
+#: text after it is not an end: a credential filter reads a separator on the next line.
+_PLAIN_RUN_END = re.compile(r"[ \t]*+(?:[,}\])]|\[redacted\])|\s*+\Z")
+#: The same inside a container, where a closer or comma may follow a line break too: the policy
+#: :func:`_policy_after_close` keeps holds until a delimiter, so a run there must end at one.
+_PLAIN_RUN_END_NESTED = re.compile(r"\s*+(?:[,}\])]|\Z)|[ \t]*+\[redacted\]")
+#: A credential word in a plain run, which :func:`_placeholder_runs_on` will not read on into: a
+#: credential filter or :data:`_CREDENTIAL_AHEAD` reads such a word. Wider than either, which only
+#: costs a value the read-on leaves as it was.
+_CREDENTIAL_WORD = re.compile(
+    r"(?i:bearer|basic|token|pass|pwd|secret|session|key|auth|credential|cookie|code|state)"
+    r"|MEFOR_"
+)
 
 
 def _next_json_token(text: str, pos: int, nested: bool) -> re.Match[str] | None:
