@@ -7,7 +7,8 @@ or secret reaches the bundle."""
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import errno
+import io
 import json
 import os
 import re
@@ -731,37 +732,57 @@ def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same race, driven through :func:`build_bundle` as the CLI drives it, so it names no
-    helper of the bundle's own: the first listing saw a regular file, and a FIFO is at the name by
-    the open. A plain open then waits for a writer and the bundle never finishes (BACKLOG #5383).
-    That first look is stood in for by answering the first ``os.stat`` or ``os.lstat`` of that one
-    name with a regular file's stat; every later look sees the FIFO, as a real swap leaves it, so a
-    listing made again leaves it out and the bundle carries no app log. The test does rest on the
-    listing checking the file through one of those two calls; the count below fails it by name if
-    neither is reached. A FIFO cannot be made on Windows, so this runs on POSIX only."""
+    helper of the bundle's own: the listing saw a regular file, and a FIFO is at the name by the
+    open. A plain open then waits for a writer and the bundle never finishes (BACKLOG #5383).
+    Every ``os.stat`` or ``os.lstat`` of that name before its first open is answered with a
+    regular file's stat, so a look taken again just before a blocking open sees the regular file
+    too and cannot pass the test; every look after the open sees the FIFO, as a real swap leaves
+    it, so a listing made again leaves it out and the bundle carries no app log. The test does
+    rest on the file being looked at through ``os.stat`` or ``os.lstat`` and opened through
+    ``os.open`` or ``io.open``; the counts below fail it by name if either is not reached. A FIFO
+    cannot be made on Windows, so this runs on POSIX only."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
     fifo = log_dir / "engine.log"
     try:
         os.mkfifo(fifo)
-    except OSError:
+    except OSError as exc:
+        if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL):
+            raise
         pytest.skip("this file system cannot hold a FIFO")
     fifo_name = os.fspath(fifo)
     decoy = tmp_path / "decoy.log"
     decoy.write_text("x\n", encoding="utf-8")
     seen_as_regular = os.lstat(decoy)
     forged = [0]
+    opened = [0]
+    real_os_open = os.open
+
+    def is_the_fifo(path: Any) -> bool:
+        # By name, so a look relative to a directory descriptor still counts as this file.
+        return not isinstance(path, int) and os.path.basename(os.fspath(path)) == fifo.name
 
     def as_listed(real: Any) -> Any:
         def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
-            if not forged[0] and not isinstance(path, int) and os.fspath(path) == fifo_name:
+            if not opened[0] and is_the_fifo(path):
                 forged[0] += 1
                 return seen_as_regular
             return real(path, *args, **kwargs)
 
         return fake
 
+    def counting(real: Any) -> Any:
+        def spy(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if is_the_fifo(path):
+                opened[0] += 1
+            return real(path, *args, **kwargs)
+
+        return spy
+
     monkeypatch.setattr(os, "stat", as_listed(os.stat))
     monkeypatch.setattr(os, "lstat", as_listed(os.lstat))
+    monkeypatch.setattr(os, "open", counting(os.open))
+    monkeypatch.setattr(io, "open", counting(io.open))
 
     result: list[str | None] = []
     failed: list[BaseException] = []
@@ -775,18 +796,24 @@ def test_log_tail_does_not_hang_on_a_fifo_put_at_the_listed_name(
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
     # Generous, so a loaded runner's build is not taken for a hang; a pass returns at once.
-    worker.join(30)
+    wait = 30
+    worker.join(wait)
     hung = worker.is_alive()
     deadline = time.monotonic() + 10
     while worker.is_alive() and time.monotonic() < deadline:
         # Release each open still waiting on the FIFO: a writer arriving lets it return, and the
         # close gives it end of file. ENXIO means no open is waiting at this moment.
-        with contextlib.suppress(OSError):
-            os.close(os.open(fifo_name, os.O_WRONLY | os.O_NONBLOCK))
+        try:
+            os.close(real_os_open(fifo_name, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError as exc:
+            if exc.errno != errno.ENXIO:
+                raise
         worker.join(0.5)
-    assert not hung, "build_bundle was still waiting on the FIFO after 30 seconds"
+    leaked = " and was not released" if worker.is_alive() else ""
+    assert not hung, f"build_bundle was still waiting on the FIFO after {wait} seconds{leaked}"
     assert not failed, failed
-    assert forged[0] == 1, "neither os.stat nor os.lstat was asked about the log file"
+    assert forged[0] >= 1, "neither os.stat nor os.lstat was asked about the log file"
+    assert opened[0] == 1, f"the log file was opened {opened[0]} times, not once"
     assert result == [None]
 
 
