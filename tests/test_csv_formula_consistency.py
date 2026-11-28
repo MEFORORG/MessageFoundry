@@ -260,6 +260,12 @@ _RECORDED_SPREADSHEET_WRITERS = {
         "vuln-metrics workflow runs it with no install), so it cannot import the engine rule. Route "
         "it through spreadsheet_safe if a free-text column, or the engine on sys.path, ever lands."
     ),
+    "scripts/hooks/runbook_take_prompt.py": (
+        "READ-ONLY, not a writer: it imports openpyxl only to read the owner's local runbook "
+        "workbook with load_workbook(read_only=True, data_only=True) and never saves one; the only "
+        "file it writes is its own JSON state file. Recorded by owner decision 2026-11-28. If it "
+        "ever writes a workbook, its free-text cells go through the rule like any other writer's"
+    ),
 }
 
 #: Libraries that write a *binary* spreadsheet format. The ASVS text covers "CSV **or other
@@ -379,6 +385,27 @@ def test_no_unrecorded_spreadsheet_writer_exists() -> None:
     )
     stale = sorted(_RECORDED_SPREADSHEET_WRITERS.keys() - sites)
     assert not stale, f"recorded spreadsheet writer(s) that no longer exist: {stale}"
+
+
+def test_the_runbook_hook_recorded_as_read_only_writes_no_workbook() -> None:
+    # Its record above says READ-ONLY. This binds that claim: the hook makes no `.save(` call, builds
+    # no openpyxl Workbook, opens nothing write_only, and still opens its workbook read_only.
+    rel = "scripts/hooks/runbook_take_prompt.py"
+    source = (_REPO / rel).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    saves = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "save"
+    ]
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    assert not saves, f"{rel} calls .save( at line(s) {saves}; it is recorded as read-only"
+    assert "Workbook" not in names and "write_only" not in source, rel
+    assert "load_workbook(path, read_only=True, data_only=True)" in source, rel
 
 
 def test_the_writer_gate_sees_every_binding_of_the_csv_module() -> None:

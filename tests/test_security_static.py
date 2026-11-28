@@ -1761,6 +1761,14 @@ _XML_PARSER_ALLOWLIST = {
         "HARNESS surface no engine data reaches. The formula-injection half of this write-back is "
         "ASVS 1.2.10's, held by tests/test_csv_formula_consistency.py"
     ),
+    "scripts/hooks/runbook_take_prompt.py": (
+        "openpyxl load_workbook(read_only=True, data_only=True) over the owner's own local runbook "
+        "workbook, in read_book() — a dev hook under scripts/ that the wheel does not ship, and a "
+        "surface no engine data reaches. NOT defused: openpyxl uses defusedxml only where it is "
+        "installed, and on the tools interpreter that runs the hook (checked 2026-11-28) it is not, "
+        "so the stdlib xml.etree parser reads the parts. Recorded by owner decision 2026-11-28; "
+        "tests/test_xml_parser_consistency.py records it as outside the corpus"
+    ),
     "scripts/ci/tooling_receipt.py": (
         "the vendored defusedxml copy's ElementTree.parse over pytest's junit.xml, written by the `tooling` job's own "
         "pytest invocation seconds earlier in the same runner workspace — the same shape as "
