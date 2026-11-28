@@ -1366,10 +1366,50 @@ def _os_open_may_write(call: ast.Call) -> bool:
 
 #: Bounds on one :meth:`_NameResolver.expand`: the longest dotted name it produces, in parts, and the
 #: most names it returns. Bindings that extend each other (``a = b.x`` and ``b = a.y``) would grow
-#: without end; no real call chain comes near either bound, and an expansion that reaches one is
-#: reported as truncated, so the call is flagged rather than passed unread.
+#: without end, and ordinary code has them: a linked-list walk (``cur = nxt``, ``nxt = cur.next``)
+#: or one generic name bound in several functions reaches a bound on every call through it. So an
+#: expansion cut short is reported as truncated only when a name it left unread could still meet a
+#: name test of this rule (:meth:`_NameResolver.cut_may_hit`), and the call is then flagged rather
+#: than passed unread.
 _MAX_ALIAS_PARTS = 16
 _MAX_ALIAS_NAMES = 256
+#: The heads a resolved call name must start with to meet any name test of the ambient-authority
+#: rule (:func:`_ambient_name_hit`, :func:`_open_write_hit`); the one test that reads no head, a
+#: filesystem-write method, is :data:`_AMBIENT_FS_WRITE_ATTRS`. A new name test must keep this whole.
+_HIT_HEADS = frozenset(
+    {"builtins", "importlib", "urllib", "http", "os"}
+    | _AMBIENT_BARE_NAMES
+    | _AMBIENT_ROOTS
+    | _AMBIENT_ROOT_EXEMPTIONS.keys()
+    | {name.partition(".")[0] for name in _MODULE_OPENERS | _AMBIENT_OS_PATHS}
+)
+
+
+def _non_import_binding(node: ast.AST) -> str | None:
+    """The name ``node`` binds other than by an import, or None: an assignment, ``for``, ``with``,
+    comprehension or walrus target, a parameter, an ``except`` name, a ``def``/``class`` name, a type
+    parameter or a ``match`` capture."""
+    if isinstance(node, ast.Name):
+        return node.id if isinstance(node.ctx, ast.Store) else None
+    if isinstance(node, ast.arg):
+        return node.arg
+    if isinstance(
+        node,
+        (
+            ast.FunctionDef,
+            ast.AsyncFunctionDef,
+            ast.ClassDef,
+            ast.TypeVar,
+            ast.ParamSpec,
+            ast.TypeVarTuple,
+        ),
+    ):
+        return node.name
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return node.name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest
+    return None
 
 
 class _NameResolver:
@@ -1393,8 +1433,12 @@ class _NameResolver:
         self._self_suffixes: dict[str, set[str]] = {}
         self._cache: dict[str, tuple[frozenset[str], bool]] = {}
         self._imported: set[str] = set()
+        self._rebound: set[str] = set()
         values: list[tuple[list[str], ast.expr]] = []
         for node in ast.walk(tree):
+            rebound = _non_import_binding(node)
+            if rebound is not None:
+                self._rebound.add(rebound)
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.asname:
@@ -1435,11 +1479,14 @@ class _NameResolver:
             self._self_suffixes.setdefault(name, set()).add(rest)
 
     def is_unbound(self, name: str) -> bool:
-        """No binding this resolver follows, and no path binding, names ``name``."""
+        """No binding but a plain ``import name`` names ``name``: none this resolver follows, no path
+        binding and no other (:func:`_non_import_binding`), so a parameter, loop target or ``except``
+        name spelt like an imported module is not read as that module."""
         return (
             name not in self._aliases
             and name not in self._self_suffixes
             and name not in self.path_names
+            and name not in self._rebound
         )
 
     def is_module_named_directly(self, name: str) -> bool:
@@ -1448,7 +1495,8 @@ class _NameResolver:
 
     def expand(self, dotted: str) -> tuple[frozenset[str], bool]:
         """``dotted`` as written plus every name its head may stand for, and whether a bound in
-        :data:`_MAX_ALIAS_NAMES` / :data:`_MAX_ALIAS_PARTS` cut the expansion short.
+        :data:`_MAX_ALIAS_NAMES` / :data:`_MAX_ALIAS_PARTS` cut the expansion short where a name it
+        left unread could meet a name test (:meth:`cut_may_hit`).
 
         Each distinct name is expanded once, whatever path reached it, so a lattice of names bound
         from one another costs the number of names it reaches, not the number of paths through it.
@@ -1476,9 +1524,30 @@ class _NameResolver:
                     continue
                 seen.add(item)
                 queue.append(item)
-        result = (frozenset(name for name, _ in seen), truncated)
+        result = (frozenset(name for name, _ in seen), truncated and self.cut_may_hit(dotted))
         self._cache[dotted] = result
         return result
+
+    def cut_may_hit(self, dotted: str) -> bool:
+        """Whether some name :meth:`expand` could reach from ``dotted`` may meet a name test: a head
+        reachable through the bindings is in :data:`_HIT_HEADS`, or a part of ``dotted`` or of a
+        binding reachable from it is in :data:`_AMBIENT_FS_WRITE_ATTRS`. Every name an expansion
+        produces is a reachable head followed by such parts, so when neither holds, no name it left
+        unread can be a hit and a cut expansion loses nothing."""
+        heads = {dotted.partition(".")[0]}
+        parts = set(dotted.split("."))
+        stack = list(heads)
+        while stack:
+            head = stack.pop()
+            for target in self._aliases.get(head, ()):
+                parts.update(target.split("."))
+                target_head = target.partition(".")[0]
+                if target_head not in heads:
+                    heads.add(target_head)
+                    stack.append(target_head)
+            for suffix in self._self_suffixes.get(head, ()):
+                parts.update(suffix.split("."))
+        return not heads.isdisjoint(_HIT_HEADS) or not parts.isdisjoint(_AMBIENT_FS_WRITE_ATTRS)
 
     def call_names(self, func: ast.expr) -> tuple[frozenset[str], bool]:
         """Every dotted name a call's ``func`` may resolve to, or none when it is not a dotted chain
@@ -1589,8 +1658,9 @@ def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
     cannot tell is a path; a write through a handle passed in, or by ``json.dump``/``csv.writer``;
     an opener not in :data:`_MODULE_OPENERS` (``dbm.open``) or an archive
     extraction; and any ``os`` call not named in :data:`_AMBIENT_OS_PATHS`. A call whose alias
-    expansion hit a bound in :meth:`_NameResolver.expand` is flagged, since what it stands for was not
-    all read. The other rules in this check follow no alias."""
+    expansion hit a bound in :meth:`_NameResolver.expand` is flagged when a name it left unread could
+    still be a hit, since what it stands for was not all read. The other rules in this check follow
+    no alias."""
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr in _AMBIENT_FS_WRITE_ATTRS:
         return True

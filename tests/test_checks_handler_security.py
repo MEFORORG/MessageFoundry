@@ -1085,6 +1085,38 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         'from pathlib import Path\n\ngzip = Path("/tmp/q")\n\ndef f(msg):\n    gzip.open("w")\n',
     ),
     ("opener_module_name_is_a_param", 'def g(msg, codecs):\n    codecs.open("w")\n'),
+    # ... and an import does not make it that module where a parameter, loop, with, except,
+    # comprehension, walrus, lambda or call result rebinds the name: the slot-0 reading still holds.
+    ("imported_opener_rebound_by_param", 'import gzip\n\ndef f(msg, gzip):\n    gzip.open("w")\n'),
+    (
+        "imported_opener_rebound_by_loop",
+        'import io\n\ndef f(msg, items):\n    for io in items:\n        io.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_with",
+        'import codecs\n\ndef f(msg, cm):\n    with cm as codecs:\n        codecs.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_except",
+        "import gzip\n\ndef f(msg):\n    try:\n        pass\n    except OSError as gzip:\n"
+        '        gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_comprehension",
+        'import io\n\ndef f(msg, items):\n    return [io.open("w") for io in items]\n',
+    ),
+    (
+        "imported_opener_rebound_by_walrus",
+        'import gzip\n\ndef f(msg, g):\n    if gzip := g:\n        gzip.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_lambda",
+        'import codecs\n\nf = lambda msg, codecs: codecs.open("w")\n',
+    ),
+    (
+        "imported_opener_rebound_by_call_result",
+        'import codecs\n\ndef f(msg, make):\n    codecs = make()\n    codecs.open("w")\n',
+    ),
     # A binding from the bound name itself is still followed, once.
     (
         "self_binding_on_import_alias",
@@ -1146,6 +1178,18 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
     ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
+    # Bindings that extend each other reach the expansion bound on every call through them; with no
+    # import, opener or write method among them, the unread names cannot be a write.
+    (
+        "linked_list_walk",
+        "def f(msg, head):\n    cur = head\n    nxt = cur.next\n    while nxt:\n        cur = nxt\n"
+        "        nxt = cur.next\n    return cur.value()\n",
+    ),
+    (
+        "generic_names_reused_across_functions",
+        "def a(msg, data):\n    resp = data.resp\n    return resp.get()\n\n"
+        "def b(msg, resp):\n    data = resp.data\n    return data.get()\n",
+    ),
     # Default and read modes of the other openers, by slot.
     ("receiver_open_read_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "r")\n'),
     ("zipfile_read_default", "import zipfile\n\ndef f(msg, p):\n    zipfile.ZipFile(p)\n"),
