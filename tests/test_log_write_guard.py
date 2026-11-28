@@ -1790,6 +1790,29 @@ def test_an_unnameable_type_is_said_once_per_interval(
     assert "no name" not in err
 
 
+def test_a_bytes_encoding_counts_a_line_once_under_its_cause(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A line escaped because the encoding read back as bytes is counted under that cause only.
+    # NEGATIVE CONTROL: on bbce6268109 it was counted under the escaped entry as well.
+    class _BytesEncoding(io.StringIO):
+        encoding = b"cp1252"  # type: ignore[assignment]
+
+    stream = _BytesEncoding()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("caf%s", chr(0xE9)))
+    handler.close()
+    err = capsys.readouterr().err
+
+    assert stream.getvalue().splitlines() == ["caf" + "\\" + "u00e9"]
+    assert f"{logging_guard._ENCODING_NOT_STR_FAULT} ('bytes')" in err
+    assert logging_guard._ESCAPED_FAULT not in err
+
+
 def test_an_unhashable_str_encoding_does_not_fail_the_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

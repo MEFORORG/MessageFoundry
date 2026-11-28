@@ -477,13 +477,12 @@ text, except a lone surrogate, which is spelled as the log spells one and parses
 characters naming it (BACKLOG #5813; this sentence replaced, on 2026-11-27, one that called the
 case open). On a text sink an escape reads the same as the six characters typed, since a
 backslash in the text is not doubled, the ambiguity the log's own escape accepts. The escape is
-taken BEFORE the write, for the codec the stream's `encoding` names, so it wins over a stream
-that would replace the character itself. `serve` sets its stdout and stderr to
+taken for the codec the stream's `encoding` names. `serve` sets its stdout and stderr to
 `errors="replace"` (`console_streams.harden_console_streams`), so on serve's default stdout the
 line carries the escape, not `?`. **CORRECTED 2026-11-27:** the first form of this paragraph
 escaped only after the stream raised `UnicodeEncodeError`, and called a stream left strict the
 case; a replacing stream never raises, so on serve's default stdout that escape never ran and the
-line carried `?`. The escape holds for every line the guard writes: the stdout sink's record
+line carried `?`. The escape holds for at least these lines the guard writes: the stdout sink's record
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
 least these. A stream whose `encoding` reads as a string is escaped for that codec. A stream whose

@@ -819,7 +819,10 @@ def _encodable(line: str, encoding: object) -> str:
     JSON ``\\uXXXX`` escape, a surrogate pair for one outside the BMP, and a lone surrogate as the
     log spells it (:func:`~messagefoundry.controlchars.escape_lone_surrogates`) (BACKLOG #5813). An
     ``encoding`` that is not a known text codec, or that cannot encode the escapes themselves,
-    reads as ASCII. Never raises."""
+    reads as ASCII. It catches ``LookupError``, ``ValueError`` (``UnicodeError`` among them) and
+    ``TypeError`` only. Any other exception a codec raises propagates, and from
+    :meth:`_GuardedHandlerMixin._write_line` it is a failed write, which the two stages decide, so
+    it can reach stage 2."""
     codec = encoding if isinstance(encoding, str) else "ascii"
     try:
         return line.encode(codec, _ESCAPE_HANDLER).decode(codec)
@@ -1319,16 +1322,18 @@ class _GuardedSinkMixin(_SinkBase):
             codec = None
         else:
             codec = "ascii"
+            unreadable = self._type_name(encoding)
             self._note_format_fault(
-                f"{_ENCODING_NOT_STR_FAULT} ({self._type_name(encoding)}); lines to it are "
-                "escaped for ASCII"
+                f"{_ENCODING_NOT_STR_FAULT} ({unreadable}); lines to it are escaped for ASCII"
             )
         written = line
         if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
             try:
                 line.encode(codec)
             except (LookupError, ValueError, TypeError):
-                # ValueError covers UnicodeEncodeError; the rest are a name codecs refuses.
+                # ValueError covers UnicodeEncodeError; the rest are a name codecs refuses. Any
+                # other exception a codec raises propagates as a failed write, and the two stages
+                # decide, so it can reach stage 2.
                 written = _encodable(line, codec)
         try:
             self._write_raw(written)
