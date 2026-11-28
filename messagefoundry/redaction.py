@@ -2555,11 +2555,11 @@ _CAMEL_LABEL_WORDS = (
     "authkey",
 )
 #: The key words and the ``_?<suffix>`` qualifier words the connection-string member reader reads
-#: (``secretscrub._MEMBER_KEY_RUN``). That reader takes any word characters before a key, so a
-#: caller's text glued after a masked word can complete one from any index (``Zqcreden`` and a
-#: caller's ``tial=``). This module is pure stdlib, so they are spelled here; a test holds them to
-#: that module's word tuples, which ``tests/test_connection_string_member_scrub.py`` holds to the
-#: reader's pattern.
+#: (``secretscrub._MEMBER_KEY_RUN``). That reader can read word characters before a key word as part
+#: of the key, so a caller's text glued after a masked word may complete one from any index
+#: (``Zqcreden`` and a caller's ``tial=``). This module is pure stdlib, so they are spelled here; a
+#: test holds them to that module's word tuples, which
+#: ``tests/test_connection_string_member_scrub.py`` holds to the reader's pattern.
 _MEMBER_KEY_WORDS = (
     "passphrase",
     "credential",

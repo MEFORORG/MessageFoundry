@@ -372,8 +372,8 @@ def test_each_end_tag_vocabulary_copy_matches_the_named_sets(name: str) -> None:
 
 def test_the_line_break_rule_after_a_rest_is_pinned() -> None:
     """Added item 18: the ``later-line`` kept shape returns before the line-break rule, so nothing
-    exercised it. A rest followed only by a line break is judged as ending the text, since an
-    answer is stripped before a caller glues to it, so a last word of two letters is masked too.
+    exercised it. A rest followed only by a line break is judged as ending the text, since a line
+    break before the end is read as the text's end, so a last word of two letters is masked too.
     Before item 15 was fixed it was judged as glued to the line break and kept."""
     assert redact("<family>Smith</family Zqxdoe\n") == "<family>[redacted]</family Xxxxxx\n"
     assert redact("<family>Smith</family Li\n") == "<family>[redacted]</family Xx\n"

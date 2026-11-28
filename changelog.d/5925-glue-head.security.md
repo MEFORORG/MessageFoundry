@@ -9,10 +9,9 @@
   are masked. Where a rest is masked that way, an ending a caller's text could complete into a
   connection-string member key, such as `creden` before a caller's `tial=`, is kept as it stood
   from wherever it starts in the word, since the credential filter's connection-string member reader
-  takes the letters, digits and `_` before a key word as part of the key, where the key follows a
-  `;` or opens a first member whose value runs to a `;` that a later `<key>=` follows: `</family
-  Zqcreden` becomes `</family Xxcreden`, and a caller's `tial=hunter2zz;Server=x` is read as before,
-  while a caller's `tial=hunter2zz` with no later member prints, as on main. The same holds where an
+  can read the letters before a key word as part of that key: `</family Zqcreden` becomes
+  `</family Xxcreden`, so a caller's `tial=hunter2zz;Server=x` is read as it is on main. What that
+  reader reads is stated by its own pattern in `secretscrub`, not here. The same holds where an
   HL7 field run took the end tag's name (`a|b|<family>Smith</family Kim`). A short last word before
   a closing line break, as in `</family Li` then a line break, is now masked too. Some words after a
   malformed end tag still print, at least these: every word of a rest whose last word holds a digit

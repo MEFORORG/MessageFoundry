@@ -374,8 +374,9 @@ def test_the_camel_label_words_cover_the_credential_filter() -> None:
 
 
 #: The Lander's hold on PR 3387 at 9004a36d079: a connection-string member key split across the
-#: answer's end and glued text. The member reader takes any word characters before a key, so the
-#: glue-head mask kept only ``n`` of ``Zqcreden`` and the glued ``tial=`` no longer completed a key.
+#: answer's end and glued text. The member reader can read word characters before a key word as part
+#: of the key, so the glue-head mask kept only ``n`` of ``Zqcreden`` and the glued ``tial=`` no
+#: longer completed a key.
 _SPLIT_MEMBER_KEYS = {
     "credential": ("<family>Smith</family Zqcreden", "tial=hunter2zz;Server=x"),
     "camel-capital": ("<family>Smith</family zqpaS", "sword=hunter2zz;Server=x"),
