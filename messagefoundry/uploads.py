@@ -477,10 +477,11 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # A refusal is converted when the name is now not plain, is gone and the open met
         # something other than absence, or cannot be reached; anything else is re-raised.
         absent = is_absent(exc)
-        # An open's FileNotFoundError is absence only when a fresh lstat agrees the name is gone:
-        # Windows maps a dropped share to ENOENT with no winerror on an open, so a share that came
-        # back for the lstat, or one the lstat could not check, would otherwise read as an upload
-        # that is gone (BACKLOG #5388).
+        # An open's FileNotFoundError is absence only when a fresh lstat agrees the path is gone.
+        # That lstat is read with is_absent, so a missing folder or drive above the name counts as
+        # gone too, on Windows as on POSIX. Windows maps a dropped share to ENOENT with no winerror
+        # on an open, so a share that came back for the lstat, or one the lstat could not check,
+        # would otherwise read as an upload that is gone (BACKLOG #5388).
         if isinstance(exc, FileNotFoundError) and seen not in ("gone", "unplain"):
             seen = "unreachable"
         if seen not in ("unplain", "unreachable") and not (seen == "gone" and not absent):

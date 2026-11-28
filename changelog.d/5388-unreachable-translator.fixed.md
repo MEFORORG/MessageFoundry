@@ -9,7 +9,7 @@
   of a cancelled save's pair, the `rotate-key` replace, the `rotate-key` decision that a body is
   lost, and the Windows check after an open. On POSIX a missing folder above the name still reads as
   the name missing, so with the uploads root removed during `rotate-key` each body is logged as one
-  no key can read, though its pair counts as a skip. Not covered, at least: elsewhere a Windows
+  no key can read, and its pair counts as a skip only while its sidecar cannot be read either. Not covered, at least: elsewhere a Windows
   missing folder or drive still reads as absence, including the by-id reads' first check, the
   re-check after a failed open, the prune's and the delete's body unlink, and the body size check
   `rotate-key` asks of a sidecar's body. On POSIX a dropped mount whose mount point still answers
