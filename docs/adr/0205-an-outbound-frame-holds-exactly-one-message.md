@@ -173,6 +173,14 @@ carry them raw. For the other C0 characters it is a behaviour change, accepted o
 existing `hl7_raw_separators` escape hatch does not reverse it (it emits only the four structural
 separators raw).
 
+*(Note 2026-11-27, vault BACKLOG #5928; owner ruling of 2026-11-27, as corrected that day and
+relayed by the batch 20009 Manager.)* Title case in `convert_case` departs from this per-byte
+reading in one place: when it decides whether a letter starts a word, it may read the bytes of a
+run of adjacent hex escapes as UTF-8, depending on `MSH-18`, and it does so for a message with no
+`MSH-18` too. Which values of `MSH-18` allow that is stated once, in the docstring of `convert_case` in
+[`messagefoundry/actions.py`](../../messagefoundry/actions.py). The escapes are still kept as sent
+in every case mode, as ruled on engine PR 2936, and `unescape`'s reading of a value is unchanged.
+
 ## Acceptance Criteria
 
 - **AC-1** -- IF an outbound payload's encoded bytes hold the codec's start or end byte, THEN THE
