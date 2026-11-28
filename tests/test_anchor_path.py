@@ -572,21 +572,59 @@ def test_a_device_path_holding_a_dos_device_name_is_not_walked(path: str) -> Non
     "path",
     [r"\\?\C:\certs\NULL.pem", r"\\?\C:\certs\COM10", r"\\?\C:\console\ca.pem", r"C:\certs\NUL"],
 )
-def test_a_name_that_is_not_a_device_name_or_has_no_prefix_is_still_walked(path: str) -> None:
-    """The must-not-trip twins: a name that only starts like a device name, and a plain path,
-    which the open and the walk both read as the device."""
+def test_a_name_that_only_looks_like_a_device_name_is_still_walked(path: str) -> None:
+    """The must-not-trip twins: a name that only starts like a device name, and a plain path's own
+    last name, which the open reads as the device too (``os.devnull`` is ``nul`` on Windows)."""
     _chain, cause = windows_chain(path, "C:\\cwd", _probe())
     assert cause is None
 
 
+_DEVICE_NAME_KIND = "a name in the path is a DOS device name, which Windows opens as the device"
+
+
 @pytest.mark.parametrize(
-    "target",
-    [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem", "NUL", r"..\real\NUL", r"C:\real\NUL"],
+    ("path", "links", "subst"),
+    [
+        # Plain: the open passes through a folder named NUL, the probe opens \Device\Null.
+        (r"C:\certs\NUL\ca.pem", {}, None),
+        (r"NUL\ca.pem", {}, None),
+        (r"C:\certs\Aux .d\ca.pem", {}, None),
+        # Spliced in by a link the kernel reads as written, relative or unprefixed.
+        (r"C:\certs\lnk", {"C:\\certs\\lnk": "NUL"}, None),
+        (r"C:\certs\lnk", {"C:\\certs\\lnk": r"..\real\NUL"}, None),
+        (r"C:\certs\lnk", {"C:\\certs\\lnk": r"C:\real\NUL"}, None),
+        (r"C:\certs\lnk\ca.pem", {"C:\\certs\\lnk": r"C:\real\com1"}, None),
+        # Reached under a subst drive's target.
+        (r"S:\NUL\ca.pem", {}, r"\??\C:\keys"),
+    ],
 )
-def test_a_link_to_a_dos_device_name_is_not_walked(target: str) -> None:
-    """A link target is an NT path the kernel reads as written, a relative or unprefixed one too,
-    so ``NUL`` there is the file named ``NUL``, where the splice would have walked the device.
-    Measured on Windows 10.0.26300 for a relative symlink to ``NUL``. Red as above."""
+def test_a_path_reaching_a_dos_device_name_is_not_walked(
+    path: str, links: dict[str, str], subst: str | None
+) -> None:
+    """Vault BACKLOG #5515 remainder. The walk probes and reads each object by its own Win32 text,
+    and Win32 opens a last name ``NUL`` as the device, so a folder of that name, or a file a link
+    names, was judged by the device's DACL. Measured on Windows 10.0.26300: a key file under a
+    folder named ``NUL`` that Everyone can write passed the key-file folder check. Red under
+    origin/main, which walked each."""
+    _chain, cause = windows_chain(
+        path,
+        "C:\\cwd",
+        _probe(links),
+        drive_target=lambda drive: subst if drive == "S:" else None,
+    )
+    assert cause is not None and cause.kind == _DEVICE_NAME_KIND
+
+
+def test_the_dos_device_names_are_cpythons() -> None:
+    """The walk's copy of the device names is CPython's ``ntpath`` list, so the two cannot drift."""
+    import ntpath
+
+    assert ntpath._reserved_names == ap._DOS_DEVICE_NAMES  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("target", [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem"])
+def test_a_link_to_a_prefixed_dos_device_name_is_not_walked(target: str) -> None:
+    """A prefixed link target holding a device name is refused as the device path it is."""
     links = {"C:\\certs\\lnk": target}
     _chain, cause = windows_chain("C:\\certs\\lnk", "C:\\cwd", _probe(links))
     assert cause is not None and cause.kind == "a link points at a path this check does not read"
