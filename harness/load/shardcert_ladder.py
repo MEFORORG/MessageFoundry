@@ -3881,7 +3881,7 @@ async def run_drive_ladder(
     # The routing mode the engine box served, learned with the rest of the shape. BROADCAST until a rung
     # reports — the same "nothing served yet" posture as the zeros above, and the correct default anyway.
     routing = BROADCAST
-    # ARTIFACT 5: lanes-per-shard — the OTHER half of G, learned from the same SHARDS_READY post as the shape.
+    # ARTIFACT 5: lanes-per-engine-shard — the OTHER half of G, learned from the same SHARDS_READY post as the shape.
     # The drive has always received it (it slices sender bands with it) and always dropped it on the floor.
     lanes_per_shard = 1
     # The EFFECTIVE sink_count. `sink_count=None` means "derive from the engine's advertised band width"
