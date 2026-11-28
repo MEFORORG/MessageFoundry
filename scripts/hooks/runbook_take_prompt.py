@@ -1,32 +1,40 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Warn a session that holds claims on a batch's rows the runbook workbook does not show as held.
+"""Tell a session that holds claims on a batch's rows the runbook workbook does not show as held.
 
-Run by ``scripts/hooks/runbook-take-prompt.ps1``, a Stop hook, with the interpreter that has openpyxl.
-Owner decision 2026-11-27 ("Stop hook + Lander"): a session that picks up a batch through a handoff,
-/carry-on or a respawn never reads the /batch skill's step that runs ``read_batch.py --take``, so the
-owner's runbook dashboard reads FREE for a batch somebody holds. This prints the command that fixes it.
+Run by ``scripts/hooks/runbook-take-prompt.ps1`` with the interpreter that has openpyxl, on
+SessionStart and UserPromptSubmit. Owner decision 2026-11-27 ("Stop hook + Lander"): a session that
+picks up a batch through a handoff, /carry-on or a respawn never reads the /batch skill's step that
+runs ``read_batch.py --take``, so the owner's runbook dashboard reads FREE for a batch somebody holds.
+This hands the session the command that fixes it.
 
 IT NEVER BLOCKS AND NEVER FAILS. Every path exits 0. The only stdout it ever writes is one JSON object,
-``{"systemMessage": ...}``, the form the installer's notice shim uses on Stop. Anything it cannot read
-(no workbook, no openpyxl, no claims, a locked or unreadable file, an unresolvable claim registry)
-means no stdout at all; a one-line reason goes to stderr, which the wrapper passes on to its own.
+``{"additionalContext": ...}``, which the wrapper puts in the event's hookSpecificOutput so that it
+reaches the model's context. Anything it cannot read (no workbook, no openpyxl, no claims, a locked or
+unreadable file, an unresolvable claim registry) means no stdout at all; a one-line reason goes to
+stderr, which the wrapper passes on to its own.
 
-WHOSE CLAIMS. Only claims whose ``worktree`` is this session's worktree, on this machine. A session
-is recognised in a holder cell by its worktree name or by its session id's first eight characters,
-each as a whole token. A Builder seat is never warned: a Manager takes the batch, and a Builder's
-claims sit under its Manager's hold by design (claim.ps1's header: the holder of a batch is not
-always the worktree a claim names).
+WHOSE CLAIMS. Only claims whose ``worktree`` is this session's worktree, on this machine, and none at
+all in the primary checkout: claim.ps1 records the checkout of the copy it ran from, so the primary's
+claims belong to whichever sessions ran that copy. Builder, Lander and Watchdog seats are never told
+(``NEVER_TAKES``): a Manager takes a batch, and a Builder's claims sit under its Manager's hold by
+design (claim.ps1's header: the holder of a batch is not always the worktree a claim names).
+
+WHO HOLDS A BATCH. Only the holder cell's CURRENT text counts, the part before any ``||`` history.
+It names this session when it carries the worktree name, the session id's first eight characters or
+the whole id, each as a whole token, and does not record a release ("released by ..."). A release
+never earns ``--force-take`` in the printed command.
 
 COLUMN LAYOUT. Read by row-1 header, never by letter, as the batch skill's ``read_batch.py`` reads it:
 the Batch queue tab's ``Batch``, ``State``, ``Status`` and ``Manager / session``, and the Rows tab's
 ``Batch``, ``Row`` and ``Status``. Nothing is imported from the skill directory: that file sits outside
-the repository, and this one runs in every session's Stop.
+the repository, and this one runs at every prompt.
 
-CHEAP WHEN NOTHING CHANGED. The batches found are cached per session against the workbook's mtime and
-size and this worktree's claim keys, so an unchanged state reads no xlsx; the claim files are re-read
-only when the claims directory's mtime moves. A batch is warned about at most once per
-``COOLDOWN_SECONDS`` per session.
+CHEAP WHEN NOTHING CHANGED. State lives in <git-common-dir>/mefor-coord/runbook-take/<session>.json.
+The batches found are cached against the workbook's mtime and size and this worktree's claim keys, so
+an unchanged state reads no xlsx. The claim files are re-read when the claims directory's mtime moves,
+and after any scan that met an unreadable claim. A batch is named at most once per
+``COOLDOWN_SECONDS`` per session, so UserPromptSubmit does not repeat SessionStart's notice.
 
 Workbook and claim content are DATA. A holder cell is shown quoted, with every control, format and
 line or paragraph separator character replaced, and nothing read from either file reaches the
@@ -59,13 +67,16 @@ NEVER_TAKES = frozenset({"builder", "lander", "watchdog"})
 # Claim-key readings, built from read_batch.py's patterns but narrower, because here a false warning
 # costs more than a missed one. A key that mentions a batch names the batches it marks and every
 # batch inside a range it writes (batch-472, batches-462-465), and any other number in it as a row
-# (b472-3765-b). A key with no batch marker names only its LEADING number, as a row (3765, 3765-b).
+# (b472-3765-b), except a PR number (batch-20011-pr-3385) and a date. A key with no batch marker
+# names only its LEADING number, as a row (3765, 3765-b), and no row when it leads with a date.
 _MENTIONS_BATCH = re.compile(r"(?i)batch|(?<![a-z0-9])b[-_.]?\d")
 _BATCH_MARK = re.compile(r"(?i)(?:batch(?:es)?[-_. ]?|(?<![a-z0-9])b[-_.]?)(\d+)")
 _NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)")
 _RANGE = re.compile(r"(?<!\d)(\d{1,6})\s*[-–]\s*(\d{1,6})(?!\d)")
 _LEADING = re.compile(r"^(\d{1,6})(?!\d)")
 _DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
+_PR = re.compile(r"(?i)(?<![a-z0-9])(?:pr|pull)[-_. #]?\d+")
+_RELEASED = re.compile(r"(?i)\breleased\b")
 RANGE_MAX = 100
 # read_batch.py's _FINISHED, applied to the upper-cased queue Status: a batch finished there is no
 # batch to take. Its State column is checked against the --done states that end a batch.
@@ -128,8 +139,11 @@ def key_targets(key: str) -> tuple[set[int], set[int]]:
             lo, hi = int(a), int(b)
             if lo in batches and lo < hi <= lo + RANGE_MAX:
                 batches.update(range(lo, hi + 1))
-        rows = {int(x) for x in _NUMBER.findall(_DATE.sub(" ", key))} - batches
+        rest = _PR.sub(" ", _DATE.sub(" ", key))
+        rows = {int(x) for x in _NUMBER.findall(rest)} - batches
         return rows, batches
+    if _DATE.match(key):
+        return set(), set()
     m = _LEADING.match(key)
     return ({int(m.group(1))} if m else set()), set()
 
@@ -154,6 +168,21 @@ def names_us(holder: str, names: Iterable[str]) -> bool:
     )
 
 
+def current_holder(cell: str) -> str:
+    """The cell's current holder text: what precedes any ``||`` history."""
+    return cell.split("||", 1)[0].strip()
+
+
+def released(cell: str) -> bool:
+    """The current text records a release rather than a holder."""
+    return bool(_RELEASED.search(current_holder(cell)))
+
+
+def holder_is_us(cell: str, names: Iterable[str]) -> bool:
+    """The current text names this session and is not a release."""
+    return not released(cell) and names_us(current_holder(cell), names)
+
+
 def _live(entry: QueueEntry) -> bool:
     if _FINISHED.match(entry.status.upper()):
         return False
@@ -162,7 +191,7 @@ def _live(entry: QueueEntry) -> bool:
 
 def _ours(entry: QueueEntry, names: tuple[str, ...]) -> bool:
     """The queue tab records this session as the holder, and does not read FREE."""
-    return not entry.state.upper().startswith("FREE") and names_us(entry.holder, names)
+    return not entry.state.upper().startswith("FREE") and holder_is_us(entry.holder, names)
 
 
 def pending_batches(keys: Iterable[str], book: Book, names: Iterable[str]) -> list[Pending]:
@@ -180,24 +209,24 @@ def pending_batches(keys: Iterable[str], book: Book, names: Iterable[str]) -> li
             if entry is not None and _live(entry) and not _ours(entry, names):
                 hits.setdefault(b, set())
         for r in rows:
+            entries = book.rows.get(r, [])
+            if any(b in book.queue and _ours(book.queue[b], names) for b, _st in entries):
+                continue
             cands = [
                 b
-                for b, st in book.rows.get(r, [])
+                for b, st in entries
                 if (not st or _OPEN_ROW.match(st))
                 and (e := book.queue.get(b)) is not None
                 and _live(e)
             ]
-            held = any(
-                _ours(book.queue[b], names) for b, _st in book.rows.get(r, []) if b in book.queue
-            )
-            if not cands or held:
-                continue
             for b in cands:
                 hits.setdefault(b, set()).add(r)
     out = []
     for b in sorted(hits):
         e = book.queue[b]
-        out.append(Pending(b, e.holder, tuple(sorted(hits[b])), names_us(e.holder, names), e.state))
+        out.append(
+            Pending(b, e.holder, tuple(sorted(hits[b])), holder_is_us(e.holder, names), e.state)
+        )
     return out
 
 
@@ -209,6 +238,11 @@ def _columns(head: list[str], names: tuple[str, ...]) -> list[int]:
             raise ValueError(f"{len(idx)} columns headed {name!r}, need exactly one")
         out.append(idx[0])
     return out
+
+
+def _at(row: tuple[object, ...], i: int) -> object:
+    """A short row stops at its last filled cell, so a missing column reads as an empty cell."""
+    return row[i] if i < len(row) else None
 
 
 def read_book(path: Path) -> Book:
@@ -225,22 +259,20 @@ def read_book(path: Path) -> Book:
         )
         queue: dict[int, QueueEntry] = {}
         for r in it:
-            n = _int(r[qb]) if qb < len(r) else None
+            n = _int(_at(r, qb))
             if n is None:
                 continue
-            vals = [_cell(r[i]) if i < len(r) else "" for i in (qstate, qstatus, qmgr)]
-            queue[n] = QueueEntry(*vals)
+            queue[n] = QueueEntry(*(_cell(_at(r, i)) for i in (qstate, qstatus, qmgr)))
         rws = wb["Rows"]
         it = rws.iter_rows(values_only=True)
         head = [_cell(c) for c in next(it)]
         rb, rrow, rstatus = _columns(head, ("Batch", "Row", "Status"))
         rows: dict[int, list[tuple[int, str]]] = {}
         for r in it:
-            b = _int(r[rb]) if rb < len(r) else None
-            n = _int(r[rrow]) if rrow < len(r) else None
+            b, n = _int(_at(r, rb)), _int(_at(r, rrow))
             if b is None or n is None:
                 continue
-            rows.setdefault(n, []).append((b, _cell(r[rstatus]) if rstatus < len(r) else ""))
+            rows.setdefault(n, []).append((b, _cell(_at(r, rstatus))))
         return Book(queue, rows)
     finally:
         wb.close()
@@ -324,16 +356,28 @@ def message(
     parts = []
     for p in pending:
         rows = f" (rows {', '.join(map(str, p.rows))})" if p.rows else ""
+        now_text = current_holder(p.holder)
+        # read_batch.py refuses --take while the cell names any other text, our own older one too.
+        force, advice = "", ""
         if p.named_us:
-            seen = "names this session but reads FREE in its State column"
-        elif p.holder:
-            seen = f'names "{_display(p.holder)}"'
-        elif p.state.upper().startswith("FREE") or not p.state:
+            seen, force = "names this session but reads FREE in its State column", " --force-take"
+        elif released(p.holder):
+            seen = f'records a release ("{_display(now_text)}")'
+            advice = (
+                "--take refuses while the cell holds that text. Add --force-take only if this "
+                "session has taken the batch back; if it has not, release its stale claims on "
+                "the batch's rows instead."
+            )
+        elif now_text:
+            seen = f'names "{_display(now_text)}"'
+            advice = (
+                "The cell names another holder, so --take refuses unless you add --force-take; "
+                "add it only once that holder has released the batch."
+            )
+        elif p.state.upper().startswith("FREE") or not p.state:  # nothing before any ||
             seen = "reads FREE"
         else:
             seen = "has an empty Manager / session cell"
-        # read_batch.py refuses --take while the cell names any other text, our own older one too.
-        force = " --force-take" if p.named_us else ""
         parts.append(
             f"[runbook] This session holds claims on batch {p.batch}{rows}, but the runbook "
             f"workbook's Batch queue tab {seen} for it, so the owner's dashboard does not show the "
@@ -343,11 +387,8 @@ def message(
             f"  {lead} {_quote(read_batch)} --workbook {_quote(workbook)} --take {p.batch} "
             f'--holder "{holder}"{force}'
         )
-        if p.holder and not p.named_us:
-            parts.append(
-                "The cell names another holder, so --take refuses unless you add --force-take; "
-                "add it only once that holder has released the batch."
-            )
+        if advice:
+            parts.append(advice)
     if "<seat>" in holder:
         parts.append("No seat is declared here: replace <seat> with this session's seat first.")
     parts.append(
@@ -397,7 +438,7 @@ def _cached_pending(state: dict[str, Any], key: list[Any]) -> list[Pending] | No
 
 
 def run(args: argparse.Namespace) -> str | None:
-    """The systemMessage to print, or None. Raises on what it cannot read."""
+    """The context text to print, or None. Raises on what it cannot read."""
     if not _SESSION_ID.fullmatch(args.session) or args.seat in NEVER_TAKES:
         return None
     workbook = Path(args.workbook)
@@ -475,7 +516,7 @@ def run(args: argparse.Namespace) -> str | None:
         "warned": warned,
     }
     # Saved BEFORE the warning goes out, so a warning whose cooldown was not recorded never
-    # repeats; and only when something changed, so a quiet Stop writes nothing.
+    # repeats; and only when something changed, so a quiet prompt writes nothing.
     if json.dumps(new, sort_keys=True) != before:
         _save(state_path, new)
     if not due:
@@ -500,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
         text = run(args)
     except SystemExit:
         return 0
-    except Exception as exc:  # noqa: BLE001 - a Stop hook must never fail; the reason goes to stderr
+    except Exception as exc:  # noqa: BLE001 - this hook must never fail; the reason goes to stderr
         with contextlib.suppress(OSError):
             print(
                 f"runbook-take-prompt: nothing printed: {type(exc).__name__}: {exc}",
@@ -508,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
     if text:
-        sys.stdout.write(json.dumps({"systemMessage": text}))
+        sys.stdout.write(json.dumps({"additionalContext": text}))
     return 0
 
 

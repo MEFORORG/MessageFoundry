@@ -37,7 +37,7 @@
       SessionStart, Stop                    -> scripts/hooks/mail-drain.ps1          (deliver session mail)
       Stop                                  -> scripts/hooks/seat-record.ps1         (record this seat's episode)
       Stop                                  -> scripts/hooks/wiki-write-prompt.ps1   (after real work, ask for one fleet wiki note)
-      Stop                                  -> scripts/hooks/runbook-take-prompt.ps1 (a held batch the runbook reads FREE: print the --take command)
+      SessionStart, UserPromptSubmit        -> scripts/hooks/runbook-take-prompt.ps1 (a held batch the runbook reads FREE: give the session the --take command)
 
     RETIRED, STRIPPED ON EVERY RUN AND NEVER ADDED
       Stop (async rewake)                   -> scripts/hooks/mail-watch.ps1          (the urgent mail tier; ADR 0161)
@@ -320,11 +320,13 @@ $WIRING = @(
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/wiki-write-prompt.ps1"; Timeout = 25; Msg = "Checking for a fleet wiki note"; Marker = $WIKI_MARKER; Shim = "notice"
         Notice = "[wiki] scripts/hooks/wiki-write-prompt.ps1 is missing from this checkout -- the fleet wiki write prompt is wired but resolving nothing." }
     # The runbook take prompt (owner decision 2026-11-27, "Stop hook + Lander"). It never blocks: its
-    # only output is a systemMessage naming the read_batch.py --take command for a batch this seat's
-    # claims hold while the workbook reads FREE or names someone else. Timeout 20 sits above the
-    # script's own bound on its openpyxl helper ($HelperTimeoutMs in the script).
-    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/runbook-take-prompt.ps1"; Timeout = 20; Msg = "Checking the runbook for a held batch"; Marker = $RUNBOOK_MARKER; Shim = "notice"
-        Notice = "[runbook] scripts/hooks/runbook-take-prompt.ps1 is missing from this checkout -- the runbook take prompt is wired but resolving nothing." }
+    # only output is additionalContext naming the read_batch.py --take command for a batch this seat's
+    # claims hold while the workbook reads FREE or names someone else. On SessionStart and
+    # UserPromptSubmit, not Stop, because those are the events whose exit-0 output reaches the model;
+    # the script's header says why. Timeout 20 sits above the script's own bound on its openpyxl
+    # helper ($HelperTimeoutMs in the script).
+    @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/hooks/runbook-take-prompt.ps1"; Timeout = 20; Msg = "Checking the runbook for a held batch"; Marker = $RUNBOOK_MARKER; Shim = "std" }
+    @{ Event = "UserPromptSubmit"; Matcher = $null; Script = "scripts/hooks/runbook-take-prompt.ps1"; Timeout = 20; Msg = "Checking the runbook for a held batch"; Marker = $RUNBOOK_MARKER; Shim = "std" }
 
     # The URGENT tier: mail-watch.ps1, armed at Stop, which is the moment the session goes IDLE.
     #

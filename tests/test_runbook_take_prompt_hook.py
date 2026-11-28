@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The runbook take prompt: a Stop hook that prints ``read_batch.py --take`` for a held batch.
+"""The runbook take prompt: a hook that hands the session ``read_batch.py --take`` for a held batch.
 
-Owner decision 2026-11-27 ("Stop hook + Lander"). The hook is ``scripts/hooks/runbook-take-prompt.ps1``
+Owner decision 2026-11-27 ("Stop hook + Lander"), wired on SessionStart and UserPromptSubmit so its
+text reaches the model. The hook is ``scripts/hooks/runbook-take-prompt.ps1``
 over ``scripts/hooks/runbook_take_prompt.py``, and its installer row is ``mefor-runbook`` in
 ``scripts/coord/install-coordination.ps1``.
 
@@ -133,9 +134,34 @@ def test_key_readings() -> None:
     assert rt.key_targets("npm-audit-brace-expansion") == (set(), set())
     assert rt.key_targets("1234567") == (set(), set())
     assert rt.key_targets("batches-462-465") == (set(), {462, 463, 464, 465})
-    assert rt.key_targets("2026-11-27-notes") == ({2026}, set())
+    assert rt.key_targets("2026-11-27-notes") == (set(), set())
+    assert rt.key_targets("batch-20011-pr-3385") == (set(), {20011})
+    assert rt.key_targets("b472-PR3385-3765") == ({3765}, {472})
     assert rt.key_targets("1719-items-22-35") == ({1719}, set())
     assert rt.key_targets("batch-472-2026-11-27") == (set(), {472})
+
+
+def test_a_release_naming_this_session_is_not_ours_and_earns_no_force_take() -> None:
+    cell = f"released by Manager {WT} (acct-5) 2026-11-27"
+    book = _book({511: ("FREE", "FREE", cell)}, {9011: [(511, "Not started")]})
+    (p,) = rt.pending_batches(["9011"], book, NAMES)
+    assert not p.named_us
+    text = rt.message([p], "py", "rb.py", "w.xlsx", f"Manager {WT} (sess1234)")
+    assert "records a release" in text
+    assert '(sess1234)" --force-take' not in text and "names another holder" not in text
+    taken = _book({511: ("TAKEN", "T", cell)}, {9011: [(511, "Not started")]})
+    assert [q.batch for q in rt.pending_batches(["9011"], taken, NAMES)] == [511]
+
+
+def test_only_the_current_text_before_the_history_names_a_holder() -> None:
+    cell = f"Manager other-wt (ffff) || was Manager {WT} (old)"
+    book = _book({512: ("TAKEN", "T", cell)}, {9012: [(512, "")]})
+    (p,) = rt.pending_batches(["9012"], book, NAMES)
+    assert not p.named_us
+    text = rt.message([p], "py", "rb.py", "w.xlsx", "M w (s)")
+    assert 'names "Manager other-wt (ffff)"' in text and "was Manager" not in text
+    ours = _book({512: ("TAKEN", "T", f"Manager {WT} (s) || was Manager x")}, {9012: [(512, "")]})
+    assert rt.pending_batches(["9012"], ours, NAMES) == []
 
 
 def test_a_holder_cell_with_the_full_session_id_is_ours() -> None:
@@ -241,7 +267,7 @@ def test_run_warns_once_per_cooldown_and_caches_the_workbook_read(
     monkeypatch.setattr(rt, "read_book", fake)
     assert rt.main(_args(tmp_path, wt, claims, workbook, 1000.0)) == 0
     out = json.loads(capsys.readouterr().out)
-    assert list(out) == ["systemMessage"] and "--take 501" in out["systemMessage"]
+    assert list(out) == ["additionalContext"] and "--take 501" in out["additionalContext"]
     assert rt.main(_args(tmp_path, wt, claims, workbook, 1000.0 + 60)) == 0
     assert capsys.readouterr().out == ""
     assert len(reads) == 1, "an unchanged workbook and claims directory must not be re-read"
@@ -341,20 +367,25 @@ def test_run_is_quiet_on_a_missing_workbook_and_on_a_read_failure(
 _SRC = INSTALLER.read_text(encoding="utf-8")
 
 
-def test_the_installer_wires_the_hook_as_a_stop_notice_row() -> None:
+EVENTS = ("SessionStart", "UserPromptSubmit")
+
+
+def test_the_installer_wires_the_hook_on_the_two_context_events_only() -> None:
     assert f'$RUNBOOK_MARKER = "{MARKER}"' in _SRC
     rows = [ln for ln in _SRC.splitlines() if f'Script = "{HOOK_REL}"' in ln]
-    assert len(rows) == 1
-    assert '@{ Event = "Stop"' in rows[0]
-    assert "Marker = $RUNBOOK_MARKER" in rows[0] and 'Shim = "notice"' in rows[0]
+    assert sorted(r.split('"')[1] for r in rows) == sorted(EVENTS)
+    for row in rows:
+        assert "Marker = $RUNBOOK_MARKER" in row and 'Shim = "std"' in row
     assert HOOK.is_file() and HELPER.is_file()
     assert "runbook-take-prompt.ps1" in _SRC.split("#>", 1)[0], "the header table names it"
 
 
-def test_the_hook_never_prints_a_block_decision() -> None:
+def test_the_hook_never_prints_a_decision_or_a_system_message() -> None:
     for path in (HOOK, HELPER):
         text = path.read_text(encoding="utf-8")
         assert "'block'" not in text and '"block"' not in text
+        assert "decision =" not in text and '"decision"' not in text
+        assert "systemMessage =" not in text and '"systemMessage"' not in text
 
 
 @pytest.fixture
@@ -374,26 +405,29 @@ def _run_installer(settings: Path, *args: str) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def _stop_entries(settings: Path) -> list[dict[str, object]]:
+def _entries(settings: Path, event: str) -> list[dict[str, object]]:
     data = json.loads(settings.read_text(encoding="utf-8-sig"))
-    return [h for g in data["hooks"].get("Stop", []) for h in g["hooks"]]
+    return [h for g in data["hooks"].get(event, []) for h in g["hooks"]]
 
 
 @needs_pwsh
-def test_install_adds_one_runbook_stop_entry_and_uninstall_removes_only_it(settings: Path) -> None:
+def test_install_adds_one_entry_per_event_and_uninstall_removes_only_them(settings: Path) -> None:
     _run_installer(settings)
-    ours = [h for h in _stop_entries(settings) if MARKER in str(h["command"])]
-    assert len(ours) == 1
-    assert f"'{HOOK_REL}'" in str(ours[0]["command"]) and ours[0]["timeout"] == 20
-    assert "async" not in ours[0]
+    for event in EVENTS:
+        ours = [h for h in _entries(settings, event) if MARKER in str(h["command"])]
+        assert len(ours) == 1, event
+        assert f"'{HOOK_REL}'" in str(ours[0]["command"]) and ours[0]["timeout"] == 20
+        assert "async" not in ours[0]
+    assert not [h for h in _entries(settings, "Stop") if MARKER in str(h["command"])]
     first = settings.read_text(encoding="utf-8-sig")
     _run_installer(settings)
     assert settings.read_text(encoding="utf-8-sig") == first
-    before = [h["command"] for h in _stop_entries(settings)]
+    before = {e: [h["command"] for h in _entries(settings, e)] for e in (*EVENTS, "Stop")}
     _run_installer(settings, "-Script", "runbook-take-prompt", "-Uninstall")
-    after = [h["command"] for h in _stop_entries(settings)]
-    assert after == [c for c in before if MARKER not in str(c)]
-    assert "echo foreign-stop" in after
+    for event, cmds in before.items():
+        after = [h["command"] for h in _entries(settings, event)]
+        assert after == [c for c in cmds if MARKER not in str(c)], event
+    assert "echo foreign-stop" in [h["command"] for h in _entries(settings, "Stop")]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -433,7 +467,11 @@ def _claim(primary: Path, key: str, worktree: Path) -> None:
 
 
 def _env(**extra: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("MEFOR_", "CLAUDE_", "KORUS_"))}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("MEFOR_", "CLAUDE_", "KORUS_", "GIT_"))
+    }
     env.update(extra)
     return env
 
@@ -450,8 +488,8 @@ def _hook(
     )  # fmt: skip
 
 
-def _payload(cwd: Path, session: str = "sess-e2e-1") -> str:
-    return json.dumps({"session_id": session, "cwd": str(cwd), "hook_event_name": "Stop"})
+def _payload(cwd: Path, session: str = "sess-e2e-1", event: str = "SessionStart") -> str:
+    return json.dumps({"session_id": session, "cwd": str(cwd), "hook_event_name": event})
 
 
 @needs_pwsh
@@ -546,13 +584,22 @@ def test_the_hook_end_to_end_on_a_real_workbook(tmp_path: Path, key: str, warns:
     if not warns:
         assert proc.stdout == "", proc.stdout
         return
-    msg = json.loads(proc.stdout)["systemMessage"]
+    out = json.loads(proc.stdout)
+    assert list(out) == ["hookSpecificOutput"], out
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    msg = out["hookSpecificOutput"]["additionalContext"]
     want = (
         f"{py} C:\\skills\\batch\\read_batch.py --workbook {workbook} --take 501 "
         f'--holder "<seat> {WT} (sess-e2e)"'
     )
     assert want in msg, msg
-    again = _hook(_payload(wt), env, cwd=wt)
+    again = _hook(_payload(wt, event="UserPromptSubmit"), env, cwd=wt)
     assert again.returncode == 0 and again.stdout == "", (
-        "a second Stop inside the cooldown is quiet"
+        "a prompt inside the cooldown does not repeat what SessionStart said"
     )
+    # A fresh session's first prompt does say it, under its own event name.
+    other = _hook(_payload(wt, "sess-e2e-2", "UserPromptSubmit"), env, cwd=wt)
+    assert json.loads(other.stdout)["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    # Any other event prints nothing: Stop output would not reach the model anyway.
+    stop = _hook(_payload(wt, "sess-e2e-3", "Stop"), env, cwd=wt)
+    assert stop.returncode == 0 and stop.stdout == ""
