@@ -161,7 +161,8 @@ class DrProfileNotLeading(RuntimeError):
 
 class DrActivationError(RuntimeError):
     """Activation (or release) was refused. Carries a ``kind`` (at least ``seed``/``key``/``vip``/
-    ``profile``/``state``/``audit``/``error``, the last for an error no abort path caught) so the
+    ``profile``/``state``/``lease``/``audit``/``error``, the last for an error no abort path
+    caught; ``lease`` for a cluster node that lost its lease, BACKLOG #5906) so the
     caller (the API endpoint) can map it to an HTTP error and the operator sees the failing phase.
     ``audit`` is the one kind that is not an abort: the box's
     posture already changed and the audit row recording that could not be written, so the call
@@ -253,8 +254,13 @@ class DrCoordinator:
         after_release: Callable[[], Awaitable[None]] | None = None,
         hop_posture: HopPosture | None = None,
         instance: Callable[[], str | None] | None = None,
+        lease_lost: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
+        # Whether this cluster node lost its lease while its graph runs (BACKLOG #5906). The
+        # profile's reload refuses there, so an activation asks first and aborts before its store
+        # recovery and takeover hook act on a node about to stand by. None reads as False.
+        self._lease_lost = lease_lost
         self._settings = settings
         # The engine's identity, ``shard:<id>`` or ``node:<id>``, or None for a lone engine
         # (Engine.instance_identity). Read at each use: it is known once the engine holds its
@@ -580,6 +586,17 @@ class DrCoordinator:
     ) -> DrResult:
         """Steps 1 to 4 of :meth:`activate`, run under its lock. ``progress`` records the step
         reached, for the cancellation arm there."""
+        if self._lease_lost is not None and self._lease_lost():
+            # BACKLOG #5906: before step 1, so neither the store recovery, which re-pends the rows
+            # the leader has in flight in the shared store, nor the takeover hook runs here.
+            await self._record_aborted(
+                "lease",
+                "DR activation refused: this node no longer holds the cluster lease, so nothing "
+                "was recovered, no takeover hook ran and the box stays passive; run the activation "
+                "on the node that holds the lease",
+                actor,
+                now,
+            )
         seed = archive or self._settings.seed_archive
         if archive:
             seed = await self._confine_request_archive(archive, actor, now)

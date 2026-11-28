@@ -36,11 +36,17 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.models import ConnectorType, RetryPolicy
-from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+from messagefoundry.config.settings import (
+    ApprovalsSettings,
+    DrSettings,
+    EgressSettings,
+    StoreSettings,
+)
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
+from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     RunnerLeaseLostError,
@@ -956,3 +962,84 @@ async def test_a_convergence_reload_on_a_lease_lost_node_loads_no_config(
     finally:
         monkeypatch.undo()
         await engine.stop()
+
+
+# --- BACKLOG #5906 remainder: the inline reload and the DR activation refuse first ----------------
+
+
+class _NotReached(Exception):
+    """Raised by a step the lease check must come before."""
+
+
+async def test_a_lease_lost_reload_detail_reads_nothing_before_it_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inline route, a released hold and convergence all apply a reload through
+    ``reload_detail``. On a lease-lost node it refuses before the settings preflight reads the
+    anchors and the load runs the config modules. A dry run swaps nothing, so it still runs."""
+    engine = await Engine.create(
+        tmp_path / "inline.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+
+        async def not_reached(*_args: Any, **_kwargs: Any) -> Any:
+            raise _NotReached
+
+        monkeypatch.setattr(engine, "preflight_settings", not_reached)
+        monkeypatch.setattr(engine, "_existing_reload_target", not_reached)
+        monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(lease_lost=True))
+        with pytest.raises(RunnerLeaseLostError):
+            await engine.reload_detail(tmp_path)
+        with pytest.raises(_NotReached):  # the dry run still reads the directory
+            await engine.reload_detail(tmp_path, dry_run=True)
+        monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(lease_lost=False))
+        with pytest.raises(_NotReached):  # the negative control: a leader goes on to the preflight
+            await engine.reload_detail(tmp_path)
+    finally:
+        monkeypatch.undo()
+        await engine.stop()
+
+
+async def test_a_dr_activation_on_a_lease_lost_node_aborts_before_its_store_and_vip_steps(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The profile's reload refused on such a node only after the store recovery had re-pended
+    the shared store's in-flight rows and the takeover hook had run. Now the activation aborts
+    first, with kind ``lease`` (a 503) and its own ``dr_activation_aborted`` row."""
+    engine = Engine(
+        store,
+        config_dir=None,
+        store_settings=StoreSettings(path=str(tmp_path / "doors.db")),
+        dr_settings=DrSettings(enabled=True, seed_archive=str(tmp_path / "missing.tar")),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    coordinator = engine.dr_coordinator
+    assert coordinator is not None
+    calls: list[str] = []
+
+    async def reset(**_kwargs: Any) -> None:
+        calls.append("reset_stale_inflight")
+
+    async def hook(*_args: Any, **_kwargs: Any) -> bool:
+        calls.append("takeover_hook")
+        return True
+
+    async def verify(*_args: Any, **_kwargs: Any) -> Any:
+        calls.append("verify_seed")
+        raise _NotReached
+
+    monkeypatch.setattr(store, "reset_stale_inflight", reset)
+    monkeypatch.setattr(coordinator, "_run_vip_hook", hook)
+    monkeypatch.setattr(coordinator, "_verify_seed", verify)
+    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(lease_lost=True))
+    with pytest.raises(DrActivationError) as ei:
+        await coordinator.activate(actor="op")
+    assert ei.value.kind == "lease" and "lease" in str(ei.value)
+    assert calls == []
+    (row,) = await store.list_audit(action="dr_activation_aborted")
+    assert json.loads(row["detail"])["kind"] == "lease"
+    # The negative control: with the lease held, the same activation goes on to its seed check.
+    monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(lease_lost=False))
+    with pytest.raises(DrActivationError):  # the generic arm turns the sentinel into an abort
+        await coordinator.activate(actor="op")
+    assert calls == ["verify_seed"]

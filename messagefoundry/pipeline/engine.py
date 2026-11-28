@@ -1264,8 +1264,15 @@ class Engine:
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
                 hop_posture=self._hop_posture,
+                lease_lost=self._dr_lease_lost,
             )
         return self._dr_coordinator
+
+    def _dr_lease_lost(self) -> bool:
+        """Whether the runner reads this node as lease-lost (BACKLOG #5906), read at each
+        activation so it follows a reload that swaps the runner."""
+        rr = self._registry_runner
+        return rr is not None and rr.lease_lost
 
     async def _dr_config_fingerprint(self) -> str | None:
         """The config digest a DR activation's seed marker records, or ``None`` when there is none.
@@ -3781,7 +3788,8 @@ class Engine:
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / a
         config directory or environment value file this reload could not read), or the runner's
         ``RunnerLeaseLostError`` (a cluster node that lost its lease while its graph runs, BACKLOG
-        #5906) — the caller maps these to HTTP errors.
+        #5906; a non-dry-run reload refuses it first, before anything is read) — the caller maps
+        these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
@@ -3796,6 +3804,13 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
+        rr = self._registry_runner
+        if not dry_run and rr is not None and rr.lease_lost:
+            # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
+            # here, before the preflights read the anchors and the load runs the config modules,
+            # on every path that applies a reload: the inline route, a released hold and
+            # convergence. A dry run swaps nothing, so it still runs.
+            raise RunnerLeaseLostError.for_reload()
         try:
             if not dry_run:
                 # First, so every reload route refuses a bad settings anchor at the point the
