@@ -1453,6 +1453,8 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
                 if punct != frames[-1][2]:
                     raise _MismatchedJsonCloser
                 frames.pop()
+                if _json_value_runs_on(text, pos, nested=bool(frames)):
+                    raise _MismatchedJsonCloser
                 if not frames:
                     return "".join(out), pos
                 pending = frames[-1][1]
@@ -1486,6 +1488,41 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
         if not frames:
             return "".join(out), pos
     return "".join(out), pos
+
+
+def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
+    """Whether a value follows the container that closed at ``pos`` with no delimiter between them,
+    which well-formed JSON never does (BACKLOG #5814, added item 2).
+
+    A stray closer of the container's own kind reads as its real close, so ``{"given": [Jane] Doe]}``
+    closes the value at ``[Jane]`` and ``Doe`` would be read as no key's value. So such a value makes
+    :func:`_scrub_json_value` raise :class:`_MismatchedJsonCloser`, and the text becomes the
+    placeholder. ``nested`` says a container is still open around this one, where a line break is
+    whitespace; outside every container the line ends the value, as the walk's own rule says.
+
+    **Not a value here:** a delimiter or closer, a line end outside every container, the end of the
+    text, :func:`safe_text`'s ``…(+N chars)`` count, and anything after a container that is exactly
+    the placeholder ``[redacted]``. A scrub writes that placeholder for a bare token, and a field-run
+    pass for a run, so ``x y`` under a leaf key reads as ``[redacted] [redacted]`` on a second pass,
+    which must not then be blanked (the fixed point :func:`safe_text` relies on). Text that writes
+    the placeholder itself before a value is therefore read as it was before this rule.
+
+    **Only a container's end is read, by choice.** A token after a scalar (``"family": "Doe"
+    failed``) is far more often prose after a diagnostic's value than a stray closer, and blanking
+    every such line would cost most of the diagnostics this module keeps, so it stays a residual."""
+    if pos >= len(_REDACTED) and text.startswith(_REDACTED, pos - len(_REDACTED)):
+        return False
+    match = _JSON_TOKEN.match(text, pos)
+    if match is not None and (space := match.group("ws")) is not None:
+        if not nested and ("\n" in space or "\r" in space):
+            return False
+        match = _JSON_TOKEN.match(text, match.end())
+    if match is None:
+        return False
+    punct = match.group("punct")
+    if punct is not None:
+        return punct in "{[("
+    return not text.startswith(_COUNT_OPENER, match.start())
 
 
 def _redact_json_fields(text: str, *, widened: bool) -> str:
@@ -2094,8 +2131,10 @@ def redact(text: str) -> str:
     and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
 
     **A mismatched or stray JSON closer after a PHI JSON key can make the result the placeholder
-    for the whole text (BACKLOG #5814)**, followed by any trailing bound note. Text shaped like such
-    a key can do it too, including text inside a JSON string. This can blank text beyond the key's
+    for the whole text (BACKLOG #5814)**, followed by any trailing bound note. So can a value
+    straight after a container in such a key's value, with no delimiter between them
+    (:func:`_json_value_runs_on`), which is how a stray closer of the container's own kind shows.
+    Text shaped like such a key can do it too, including text inside a JSON string. This can blank text beyond the key's
     value, including some balanced inputs, and it misses some shapes. The code from
     :func:`_redact_noted` down is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
     ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
@@ -2143,27 +2182,32 @@ def _stray_json_closer(text: str) -> bool:
     below is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
     ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
     list."""
-    keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+    keys = [match.span() for match in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
     stack: list[str] = []
     armed: int | None = None
+    #: The end of the last key armed. A line break before it is inside that key, between its name
+    #: and its colon, so it does not disarm the walk.
+    key_end = 0
     next_key = 0
     for match in _JSON_STRUCTURE.finditer(text):
         char = match.group("char")
         if char is None:
             break  # the text's tail holds no bracket and no line break
         at = match.start("char")
-        while next_key < len(keys) and keys[next_key] <= at:
+        while next_key < len(keys) and keys[next_key][0] <= at:
             armed = len(stack) if armed is None else min(armed, len(stack))
+            key_end = keys[next_key][1]
             next_key += 1
         if char[0] in "\r\n":
-            if armed == 0 and not stack:
+            if armed == 0 and not stack and match.end("char") > key_end:
                 armed = None
         elif char in _CLOSER_OF:
             stack.append(_CLOSER_OF[char])
         else:
-            if stack and stack[-1] != char and armed is not None:
+            # Armed with nothing open, the closer has no opener after the key: stray too.
+            if armed is not None and (not stack or stack[-1] != char):
                 return True
             if stack:
                 stack.pop()

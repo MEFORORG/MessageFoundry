@@ -234,12 +234,13 @@ def test_the_keyword_screen_is_the_pattern_vocabulary() -> None:
 def test_a_quoted_phi_value_ending_in_a_marker_head_is_still_masked() -> None:
     """Found by the differential after review round 2: the credential arm's extra heads, applied to
     the PHI arm too, left this quoted PHI value in view where the answer before #2968 masked it."""
-    # Without its `{`, as a cut head leaves it: with it, the `]` meets the `{` and the whole text is
-    # the placeholder (BACKLOG #5814), so this mask would not be exercised.
-    text = '"given":"A^B^C,pwd::Bearer zqbafhgmfb6"]}'
+    # With no closer after it: a closer there, with or without the `{`, makes the whole text the
+    # placeholder (BACKLOG #5814), so this mask would not be exercised.
+    text = '"given":"A^B^C,pwd::Bearer zqbafhgmfb6"; ok'
     assert not _all_paths_keeping(text, "zqbafhgmfb6")
-    assert redact(text) == '[redacted] xxxxxxxxxx0"]}'
-    assert redact("{" + text) == "[redacted]"
+    assert redact(text) == '[redacted] xxxxxxxxxx0"; ok'
+    cut = '"given":"A^B^C,pwd::Bearer zqbafhgmfb6"]}'
+    assert redact(cut) == redact("{" + cut) == "[redacted]"
 
 
 def test_a_label_spelled_with_a_fold_character_is_still_read() -> None:

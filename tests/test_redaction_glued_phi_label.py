@@ -293,7 +293,8 @@ def test_a_segment_id_head_glued_to_its_quote_is_refused() -> None:
 
 
 def test_a_run_over_declared_delimiters_masks_a_glued_value() -> None:
-    text = 'MSH*^~\\&*A*B\r x*y*z,"name":"Zqxdoe Vandtjane"}'
+    # The `{` keeps the closer matched, or the whole text is the placeholder (BACKLOG #5814).
+    text = 'MSH*^~\\&*A*B\r {x*y*z,"name":"Zqxdoe Vandtjane"}'
     assert "Vandtjane" not in redact(text)
     with _rule_off():
         assert "Vandtjane" in redact(text)

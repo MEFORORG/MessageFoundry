@@ -12,6 +12,7 @@ tell from a real close. In both, a single-token value after the closer walked th
 from __future__ import annotations
 
 import ast
+import functools
 import random
 import re
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import messagefoundry.redaction as redaction
 from messagefoundry.redaction import (
     _JSON_PHI_KEY,
     _JSON_STRUCTURE,
@@ -45,9 +47,11 @@ STRAY = [
     f'[{{"family": ["Doe"] ] {SECRET}}}]',
 ]
 
-#: Some texts whose PHI value is kept: examples, not a complete list. Strict, so a change that
-#: catches one turns this red.
-MISSED = [
+#: Texts origin/main 4ad697da713 kept the PHI value of, each now the placeholder. A value straight
+#: after a PHI value's container, with no delimiter between, makes the scrub raise
+#: (``_json_value_runs_on``); a key's colon on the next line no longer disarms the check, and a
+#: closer with nothing open after a key is stray.
+RUN_ON = [
     f'"given": [Jane] {SECRET}]',  # no container open: the head was cut
     f'{{"given": [x] {SECRET}}}}}',  # the key's own container's kind
     f'can\'t map {{"given": [Jane] {SECRET}]}}',  # a string opened before the key
@@ -57,8 +61,29 @@ MISSED = [
     f'"telecom"\n: [a|b|c ) , {{"value": "{SECRET}"}}]',
     # One token after a closed PHI value, with no stray closer.
     f'{{"given": [x] {SECRET}}}',
-    # An apostrophe before a same-kind stray closer. origin/main keeps the value identically.
+    # An apostrophe before a same-kind stray closer.
     f'{{"given": [Jane] can\'t {SECRET}]}}',
+    # A stray closer after the value, then the token.
+    f'"given": [Jane] ] {SECRET}',
+    # A PHI key nested in another PHI key's value.
+    f'{{"identifier": [{{"value": ["x"] {SECRET}}}]}}',
+    # Labels after the value: they go with the text, so no later pass reads one without its value.
+    f'{{"given": [Jane] password= {SECRET}:8080}}',
+    f'{{"given": [Jane] {SECRET}: 1}}',
+    f'{{"given": [Jane] frozenset({{{SECRET}}})}}',
+]
+
+#: Some texts whose PHI value is kept: examples, not a complete list. Strict, so a change that
+#: catches one turns this red.
+MISSED = [
+    # The key's own container closed by a same-kind stray closer, then another closer, then the token.
+    f'{{"given": [x] }} }} {SECRET}',
+    # A line break before the token: outside every container the walk ends a value at the line.
+    f'{{"given": [x]\n {SECRET}}}',
+    # A token after a scalar value: the run-on rule reads only what follows a container.
+    f'"family": "Doe" {SECRET}',
+    # The placeholder written by the text itself, which a second pass must be able to read.
+    f'"given": [redacted] {SECRET}',
 ]
 
 
@@ -78,6 +103,23 @@ def test_a_cut_or_quoted_string_after_a_key_keeps_its_diagnostic(text: str) -> N
     for limit in (200, 10_000):
         once = safe_text(text, limit=limit)
         assert once != PLACEHOLDER and safe_text(once, limit=limit) != PLACEHOLDER, once
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize("text", RUN_ON)
+def test_a_value_run_on_after_a_phi_container_redacts_the_whole_text(
+    scrub: Callable[[str], str], text: str
+) -> None:
+    assert scrub(text) == PLACEHOLDER
+
+
+@pytest.mark.parametrize("text", RUN_ON)
+def test_origin_main_kept_each_run_on_value(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control: with this branch's rules off, each RUN_ON text keeps its value. The rule
+    is a fixed point of ``safe_text`` too."""
+    assert safe_text(safe_text(text)) == safe_text(text)
+    _rules_off(monkeypatch)
+    assert SECRET in redact(text)
 
 
 @pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED")
@@ -147,6 +189,11 @@ KNOWN_COST = [
     f'{{"note": "x \'family\': {SECRET}", "a": [1}}}}',
     # Balanced, well-formed JSON: the result is read too, and a scrub left a stray closer there.
     f'{{"family": "{SECRET}", "id": ["a|b|c", 1]}}',
+    # A closer with nothing open after a top-level key.
+    f'"family": "{SECRET}" step 2) failed',
+    # Prose after a PHI value's container on its line.
+    f"connect failed for 'address': ('10.0.0.1', 2575) after {SECRET} tries",
+    f'"family": ["{SECRET}"] failed to map',
 ]
 
 
@@ -160,13 +207,21 @@ def test_a_known_cost_blanks_the_whole_text(scrub: Callable[[str], str], text: s
 
 def _reference_walk(text: str) -> bool:
     """The check's walk as it stood before the structure-only step (engine head 79a11bc4f2b), over
-    every ``_JSON_TOKEN`` token. It reads the live ``_JSON_TOKEN`` and ``_JSON_PHI_KEY``, so it is
-    that walk only while those two are unchanged. The shipped walk must give the same verdict."""
-    keys = [match.start() for match in _JSON_PHI_KEY.finditer(text)]
+    every ``_JSON_TOKEN`` token, with the two rules BACKLOG #5814's run-on build added: a line break
+    inside a key does not disarm it, and an armed closer with nothing open is stray. It reads the live ``_JSON_TOKEN`` and
+    ``_JSON_PHI_KEY``, so it is that walk only while those two are unchanged. The shipped walk must
+    give the same verdict."""
+    return _token_walk(text, run_on=True)
+
+
+def _token_walk(text: str, *, run_on: bool) -> bool:
+    """The token walk; ``run_on=False`` is the walk origin/main 4ad697da713 shipped."""
+    keys = [m.span() for m in _JSON_PHI_KEY.finditer(text)]
     if not keys:
         return False
     stack: list[str] = []
     armed: int | None = None
+    key_end = 0
     next_key = 0
     pos = 0
     while pos < len(text):
@@ -174,20 +229,23 @@ def _reference_walk(text: str) -> bool:
             return False
         match = _JSON_TOKEN.match(text, pos)
         assert match is not None
-        while next_key < len(keys) and keys[next_key] <= match.start():
+        while next_key < len(keys) and keys[next_key][0] <= match.start():
             armed = len(stack) if armed is None else min(armed, len(stack))
+            key_end = keys[next_key][1] if run_on else 0
             next_key += 1
         pos = match.end()
         punct = match.group("punct")
         if punct is None:
             ws = match.group("ws")
-            if armed == 0 and not stack and ws is not None and ("\n" in ws or "\r" in ws):
-                armed = None
+            if armed == 0 and not stack and ws is not None:
+                last = max(ws.rfind("\n"), ws.rfind("\r"))
+                if last >= 0 and match.start() + last >= key_end:
+                    armed = None
             continue
         if punct in "{[(":
             stack.append("}" if punct == "{" else "]" if punct == "[" else ")")
         elif punct in "}])":
-            if stack and stack[-1] != punct and armed is not None:
+            if armed is not None and ((stack and stack[-1] != punct) or (not stack and run_on)):
                 return True
             if stack:
                 stack.pop()
@@ -238,9 +296,10 @@ def _fuzz(count: int) -> list[str]:
     return ["".join(rng.choices(parts, k=rng.randint(1, 40))) for _ in range(count)]
 
 
+@functools.cache
 def _corpus() -> list[str]:
     """This file's cases and the suites' literals with their ``redact`` results, then the fuzz."""
-    texts = [*STRAY, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
+    texts = [*STRAY, *RUN_ON, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
     texts += _redaction_suite_strings()
     return texts + [redact(text) for text in texts] + _fuzz(30_000)
 
@@ -258,3 +317,81 @@ def test_the_structure_walk_matches_the_token_walk() -> None:
         verdicts[verdict] += 1
     # Positive controls: the corpus reaches both verdicts often.
     assert verdicts[True] > 500 and verdicts[False] > 500, verdicts
+
+
+def _rules_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Turn this branch's rules off, which leaves the scrubber origin/main 4ad697da713 shipped."""
+    monkeypatch.setattr(redaction, "_json_value_runs_on", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        redaction, "_stray_json_closer", lambda text: _token_walk(text, run_on=False)
+    )
+
+
+#: Leak cases an earlier attempt at this rule had (04102211b39, reverted in 71752f81d0d), and others
+#: from its review: a credential label without a colon, an unclosed opener after the value, nested
+#: keys, a token a colon follows, a callable, and an unclosed piece before later lines.
+LEAK_PROBES = [
+    f'"given": [Jane] password= {SECRET}pw:8080',
+    f'{{"given": [Jane] password= {SECRET}pw:8080}}',
+    f'"family": ["x"] token={SECRET}123 Authorization= Bearer {SECRET}987',
+    f'"family": ["x"] (see [ref) {SECRET}',
+    f'"family": ["x"] PatientID: {SECRET}',
+    f'{{"family": ["x"] [ {SECRET}',
+    f'"name": [a] "given": [b] {SECRET}',
+    f'{{"given": [Jane] (\n{SECRET}\nline2 Pqwerty',
+]
+
+
+def _differential_fuzz(count: int) -> list[str]:
+    """Seeded texts mixing PHI keys, brackets, credential and DICOM labels, field runs, the
+    placeholder and the count note, so both scrubbers' rules meet one another."""
+    rng = random.Random(58140)
+    parts = ["{", "}", "[", "]", "(", ")", '"', "'", "\\", "\n", " ", " ", "\t", ",", ":"]
+    parts += ['"family": ', "'given': ", '"name":', '"address": ', '"identifier": ', '"value": ']
+    parts += ['"telecom":', '"0010ABCD": ', '"system": ', SECRET, "a|b|c", "x", "IB_ACME_ADT"]
+    parts += ["password=", "password: ", "token=", "Authorization: Bearer ", "https://h:1/p"]
+    parts += ["PatientID: ", "PatientName=", "MRN 123456", "DOE^JANE", "PID|1||", PLACEHOLDER]
+    parts += ["\u2026(+3 chars)", "frozenset(", "date(", "1980-05-05", "Doe, Jane", "<given value="]
+    return ["".join(rng.choices(parts, k=rng.randint(1, 30))) for _ in range(count)]
+
+
+_WORD = re.compile(r"[A-Za-z0-9]{3,}")
+#: The words of the placeholder and of this module's notes, which a blanked answer may carry.
+_NOTE_WORDS = set(_WORD.findall(PLACEHOLDER + redaction._clamp_marker(1) + redaction._COUNT_CLOSER))
+
+
+def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE CONTROL'S DIFFERENTIAL. Over the corpus, the leak probes and a seeded fuzz, no scrubber
+    prints a word that origin/main 4ad697da713's form of it (this branch's rules off) hid. This
+    reads the rules-off form, so it holds as long as ``_rules_off`` restores main, which
+    ``test_origin_main_kept_each_run_on_value`` checks; a scratchpad run against origin/main's own
+    module, kept out of the suite because it needs git, agreed."""
+    texts = [*_corpus()[:4_000], *LEAK_PROBES, *RUN_ON, *_differential_fuzz(4_000)]
+    # Neither rule reads a text with no PHI key, so only those can differ.
+    texts = [text for text in texts if _JSON_PHI_KEY.search(text)]
+    scrubbers: list[Callable[[str], str]] = [*SCRUBBERS, lambda text: safe_text(text, limit=60)]
+    ours = [[scrub(text) for scrub in scrubbers] for text in texts]
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        mains = [[scrub(text) for scrub in scrubbers] for text in texts]
+    changed = 0
+    for text, mine, theirs in zip(texts, ours, mains, strict=True):
+        for got, main in zip(mine, theirs, strict=True):
+            if got != main:
+                extra = set(_WORD.findall(got)) - set(_WORD.findall(main)) - _NOTE_WORDS
+                assert not extra, (text, got, main)
+                changed += 1
+    # Positive control: the rules changed many answers, so the comparison saw the two apart.
+    assert changed > 200, changed
+
+
+@pytest.mark.parametrize("text", LEAK_PROBES)
+def test_a_leak_probe_keeps_no_secret(text: str) -> None:
+    for scrub in SCRUBBERS:
+        assert SECRET not in scrub(text), (scrub, text)
+
+
+def test_the_count_note_after_a_closed_value_is_not_a_run_on() -> None:
+    """``safe_text``'s count after a closed value is not a value, so a cut answer stays legible."""
+    note = "\u2026(+12 chars)"
+    assert redact('{"given": ["x"]' + note) == '{"given": ["[redacted]"]' + note
