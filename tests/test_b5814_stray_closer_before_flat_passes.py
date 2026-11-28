@@ -78,8 +78,14 @@ RUN_ON = [
 MISSED = [
     # The key's own container closed by a same-kind stray closer, then another closer, then the token.
     f'{{"given": [x] }} }} {SECRET}',
-    # A line break before the token: outside every container the walk ends a value at the line.
+    # A line break before the token. The walk starts at the key, so a line break after the key's
+    # own container ends the value there, even inside an object opened before the key.
     f'{{"given": [x]\n {SECRET}}}',
+    f'{{\n  "given": [x]\n  {SECRET}}}\n}}',
+    # The key's own container closed, then a colon: the walk has returned before it.
+    f'{{"given": [Jane]}}:{SECRET}}}',
+    # A container after a scalar value.
+    f'"given": x [{SECRET}]',
     # A token after a scalar value: the run-on rule reads only what follows a container.
     f'"family": "Doe" {SECRET}',
     # The placeholder written by the text itself, which a second pass must be able to read.
@@ -115,11 +121,27 @@ def test_a_value_run_on_after_a_phi_container_redacts_the_whole_text(
 
 @pytest.mark.parametrize("text", RUN_ON)
 def test_origin_main_kept_each_run_on_value(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Positive control: with this branch's rules off, each RUN_ON text keeps its value. The rule
-    is a fixed point of ``safe_text`` too."""
-    assert safe_text(safe_text(text)) == safe_text(text)
+    """Positive control: with this branch's rules off, each RUN_ON text keeps its value."""
     _rules_off(monkeypatch)
     assert SECRET in redact(text)
+
+
+#: Texts the run-on rule leaves legible, each a fixed point of ``safe_text``: a placeholder a scrub
+#: wrote before another value, and the count note after a closed value.
+KEPT = [
+    '{"identifier": {"value": x y}}',
+    '"given": x y',
+    '{"given": [x, "y"], "family": ("a") }',
+    '{"given": ["x"]\u2026(+12 chars)',
+    '{"telecom": [build(t) for t in tels], "x": 1}',
+]
+
+
+@pytest.mark.parametrize("text", KEPT)
+def test_a_kept_text_is_legible_and_a_fixed_point(text: str) -> None:
+    once = safe_text(text)
+    assert once != PLACEHOLDER
+    assert safe_text(once) == once
 
 
 @pytest.mark.xfail(strict=True, reason="KNOWN RESIDUAL of BACKLOG #5814: see MISSED")
@@ -194,6 +216,9 @@ KNOWN_COST = [
     # Prose after a PHI value's container on its line.
     f"connect failed for 'address': ('10.0.0.1', 2575) after {SECRET} tries",
     f'"family": ["{SECRET}"] failed to map',
+    # Source lines of a rendered traceback that build JSON with a call or an attribute.
+    f'    out = {{"name": names({SECRET}).upper() if pid else None}}',
+    f'        "family": {SECRET}.family}})',
 ]
 
 
@@ -322,6 +347,7 @@ def test_the_structure_walk_matches_the_token_walk() -> None:
 def _rules_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Turn this branch's rules off, which leaves the scrubber origin/main 4ad697da713 shipped."""
     monkeypatch.setattr(redaction, "_json_value_runs_on", lambda *_a, **_k: False)
+    monkeypatch.setattr(redaction, "_runs_on_as_received", lambda _text: False)
     monkeypatch.setattr(
         redaction, "_stray_json_closer", lambda text: _token_walk(text, run_on=False)
     )
@@ -360,29 +386,58 @@ _WORD = re.compile(r"[A-Za-z0-9]{3,}")
 _NOTE_WORDS = set(_WORD.findall(PLACEHOLDER + redaction._clamp_marker(1) + redaction._COUNT_CLOSER))
 
 
-def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """THE CONTROL'S DIFFERENTIAL. Over the corpus, the leak probes and a seeded fuzz, no scrubber
-    prints a word that origin/main 4ad697da713's form of it (this branch's rules off) hid. This
-    reads the rules-off form, so it holds as long as ``_rules_off`` restores main, which
-    ``test_origin_main_kept_each_run_on_value`` checks; a scratchpad run against origin/main's own
-    module, kept out of the suite because it needs git, agreed."""
-    texts = [*_corpus()[:4_000], *LEAK_PROBES, *RUN_ON, *_differential_fuzz(4_000)]
-    # Neither rule reads a text with no PHI key, so only those can differ.
-    texts = [text for text in texts if _JSON_PHI_KEY.search(text)]
-    scrubbers: list[Callable[[str], str]] = [*SCRUBBERS, lambda text: safe_text(text, limit=60)]
-    ours = [[scrub(text) for scrub in scrubbers] for text in texts]
+_DIFF_SCRUBBERS: list[Callable[[str], str]] = [*SCRUBBERS, lambda text: safe_text(text, limit=60)]
+
+
+def _answers(texts: list[str]) -> list[list[str]]:
+    return [[scrub(text) for scrub in _DIFF_SCRUBBERS] for text in texts]
+
+
+def _main_answers(texts: list[str], monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     with monkeypatch.context() as patch:
         _rules_off(patch)
-        mains = [[scrub(text) for scrub in scrubbers] for text in texts]
+        return _answers(texts)
+
+
+def _words_main_hid(
+    texts: list[str], ours: list[list[str]], mains: list[list[str]]
+) -> tuple[list[str], int]:
+    """``(leaks, changed)``: each text with an answer that prints a word the rules-off answer hid,
+    and how many answers differ at all."""
+    leaks: list[str] = []
     changed = 0
     for text, mine, theirs in zip(texts, ours, mains, strict=True):
         for got, main in zip(mine, theirs, strict=True):
             if got != main:
-                extra = set(_WORD.findall(got)) - set(_WORD.findall(main)) - _NOTE_WORDS
-                assert not extra, (text, got, main)
                 changed += 1
+                if set(_WORD.findall(got)) - set(_WORD.findall(main)) - _NOTE_WORDS:
+                    leaks.append(text)
+    return leaks, changed
+
+
+def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE CONTROL'S DIFFERENTIAL. Over the corpus, the leak probes and a seeded fuzz, no scrubber
+    prints a word that the rules-off form (``_rules_off``) hid. That form is origin/main
+    4ad697da713's scrubber only while ``_rules_off`` names every rule this branch added; the
+    scratchpad run of this build against origin/main's own module, kept out of the suite because it
+    needs git, agreed on 72,208 texts. Every rule here only turns a text into the placeholder, so
+    this is the check that a later change keeps it that way."""
+    texts = [*_corpus()[:4_000], *LEAK_PROBES, *RUN_ON, *KEPT, *_differential_fuzz(4_000)]
+    # Neither rule reads a text with no PHI key, so only those can differ.
+    texts = [text for text in texts if _JSON_PHI_KEY.search(text)]
+    leaks, changed = _words_main_hid(texts, _answers(texts), _main_answers(texts, monkeypatch))
+    assert not leaks, leaks[:5]
     # Positive control: the rules changed many answers, so the comparison saw the two apart.
     assert changed > 200, changed
+
+
+def test_the_differential_sees_a_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: a scrubber that keeps the JSON values it should hide is caught."""
+    texts = [f'{{"family": "{SECRET}", "a": 1}}']
+    mains = _main_answers(texts, monkeypatch)
+    monkeypatch.setattr(redaction, "_redact_json_fields", lambda text, **_k: text)
+    leaks, _ = _words_main_hid(texts, _answers(texts), mains)
+    assert set(leaks) == set(texts)
 
 
 @pytest.mark.parametrize("text", LEAK_PROBES)

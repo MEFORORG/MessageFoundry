@@ -1453,7 +1453,10 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
                 if punct != frames[-1][2]:
                     raise _MismatchedJsonCloser
                 frames.pop()
-                if _json_value_runs_on(text, pos, nested=bool(frames)):
+                # Only where the parent would keep the value: a leaf or value frame scrubs it.
+                if (not frames or frames[-1][1] == _INHERIT) and _json_value_runs_on(
+                    text, pos, nested=bool(frames)
+                ):
                     raise _MismatchedJsonCloser
                 if not frames:
                     return "".join(out), pos
@@ -1490,39 +1493,71 @@ def _scrub_json_value(text: str, pos: int, policy: int, widened: bool) -> tuple[
     return "".join(out), pos
 
 
+#: :func:`safe_text`'s whole count note, as :func:`_held_back` writes it.
+_COUNT_NOTE = re.compile(r"\u2026\(\+[0-9]++ chars\)")
+
+
 def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     """Whether a value follows the container that closed at ``pos`` with no delimiter between them,
     which well-formed JSON never does (BACKLOG #5814, added item 2).
 
-    A stray closer of the container's own kind reads as its real close, so ``{"given": [Jane] Doe]}``
-    closes the value at ``[Jane]`` and ``Doe`` would be read as no key's value. So such a value makes
-    :func:`_scrub_json_value` raise :class:`_MismatchedJsonCloser`, and the text becomes the
-    placeholder. ``nested`` says a container is still open around this one, where a line break is
-    whitespace; outside every container the line ends the value, as the walk's own rule says.
+    A stray closer of a container's own kind reads as its real close, so in
+    ``{"given": [Jane] Doe}}`` the value closes at ``[Jane]`` and ``Doe`` would be read as no
+    key's value; the stray-closer walk sees nothing wrong, since every closer has an opener. So
+    such a value makes :func:`_scrub_json_value` raise :class:`_MismatchedJsonCloser`, and the text
+    becomes the placeholder. It is read only where the enclosing frame would keep the value: none
+    is open, or an object that is searched. ``nested`` says the walk has a frame open around this
+    one, where a line break is whitespace. The walk starts at the key, so a frame opened before the
+    key does not count, and a line break after the key's own container ends the value even inside
+    such a frame: pretty-printed ``{\n "given": [x]\n Doe}}`` is a residual.
 
-    **Not a value here:** a delimiter or closer, a line end outside every container, the end of the
-    text, :func:`safe_text`'s ``…(+N chars)`` count, and anything after a container that is exactly
-    the placeholder ``[redacted]``. A scrub writes that placeholder for a bare token, and a field-run
-    pass for a run, so ``x y`` under a leaf key reads as ``[redacted] [redacted]`` on a second pass,
-    which must not then be blanked (the fixed point :func:`safe_text` relies on). Text that writes
-    the placeholder itself before a value is therefore read as it was before this rule.
+    **A colon after a list or dict is a value here**, since neither can be a key; one after a call
+    or tuple is not. The full ``…(+N chars)`` note :func:`safe_text` writes is skipped, and the
+    token after it read; a peer can write it, so it is read past rather than trusted.
+
+    **Not a value here:** a comma, a closer, a line end at the walk's top level, the end of the
+    text, and anything after a container that is exactly the placeholder ``[redacted]``. A scrub
+    writes that placeholder for a bare token inside a container, and a field-run pass for a run,
+    so ``{"value": x y}`` reads as ``{"value": [redacted] [redacted]}`` on a second pass, which
+    must not then be blanked (the fixed point :func:`safe_text` relies on). A run a field-run pass
+    turns into the placeholder before this walk reads it is covered by :func:`_runs_on_as_received`.
 
     **Only a container's end is read, by choice.** A token after a scalar (``"family": "Doe"
     failed``) is far more often prose after a diagnostic's value than a stray closer, and blanking
     every such line would cost most of the diagnostics this module keeps, so it stays a residual."""
-    if pos >= len(_REDACTED) and text.startswith(_REDACTED, pos - len(_REDACTED)):
+    if text.endswith(_REDACTED, 0, pos):
         return False
-    match = _JSON_TOKEN.match(text, pos)
-    if match is not None and (space := match.group("ws")) is not None:
-        if not nested and ("\n" in space or "\r" in space):
+    closer = text[pos - 1]
+    while True:
+        match = _JSON_TOKEN.match(text, pos)
+        if match is not None and (space := match.group("ws")) is not None:
+            if not nested and ("\n" in space or "\r" in space):
+                return False
+            match = _JSON_TOKEN.match(text, match.end())
+        if match is None:
             return False
-        match = _JSON_TOKEN.match(text, match.end())
-    if match is None:
-        return False
+        note = _COUNT_NOTE.match(text, match.start())
+        if note is None:
+            break
+        pos = note.end()
     punct = match.group("punct")
     if punct is not None:
-        return punct in "{[("
-    return not text.startswith(_COUNT_OPENER, match.start())
+        return punct in "{[(" or (punct == ":" and closer in "]}")
+    return True
+
+
+def _runs_on_as_received(text: str) -> bool:
+    """Whether the JSON walk reads a run-on value (:func:`_json_value_runs_on`) or a mismatched
+    closer in ``text`` as received, before any flat pass rewrites it. A field-run pass turns
+    ``[a|b|c]`` into ``[redacted]``, which the run-on check then exempts, so the value after it is
+    read here instead. Only a text holding a PHI JSON key is walked."""
+    if _JSON_PHI_KEY.search(text) is None:
+        return False
+    try:
+        _redact_json_fields(text, widened=True)
+    except _MismatchedJsonCloser:
+        return True
+    return False
 
 
 def _redact_json_fields(text: str, *, widened: bool) -> str:
@@ -2161,7 +2196,7 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     # The whole-text placeholder keeps this module's trailing bound note, the only sign the text
     # was cut (:data:`_TRAILING_NOTES`).
     body = _without_trailing_note(text)
-    if _stray_json_closer(body):
+    if _stray_json_closer(body) or _runs_on_as_received(body):
         return _REDACTED + text[len(body) :]
     try:
         out = _redact_unguarded(text, noted=noted)
@@ -2171,7 +2206,8 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     # or one whose opener a flat pass consumed, and a second call reads that output as received, so
     # without this the rule broke the fixed point.
     out_body = _without_trailing_note(out)
-    return _REDACTED + out[len(out_body) :] if _stray_json_closer(out_body) else out
+    stray = _stray_json_closer(out_body) or _runs_on_as_received(out_body)
+    return _REDACTED + out[len(out_body) :] if stray else out
 
 
 def _stray_json_closer(text: str) -> bool:
