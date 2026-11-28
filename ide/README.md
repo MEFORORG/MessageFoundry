@@ -244,9 +244,9 @@ and uses your user value or the default instead, until you trust the workspace (
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
-  that passes through a link it can detect; set an outside file in user settings. A user-set path
-  with a folder or file name anywhere on it that ends in a dot or a space, holds a colon or is a
-  device name is refused before any read. One that reaches the workspace folder or a folder below
+  that passes through a link it can detect; set an outside file in user settings. On Windows, a
+  user-set path with a folder or file name anywhere on it that ends in a dot or a space, holds a
+  colon or is a device name is refused before any read. One that reaches the workspace folder or a folder below
   it through a junction or a directory symbolic link outside the folder (by real path), or a UNC
   loopback admin share (by file id), gets the same checks on the part below the folder; those three
   were measured on Windows with standalone Node v24.20.0, not the editor's Electron runtime.

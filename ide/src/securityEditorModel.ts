@@ -346,7 +346,7 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
  *    and the folder itself is refused. Otherwise every folder and file name on its whole path gets
- *    rule 2's name checks first, before any file-system call: a name ending in a dot or a space,
+ *    rule 2's name checks first, before any file-system call: on Windows, a name ending in a dot or a space,
  *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
  *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
  *    once the case variant below is settled, each folder on its path is read, shallowest first and the drive or share root included, down to
