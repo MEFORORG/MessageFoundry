@@ -293,10 +293,93 @@ def test_a_lead_is_followed_by_the_empty_users_segment() -> None:
     assert wide.search("redis://ops:Kv9;w@cache") is not None
     match = wide.search("redis://ops:@Kv9w@cache")
     assert match is not None and match.group("lead") == "@", match
-    # After user@host a password that opens with "@", and an empty one, are not read: that branch
-    # has no group to keep the "@" signs in (code review).
-    for line in ("postgres://u@h:@pw@x", "smtp://u@h:@x"):
+    # After user@host a password that opens with "@" is read too since batch 20010, its "@" signs
+    # kept in group ``host_lead``. The segment after them is the empty user's, so a separator
+    # still ends the match, and a password that is only "@" signs is not read.
+    match = wide.search("postgres://u@h:@pw@x")
+    assert match is not None and match.group("host_lead") == "@", match
+    for line in ("smtp://u@h:@x", "postgres://u@h:@Kv9;w@x", "postgres://u@h:@@x"):
         assert wide.search(line) is None, line
+
+
+def test_the_batch_20010_readings_refuse_an_mfb64_password() -> None:
+    """A user holding a second "@", and a password after user@host opening with "@", read a line
+    whose password opens with ``mfb64:`` as ``origin/main`` did, not at all; the comment on
+    ``_WIDE_DSN_PASSWORD`` says why. The reading ``origin/main`` already had still takes it."""
+    wide = scrub_mod._WIDE_DSN_PASSWORD
+    for line in (
+        "postgres://ops@corp.example@srv:mfb64:v1:x@corp.example",
+        "postgres://ops@srv:@mfb64:v1:x@corp.example",
+    ):
+        assert wide.search(line) is None, line
+    assert wide.search("postgres://ops@srv:mfb64:v1:x@corp.example") is not None
+
+
+#: A DSN only the batch 20010 readings read, inside a camelCase value the reading before hid
+#: whole (BACKLOG #5386, Lander hold on PR 3397). At ``5c29af1aeaa`` the union kept the ":" and "@"
+#: signs those readings write as fixed text, and each line printed
+#: ``x accessToken=<redacted>:@<redacted>@<redacted>`` and
+#: ``x accessToken=<redacted>:<redacted>@<redacted>`` on all three entry points below.
+#: ``origin/main`` prints ``x accessToken=<redacted>`` on each.
+_CAMEL_VALUE_NEW_READING = (
+    "x accessToken=(Bearer Tk9~redis://ops@srv:@Kv9@db",
+    "x accessToken=(Bearer Tk9~redis://a@b@srv:Kv9@db",
+)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [scrub_credentials, scrub_log_text, _one_handler],
+    ids=("scrub_credentials", "write-time chain", "one handler"),
+)
+@pytest.mark.parametrize("line", _CAMEL_VALUE_NEW_READING)
+def test_a_new_reading_inside_a_camelcase_value_prints_what_origin_main_prints(
+    line: str, call: Callable[[str], str]
+) -> None:
+    assert call(line) == "x accessToken=<redacted>"
+
+
+@pytest.mark.parametrize("call", [*_ENTRY_POINTS, _one_handler], ids=(*_IDS, "one handler"))
+@pytest.mark.parametrize(
+    "line",
+    ["x postgres://a@b@srv:Pwd2=Kv9@Sec_77;UID=u", "x postgres://ops@srv:@Pwd2=Kv9@Sec_77;UID=u"],
+    ids=("more_at", "host_lead"),
+)
+def test_a_qualified_key_in_a_new_readings_segment_keeps_its_value_hidden(
+    line: str, call: Callable[[str], str]
+) -> None:
+    """The segment after a user holding a second "@", and after the "@" signs that open a
+    password after user@host, stops at a qualified key (``_DSN_QUALIFIED_WIDE_SEGMENT``), so the
+    member pass still reads ``Pwd2=``. With the plain segment in either branch, ``Sec_77`` printed
+    on each entry point here (code review of PR 3397)."""
+    out = call(line)
+    assert "Sec_77" not in out and "Kv9" not in out, out
+
+
+def test_the_union_strip_finds_both_new_readings() -> None:
+    """``_without_new_dsn_readings`` matches its two group fragments literally, so a respelled
+    group would make it change nothing, silently; this holds both fragments in the widened
+    pattern and the derived reading apart from it (code review of PR 3397)."""
+    wide = scrub_mod._WIDE_DSN_PASSWORD
+    for fragment, _never in scrub_mod._NEW_DSN_READINGS:
+        assert fragment in wide.pattern, fragment
+    derived = scrub_mod._without_new_dsn_readings(wide)
+    assert derived is not wide
+    assert derived.search("postgres://a@b@srv:Kv9@db") is None
+    assert derived.search("postgres://ops@srv:@Kv9@db") is None
+    assert derived.search("postgres://ops@srv:Kv9@db") is not None
+    assert wide.search("postgres://a@b@srv:Kv9@db") is not None
+
+
+def test_the_member_tail_head_is_the_narrow_head_and_its_key_qualifier_the_member_passs() -> None:
+    """``_DSN_MEMBER_TAIL`` hides what the narrow pass would at the same start, so its head must be
+    the narrow pattern's, possessive; and the new readings' run stop reads the qualifier the member pass reads, where the run ``origin/main`` had does not."""
+    narrow_head = scrub_mod._DSN_PASSWORD.pattern.split("):", 1)[0] + "):"
+    tail_head = scrub_mod._DSN_MEMBER_TAIL.pattern.split("):", 1)[0] + "):"
+    assert tail_head.replace("++", "+") == narrow_head
+    assert scrub_mod._DSN_KEY_QUALIFIER in scrub_mod._MEMBER_KEY_RUN
+    assert scrub_mod._DSN_KEY_QUALIFIER in scrub_mod._DSN_QUALIFIED_RUN_STOP
+    assert scrub_mod._DSN_KEY_QUALIFIER not in scrub_mod._DSN_RUN_STOP
 
 
 @pytest.mark.parametrize("call", [redact_log_line, _chain_then_bundle], ids=_IDS[2:])
@@ -336,22 +419,20 @@ _KNOWN_RESIDUALS = (
     ("x;PWD=P'Kv9_Sec;", "Kv9_Sec"),
     ("Server=h;Password=P'Kv9_Sec;Database=d", "Kv9_Sec"),
     ('x;pwd=P"Kv9_Sec;', "Kv9_Sec"),
-    # A JDBC DSN with no user before its host: the narrow match takes the member's key.
-    ("jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;", "ss_Sec9"),
-    # After user@host: a password opening with digits then a non-word character, a host word
-    # holding "_", and a user holding two "@".
+    # After user@host: a password opening with digits then a non-word character, and a host word
+    # holding "_". Three shapes this list held are hidden since batch 20010 and are held in
+    # ``tests/test_b20010_dsn_5386_remainder.py``: a JDBC DSN with no user before its host, a user
+    # holding two "@", and a password after user@host that opens with "@".
     ("postgres://ops@srv:12-Kv9Az@srv.example.invalid/x", "12-Kv9Az"),
     ("postgres://ops@srv_1:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
-    ("postgres://a@b@srv:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
     # After user@host or a lead, the segment is an empty user's, which stops at ";", "#", a quote,
-    # "," and the rest, and an all-digit password reads as a port; after user@host a password that
-    # opens with "@" is not read. The same password after a plain user is hidden.
+    # "," and the rest, and an all-digit password reads as a port. The same password after a plain
+    # user is hidden.
     ("x postgres://ops@srv:Kv9;x@db.invalid", "Kv9;x"),
     ("x postgres://ops@srv:Kv9#x@db.invalid", "Kv9#x"),
     ("x postgres://ops@srv:Kv9'x@db.invalid", "Kv9'x"),
     ("x postgres://ops@srv:Kv9,x@db.invalid", "Kv9,x"),
     ("x postgres://ops@srv:123456@db.invalid", "123456"),
-    ("x postgres://ops@srv:@Kv9x@db.invalid", "Kv9x"),
     ("x postgres://svc:@Kv9;x@db.invalid", "Kv9;x"),
 )
 
@@ -418,6 +499,21 @@ _SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("lead then bracket lookahead run", lambda n: "postgres://svc:@" + ("[aaaa" * n)[:n]),
     ("lead then equals run", lambda n: "postgres://svc:@" + ("a=" * n)[:n]),
     ("lead then separators", lambda n: "postgres://svc:@a" + ("=b|" * n)[:n]),
+    # Batch 20010: a user holding many "@", and a password after user@host opening with "@".
+    ("user holding at-sign hosts", lambda n: "postgres://u" + ("@h" * n)[:n] + ":x"),
+    ("host lead run", lambda n: "postgres://u@h:" + "@" * n),
+    ("host lead then letters", lambda n: "postgres://u@h:" + ("@a" * n)[:n] + " "),
+)
+
+#: The JDBC member-tail pass (batch 20010): segments with no key, a long key with no "=", a key
+#: before a tail with no terminator, and glued heads.
+_MEMBER_TAIL_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
+    ("semicolons with no key", lambda n: "jdbc:x://db:" + (";a" * n)[:n] + "@"),
+    ("one long key with no equals", lambda n: "jdbc:x://db:;" + "pass" * (n // 4) + "@"),
+    ("keys with no credential word", lambda n: "jdbc:x://db:" + (";a=b" * n)[:n] + "@"),
+    ("a tail with no terminator", lambda n: "jdbc:x://db:1;pwd=P@" + "a" * n + "'"),
+    ("a tail of label stops", lambda n: "jdbc:x://db:1;pwd=P@" + ("acc" * n)[:n] + "'"),
+    ("glued heads", lambda n: ("a://b:;pwd=" * n)[:n]),
 )
 
 _MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
@@ -447,6 +543,7 @@ def test_the_dsn_and_member_patterns_grow_linearly_and_the_control_does_not() ->
     assert ratio > _MAX_GROWTH, f"the backtracking control grew only {ratio:.1f}x"
     for pattern, shapes in (
         (scrub_mod._WIDE_DSN_PASSWORD, _SHAPES),
+        (scrub_mod._DSN_MEMBER_TAIL, _MEMBER_TAIL_SHAPES),
         (scrub_mod._CONNECTION_STRING_MEMBER, _MEMBER_SHAPES),
         (scrub_mod._CONNECTION_STRING_FIRST_MEMBER, _FIRST_MEMBER_SHAPES),
     ):

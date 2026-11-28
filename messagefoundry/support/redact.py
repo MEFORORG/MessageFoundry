@@ -58,6 +58,7 @@ from messagefoundry.secretscrub import (
     _BYTES_PROBE,
     _CONNECTION_STRING_FIRST_MEMBER,
     _CONNECTION_STRING_MEMBER,
+    _DSN_MEMBER_TAIL,
     _KEY_LINE,
     _KEY_SEPARATOR,
     _KV_TAILS,
@@ -65,6 +66,7 @@ from messagefoundry.secretscrub import (
     _MEFOR_TAILS,
     _SHIPPED_TAILS,
     _braced_tail,
+    _dsn_member_tail_repl,
     _dsn_password_repl,
     _keep_key_marker,
     _mask_member,
@@ -573,7 +575,10 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 #
-# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". The widened reading
+# THIS FIRST PASS STAYS NARROW: a user, and a password that stops at its first "@". One pass before
+# it reads past that "@": secretscrub's ``_DSN_MEMBER_TAIL``, on a password span holding a
+# credential member, masks the run after the "@" word by word, before the PHI pass; the comment on
+# that pattern says why it masks rather than deletes. The widened reading
 # (BACKLOG #5386), which reads at least an empty user and a password holding an "@", is secretscrub's
 # ``_WIDE_DSN_PASSWORD``, and :func:`redact_log_line` runs it last of the credential passes, after the
 # member mask and before only the long-base64 sweep, over the whole line. Run here, first, a review
@@ -690,7 +695,8 @@ def redact_log_line(line: str) -> str:
 
     Two layers: (1) on a line holding "-----", secretscrub's PRIVATE KEY block pattern (BACKLOG
     #5550), then the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
-    bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
+    bearer/session tokens) the engine redactor does not carry, among them secretscrub's JDBC
+    member-tail pass and then the narrow DSN pass; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the
@@ -722,6 +728,9 @@ def redact_log_line(line: str) -> str:
         body = _AUTH_SCHEME.sub(_keep_scheme, body)
         body = read(_CREDENTIAL_KV).sub(_keep_label, body)
         body = read(_KEY_MATERIAL).sub(_keep_label, body)
+        # secretscrub's JDBC member-tail pass, before the narrow copy takes the member's key.
+        if ";" in body and "@" in body and "://" in body:
+            body = _DSN_MEMBER_TAIL.sub(_keep_dsn_member_tail, body)
         body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
         body = _redact_phi(body)  # shared engine PHI pass: HL7 segments/field runs + DOB + names
         # The second credential layer; see the comment above this function.
@@ -926,3 +935,8 @@ def _keep_dsn_user(m: re.Match[str]) -> str:
     """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``, by
     secretscrub's own replacement, so the two surfaces cannot drift apart."""
     return _dsn_password_repl(m, REDACTION_PLACEHOLDER)
+
+
+def _keep_dsn_member_tail(m: re.Match[str]) -> str:
+    """secretscrub's member-tail rewrite, with this module's placeholder."""
+    return _dsn_member_tail_repl(m, REDACTION_PLACEHOLDER)

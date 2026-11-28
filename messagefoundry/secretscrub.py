@@ -1768,10 +1768,28 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # The cost, at least: a password the narrow pass did not read, because it held whitespace or a "/"
 # before its "@", is not read here either once a later pass has put a placeholder or a label inside
 # its first segment, and it prints, as it did on ``origin/main``.
+#: The qualifier a member key may carry after its word, as :data:`_MEMBER_KEY_RUN` reads it, so
+#: :data:`_DSN_QUALIFIED_RUN` stops at ``Pwd2=`` and ``Password_old=`` as at ``pwd=`` (code review of
+#: BACKLOG #5386, batch 20010). A test holds it inside :data:`_MEMBER_KEY_RUN`.
+_DSN_KEY_QUALIFIER = (
+    r"(?:_?(?:secondary|plaintext|previous|primary|current|string|value|plain|next|prev|text|old"
+    r"|new|raw|[0-9]++))?"
+)
 _DSN_RUN_STOP = (
     r"(?!(?:"
     + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
     + r")[:=]|(?-i:"
+    + re.escape(_ENV_PREFIX)
+    + r"))"
+)
+#: The run stop of the two readings batch 20010 added: :data:_DSN_RUN_STOP, and a key word with
+#: a qualifier before its ":" or "=" too (:data:_DSN_KEY_QUALIFIER).
+_DSN_QUALIFIED_RUN_STOP = (
+    r"(?!(?:"
+    + _alternation(_CREDENTIAL_QUERY_KEYS + _CAMEL_WORDS)
+    + r")"
+    + _DSN_KEY_QUALIFIER
+    + r"[:=]|(?-i:"
     + re.escape(_ENV_PREFIX)
     + r"))"
 )
@@ -1784,7 +1802,15 @@ _DSN_USER_FIRST_SEGMENT = (
 _DSN_RUN_STOPS = r"\s/;?#&,()|^~{}<>\[\]%\x27\x22"
 #: The run, less the "@" it ends at: the pattern takes that "@" once, last, after the tail
 #: (:data:`_DSN_TAIL`).
-_DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*"
+#: One character of the run, which :data:`_DSN_MEMBER_TAIL`'s tail takes too.
+_DSN_RUN_CHAR = _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"]"
+_DSN_RUN = r"(?:" + _DSN_RUN_CHAR + r")*"
+#: The run after the two readings batch 20010 added, which stops at a qualified key too: those
+#: readings matched nothing on `origin/main`, so the member pass read every key after them, and
+#: a run crossing `Pwd2=` or `Password_old=` left it none (code review). The readings
+#: `origin/main` had keep :data:_DSN_RUN: given this stop, they hid less where no later pass
+#: reads the key, and a differential fuzz measured 2,663 of 600,000 line and surface pairs worse.
+_DSN_QUALIFIED_RUN = r"(?:" + _DSN_QUALIFIED_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*"
 # One character of a tail group after a user's placeholder (BACKLOG #5386, the
 # ``svc:Kv9x@Zq7;w@db`` shape): a ";", or a character of the run's class but ".", ":", "=" or "@",
 # so a group holding a host's dot, a port or a ``key=`` member is not taken. The comment above says
@@ -1810,16 +1836,32 @@ _DSN_EMPTY_USER_SEGMENT = (
     + r"(?:[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)"
     r"|\[(?![a-z]++\])|\]))*+"
 )
-# A USER MAY HOLD ONE "@" WHEN A HOST-SHAPED WORD FOLLOWS IT, the ``user@server`` login of a hosted
-# database (``postgres://ops@srv:Kv9@srv.example``), and a user's password may START with "@"
-# (group ``lead``, written back by :func:`_dsn_password_repl`). A user holding an "@" takes the
+# A USER MAY HOLD AN "@" WHEN A HOST-SHAPED WORD FOLLOWS IT, the ``user@server`` login of a hosted
+# database (``postgres://ops@srv:Kv9@srv.example``), and more than one since batch 20010, as an
+# e-mail login there holds (``postgres://ops@corp.example@srv:Kv9@srv.example``): each "@" is
+# followed by a possessive host word, and the repeats are possessive. A user's password may START
+# with "@" (group ``lead``, written back by :func:`_dsn_password_repl`). A user holding an "@" takes the
 # empty user's segment (group 2 decides), which stops at ";", ",", "=" and the rest, so
 # ``postgres://svc@db:5432;sslpassword=Tail@Sec`` and ``http://user@host:8080,admin@corp``, where
 # the "@" ends a user and a port follows, still match nothing; and a segment that opens with a run
 # of digits no ASCII letter, digit or "_" follows is a port, not a password, so ``user@host:8080!admin@corp``
-# matches nothing either (code review). A password after ``user@host:`` that opens that way prints,
-# and so does one that opens with "@": that branch has no group ``lead`` to keep the "@" signs, so
-# it reads none, as ``origin/main`` read none.
+# matches nothing either (code review). A password after ``user@host:`` that opens that way prints.
+# One that opens with "@" is read since batch 20010: the "@" signs are group ``host_lead``, which
+# :func:`_dsn_password_repl` writes back as it writes ``lead``, then the empty user's segment, so
+# ``ops@srv:@<placeholder>@`` keeps them. Not on a line :func:`_union` merges: its traced shipped
+# reading leaves this reading and ``more_at`` out (:func:`_without_new_dsn_readings` says why), the
+# reading before hides the password, and the ":" and "@" signs around it are hidden with it, as in
+# ``pwd=Ab9 userPwd=Zq7 x postgres://ops@srv:@Kv9x@db.invalid``, where ``ops@srv`` is followed by
+# one placeholder and then ``db.invalid`` on :func:`scrub_credentials`, the write-time chain and
+# one log handler; ``support.redact.redact_log_line``, which runs the widened pass outside any
+# union, keeps them there. With no "@" signs the "@" is still refused there, so
+# ``smtp://u@h:@x``, an empty password, matches nothing. The two readings batch 20010 added, a user
+# holding a second "@" (group ``more_at``) and ``host_lead``, refuse a password that opens with
+# ``mfb64:``, so they read such a line as ``origin/main`` did, not at all: read, the write-time
+# chain hid the blob the bundle's ``_MFB64`` keys on, and the bundle reading that chain line printed
+# a camelCase value later in it, ``userPwd='Sec9;PWD='``, that ``origin/main`` hid there (code
+# review). The readings ``origin/main`` already had print that value on the same path; that is
+# the residual ``tests/test_b532r_redaction_segments.py`` pins for a value after a DSN label.
 # After a password's leading "@" signs the segment is the empty user's too, for the reason the
 # comment above gives. The lead keeps its "@" signs before the placeholder, so
 # ``svc:@<placeholder>@`` is no ``user:password@`` the URL arm of
@@ -1835,10 +1877,28 @@ _DSN_EMPTY_USER_SEGMENT = (
 # user's does. Only a placeholder the "@" follows is read, so the segment still crosses none.
 _DSN_PLACEHOLDER_WORD = r"(?:\[[a-z]+\]|<[a-z]+>)"
 _DSN_WIDE_SEGMENT = r"(?>" + _DSN_PLACEHOLDER_WORD + r"(?=@)|" + _DSN_EMPTY_USER_SEGMENT + ")"
+#: The segment of the two readings batch 20010 added: the same, with :data:`_DSN_QUALIFIED_RUN`'s
+#: stop, for the reason given there.
+_DSN_QUALIFIED_WIDE_SEGMENT = _DSN_WIDE_SEGMENT.replace(_DSN_RUN_STOP, _DSN_QUALIFIED_RUN_STOP)
+# NOT IN A VERIFY DETAIL (the Lander's hold on engine PR 3397, code review).
+# ``verify_leaf.safe_detail_text``, and so ``safe_exc_detail`` and ``safe_exc_text``, read without
+# the two readings batch 20010 added here and without :data:`_DSN_MEMBER_TAIL`
+# (:func:`scrub_credentials_without_tails` says why), so a verify detail prints the shapes those
+# three readings hide wherever ``origin/main`` printed them: at least the value of each line the
+# changelog fragment for BACKLOG #5386 lists, such as ``Kv9x`` in
+# ``x postgres://ops@srv:@Kv9x@db.invalid`` and ``ss_Sec9`` in
+# ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``.
 _WIDE_DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)?):"
-    r"(?(2)(?![0-9]++(?![a-z0-9_])|@)"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+"
+    r"(?:(@)[a-z0-9.\-]++(?:(?P<more_at>@)[a-z0-9.\-]++)*+)?):"
+    r"(?(2)(?:(?P<host_lead>@++)(?!mfb64:)|(?![0-9]++(?![a-z0-9_])|@)(?(more_at)(?!mfb64:)))"
+    + r"(?(more_at)"
+    + _DSN_QUALIFIED_WIDE_SEGMENT
+    + r"|(?(host_lead)"
+    + _DSN_QUALIFIED_WIDE_SEGMENT
+    + r"|"
     + _DSN_WIDE_SEGMENT
+    + r"))"
     + r"|(?:(?<=//:)"
     + _DSN_WIDE_SEGMENT
     + r"|(?<!//:)(?:(?P<lead>@++)"
@@ -1846,7 +1906,13 @@ _WIDE_DSN_PASSWORD = re.compile(
     + r"|"
     + _DSN_USER_FIRST_SEGMENT
     + r")))"
+    + r"(?(more_at)"
+    + _DSN_QUALIFIED_RUN
+    + r"|(?(host_lead)"
+    + _DSN_QUALIFIED_RUN
+    + r"|"
     + _DSN_RUN
+    + r"))"
     + _DSN_TAIL
     + r"@"
 )
@@ -1854,16 +1920,20 @@ _WIDE_DSN_PASSWORD = re.compile(
 
 def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
     """The replacement for a match of :data:`_DSN_PASSWORD` or :data:`_WIDE_DSN_PASSWORD`: group 1,
-    then ":", the widened match's leading "@" signs (group ``lead``), the placeholder and the "@".
-    Both surfaces call this one function, so their rewrites cannot drift apart.
+    then ":", the widened match's leading "@" signs (group ``lead``, or ``host_lead`` after
+    user@host), the placeholder and the "@". Both surfaces call this one function, so their
+    rewrites cannot drift apart.
 
-    The JDBC no-user member tail (BACKLOG #5386) is NOT handled here. On
+    The JDBC no-user member tail (BACKLOG #5386) is not handled by writing anything back. On
     ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;`` the narrow match takes the
-    member's key and ``ss_Sec9`` prints. Writing the key back was built and backed out: a DSN with a
-    real user whose password opens the same way (``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``) cannot
-    be told apart, and the write-back printed that password's ``;Zq7Kpass=`` where the placeholder
-    hid it (code review)."""
-    lead = (m.group("lead") or "") if "lead" in m.re.groupindex else ""
+    member's key. Writing the key back was built and backed out: a DSN with a real user whose
+    password opens the same way (``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``) cannot be told apart,
+    and the write-back printed that password's ``;Zq7Kpass=`` where the placeholder hid it (code
+    review). :data:`_DSN_MEMBER_TAIL`, a pass before the narrow one, writes the tail back masked
+    word by word instead. A kept word in it, the shape of each masked word, and any text after
+    whitespace in it still print, as the comment on that pattern says."""
+    groups = m.groupdict()
+    lead = groups.get("lead") or groups.get("host_lead") or ""
     return f"{m.group(1)}:{lead}{placeholder}@"
 
 
@@ -2295,6 +2365,63 @@ def _mask_member(m: re.Match[str]) -> str:
     return f"{m.group(1)}={_mask_member_value(m.string, start, end)}"
 
 
+# THE JDBC NO-USER MEMBER TAIL (BACKLOG #5386, added item 3). In
+# ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;`` the narrow pattern reads ``db`` as a
+# user and ``1433;user=svc;sslpassword=P`` as the password, so the member's key goes into the match
+# and ``ss_Sec9`` prints, since no later pass finds a key to hide it under. This pass runs just
+# before the narrow one, on both callers, and reads only that shape: a password span holding a
+# ``;`` member whose key the member pass reads (:data:`_MEMBER_KEY_RUN`, so ``;passive=`` is no
+# key), followed after its first "@" by a run that ends at a ";", whitespace or the end of the
+# text. It rewrites the password as the narrow pass does and writes the run back MASKED, word by
+# word, by :func:`_mask_member_value`, as the member pass masks a value, for that pass's reason:
+# the same text is redacted again, and the PHI pass reads what is left. Deleted, the run took the
+# first word of a name, ``P@Jane Doe;``, and the bundle printed ``Doe`` where ``origin/main`` hid
+# both (code review). It never writes the key back (:func:`_dsn_password_repl` says why that was
+# declined). The run takes only characters the widened run takes (:data:`_DSN_RUN_CHAR`): it stops
+# before a credential or query key, qualified or not, and before a ``MEFOR_`` name, and holds no "/"
+# a DSN needs, no quote and no separator. It may still hold a word another pass reads, such as a
+# PHI label (``name=``, ``MRN:``); what keeps that word is :func:`_mask_member_value`'s kept-word
+# rule, as in a member value, not the run's class. Where the run would end at anything but a ";",
+# whitespace or the end, nothing matches, and the narrow pass reads the line as before. A quote does
+# not end it: tried, a differential fuzz found a value ``origin/main`` hid printed in 56 of 600,000
+# line and surface pairs, at least on the store error path after a camelCase label, as in
+# ``cfg accessToken=jdbc:sqlserver://svc:1433;sslpassword=P@Sec'q@p%40Kv9@h;...``. The cost is that
+# the run after the first "@", up to the next ";" or whitespace, is masked word by word, which is
+# at least: the host of a DSN with a real user whose password holds such a member,
+# ``jdbc:mysql://svc:2024;Zq7Kpass=Kv9@db``, and the server of a ``user=login@server`` member after
+# a credential member, as in
+# ``jdbc:sqlserver://srv.invalid:1433;password=Kv9;user=admin@srv;encrypt=true``, so an operator no
+# longer reads which server that login named. What it leaves, at least: a run that ends at a
+# quote, a "/" or a separator prints, as it did before, and so does a tail after a key-material
+# member, such as ``;encryptionKey=P@ss_Sec9;``, on ``support.redact.redact_log_line``, whose key
+# no word here names; the text after whitespace in the run prints, as in ``P@ss Kv9 Zq7;``, where
+# ``Kv9 Zq7`` prints; and a kept word inside the run prints, as in ``P@Passw0rd:abc;`` and
+# ``P@Secretive=Kv9;``, where ``Passw0rd`` and ``Secretive`` print; and, inside a camelCase value
+# the reading before hid whole, the ":" and "@" signs that the DSN readings ``origin/main`` had
+# write back still print between the placeholders, as on ``origin/main``, at least through
+# :func:`scrub_credentials`, the write-time chain and one log handler:
+# ``x accessToken=(Bearer Tk9~redis://ops@srv:Kv9@db`` prints
+# ``x accessToken=<redacted>:<redacted>@<redacted>``. The two readings batch 20010 added no longer
+# do (:func:`_without_new_dsn_readings`).
+#
+# A verify detail reads without this pass: the comment above :data:`_WIDE_DSN_PASSWORD` says what
+# that prints.
+_DSN_MEMBER_TAIL = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]++://[^\s:/@]++):(?=[^\s/@]*?;"
+    + _MEMBER_KEY_RUN
+    + r"=)[^\s/@]++@(?P<dsn_member_tail>(?:"
+    + _DSN_RUN_CHAR
+    + r")++)(?=[;\s]|\Z)"
+)
+
+
+def _dsn_member_tail_repl(m: re.Match[str], placeholder: str) -> str:
+    """The replacement for a :data:`_DSN_MEMBER_TAIL` match: the narrow pass's rewrite, then the run
+    after the "@" with its words masked, one character for one. Both callers call this."""
+    start, end = m.span("dsn_member_tail")
+    return _dsn_password_repl(m, placeholder) + _mask_member_value(m.string, start, end)
+
+
 def _keep_label(m: re.Match[str], placeholder: str) -> str:
     """Replace a ``<label>=<value>`` match, keeping the label so a reader sees WHICH credential was
     there, and never the value. Group 1 is the label in every pattern that uses this."""
@@ -2599,26 +2726,56 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     return _scrub_credentials(text, placeholder, folded)
 
 
-def scrub_credentials_without_tails(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+def scrub_credentials_without_tails(
+    text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER, new_dsn_readings: bool = True
+) -> str:
     """:func:`scrub_credentials` as it read before the masked tails and the key-block pass, for a
-    caller that compares the two readings itself (``support/redact.py``)."""
+    caller that compares the two readings itself (``support/redact.py``).
+
+    ``new_dsn_readings`` False also leaves out the three DSN readings batch 20010 added (BACKLOG
+    #5386): the JDBC member-tail pass (:data:`_DSN_MEMBER_TAIL`), and in the widened pass a user
+    holding a second "@" and the "@" signs after ``user@host:`` (:func:`_without_new_dsn_readings`).
+    So the DSN passes read as they did before that batch. For ``verify_leaf.safe_detail_text``,
+    which hides a word holding a copy of a fragment a pass hid: where one of those readings hid or
+    masked the last copy, nothing was left to mark the word, and it printed. In
+    ``jdbc:sqlserver://db:1433;sslpassword=P@Passw0rd:1433;`` the member-tail pass masked the
+    second ``1433`` and ``Passw0rd`` printed (the Lander's hold on engine PR 3397). With that pass
+    alone left out, as a first draft of the repair did, the "@"-lead reading hid the second ``P``
+    in ``jdbc:sqlserver://db:1433;sslpassword=P@ss_Sec9;x;postgres://ops@srv:@P@h`` and
+    ``ss_Sec9`` printed (code review). ``origin/main`` printed one placeholder for each."""
     folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
-    return _scrub_credentials(text, placeholder, folded, tails=False)
+    return _scrub_credentials(
+        text, placeholder, folded, tails=False, new_dsn_readings=new_dsn_readings
+    )
 
 
 def _scrub_credentials(
-    text: str, placeholder: str, folded: str | None, *, tails: bool = True
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    *,
+    tails: bool = True,
+    new_dsn_readings: bool = True,
 ) -> str:
     """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
     tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
     printed. With it True, that reading's output wherever the tailed one is not that output with
     characters written as "x" (:func:`_mask_only`), and the tailed one otherwise, either one with
     the key-block mask run over it once more where a key block's hint is in the text; a line no
-    tail could fire on takes one reading, which the two share there."""
+    tail could fire on takes one reading, which the two share there. ``new_dsn_readings`` as
+    :func:`scrub_credentials_without_tails`, which alone passes it, with ``tails`` False; the
+    readings with ``tails`` True never read it."""
     if not tails:
-        return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+        return _one_reading(
+            text,
+            placeholder,
+            folded,
+            _without_tails,
+            _without_tails_sub,
+            new_dsn_readings=new_dsn_readings,
+        )
     tailed = _one_reading(text, placeholder, folded, _same, None)
     if not _could_take_a_tail(folded):
         return tailed
@@ -2638,12 +2795,15 @@ def _one_reading(
     folded: str | None,
     read: Callable[[re.Pattern[str]], re.Pattern[str]],
     sub: _Sub | None,
+    *,
+    new_dsn_readings: bool = True,
 ) -> str:
     """One reading of ``text``: each pattern through ``read``, applied by ``sub``, and through
-    :func:`_union` on a line the camelCase reading could change."""
+    :func:`_union` on a line the camelCase reading could change. ``new_dsn_readings`` as
+    :func:`_run`."""
     if _reads_camel(text, folded, placeholder):
-        return _union(text, placeholder, folded, read, sub)
-    return _run(text, placeholder, folded, sub)
+        return _union(text, placeholder, folded, read, sub, new_dsn_readings=new_dsn_readings)
+    return _run(text, placeholder, folded, sub, new_dsn_readings=new_dsn_readings)
 
 
 #: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
@@ -2914,7 +3074,13 @@ def has_credential_like_segment(text: str) -> bool:
 
 
 def _run(
-    text: str, placeholder: str, folded: str | None, sub: _Sub | None = None, *, wide: bool = True
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    sub: _Sub | None = None,
+    *,
+    wide: bool = True,
+    new_dsn_readings: bool = True,
 ) -> str:
     """The pass itself. Straight-line rather than a table, so a test monkeypatching one pattern on this
     module reaches the object this function reads -- a table would hold the pre-patch pattern by
@@ -2931,15 +3097,23 @@ def _run(
     readings, where the probe matched; and the reading before alone, on an untraceable line.
     :func:`scrub_credentials`'s own run, on a line it sends to no union, takes it too. So the pass
     also runs where the union returns its reading before whole: on a line where the shipped
-    reading would hide a member key's ";", and on an untraceable one.
+    reading would hide a member key's ";", and on an untraceable one. The shipped one of the two
+    traced readings takes it without the two readings batch 20010 added
+    (:func:`_without_new_dsn_readings` says why).
     The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is,
-    the tail after a user's placeholder (:data:`_DSN_TAIL`) included, and both readings apply the
-    same pattern. So a line the union returns its reading before for, whole, on either branch
+    the tail after a user's placeholder (:data:`_DSN_TAIL`) included, and the reading before
+    applies the whole pattern, the two readings batch 20010 added among it, where
+    ``new_dsn_readings`` is True, and the pattern less those two where it is False; the traced
+    shipped reading applies it less those two either way, as above. So a line the union returns its reading before for, whole, on either branch
     above, still takes the tail. Its run does not cross a camelCase label only the shipped
     reading reads, because every segment of the widened match stops at a label word
     (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
     ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
-    ``pw``, which the pass hides."""
+    ``pw``, which the pass hides.
+
+    ``new_dsn_readings`` False leaves out :data:`_DSN_MEMBER_TAIL`, and applies the widened pass
+    less the two readings batch 20010 added (:func:`_without_new_dsn_readings`), for
+    :func:`scrub_credentials_without_tails`, which says why."""
     apply = _plain_sub if sub is None else sub
     # FIRST, so no label pass reads a key body (BACKLOG #5550; see the pattern).
     if _admits(folded, _KEY_BLOCK_HINT):
@@ -2959,16 +3133,29 @@ def _run(
         text = apply(_CREDENTIAL_KV, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _KEY_MATERIAL_HINT):
         text = apply(_KEY_MATERIAL, lambda m: _keep_label(m, placeholder), text, _BRACED)
+    member_words = _admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)
     if _admits(folded, _DSN_HINT):
 
         def dsn_repl(m: re.Match[str]) -> str:
             return _dsn_password_repl(m, placeholder)
 
+        # Before the narrow pass, which would take the member's key (see the pattern). Its ";",
+        # "@" and key word are required, so the gate skips only lines it cannot match.
+        if new_dsn_readings and member_words and ";" in text and "@" in text:
+            text = apply(
+                _DSN_MEMBER_TAIL,
+                lambda m: _dsn_member_tail_repl(m, placeholder),
+                text,
+                "dsn_member_tail",
+            )
         text = apply(_DSN_PASSWORD, dsn_repl, text, None)
         if wide:
-            text = apply(_WIDE_DSN_PASSWORD, dsn_repl, text, None)
+            widened = _WIDE_DSN_PASSWORD
+            if not new_dsn_readings:
+                widened = _without_new_dsn_readings(widened)
+            text = apply(widened, dsn_repl, text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
-    if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
+    if ";" in text and member_words:
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)
         text = apply(_CONNECTION_STRING_FIRST_MEMBER, _mask_member, text, 2)
     return text
@@ -2981,7 +3168,8 @@ def _run(
 # class. Applied alone they were a trade: the passes run one after another over rewritten text, so a
 # newly read value could take a later label that hid something, and that something printed (the
 # comment on :data:`_CAMEL_START` gives the measurement). So on a line where they can read anything,
-# :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns and once with
+# :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns (the widened
+# DSN pass less two readings, :func:`_without_new_dsn_readings`) and once with
 # :func:`_pre_camel` of each, which is the pattern without them and without the masked tails, with
 # the key-block pass as a pattern that never matches, and keeps a character of the
 # first output only where the second kept it too. Before those two runs :func:`_union` probes the
@@ -3009,7 +3197,11 @@ def _run(
 # which is what ``origin/main`` printed before BACKLOG #5545, plus the widened DSN pass (:func:`_run`).
 # ONE EXCEPTION, which the trace cannot see: :func:`_dsn_password_repl` writes back, as "fixed"
 # text, a password's leading "@" signs (BACKLOG #5386). They are only "@" signs, and the trace reads
-# them as text a replacement wrote.
+# them as text a replacement wrote. The ":" and "@" signs it writes are fixed text too, which the
+# union keeps from the shipped reading, so that reading runs the widened pass without the two
+# readings batch 20010 added (:func:`_without_new_dsn_readings` says why). The DSN readings
+# ``origin/main`` had still write those signs there, and they still print between placeholders
+# inside a camelCase value; the comment on :data:`_DSN_MEMBER_TAIL` states that residual.
 
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
@@ -3145,6 +3337,44 @@ def _without_tails_sub(
     pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None
 ) -> str:
     return _without_tails(pattern).sub(repl, text)
+
+
+#: The groups the two readings batch 20010 added open with in :data:`_WIDE_DSN_PASSWORD`'s source
+#: (BACKLOG #5386), each with a form that cannot match, for :func:`_without_new_dsn_readings`.
+_NEW_DSN_READINGS = (
+    ("(?P<more_at>@)", "(?P<more_at>(?!)@)"),
+    ("(?P<host_lead>@++)", "(?P<host_lead>(?!)@++)"),
+)
+#: :func:`_without_new_dsn_readings`' compiled readings, keyed as :data:`_PRE_CAMEL` is.
+_WITHOUT_NEW_DSN_READINGS: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
+
+
+def _without_new_dsn_readings(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """``pattern`` with the two readings batch 20010 added to :data:`_WIDE_DSN_PASSWORD`, a user
+    holding a second "@" (group ``more_at``) and the "@" signs after ``user@host:`` (group
+    ``host_lead``), unable to match; a pattern holding neither group, as it is. :func:`_union`'s
+    shipped reading reads the line with this. Derived from the live pattern, as :func:`_pre_camel`
+    is, so a test that patches the pattern patches this reading too. Compiled once per pattern.
+
+    Why (BACKLOG #5386, code review): those readings matched inside a camelCase value, and the
+    ":" and "@" signs :func:`_dsn_password_repl` writes are fixed text, which the union keeps from
+    the shipped reading. On ``x accessToken=(Bearer Tk9~redis://ops@srv:@Kv9@db`` the reading
+    before hid the whole value, and the union printed ``:@`` and ``@`` between its placeholders,
+    where ``origin/main``, whose readings matched nothing there, printed one placeholder. Their
+    shapes are still read by the reading before, so the union still hides what that reading hid.
+    The readings ``origin/main`` had are left in, and their signs still print there, a residual
+    the comment on :data:`_DSN_MEMBER_TAIL` states."""
+    found = _WITHOUT_NEW_DSN_READINGS.get(id(pattern))
+    if found is not None and found[0] is pattern:
+        return found[1]
+    source = pattern.pattern
+    for fragment, never in _NEW_DSN_READINGS:
+        source = source.replace(fragment, never)
+    compiled = pattern if source == pattern.pattern else re.compile(source, pattern.flags)
+    if len(_WITHOUT_NEW_DSN_READINGS) >= 64:  # only patched test patterns get here
+        _WITHOUT_NEW_DSN_READINGS.clear()
+    _WITHOUT_NEW_DSN_READINGS[id(pattern)] = (pattern, compiled)
+    return compiled
 
 
 def _pre_camel_sub(
@@ -3295,14 +3525,23 @@ def _union(
     folded: str | None,
     read: Callable[[re.Pattern[str]], re.Pattern[str]] | None = None,
     sub: _Sub | None = None,
+    *,
+    new_dsn_readings: bool = True,
 ) -> str:
     """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
     :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
     hid it, one ``placeholder`` for the run. That reading's own output instead where the shipped one
     would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
-    they are by default; :func:`_scrub_credentials` passes the reading without the tails."""
+    they are by default; :func:`_scrub_credentials` passes the reading without the tails. The
+    traced shipped reading also leaves out the two readings batch 20010 added to the widened DSN
+    pass (:func:`_without_new_dsn_readings`); the shortcut, which applies ``sub``, leaves them out
+    only when ``new_dsn_readings`` is False. ``new_dsn_readings`` reaches every :func:`_run`
+    here, the probes and the reading before included, and with it False no run here applies the
+    member-tail pass (:data:`_DSN_MEMBER_TAIL`) or those two readings."""
     before = _Trace(len(text), _pre_camel)
-    shipped = _Trace(len(text), _same if read is None else read)
+    shipped_read = _same if read is None else read
+    # Without the two widened DSN readings batch 20010 added; the function says why.
+    shipped = _Trace(len(text), lambda pattern: shipped_read(_without_new_dsn_readings(pattern)))
     try:
         # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as it was
         # before BACKLOG #5386 widened that reading. Decided on the widened one, a line where that
@@ -3325,20 +3564,34 @@ def _union(
         # code review).
         fallback = True
         try:
-            _run(text, placeholder, folded, _narrow_probe_sub, wide=False)
+            _run(
+                text,
+                placeholder,
+                folded,
+                _narrow_probe_sub,
+                wide=False,
+                new_dsn_readings=new_dsn_readings,
+            )
         except _Changed:
             pass
         else:
             try:
-                _run(text, placeholder, folded, _probe_sub, wide=False)
+                _run(
+                    text,
+                    placeholder,
+                    folded,
+                    _probe_sub,
+                    wide=False,
+                    new_dsn_readings=new_dsn_readings,
+                )
             except _Changed:
                 fallback = False
             else:
-                return _run(text, placeholder, folded, sub)
-        old = _run(text, placeholder, folded, before.sub)
-        new = _run(text, placeholder, folded, shipped.sub)
+                return _run(text, placeholder, folded, sub, new_dsn_readings=new_dsn_readings)
+        old = _run(text, placeholder, folded, before.sub, new_dsn_readings=new_dsn_readings)
+        new = _run(text, placeholder, folded, shipped.sub, new_dsn_readings=new_dsn_readings)
     except _Untraceable:
-        return _run(text, placeholder, folded, _pre_camel_sub)
+        return _run(text, placeholder, folded, _pre_camel_sub, new_dsn_readings=new_dsn_readings)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
     old_masks: dict[int, str] = {}

@@ -817,7 +817,22 @@ _UNSCANNABLE_RE_PATTERNS = {
     # where the user's first segment is a placeholder (a conditional on its named group
     # ``dsn_placeholder``) the run is followed by tail groups (``_DSN_TAIL``), each an "@" then a
     # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before the
-    # next "@", so the repeats tile the text; the final "@" follows the tail.
+    # next "@", so the repeats tile the text; the final "@" follows the tail. Since batch 20010
+    # (BACKLOG #5386) the user's host words repeat, a possessive ``*+`` over an "@" and the possessive
+    # host word, which holds no "@", so the repeats tile the user; and after user@host a password
+    # may open with a possessive run of "@" (group ``host_lead``), which the segment cannot start
+    # with. Those two readings take ``_DSN_QUALIFIED_WIDE_SEGMENT`` and ``_DSN_QUALIFIED_RUN``
+    # instead, chosen by conditionals: the same shapes, with a stop lookahead that also tries
+    # ``_DSN_KEY_QUALIFIER``, an optional "_" and one word or a possessive digit run, after a
+    # matched word only, so the cost per character stays bounded. ``_DSN_MEMBER_TAIL`` splices ``_DSN_RUN_CHAR`` (``_DSN_RUN_STOP`` and one class) and
+    # ``_MEMBER_KEY_RUN``. Its key lookahead is a lazy run to each ";", where ``_MEMBER_KEY_RUN``
+    # reads the key: a lazy run that tries the word alternation, and a bounded qualifier, at each
+    # offset of the key, so a key character is read about as many times as the longest word is long,
+    # then a possessive key run. That is bounded per character, not "twice at most", so lengthening
+    # the word list raises the constant and never the order. The lookahead stops at the first "/",
+    # "@" or whitespace, so a scheme start reads to the next DSN's "/" at most. The password is
+    # possessive, and the tail is a possessive run of ``_DSN_RUN_CHAR``, then a fixed-width
+    # lookahead. The stopwatch is ``tests/test_b532w3_redaction_5386.py``.
     # BACKLOG #5546 to #5548: the four label patterns that take a masked tail, ``_BEARER``,
     # ``_MEFOR_SECRET``, ``_CREDENTIAL_KV`` and ``_KEY_MATERIAL``, splice ``_BYTES_PROBE`` and a tails
     # fragment, and ``_BEARER`` also ``_MARKED_SCHEME_WORDS``; the query filter in ``logging_setup``
@@ -830,8 +845,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # repetition the tails add is possessive or bounded, the label stops in ``_NO_LABEL_BEFORE`` are
     # fixed-width lookbehinds with no repetition, and each tail group is optional and possessive after the whole
     # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
-    # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
-    # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
+    # stops; why it is linear is on the pattern. The three ``source`` entries are ``_pre_camel``'s,
+    # ``_without_tails``' and ``_without_new_dsn_readings``' compiles of a shipped pattern rewritten
+    # at runtime; the last only puts a ``(?!)`` at the head of two groups, which adds no repetition.
     "messagefoundry/secretscrub.py": (
         "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
@@ -839,8 +855,10 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])|' + _MEFOR_GLUED_BRANCH + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)' + _MEFOR_TAILS",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')' + _KV_TAILS",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')' + _KV_TAILS",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++(?:(?P<more_at>@)[a-z0-9.\\\\-]++)*+)?):(?(2)(?:(?P<host_lead>@++)(?!mfb64:)|(?![0-9]++(?![a-z0-9_])|@)(?(more_at)(?!mfb64:)))' + '(?(more_at)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|(?(host_lead)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|' + _DSN_WIDE_SEGMENT + '))' + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + '(?(more_at)' + _DSN_QUALIFIED_RUN + '|(?(host_lead)' + _DSN_QUALIFIED_RUN + '|' + _DSN_RUN + '))' + _DSN_TAIL + '@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]++://[^\\\\s:/@]++):(?=[^\\\\s/@]*?;' + _MEMBER_KEY_RUN + '=)[^\\\\s/@]++@(?P<dsn_member_tail>(?:' + _DSN_RUN_CHAR + ')++)(?=[;\\\\s]|\\\\Z)'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
+        "source",
         "source",
         "source",
     ),
