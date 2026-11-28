@@ -391,7 +391,7 @@ fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64
 # in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
 # 2026-07-29. The [webconsole] extra below installs it from the index, with a floor and no ceiling
 # (packaging/messagefoundry-webconsole/RELEASE.md step 1); the console's own floor on the engine
-# makes the pair a cycle, which uv and pip both resolve. CI and a checkout still use
+# makes the pair a cycle. CI and a checkout still use
 # `-e packaging/messagefoundry-webconsole`. With the package absent, serve refuses an explicit
 # serve_web_console=true and degrades a default-on console to JSON-only with a warning (__main__).
 # The legacy [api].serve_ui key is rejected at load (ADR 0118, settings._RELOCATED_TO_SECURITY).
