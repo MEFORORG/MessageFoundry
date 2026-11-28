@@ -85,13 +85,9 @@ MISSED = [
     f'{{\n  "given": [x]\n  {SECRET}}}\n}}',
     # The key's own container closed, then a colon: the walk has returned before it.
     f'{{"given": [Jane]}}:{SECRET}}}',
-    # A container after a scalar value.
-    f'"given": x [{SECRET}]',
     # A line break after the colon: the walk reads no value on the next line (as on origin/main).
     f'"telecom":\n[a|b|c ) , {{"value": "{SECRET}"}}]',
     f'{{"telecom":\n  [{{"value": "{SECRET}"}}]}}',
-    # The placeholder written by the text itself, inside a searched object.
-    f'{{"identifier": {{"system": "x", "value": [redacted] {SECRET}}}}}',
     # A member after a comma with no key: the walk reads it under the object's policy.
     f'{{"identifier": {{"value": ["x"], {SECRET}}}}}',
     # A closer of the enclosing object's kind, then the token, then a stray closer.
@@ -100,15 +96,131 @@ MISSED = [
     f'{{"given": (Jane): {SECRET}}}',
     # A token after a scalar value: the run-on rule reads only what follows a container.
     f'"family": "Doe" {SECRET}',
-    # The placeholder written by the text itself, which a second pass must be able to read.
-    f'"given": [redacted] {SECRET}',
-    # An UNBRACKETED field run, then the token, top-level, in an object and nested (kept on
-    # origin/main 4ad697da713 too). Why: the `_json_value_runs_on` docstring.
+    # A field run, then a line break before the token: the line break ends a top-level value.
+    f'"given": [a|b|c]\n {SECRET}',
+    f'{{"given": [a|b|c]\n {SECRET}}}',
+    # A string after the field run's placeholder: the read-on takes a bare token only.
+    f'"given": a|b|c "{SECRET}"',
+    # A token glued to a count note reads as a callable's name, which the walk keeps.
+    f'"given": a|b|c {SECRET}\u2026(+12 chars)',
+    # A comma ends the value, as it does with no field run (`"given": Doe, Jane`).
+    f'"given": a|b|c x, {SECRET}',
+    # A container after a scalar value.
+    f'"given": x [{SECRET}]',
+    # A run that reaches a label or a quote: the read-on stops at the placeholder rather than take
+    # a label another pass reads (`_placeholder_runs_on`).
+    f"\"given\": a|b|c {SECRET} <given value='x'",
+    f'"given": a|b|c {SECRET}"',
+]
+
+#: An UNBRACKETED field run, then a token, each kept on origin/main 4ad697da713 and on this
+#: row's earlier heads. A field-run pass runs before the JSON walk and writes ``[redacted]`` for
+#: the run, so the token after it read as no key's value (top level) or under the enclosing
+#: object's policy (nested). The walk now reads on past that placeholder
+#: (``_placeholder_runs_on``) and keeps a scrubbed container's policy after it
+#: (``_policy_after_close``). Not a value the walk blanks whole: each keeps its keys.
+FIELD_RUN = [
     f'"given": a|b|c {SECRET}',
     f'{{"given": a|b|c {SECRET}}}',
     f'{{"family": DOE^JANE^Q {SECRET}}}',
     f'{{"identifier": {{"value": a|b|c {SECRET}}}}}',
+    f'"given": a|b|c Jane Doe {SECRET}',
+    f'"given": a|b|c 1980-05-05 {SECRET}',
+    f'"given": a|b|c 123-45-6789 {SECRET}',
+    f'"given": a|b|c {SECRET}, Jane',
+    f'{{"given": x a|b|c {SECRET}}}',
+    f'"given": x a|b|c {SECRET}',
+    f'"identifier": a|b|c {SECRET}',
+    f'[{{"given": a|b|c {SECRET}}}]',
+    f'{{"telecom": [{{"value": a|b|c {SECRET}}}]}}',
+    f'"name": a|b|c {SECRET}',
+    f'"address": a|b|c {SECRET}',
+    f'{{"name": a|b|c {SECRET}}}',
+    f'"given": a|b|c\t{SECRET}',
+    f'"given":\ta|b|c {SECRET}',
+    f'"given": a|b|c {SECRET}\n[redaction bound: dropped 12 more chars unscanned]',
+    # The placeholder written by the text itself, top level and inside a searched object.
+    f'"given": [redacted] {SECRET}',
+    f'{{"identifier": {{"system": "x", "value": [redacted] {SECRET}}}}}',
 ]
+
+
+@pytest.mark.parametrize("scrub", SCRUBBERS)
+@pytest.mark.parametrize("text", FIELD_RUN)
+def test_a_token_after_a_field_run_is_hidden(scrub: Callable[[str], str], text: str) -> None:
+    once = scrub(text)
+    assert SECRET not in once and once != PLACEHOLDER, once
+    assert scrub(once) == once
+
+
+#: The FIELD_RUN texts origin/main 4ad697da713 kept the token of. The others are pinned because
+#: the same change reaches them, and main hid them already.
+FIELD_RUN_MAIN_KEPT = [text for text in FIELD_RUN if "Jane" not in text]
+
+
+@pytest.mark.parametrize("text", FIELD_RUN_MAIN_KEPT)
+def test_origin_main_kept_each_field_run_token(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control: with this branch's rules off, each such text keeps its token."""
+    _rules_off(monkeypatch)
+    assert SECRET in redact(text)
+
+
+#: Texts the differential against origin/main found printing words main's bounded answer had cut,
+#: on earlier forms of the read-on: it wrote one placeholder for a long token, or for a run whose
+#: label and value main scrubbed in two passes, so the answer was shorter and the bound cut later.
+CUT_SHIFT = [
+    "A^B^C['given': Pqwertypassword=password=<value value=\n[redaction bound: x]'name':"
+    "Authorization: Bearer <value value=password=PID|1||Hunter2pw>\n1980-05-05Hunter2pw>"
+    '"identifier": 10.1.2.3"telecom":Hunter2pwhttps://h:1/p</name>DOE^JANE^Q 1980-05-05Hunter2pwQzorvex',
+    '"identifier": [redacted]A^B^C"system": MRN 123456\t123-45-6789(A^B^C"identifier": https://h:1/p'
+    ' "name":\'given\': token="system": Doe, Jane"address": \tJane Doe"address": Authorization: Bearer'
+    " >OtherPatientIDs=DOE^JANE>frozenset(\"0010ABCD\": MRN: 'given': ",
+    f'"given": a|b|c 1980-05-05Hunter2pw{SECRET}',
+    '"given": a|b|c MRN 123456',
+]
+
+
+@pytest.mark.parametrize("text", [*FIELD_RUN, *CUT_SHIFT])
+def test_the_read_on_never_shortens_the_answer(text: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shorter answer lets a length bound keep text it cut before, so the read-on writes each
+    token it scrubs at the token's own length at least (``_padded``). Each of these is at least
+    as long as with this branch's rules off."""
+    ours = redact(text)
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        theirs = redact(text)
+    assert len(ours) >= len(theirs) or ours == PLACEHOLDER, (ours, theirs)
+
+
+@pytest.mark.parametrize("limit", [60, 200])
+@pytest.mark.parametrize("text", CUT_SHIFT)
+def test_a_cut_shift_text_prints_no_word_the_rules_off_answer_hid(
+    text: str, limit: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ours = safe_text(text, limit=limit)
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        theirs = safe_text(text, limit=limit)
+    assert not _words(ours) - _words(theirs) - _NOTE_WORDS, (ours, theirs)
+
+
+#: Texts the read-on leaves as they were: a value after the placeholder that is not the field run's.
+FIELD_RUN_KEPT = [
+    ('"given": a|b|c\nstep 2 done', '"given": [redacted]\nstep 2 done'),
+    ('{"given": a|b|c, "status": "ok"}', '{"given": [redacted] "status": "ok"}'),
+    ('"given": a|b|c token=x', None),
+    ('{"system": [redacted] ok}', '{"system": [redacted] ok}'),
+    ('"given": ["x"]\u2026(+12 chars)', '"given": ["[redacted]"]\u2026(+12 chars)'),
+    ('"given": a|b|c\u2026(+12 chars)', None),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), FIELD_RUN_KEPT)
+def test_the_read_on_stops_where_the_value_ends(text: str, expected: str | None) -> None:
+    once = safe_text(text)
+    if expected is not None:
+        assert once == expected
+    assert safe_text(once) == once
 
 
 @pytest.mark.parametrize(
@@ -357,7 +469,7 @@ def _cases() -> list[str]:
     Not cached: the results come from whatever ``redact`` is live, so a cache filled while a test
     had the rules patched off would hand that test's answers to every later test. The pure part,
     the literals, is cached in :func:`_redaction_suite_strings`."""
-    texts = [*STRAY, *RUN_ON, *MISSED, *(text for text, _ in BALANCED), *KNOWN_COST]
+    texts = [*STRAY, *RUN_ON, *MISSED, *FIELD_RUN, *(text for text, _ in BALANCED), *KNOWN_COST]
     texts += _redaction_suite_strings()
     return texts + [redact(text) for text in texts]
 
@@ -385,6 +497,8 @@ def test_the_structure_walk_matches_the_token_walk() -> None:
 def _rules_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """Turn this branch's rules off, which leaves the scrubber origin/main 4ad697da713 shipped."""
     monkeypatch.setattr(redaction, "_json_value_runs_on", lambda *_a, **_k: False)
+    monkeypatch.setattr(redaction, "_placeholder_runs_on", lambda *_a, **_k: None)
+    monkeypatch.setattr(redaction, "_policy_after_close", lambda *a: a[-1])
     monkeypatch.setattr(redaction, "_runs_on_as_received", lambda _text: False)
     monkeypatch.setattr(
         redaction, "_stray_json_closer", lambda text: _token_walk(text, run_on=False)
@@ -416,6 +530,7 @@ def _differential_fuzz(count: int) -> list[str]:
     parts += ["password=", "password: ", "token=", "Authorization: Bearer ", "https://h:1/p"]
     parts += ["PatientID: ", "PatientName=", "MRN 123456", "DOE^JANE", "PID|1||", PLACEHOLDER]
     parts += ["\u2026(+3 chars)", "frozenset(", "date(", "1980-05-05", "Doe, Jane", "<given value="]
+    parts += [" a|b|c ", "DOE^JANE^Q ", "123-45-6789", "\t", "x a|b|c "]
     return ["".join(rng.choices(parts, k=rng.randint(1, 30))) for _ in range(count)]
 
 
@@ -448,9 +563,15 @@ def _words_main_hid(
         for got, main in zip(mine, theirs, strict=True):
             if got != main:
                 changed += 1
-                if set(_WORD.findall(got)) - set(_WORD.findall(main)) - _NOTE_WORDS:
+                if _words(got) - _words(main) - _NOTE_WORDS:
                     leaks.append(text)
     return leaks, changed
+
+
+def _words(answer: str) -> set[str]:
+    """The words of ``answer`` past its count notes. A note's number counts what a cut dropped, so a
+    scrub that hides more moves it, and it is not text the answer printed."""
+    return set(_WORD.findall(redaction._COUNT_NOTE.sub("", answer)))
 
 
 def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.MonkeyPatch) -> None:
