@@ -1931,13 +1931,14 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
     starts at the first index :func:`_glue_head_start` finds; the passes it models read only the
     characters it keeps; at least one pass, the connection-string member key reader in
     ``secretscrub``, also reads a key's characters before them, and :data:`_MEMBER_KEY_HEADS` keeps
-    those. The credential filters' camelCase start also reads the masked letter before a kept
-    capital, which must be lower-case there; the mask keeps it so (:data:`_SHAPE` keeps a
-    letter's case). A line break before the end is read as the text's end, since an answer is
-    stripped before a caller glues to it (``</family Li`` then a line break masks ``Li``).
-    ``None`` keeps the rest as it stood where those rules refuse it for another reason:
-    :func:`_rest_words` refuses it, its last word holds a digit, or the mask would leave nothing
-    changed or a last word some pass reads literally."""
+    those. Two reads also rest on the mask's shape, not on what it keeps: the member reader takes
+    the masked letters before a kept head as word characters, and the credential filters'
+    camelCase start needs the masked letter before a kept capital to be lower-case. Both hold
+    because :data:`_SHAPE` masks a letter to a letter of its case. A line break before the end is
+    read as the text's end, since an answer is stripped before a caller glues to it (``</family
+    Li`` then a line break masks ``Li``). ``None`` keeps the rest as it stood where those rules
+    refuse it for another reason: :func:`_rest_words` refuses it, its last word holds a digit, or
+    the mask would leave nothing changed or a last word some pass reads literally."""
     if _rest_words(rest, camel=True) is None:
         return None
     last = list(_GLUED_WORD.finditer(rest))[-1]  # a rest _rest_words accepts holds a word
@@ -2533,9 +2534,9 @@ _UNBOUNDED_HEADS = tuple(
 _UNBOUNDED_HEAD_SET = frozenset(_UNBOUNDED_HEADS)
 #: The credential label words a camelCase start opens on, which the credential filters read inside
 #: a longer word (``userPwd=``, ``clientSecret=``), lower-cased: the glued-label words and the
-#: compound key words. That module imports this one, so they are spelled here; a test holds this set
-#: to its ``_CAMEL_WORDS``. Read for end-tag rests, at least by :func:`_holds_camel_label` and
-#: :func:`_ends_in_camel_head`.
+#: compound key words. This module is pure stdlib, so they are spelled here; a test holds this set
+#: to ``secretscrub._CAMEL_WORDS``. Read for end-tag rests, at least by :func:`_holds_camel_label`
+#: and :func:`_ends_in_camel_head`.
 _CAMEL_LABEL_WORDS = (
     *_GLUED_CREDENTIAL_WORDS,
     "sharedaccesskey",
@@ -2583,7 +2584,10 @@ _MEMBER_KEY_SUFFIXES = (
 )
 #: Every head of each key word, lower-cased, alone or followed by a qualifier, which
 #: :func:`_glue_head_start` reads at any index. It reads only a letters-only last word, so the heads
-#: holding the reader's ``_`` or its digit-run suffix are left out: none could match.
+#: holding the reader's ``_`` or its digit-run suffix are left out: none could match. A head holding
+#: a whole key word is not reached today either, since every key word is a label word and
+#: :func:`_holds_camel_label` refuses such a rest first; those heads are kept so the set follows
+#: the reader, not that refusal.
 _MEMBER_KEY_HEADS = frozenset(
     key[:end]
     for word in _MEMBER_KEY_WORDS

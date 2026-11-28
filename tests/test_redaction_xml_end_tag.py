@@ -11,6 +11,7 @@ wrong reason."""
 
 from __future__ import annotations
 
+import itertools
 import logging
 import random
 import re
@@ -418,14 +419,17 @@ def _no_glue_head(rest: str) -> str | None:
 def _split_member_key_worse(trials: int, seed: int) -> tuple[list[str], int]:
     """Each split member key whose glued value prints where the redactor without the glue-head mask
     (:func:`_no_glue_head`) hid it, and how many splits that baseline hid, over ``trials`` keys
-    split at a random index after a random word start. That baseline, not :func:`_main`, is the
-    comparison: main masks a rest no end-of-text rule refuses too, so a key split there prints on
-    main as well (``</given Kimp`` then ``wd1=``), and :func:`_main` copies every rest."""
+    split at a random index after a random word start, each read by :data:`_SPLIT_ROUTES`. That
+    baseline, not :func:`_main`, is the comparison: main masks a rest no end-of-text rule refuses
+    too, so a key split there prints on main as well (``</given Kimp`` then ``wd1=``), and
+    :func:`_main` copies every rest."""
     rand = random.Random(seed)
+    # A cut after a whole key word leaves a rest no mask touches (a label word refuses it), so the
+    # bare words, where every cut falls inside the word, are drawn three times as often.
     keys = [
         key
         for word in secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS
-        for key in (word, word + "_old", word + "Value", word + "1")
+        for key in (word, word, word, word + "_old", word + "Value", word + "1")
     ]
     worse: list[str] = []
     hidden = 0
@@ -459,16 +463,25 @@ def _split_member_key_worse(trials: int, seed: int) -> tuple[list[str], int]:
             + key[:cut]
         )
         raw = key[cut:] + "=hunter2zz;Server=x"
-        for first in (safe_text, redact):
+        for first, route in itertools.product((safe_text, redact), _SPLIT_ROUTES):
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(redaction, "_mask_keeping_glue_head", _no_glue_head)
-                baseline = secretscrub.scrub_credentials(redact(first(a) + raw))
+                baseline = route(first(a) + raw)
             if "hunter2zz" in baseline:
                 continue
             hidden += 1
-            if "hunter2zz" in secretscrub.scrub_credentials(redact(first(a) + raw)):
-                worse.append(f"{first.__name__}: {a!r} + {raw!r}")
+            if "hunter2zz" in route(first(a) + raw):
+                worse.append(f"{first.__name__}, {route.__name__}: {a!r} + {raw!r}")
     return worse, hidden
+
+
+def _credential_filter(text: str) -> str:
+    return secretscrub.scrub_credentials(redact(text))
+
+
+#: The routes the generated split-key arm reads a joined text by: the credential filter after
+#: :func:`redact`, and the log chain.
+_SPLIT_ROUTES: tuple[Callable[[str], str], ...] = (_credential_filter, _through_the_chain)
 
 
 def test_a_split_member_key_prints_nothing_the_rest_kept_whole_hid() -> None:
