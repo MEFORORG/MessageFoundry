@@ -153,6 +153,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // What each control showed right after it was drawn: an untouched control still shows exactly
     // this, whatever the browser did to the value on assignment (a text input strips CR and LF).
     const SHOWN = new WeakMap();
+    // Text boxes the user has typed into. An env key box whose recorded key holds a line break
+    // shows it without, so it judges "untouched" by this as well as by SHOWN: retyping what the box
+    // shows is the user's repair and saves the typed key, while leaving it saves the recorded key.
+    const TYPED = new WeakSet();
     // The record's inline credentials (HELD_SECRETS) and secret env references' inline defaults
     // (HELD_DEFAULTS), by key. A transport or direction change sends the host HELD_MARK in their
     // place, never the value: the host rebuilds the fields from what it is sent, so the key (and an
@@ -214,14 +218,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const choices = f.choices || [];
         const options = ['', ...choices];
         // A recorded value outside the choices gets its own option, so it shows and an untouched
-        // save keeps it, rather than the select going blank and the save dropping the key.
-        if (f.value != null && !choices.some((c) => String(c) === displayValue(f.value))) options.push(f.value);
+        // save keeps it, rather than the select going blank and the save dropping the key. A table
+        // matches a table choice by content, whatever its key order; a scalar by its text.
+        const recordedChoice = f.value == null ? undefined : choices.find((c) => sameChoice(c, f.value));
+        if (f.value != null && recordedChoice === undefined) options.push(f.value);
         for (const c of options) {
           const o = document.createElement('option');
           o.value = displayValue(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : displayValue(c);
           control.appendChild(o);
         }
-        control.value = displayValue(f.value);
+        control.value = displayValue(recordedChoice !== undefined ? recordedChoice : f.value);
       } else {
         control = document.createElement('input');
         // Never a number box, only a numeric keyboard hint: a number box reads text it cannot parse
@@ -231,6 +237,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         if (f.control === 'number' && !useEnv) control.setAttribute('inputmode', 'decimal');
         control.placeholder = useEnv ? secretHint(f) : (f.placeholder || '');
         control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
+        control.addEventListener('input', () => TYPED.add(control));
       }
       control.dataset.key = f.key;
       control.dataset.kind = f.control === 'checkbox' && !boolish ? 'text' : f.control;
@@ -240,6 +247,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       SHOWN.set(control, control.value);
       control.disabled = REMOVED_KEYS.has(f.key);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
+      // An untouched key is saved exactly as recorded (collectSettings), including what the box
+      // cannot show, so say so where the box shows something other than the saved key.
+      if (useEnv && typeof f.envKey === 'string' && (/[\\r\\n]/.test(f.envKey) || f.envKey.trim() === '')) {
+        hint.dataset.keyHint = '1';
+        hint.textContent = (hint.textContent ? hint.textContent + ' ' : '') +
+          'The recorded environment key holds line breaks or only spaces, which this box cannot show; it is saved as recorded unless you type a key here.';
+      }
       wrap.append(lab, control);
       // Switch between a literal and env(), as the legacy row's env() box did. Not for a secret: the
       // form must not be what writes a literal credential into the file (secretOnlyEnv).
@@ -302,6 +316,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // reply is drawn, not when the request is sent, so a setting kept again before the reply
       // arrives keeps its default (BACKLOG #8243 items 18 and 20). A reference under another key
       // keeps it, so the original key typed back still finds it.
+      // A rebuild's reply is drawn only when it answers the page's latest request, matched by the
+      // id the host echoes (the message handler), so a reply to an older request never reaches
+      // this prune (item 18).
       const envRefKeys = new Set();
       for (const g of groups) for (const f of g.fields) if (f.envKey !== undefined || f.envDefault !== undefined) envRefKeys.add(f.key);
       for (const k of HELD_DEFAULTS.keys()) if (!envRefKeys.has(k)) HELD_DEFAULTS.delete(k);
@@ -328,20 +345,94 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       settingRow('', '', false, '');
     }
 
-    /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
-    function requestFields() {
+    // Each fields request carries an id, one more than the last (FIELDS_SEQ). Both hosts echo it
+    // in their reply (fieldsReply in connectionEditor.ts), with the transport and direction the
+    // groups were built for. The page draws only the reply to its latest request, so a reply to an
+    // older one can neither drop nor bring back a setting (BACKLOG #8243 items 18 and 20).
+    // FIELDS_ANSWERED is the id of the latest request answered; while the two differ a request is
+    // in flight (fieldsPending). Save waits then, unless the pickers are back on the transport and
+    // direction the drawn fields were built for (savingWouldMismatch). ASKED_SETTINGS is what the
+    // latest request sent, as JSON.
+    let FIELDS_SEQ = 0;
+    let FIELDS_ANSWERED = 0;
+    // This page load's id, sent with every request and echoed with every answer. VS Code rebuilds a
+    // hidden panel from the same html and token, and the new page restarts its request ids, so an
+    // answer meant for the page before it can carry a live request id: only the page id tells the
+    // two apart. It is not a CSP nonce and no security control, but it is what keeps an earlier
+    // instance's answers off this page. It only has to differ between loads, and 64 bits of
+    // crypto.getRandomValues make two loads match only by a 2^-64 chance.
+    const FIELDS_PAGE = (() => {
+      const words = new Uint32Array(2);
+      crypto.getRandomValues(words);
+      return Array.from(words, (w) => w.toString(16).padStart(8, '0')).join('');
+    })();
+    let ASKED_SETTINGS = null;
+    // The transport and direction the drawn fields were built for, set once the load has drawn,
+    // so a request the host could not answer puts the pickers back where the fields are.
+    let DRAWN_FOR = null;
+    function fieldsPending() { return FIELDS_SEQ !== FIELDS_ANSWERED; }
+    function savingWouldMismatch() {
+      return fieldsPending() &&
+        (DRAWN_FOR.transport !== $('transport').value || DRAWN_FOR.direction !== $('direction').value);
+    }
+    // How long a request waits for its answer before it counts as failed. A reply the page
+    // discards as malformed, or a host that does not answer, would otherwise hold Save back for good.
+    const FIELDS_WAIT_MS = 20000;
+    // The "still loading" text Save showed, so a drawn reply can clear it.
+    let LOADING_TEXT = null;
+
+    /** The latest request will get no usable answer: the pickers go back to the transport and
+     *  direction the drawn fields belong to, and Save works again. */
+    function fieldsFailed(reason) {
+      FIELDS_ANSWERED = FIELDS_SEQ;
+      $('transport').value = DRAWN_FOR.transport;
+      $('direction').value = DRAWN_FOR.direction;
+      refreshVisibility();
+      LOADING_TEXT = null;
+      // The host's reason may already end in a period.
+      errorEl.textContent = reason.replace(/[.\\s]+$/, '') + '. The transport and direction are back to what the form showed before.';
+      errorEl.style.display = '';
+    }
+
+    /** Ask the extension to rebuild the descriptors when the transport or direction changes.
+     *  settings: what collectSettings(true) returns, when the caller already has it. */
+    function requestFields(settings) {
       if (!FIELD_GROUPS) { prefillHints(); return; }
       // A setting this request leaves out (removed, or its env key box empty) loses its held default
       // when the reply is drawn (renderGroups), not here.
+      if (settings === undefined) settings = collectSettings(true);
+      FIELDS_SEQ += 1;
+      ASKED_SETTINGS = JSON.stringify(settings);
+      const seq = FIELDS_SEQ;
+      setTimeout(() => {
+        if (seq === FIELDS_SEQ && fieldsPending()) fieldsFailed('No answer came for the ' + $('transport').value + ' fields');
+      }, FIELDS_WAIT_MS);
       // The request names this page's render, so the host can drop a reply that would reach a
       // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
         command: 'fields',
+        seq: FIELDS_SEQ,
+        page: FIELDS_PAGE,
         transport: $('transport').value,
         direction: $('direction').value,
-        settings: collectSettings(true),
+        settings: settings,
         ${CHANNEL_FIELD}: MF_CHANNEL,
       });
+    }
+
+    // A value as text that does not depend on key order, so a recorded table matches a table
+    // choice by content (renderField).
+    function canon(v) {
+      if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+      if (v !== null && typeof v === 'object') {
+        return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
+      }
+      return JSON.stringify(v);
+    }
+    // Whether a select's choice is the recorded value: a table choice by content, whatever its key
+    // order; a scalar choice by its text, as its option shows it.
+    function sameChoice(c, v) {
+      return c !== null && typeof c === 'object' ? canon(c) === canon(v) : displayValue(c) === displayValue(v);
     }
 
     function refreshVisibility() {
@@ -404,9 +495,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       prefillHints();
     }
     refreshVisibility();
+    DRAWN_FOR = { transport: $('transport').value, direction: $('direction').value };
 
     $('direction').addEventListener('change', () => { refreshVisibility(); requestFields(); });
-    $('transport').addEventListener('change', requestFields);
+    $('transport').addEventListener('change', () => requestFields());
     $('addSetting').addEventListener('click', () => settingRow('', '', false, ''));
 
     function coerce(text) {
@@ -431,20 +523,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // engine's validator refuses what the user typed rather than this page guessing.
     const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
-      // A select of scalar choices takes the picked choice first, with its own type: a select whose
-      // recorded value was a table must not JSON-parse a choice such as "2" into a number (BACKLOG
-      // #8243 item 31). A select with a table or array among its choices cannot match one by its
-      // text, so it keeps the earlier order: a table-valued record parses the picked JSON.
-      const choices = f.choices || [];
-      const pick = () => { const hit = choices.find((c) => String(c) === raw); return hit !== undefined ? hit : raw; };
-      const scalarChoices = !choices.some((c) => c !== null && typeof c === 'object');
-      if (f.control === 'select' && scalarChoices) return pick();
+      // A select takes the picked choice itself, with its own type, matched by the text its option
+      // was written with (displayValue): a select whose recorded value was a table must not
+      // JSON-parse a choice such as "2" into a number, and a table choice is posted as the table,
+      // whatever the other choices are (BACKLOG #8243 item 31). Text no choice matches falls through.
+      if (f.control === 'select') {
+        const hit = (f.choices || []).find((c) => displayValue(c) === raw);
+        if (hit !== undefined) return hit;
+      }
       // TOML's inf / -inf typed into a float field is carried as the tag the engine decodes; "nan"
       // is posted as typed, for the engine to refuse.
       if (f.type === 'float' && (raw === 'inf' || raw === '-inf')) return { [NON_FINITE_TAG]: raw };
       const tableValued = f.value !== null && typeof f.value === 'object' && !isNonFiniteTag(f.value);
       if (f.control === 'table' || tableValued) return parseTable(raw);
-      if (f.control === 'select') return pick();
+      if (f.control === 'select') return raw;
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
       // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
@@ -475,19 +567,22 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const f = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
-          if (!envKey) {
+          // An untouched box writes back the recorded key exactly, surrounding spaces, line breaks
+          // and a key of only spaces included: the engine looks the key up as written, so a trimmed
+          // key names another variable (BACKLOG #8243 item 19). A key the user typed is trimmed.
+          // A box that shows the recorded key is untouched while it still shows it, typed in or
+          // not; one that shows it without its line breaks is untouched only until typed in, which
+          // is how such a key is repaired (TYPED).
+          const shownKey = SHOWN.get(el);
+          const untouchedKey = f.envKey !== undefined && el.value === shownKey &&
+            (shownKey === f.envKey || !TYPED.has(el));
+          if (!envKey && !untouchedKey) {
             // No key typed. An inline credential the record already holds is written back as it
             // was, unseen (resolved from HELD_MARK below); deleting a working credential because the
             // form will not show it would be its own outage. Removed on request.
             if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
             continue;
           }
-          // An untouched box writes back the recorded key exactly, surrounding spaces included: the
-          // engine looks the key up as written, so a trimmed key names another variable (BACKLOG
-          // #8243 item 19). A key the user typed is trimmed. A recorded key holding a CR or LF is
-          // the exception: the box cannot show it, so retyping what it shows cannot be told from
-          // leaving it, and the trimmed text is written, as before, so the key can be repaired.
-          const untouchedKey = f.envKey !== undefined && !/[\\r\\n]/.test(f.envKey) && el.value === SHOWN.get(el);
           const ref = { env: untouchedKey ? f.envKey : envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
           // A held inline default goes back only with the env key it was recorded under, compared
@@ -527,7 +622,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           settings[key] = f.value;            // untouched: the recorded value, exactly
           continue;
         }
-        const raw = el.value.trim();
+        // A select's value is the picked option's, written from the choice itself, so it is not
+        // trimmed: a choice with surrounding spaces must still match (typedValue).
+        const raw = el.tagName === 'SELECT' ? el.value : el.value.trim();
         if (raw === '') continue;             // emptied -> omit the key entirely
         settings[key] = typedValue(f, raw);
       }
@@ -616,6 +713,15 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     }
 
     $('save').addEventListener('click', () => {
+      // The drawn fields belong to the transport and direction of the last answered request; until
+      // the latest one is answered, saving would post those fields under the pickers' transport,
+      // unless the pickers are back where the drawn fields are.
+      if (savingWouldMismatch()) {
+        LOADING_TEXT = 'The fields for the ' + $('transport').value + ' transport are still loading; save once they show.';
+        errorEl.textContent = LOADING_TEXT;
+        errorEl.style.display = '';
+        return;
+      }
       const conn = build();
       if (!validate(conn)) return;
       vscode.postMessage({ command: 'save', conn: conn });
@@ -644,19 +750,58 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         mfStr(f.placeholder) && mfBool(f.isEnvRef) && mfStr(f.group) && mfBool(f.known) &&
         mfBool(f.offDirection) && mfOpt(f.envKey, mfStr) && mfOpt(f.cast, mfStr);
     }
+    // A "fields" reply echoes its request's page id and request id (page, seq) and the transport and
+    // direction its groups were built for (fieldsReply in connectionEditor.ts). An "error" answering
+    // a fields request the host could not rebuild carries that request's page and id too; other
+    // errors carry neither. One carrying only one of the two is refused as malformed, so a host that
+    // half-labels an error is reported instead of leaving the page waiting.
+    const DIRECTIONS = ['inbound', 'outbound'];
     const SHAPES = {
-      error: (d) => mfStr(d.message),
-      fields: (d) => mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
+      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt) && mfOpt(d.page, mfStr) &&
+        (d.seq === undefined) === (d.page === undefined),
+      fields: (d) => mfInt(d.seq) && mfStr(d.page) && mfStr(d.transport) && mfOneOf(d.direction, DIRECTIONS) &&
+        mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
         mfOpt(g.description, mfStr) && mfArrOf(g.fields, mfFieldDescriptor)),
     };
+    // Whether an answer is to this page load's request in flight: its page id and latest id. An
+    // older request's answer no longer matters, an earlier page instance's is not this page's, and
+    // one naming no request in flight (the page never sends id 0) is not an answer at all.
+    function answersInFlight(d) { return fieldsPending() && d.page === FIELDS_PAGE && d.seq === FIELDS_SEQ; }
     ${WEBVIEW_GUARD_NOTE}
     window.addEventListener('message', (e) => {
       const d = mfTrusted(e);
       if (!d || !mfShapeOk(d, 'command', SHAPES, 'connection editor')) { return; }
-      if (d.command === 'error') { errorEl.textContent = d.message; errorEl.style.display = ''; }
+      if (d.command === 'error') {
+        if (d.seq === undefined && d.page === undefined) { errorEl.textContent = d.message; errorEl.style.display = ''; }
+        // An error naming a request is that request's answer, taken only for the request in flight.
+        else if (answersInFlight(d)) fieldsFailed(d.message);
+      }
       // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
       // module; the webview only draws what it is handed.
       if (d.command === 'fields') {
+        // Only the reply to this page's request in flight is drawn: a reply to an older one would
+        // drop or change a setting the latest request carries, or bring back one it left out, and
+        // one meant for an earlier page instance was built from that instance's settings.
+        if (!answersInFlight(d)) return;
+        // Every picker change sends a new request, so this page's answer names the pickers'
+        // transport and direction; a reply that does not was mislabelled by its host. It is still
+        // this request's answer, so it ends the wait rather than holding Save back until the timeout.
+        if (d.transport !== $('transport').value || d.direction !== $('direction').value) {
+          fieldsFailed('The fields the editor sent were built for a different transport or direction');
+          return;
+        }
+        // The form changed since the latest request (a setting removed, kept again, emptied,
+        // retyped or switched between a literal and env()): drawing its reply would undo that, so
+        // ask again with the form as it is now (BACKLOG #8243 items 18 and 20). Each reply sends at
+        // most one request, and the form does not change until a reply is drawn, so this stops once
+        // the user stops editing. Save waits meanwhile (fieldsPending). An edit collectSettings does
+        // not record (a value in a row with no key yet) is still lost when the reply is drawn.
+        const now = collectSettings(true);
+        if (JSON.stringify(now) !== ASKED_SETTINGS) { requestFields(now); return; }
+        if (LOADING_TEXT !== null && errorEl.textContent === LOADING_TEXT) { errorEl.textContent = ''; errorEl.style.display = 'none'; }
+        LOADING_TEXT = null;
+        FIELDS_ANSWERED = d.seq;
+        DRAWN_FOR = { transport: d.transport, direction: d.direction };
         FIELD_GROUPS = d.groups;
         renderGroups(FIELD_GROUPS);
       }

@@ -3,6 +3,7 @@
 // Where a `messagefoundry validate --json` diagnostic lands in the Problems panel (BACKLOG #5847).
 // vscode-free so the node-side unit suite can drive it; validate.ts turns the result into a Uri.
 import * as path from "node:path";
+import { foldAsciiCase } from "./pathFold";
 import { IS_WIN32, resolveAgainst } from "./pathIdentity";
 
 /** One entry of `validate --json`: the engine's `Diagnostic` (config/wiring.py) carries no line field. */
@@ -41,7 +42,9 @@ export function diagnosticLocation(
   let line = 0;
   if (m) {
     const name = (win32 ? path.win32 : path.posix).basename(file);
-    const same = win32 ? m[1].toLowerCase() === name.toLowerCase() : m[1] === name;
+    // ASCII-only on Windows: toLowerCase() would take a module spelled with U+212A KELVIN SIGN for
+    // this file's "k" one, a different file on NTFS (pathFold.ts, BACKLOG #5832).
+    const same = win32 ? foldAsciiCase(m[1]) === foldAsciiCase(name) : m[1] === name;
     if (same) {
       line = Math.max(Number(m[2]) - 1, 0);
     }
