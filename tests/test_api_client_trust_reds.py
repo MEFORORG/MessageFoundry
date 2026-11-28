@@ -9,10 +9,14 @@ against that tree and against main, and the fail-before reading is this module's
 * #5627: a revoked intermediate CA refuses the clients under it; a CRL another principal can
   write refuses the build under ``enforce``.
 * #5628: a leaf with no clientAuth extended key usage maps to nobody, in a real handshake that
-  OpenSSL accepts; a repeat leaf costs no second issuer signature check.
-* #5904: :func:`~messagefoundry.api.security.resolve_client_cert_identity` does not authenticate a
+  OpenSSL accepts; a repeat leaf costs no second issuer signature check. That is the cache only:
+  a leaf's first connection still checks its issuer's signature on the event loop.
+* #5904, through the resolver's ``scope['transport']`` fallback only:
+  :func:`~messagefoundry.api.security.resolve_client_cert_identity` does not authenticate a
   request whose socket peer is a declared proxy as the principal the proxy's own certificate maps
-  to, so the identity can no longer disagree with the forwarded address the audit records.
+  to. Under ``serve`` that fallback is not reached: the shim's proxy rule is what refuses there,
+  and its red is ``test_serve_never_stashes_a_declared_proxys_certificate`` in
+  ``tests/test_api_tls_client_trust.py`` (engine PR 3179).
 
 Each refusal has a control that admits, so a refusal is the fix and not a fixture that refuses
 everyone. All material is synthetic and minted here. No PHI.
