@@ -315,6 +315,62 @@ def test_the_batch_20010_readings_refuse_an_mfb64_password() -> None:
     assert wide.search("postgres://ops@srv:mfb64:v1:x@corp.example") is not None
 
 
+#: A DSN only the batch 20010 readings read, inside a camelCase value the reading before hid
+#: whole (BACKLOG #5386, Lander hold on PR 3397). At ``5c29af1aeaa`` the union kept the ":" and "@"
+#: signs those readings write as fixed text, and each line printed
+#: ``x accessToken=<redacted>:@<redacted>@<redacted>`` and
+#: ``x accessToken=<redacted>:<redacted>@<redacted>`` on all three entry points below.
+#: ``origin/main`` prints ``x accessToken=<redacted>`` on each.
+_CAMEL_VALUE_NEW_READING = (
+    "x accessToken=(Bearer Tk9~redis://ops@srv:@Kv9@db",
+    "x accessToken=(Bearer Tk9~redis://a@b@srv:Kv9@db",
+)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [scrub_credentials, scrub_log_text, _one_handler],
+    ids=("scrub_credentials", "write-time chain", "one handler"),
+)
+@pytest.mark.parametrize("line", _CAMEL_VALUE_NEW_READING)
+def test_a_new_reading_inside_a_camelcase_value_prints_what_origin_main_prints(
+    line: str, call: Callable[[str], str]
+) -> None:
+    assert call(line) == "x accessToken=<redacted>"
+
+
+@pytest.mark.parametrize("call", [*_ENTRY_POINTS, _one_handler], ids=(*_IDS, "one handler"))
+@pytest.mark.parametrize(
+    "line",
+    ["x postgres://a@b@srv:Pwd2=Kv9@Sec_77;UID=u", "x postgres://ops@srv:@Pwd2=Kv9@Sec_77;UID=u"],
+    ids=("more_at", "host_lead"),
+)
+def test_a_qualified_key_in_a_new_readings_segment_keeps_its_value_hidden(
+    line: str, call: Callable[[str], str]
+) -> None:
+    """The segment after a user holding a second "@", and after the "@" signs that open a
+    password after user@host, stops at a qualified key (``_DSN_QUALIFIED_WIDE_SEGMENT``), so the
+    member pass still reads ``Pwd2=``. With the plain segment in either branch, ``Sec_77`` printed
+    on each entry point here (code review of PR 3397)."""
+    out = call(line)
+    assert "Sec_77" not in out and "Kv9" not in out, out
+
+
+def test_the_union_strip_finds_both_new_readings() -> None:
+    """``_without_new_dsn_readings`` matches its two group fragments literally, so a respelled
+    group would make it change nothing, silently; this holds both fragments in the widened
+    pattern and the derived reading apart from it (code review of PR 3397)."""
+    wide = scrub_mod._WIDE_DSN_PASSWORD
+    for fragment, _never in scrub_mod._NEW_DSN_READINGS:
+        assert fragment in wide.pattern, fragment
+    derived = scrub_mod._without_new_dsn_readings(wide)
+    assert derived is not wide
+    assert derived.search("postgres://a@b@srv:Kv9@db") is None
+    assert derived.search("postgres://ops@srv:@Kv9@db") is None
+    assert derived.search("postgres://ops@srv:Kv9@db") is not None
+    assert wide.search("postgres://a@b@srv:Kv9@db") is not None
+
+
 def test_the_member_tail_head_is_the_narrow_head_and_its_key_qualifier_the_member_passs() -> None:
     """``_DSN_MEMBER_TAIL`` hides what the narrow pass would at the same start, so its head must be
     the narrow pattern's, possessive; and the new readings' run stop reads the qualifier the member pass reads, where the run ``origin/main`` had does not."""

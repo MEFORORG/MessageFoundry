@@ -5,5 +5,6 @@
   - `x postgres://ops@srv:@Kv9x@db.invalid`
   - `jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;`
 
-  What still prints is stated in the comments on `_WIDE_DSN_PASSWORD` and `_DSN_MEMBER_TAIL` in
-  `messagefoundry/secretscrub.py`. (`BACKLOG #5386`)
+  What still prints includes at least the residuals stated in the comments on `_WIDE_DSN_PASSWORD`
+  and `_DSN_MEMBER_TAIL` in `messagefoundry/secretscrub.py`; that list is not complete.
+  (`BACKLOG #5386`)

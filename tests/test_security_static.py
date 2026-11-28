@@ -845,8 +845,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # repetition the tails add is possessive or bounded, the label stops in ``_NO_LABEL_BEFORE`` are
     # fixed-width lookbehinds with no repetition, and each tail group is optional and possessive after the whole
     # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
-    # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
-    # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
+    # stops; why it is linear is on the pattern. The three ``source`` entries are ``_pre_camel``'s,
+    # ``_without_tails``' and ``_without_new_dsn_readings``' compiles of a shipped pattern rewritten
+    # at runtime; the last only puts a ``(?!)`` at the head of two groups, which adds no repetition.
     "messagefoundry/secretscrub.py": (
         "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
@@ -857,6 +858,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++(?:(?P<more_at>@)[a-z0-9.\\\\-]++)*+)?):(?(2)(?:(?P<host_lead>@++)(?!mfb64:)|(?![0-9]++(?![a-z0-9_])|@)(?(more_at)(?!mfb64:)))' + '(?(more_at)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|(?(host_lead)' + _DSN_QUALIFIED_WIDE_SEGMENT + '|' + _DSN_WIDE_SEGMENT + '))' + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + '(?(more_at)' + _DSN_QUALIFIED_RUN + '|(?(host_lead)' + _DSN_QUALIFIED_RUN + '|' + _DSN_RUN + '))' + _DSN_TAIL + '@'",
         "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]++://[^\\\\s:/@]++):(?=[^\\\\s/@]*?;' + _MEMBER_KEY_RUN + '=)[^\\\\s/@]++@(?P<dsn_member_tail>(?:' + _DSN_RUN_CHAR + ')++)(?=[;\\\\s]|\\\\Z)'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
+        "source",
         "source",
         "source",
     ),
