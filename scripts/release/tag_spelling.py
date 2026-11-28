@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Refuse an engine release tag that a verifier cannot rebuild from the wheel (BACKLOG #2534).
+"""Refuse a release tag that a verifier cannot rebuild from the wheel (BACKLOG #2534).
 
 The release trigger fires on any ``vX.Y.Z-*`` tag, and the version gate compares the tag with the
 built version as PEP 440 versions. So ``v0.5.0-rc.1``, ``v0.5.0-alpha1`` and ``v0.5.0-post1`` would
@@ -14,7 +14,12 @@ that works only when each version has one tag spelling. This script allows exact
 No number may carry a leading zero, because PEP 440 drops it and the wheel could not say it.
 ``.post`` and ``.dev`` releases have no tag spelling, so they are refused.
 
-Usage: ``python scripts/release/tag_spelling.py "$GITHUB_REF_NAME"``.
+The web console's ``webconsole-v*`` tags are checked too, with the ``webconsole-`` prefix
+stripped first: the console carries the engine's version and has no ``.postN`` releases (owner
+ruling 2026-11-28), so a console tag is ``webconsole-`` followed by an engine tag spelling.
+
+Usage: ``python scripts/release/tag_spelling.py "$GITHUB_REF_NAME"``, or
+``"${GITHUB_REF_NAME#webconsole-}"`` for a console tag.
 """
 
 from __future__ import annotations

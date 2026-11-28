@@ -61,7 +61,7 @@ flowchart TB
   HARN["release-harness job<br/>build wheel, member gate, smoke test"]:::build
   GHPUB["publish-github-release job<br/>publish the draft once every asset is on it"]:::build
   TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
-  WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
+  WEB["release-webconsole job<br/>tag spelling check, build wheel, member gate, smoke test, engine floor gate"]:::build
   PUBWEB["publish-pypi-webconsole job, environment pypi<br/>check the digests, publish the console wheel"]:::build
   WEBPUB["publish-github-release-webconsole job<br/>publish the console draft once the upload job has succeeded"]:::build
 
@@ -105,7 +105,7 @@ flowchart TB
   PUBENG --> GHPUB
   PUBHARN --> GHPUB
   GHPUB -->|"publish the release"| GH
-  MAIN -->|"a maintainer tags a console release"| TAGW
+  MAIN -->|"a maintainer tags the console, once the engine release is on PyPI"| TAGW
   TAGW --> PROV
   PROV --> WEB
   WEB -->|"create the release as a draft"| GH

@@ -1578,6 +1578,16 @@ jobs:
         with:
           python-version-file: ci/python-version
 
+      # The engine job's tag-spelling guard (BACKLOG #2534), on the console tag with its
+      # `webconsole-` prefix stripped. The trigger accepts any `webconsole-vX.Y.Z-*` tag, so without
+      # this `webconsole-v0.5.3-post1` would run the job, and the release step below marks any
+      # hyphenated tag a GitHub pre-release. A `.postN` console release is what the version rule
+      # forbids (owner ruling 2026-11-28), and no engine tag can pair with that spelling. Runs
+      # first, before anything is built.
+      - name: The tag is spelled webconsole-vX.Y.Z or webconsole-vX.Y.Z-(a|b|rc)N
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: python scripts/release/tag_spelling.py "${GITHUB_REF_NAME#webconsole-}"
+
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
           # Hash-pinned like every other build job on this path: this workflow's jobs hold write scopes
