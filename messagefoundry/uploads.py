@@ -353,10 +353,13 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
     when that lands after the pin and before this call (BACKLOG #8341 item 2). It sees nothing that
     lands at another time, at least before the pin or after this call. An answer proves nothing
     about the entries under it. A file system that reports no stable identity, such as one that
-    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``, and one that
-    mints an identity on the client, at least a CIFS mount with ``noserverino`` or a FUSE mount
-    without stable inode numbers, can stop a sound pass, which then removes nothing more. Text and
-    not the exception, whose traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``. One that
+    answers ``st_dev`` as 0 too on both reads, as a Windows ``stat`` that falls back to reading the
+    parent's directory entry can, shows no swap at all. One that mints an identity on the client, at
+    least a CIFS mount with ``noserverino`` or a FUSE mount without stable inode numbers, can stop a
+    sound pass, which then removes nothing more, and can do so pass after pass, leaving orphans past
+    retention. Text and not the exception, whose traceback would hold the sweep's frame, and so its
+    whole listing, until a cyclic collection."""
     try:
         now = root.stat()
     except OSError as exc:
@@ -382,8 +385,10 @@ def _root_never_made(root: Path) -> bool:
     ``False`` when the root's own name is there, as a link, junction or mount point whose target is
     lost is; when an ancestor's name is there but does not answer, as a dangling link; when none
     answers, as above a drive letter that is no longer mapped; when one answers as something else;
-    or when one fails for any other cause. The sweep then raises rather than reports a clean pass
-    (BACKLOG #8341 item 4). At least these still read as a root never made: a root deleted after
+    or when one fails for any other cause. The sweep then raises rather than reports a clean pass,
+    unless the root answers as a folder by the time it checks again, which
+    :meth:`UploadStore._sweep_orphans_sync` reads as a save having just made it (BACKLOG #8341
+    item 4). At least these still read as a root never made: a root deleted after
     its first save, and a root under a POSIX mount point whose share dropped, since that mount point
     still answers."""
     if os.path.lexists(root):
