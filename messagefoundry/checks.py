@@ -1368,7 +1368,7 @@ def _takes_fileobj_mode(call: ast.Call, resolver: _NameResolver) -> bool:
 
 def _is_bytesio_call(node: ast.expr, resolver: _NameResolver) -> bool:
     """``node`` is a call written ``io.BytesIO(...)``, with ``io`` a module imported by that name and
-    bound no other way here. A BytesIO has no ``mode`` attribute."""
+    bound no other way this resolver reads. A BytesIO has no ``mode`` attribute."""
     return (
         isinstance(node, ast.Call)
         and _dotted_call_name(node.func) == "io.BytesIO"
@@ -1630,7 +1630,9 @@ class _NameResolver:
         )
 
     def is_module_named_directly(self, name: str) -> bool:
-        """``name`` is a module imported by that name and bound no other way here."""
+        """``name`` is a module imported by that name and bound no other way this resolver reads; it
+        does not see every dynamic rebinding (``__globals__``, frames, ``importlib``, and at least
+        others)."""
         return name in self._imported and self.is_unbound(name)
 
     def may_patch(self, module: str) -> bool:
@@ -1751,14 +1753,14 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
     * A module opener (:data:`_MODULE_OPENERS`: builtin ``open``, ``codecs.open``, ``io.open``,
       ``os.fdopen``, ``zipfile.ZipFile``, ...): the mode is the 2nd positional, and a
       ``gzip.GzipFile`` given a ``fileobj`` and no mode may write (:func:`_takes_fileobj_mode`).
-      Builtin ``open`` bound no other way here, or an opener called through a module imported by
-      its own name and bound no other way here, has that reading only, unless
-      :meth:`_NameResolver.may_patch` sees an opener patch on that name.
+      Builtin ``open`` bound no other way this resolver reads, or an opener called through a module
+      imported by its own name and bound no other way this resolver reads, has that reading only,
+      unless :meth:`_NameResolver.may_patch` sees an opener patch on that name.
     * ``tarfile.open`` and ``tarfile.TarFile.open`` (:data:`_TARFILE_OPENERS`) are module openers
-      too. Written through ``tarfile`` imported by its own name and bound no other way here, with
-      no opener patch on it that :meth:`_NameResolver.may_patch` sees, either call is resolved as
-      ``tarfile.open``, and its mode is the only one the lint splits. An alias of
-      either, or a ``tarfile`` the lint cannot tie to the module, reads its mode whole, so
+      too. Written through ``tarfile`` imported by its own name and bound no other way this
+      resolver reads, with no opener patch on it that :meth:`_NameResolver.may_patch` sees, either
+      call is resolved as ``tarfile.open``, and its mode is the only one the lint splits. An alias
+      of either, or a ``tarfile`` the lint cannot tie to the module, reads its mode whole, so
       ``tf.open(p, mode="r:xz")`` is flagged: a false positive this advisory lint accepts.
     * ``os.open``: its flags, read by :func:`_os_open_may_write`. Its 1st positional is also read
       as the last bullet reads one, so a literal path holding a ``w``, ``a``, ``x`` or ``+`` flags
@@ -1858,8 +1860,11 @@ def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
     or a method or attribute on either, which is not read, so ``(a / b).open("r", "w")`` is not
     flagged; an opener patch :meth:`_NameResolver.may_patch` does not see, which leaves the
     patched call read as the module's own opener, so ``tarfile.open(p, mode="r:xz")`` after
-    ``mock.patch.object(tarfile, "open", sftp.open)`` is split and not flagged; and any ``os``
-    call not named in :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
+    ``mock.patch.object(tarfile, "open", sftp.open)`` is split and not flagged; a module name
+    rebound dynamically in ways the resolver does not read, at least through ``__globals__``,
+    ``sys._getframe()``, ``importlib.import_module(__name__)`` or a ``builtins`` name, which can
+    leave a non-tarfile ``.open(p, mode="r:xz")`` split and not flagged; and any ``os`` call not
+    named in :data:`_AMBIENT_OS_PATHS`. A call whose alias expansion hit a bound in
     :meth:`_NameResolver.expand` is flagged when a name it left unread could still be a hit, since
     what it stands for was not all read. The other rules in this check follow no alias."""
     func = call.func
