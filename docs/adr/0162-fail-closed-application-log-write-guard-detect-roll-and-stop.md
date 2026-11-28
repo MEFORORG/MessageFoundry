@@ -487,19 +487,21 @@ line carried `?`. The escape holds for every line the guard writes: the stdout s
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
 least these. A stream whose `encoding` reads as a string is escaped for that codec. A stream whose
-`encoding` is missing, or reads as anything but a string, is written as the line came; on a
-replacing stream such a line can carry `?` with nothing said, except where classifying
-failed, below. That covers a stream with no
+`encoding` is missing or `None` is written as the line came; on a replacing stream such a line can
+carry `?` with nothing said, except where classifying failed, below. That covers a stream with no
 `encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
 `__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose class inherits no
-`encoding` definition, when its target has none or is gone; an `io.TextIOBase` subclass
-proxy inherits one, so it falls under the next rule instead. A read that raises `AttributeError` counts as missing,
-unless a class on the stream's MRO
-defines `encoding` as something other than a member descriptor. A member descriptor is a
-`__slots__` member or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything
-else, or raises `AttributeError` from such a definition, is unreadable. An unreadable stream is
+`encoding` definition, when its target has none or is gone. An `io.TextIOBase` subclass proxy
+inherits an `encoding` property that returns `None`, so one forwarding through `__getattr__` is
+written raw as well; only one forwarding through `__getattribute__` reaches the next rule. A read
+that raises `AttributeError` counts as missing, unless a class on the stream's MRO defines
+`encoding` as something other than a member descriptor. A member descriptor is a `__slots__` member
+or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything else, raises
+`AttributeError` from such a definition, or reads back as anything but a string or `None` (bytes, a
+mock standing in for a stream) is unreadable. An unreadable stream is
 written with everything outside ASCII escaped. Each line to it is counted on the stderr
-format-fault line described below, naming the exception's type, whether or not the write lands. If
+format-fault line described below, naming the exception's type or the type read back, whether
+or not the write lands. If
 classifying the stream's class fails, the stream is read as having no `encoding`, and that failure
 is counted on the same line. Each time the sink goes into stage 2 from another state, that line is
 said at once, inside

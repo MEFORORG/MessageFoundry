@@ -1660,26 +1660,40 @@ def test_a_flap_bound_trip_says_a_pending_cause(
     assert logging_guard._ENCODING_UNREADABLE_FAULT in err
 
 
-def test_an_encoding_faking_str_does_not_fail_the_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An object passing isinstance(x, str) by faking __class__ is not a str: it is no encoding,
-    # and the line goes as it came rather than failing the write.
-    # NEGATIVE CONTROL: with isinstance() deciding, str.__str__ raised TypeError on it and the
-    # sink reached stage 2.
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        pytest.param(mock.create_autospec(sys.stdout).encoding, id="create_autospec-stdout"),
+        pytest.param(mock.NonCallableMock(spec=str), id="faking-str"),
+        pytest.param(b"cp1252", id="bytes"),
+    ],
+)
+def test_an_encoding_that_reads_back_as_no_str_is_escaped_and_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], encoding: object
+) -> None:
+    # An encoding that reads back as neither a str nor None is unreadable: the line is escaped for
+    # ASCII and the cause counted, never failed, and never written raw for a replacing stream to
+    # turn into "?".
+    # NEGATIVE CONTROL: with such an encoding read as "no encoding" (head 247123168a8 of this
+    # branch), the line went raw and nothing was counted.
     class _Writer(io.StringIO):
-        encoding = mock.NonCallableMock(spec=str)
+        pass
 
     stream = _Writer()
+    monkeypatch.setattr(type(stream), "encoding", encoding, raising=False)
     monkeypatch.setattr(sys, "stdout", stream)
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
     handler = GuardedStreamHandler(stream, guard=guard)
     handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
 
     handler.emit(_record("caf%s", chr(0xE9)))
 
     assert events == []
-    assert stream.getvalue() == "caf" + chr(0xE9) + "\n"
+    assert stream.getvalue() == "caf" + "\\" + "u00e9\n"
+    assert logging_guard._ENCODING_UNREADABLE_FAULT in capsys.readouterr().err
 
 
 def test_a_classify_failure_still_counts_an_ascii_escape(

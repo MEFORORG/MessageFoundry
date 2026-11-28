@@ -390,8 +390,9 @@ class LogWriteGuard:
 
         Returns whether this call moved the sink into stage 2 (it was not already unwritable),
         which is how a guarded sink knows to say its pending format faults at once (BACKLOG
-        #5813). A ``repeat`` call writes the stderr line again but returns False, so a sink that
-        goes on rolling past the flap bound does not force a report per record."""
+        #5813). A ``repeat`` call writes the stderr line again and returns False unless the sink
+        left stage 2 in between (a concurrent :meth:`record_healthy`, say), so a sink that goes on
+        rolling past the flap bound does not force a report per record."""
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -850,9 +851,10 @@ def _encoding_read_can_fail(cls: type) -> bool:
     ``encoding``, other than a member descriptor (an empty ``__slots__`` member, or a C-level one
     such as ``io.TextIOWrapper``'s), so a property raised it. The metaclass
     is not searched, and forwarding through ``__getattr__`` or ``__getattribute__`` does not count
-    by itself: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not. A
-    proxy whose class inherits a property ``encoding``, as an ``io.TextIOBase`` subclass does, is
-    read as failed.
+    by itself: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not. An
+    ``io.TextIOBase`` subclass inherits a property ``encoding`` that returns ``None`` without
+    raising, so this is reached for one only when it forwards through ``__getattribute__``, which
+    then reads as failed; one forwarding through ``__getattr__`` reads ``None`` and is written raw.
     Raises what reading an exotic class's MRO or namespace raises; :meth:`_write_line` reads that
     as "no encoding" and counts it, so classifying never turns a healthy stream into a failed
     write. Walked per call, with no cache to hold classes."""
@@ -1252,11 +1254,13 @@ class _GuardedSinkMixin(_SinkBase):
         ``UnicodeEncodeError``, as a stream with no
         ``encoding`` or one that does not name the encoder it uses can, the line is written again
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
-        propagates. An ``encoding`` that is missing or not a string is "no encoding": the line
-        goes as it came, so on a replacing stream it can carry ``?``. That includes a forwarding
-        proxy whose class inherits no ``encoding`` definition, when its target has none or is gone,
-        and an ``io.TextIOBase`` subclass whose ``encoding`` is ``None``. An ``encoding`` whose read fails (:func:`_encoding_read_can_fail`
-        says which ``AttributeError`` counts) is escaped for ASCII, and each line is counted under
+        propagates. An ``encoding`` that is missing or ``None`` is "no encoding": the line goes as
+        it came, so on a replacing stream it can carry ``?``. That includes a forwarding proxy
+        whose class inherits no ``encoding`` definition, when its target has none or is gone, and
+        an ``io.TextIOBase`` subclass whose ``encoding`` is ``None``, a ``__getattr__`` proxy among
+        them. An ``encoding`` whose read fails (:func:`_encoding_read_can_fail` says which
+        ``AttributeError`` counts), or that reads back as anything but a str or ``None``, is
+        escaped for ASCII, and each line is counted under
         that cause instead of as an escape, whether or not it lands. A write whose line was escaped
         is counted for the stderr format-fault line. Called under the handler's lock, which that
         count needs."""
@@ -1295,14 +1299,27 @@ class _GuardedSinkMixin(_SinkBase):
                 )
         # A plain str, read with type() rather than isinstance(), which an object faking
         # __class__ would pass; a str subclass is copied, since it may be unhashable and the
-        # shortcut's cache hashes it. Anything else is no encoding.
+        # shortcut's cache hashes it. None is no encoding. Anything else read back (bytes, a mock
+        # standing in for a stream) is unreadable: escaped for ASCII and counted, as a read that
+        # raised is, since on a replacing stream a raw line would carry ``?`` unseen.
         codec: str | None
         if type(encoding) is str:
             codec = encoding
         elif issubclass(type(encoding), str):
             codec = str.__str__(encoding)
-        else:
+        elif encoding is None:
             codec = None
+        else:
+            codec = "ascii"
+            try:
+                kind = ascii(type(encoding).__name__)
+            except Exception:
+                kind = _RECORD_LABEL_DROPPED
+            unreadable = kind
+            self._note_format_fault(
+                f"{_ENCODING_UNREADABLE_FAULT} (read as {kind}, not a str); lines to it are "
+                "escaped for ASCII"
+            )
         written = line
         if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
             try:
