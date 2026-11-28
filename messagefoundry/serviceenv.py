@@ -24,7 +24,8 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   or the environment's value file for a value that is not a secret and is the same for every
   instance.
 * **So does an entry there that names a store key or another engine secret with nothing set in
-  it**, empty or blank or the name written alone, whatever ``[security].enforcement`` says (vault
+  it**, at least empty, blank, equals signs alone or the name written alone, and whether or not
+  another entry sets the same name, whatever ``[security].enforcement`` says (vault
   BACKLOG #5394). A secret can be written apart from its name, into an entry or line after it,
   where the reader may not read it as that secret, so the empty entry may be the one sign of it.
 * **Each refusal above is ``serve``'s and ``supervise``'s, and the API app factories'.**
@@ -159,8 +160,9 @@ class ServiceEnvPosture:
     service_name: str | None = None
     #: The variable names the service's environment lists set that the refusal reads, upper-cased:
     #: each secret-class or ``MEFOR_VALUE_*`` name, and ``MEFOR_SECRETS_DIRECTORY``. A
-    #: secret-class name an entry only names with nothing in it is not one for that entry, since
-    #: it sets nothing there: ``empty_class_names`` holds it. Any other
+    #: secret-class name an entry names with nothing in it is in ``empty_class_names``; it is in
+    #: this list too only where :func:`_names` reads some entry as setting it, which a value of
+    #: equals signs alone, such as ``NAME==``, is read as doing as well. Any other
     #: name is left out, since the text before an equals sign may be key material, such as a line
     #: of padded base64 (vault BACKLOG #5394). Empty unless ``status`` is ``OBSERVED``. Left out
     #: of the repr, with the other fields below that hold registry text: an operator may have
@@ -208,8 +210,8 @@ class ServiceEnvPosture:
     #: (vault BACKLOG #5394), and ``empty_class_sources`` locates it.
     empty_class_names: tuple[str, ...] = ()
     #: ``(name, registry value, line)`` for each name in ``empty_class_names``: the first entry
-    #: that names it empty, apart from any entry that sets it, which ``sources`` locates. The
-    #: line is ``None`` on its string's first line.
+    #: that names it empty, which may differ from the entry ``sources`` locates as setting it.
+    #: The line is ``None`` on its string's first line.
     empty_class_sources: tuple[tuple[str, str, int | None], ...] = field(default=(), repr=False)
     #: Whether any registry string in the lists is a directory entry in doubt
     #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
@@ -295,6 +297,7 @@ class ServiceEnvPosture:
         else:
             where = dict(self.sources)
             lines = dict(self.source_lines)
+        verb = "names it" if empty else "sets it"
 
         def located(name: str) -> str:
             if name not in where:
@@ -302,7 +305,7 @@ class ServiceEnvPosture:
             if name in lines:
                 return (
                     f"{name} (in {where[name]}, line {lines[name]} of the registry string that "
-                    "sets it)"
+                    f"{verb})"
                 )
             return f"{name} (in {where[name]})"
 
@@ -1591,10 +1594,12 @@ _EMPTY_CLASS_STEP = (
 )
 
 #: Printed after :data:`_EMPTY_CLASS_STEP` where a name that takes either a key or its path is
-#: named empty, so the operator keeps an entry that sets it to its path (vault BACKLOG #5394).
+#: named empty and no entry is read as setting it to a secret, so the operator keeps an entry
+#: that sets it to its path (vault BACKLOG #5394). Worded as a condition, since the reader keeps
+#: no record of whether such an entry is there.
 _EMPTY_PATH_FORM_STEP = (
-    f"An entry that sets {', '.join(sorted(_INLINE_PEM_NAMES))} to the path of its key file "
-    "holds no secret and is not refused: keep it"
+    f"Where an entry sets {', '.join(sorted(_INLINE_PEM_NAMES))} to the path of its key file, "
+    "that entry holds no secret and is not refused: keep it"
 )
 
 
@@ -1681,7 +1686,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     moving_keys += [
         k
         for k in posture.empty_class_names
-        if k in KEY_CLASS_NAMES and k in posture.keys_in_environment and k not in moving_keys
+        if k in KEY_CLASS_NAMES and k in posture.keys_in_environment
     ]
     moving_others = [o for o in others if o not in only]
     moving_values = [v for v in values if v not in only]
@@ -1899,7 +1904,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Before the removal step, so the entry or line it names counts among those refused when
         # that step and any pass-back step below run (vault BACKLOG #5394).
         steps.append(_EMPTY_CLASS_STEP)
-        if _INLINE_PEM_NAMES.intersection(posture.empty_class_names):
+        # Not where the name is listed: an entry of it is then read as a secret, and the steps
+        # above say to take it out, so a "keep it" here would contradict them.
+        if _INLINE_PEM_NAMES.intersection(posture.empty_class_names) - set(posture.listed):
             steps.append(_EMPTY_PATH_FORM_STEP)
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).

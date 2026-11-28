@@ -9,9 +9,10 @@ NAME = value`` writes one. Where that one ends the empty value (``serviceenv._en
 the reader does not read it as the secret, so the empty entry was the one sign of it left, and it
 refused nothing. ``test_an_empty_secret_class_entry_refuses``, the path-form test and the
 protect-key test fail on the code before this change on their refusal assertion; the
-machine-wide test fails there on its last assertion only, and the set-in-one-entry test only on
-the new field, since it pins what stays as it was. The negative controls are empty entries for
-names that are no secret, which refuse nothing on both. Synthetic values only.
+machine-wide test fails there on its last assertion only. The negative controls are empty
+entries for names that are no secret, which refuse nothing on both. The tests that cite code
+review round 3 repair that round's four findings and fail on a0b245d3d6d, each as its docstring
+says. Synthetic values only.
 """
 
 from __future__ import annotations
@@ -47,11 +48,12 @@ _EMPTY_SHAPES: dict[str, tuple[list[str], int | None]] = {
 }
 
 
-def _located(name: str, line: int | None) -> str:
-    """How the refusal locates ``name`` (``ServiceEnvPosture.named_with_source``)."""
+def _located(name: str, line: int | None, verb: str = "names it") -> str:
+    """How the refusal locates ``name`` (``ServiceEnvPosture.named_with_source``): an empty
+    entry as the string that names it, a set one, with ``verb``, as the string that sets it."""
     if line is None:
         return f"{name} (in {_EXTRA})"
-    return f"{name} (in {_EXTRA}, line {line} of the registry string that sets it)"
+    return f"{name} (in {_EXTRA}, line {line} of the registry string that {verb})"
 
 
 @pytest.mark.parametrize("shape", sorted(_EMPTY_SHAPES))
@@ -125,11 +127,12 @@ def test_a_name_set_in_one_entry_and_empty_in_another_is_both() -> None:
 
 #: The split ``nssm set <service> AppEnvironmentExtra NAME = value`` writes: the name, an item of
 #: equals signs, and the value, here one the reader cannot tell from an ordinary variable that
-#: ends the empty value (``serviceenv._ends_blank_class``).
-_CANONICAL_SPLITS: dict[str, list[str]] = {
-    "password, = item": [_PASSWORD, "=", "Path=C:\\synthetic-split"],
-    "store key, = item": [_KEY, "=", "Path=C:\\synthetic-split"],
-    "password=, = item": [f"{_PASSWORD}=", "=", "Path=C:\\synthetic-split"],
+#: ends the empty value (``serviceenv._ends_blank_class``). With whether the pass-back step
+#: prints: only a secret the secrets directory takes brings it, never a store key alone.
+_CANONICAL_SPLITS: dict[str, tuple[list[str], bool]] = {
+    "password, = item": ([_PASSWORD, "=", "Path=C:\\synthetic-split"], True),
+    "store key, = item": ([_KEY, "=", "Path=C:\\synthetic-split"], False),
+    "password=, = item": ([f"{_PASSWORD}=", "=", "Path=C:\\synthetic-split"], True),
 }
 
 
@@ -140,7 +143,7 @@ def test_the_canonical_split_is_read_as_named_empty(shape: str) -> None:
     back with ``nssm set``, which then leaves out the item that may hold the secret (code review
     round 3 on this change, finding 1). This fails on a0b245d3d6d, where the step never printed
     and the pass-back step kept that item."""
-    entries = _CANONICAL_SPLITS[shape]
+    entries, passes_back = _CANONICAL_SPLITS[shape]
     posture = _service(entries)
     name = entries[0].rstrip("=")
     refusal = service_env_refusal(posture)
@@ -151,7 +154,8 @@ def test_the_canonical_split_is_read_as_named_empty(shape: str) -> None:
     assert f"{_located(name, None)} {NAMED_EMPTY}" in refusal, shape
     assert EMPTY_CLASS_STEP in refusal, shape
     pass_back = refusal.find("`nssm set` replaces that whole list")
-    if pass_back != -1:
+    assert (pass_back != -1) is passes_back, shape
+    if passes_back:
         assert refusal.index(EMPTY_CLASS_STEP) < pass_back, shape
 
 
@@ -171,6 +175,17 @@ def test_the_step_keeps_a_path_form_entry() -> None:
 
 def test_the_path_form_line_prints_only_for_the_oidc_key() -> None:
     refusal = service_env_refusal(_service([f"{_PASSWORD}=", "Path=C:\\x"]))
+    assert refusal is not None and EMPTY_PATH_FORM_STEP not in refusal
+
+
+def test_the_path_form_line_does_not_print_where_the_key_is_listed() -> None:
+    """Empty and path lines of the OIDC client key in one string read the key as set, so the
+    steps say to take that entry out, and a "keep it" would contradict them (code review round
+    1 on the repair of round 3)."""
+    posture = _service([f"{_PEM_OR_PATH}=\n{_PEM_OR_PATH}=C:\\k.pem"])
+    assert _PEM_OR_PATH in posture.listed
+    assert posture.empty_class_names == (_PEM_OR_PATH,)
+    refusal = service_env_refusal(posture)
     assert refusal is not None and EMPTY_PATH_FORM_STEP not in refusal
 
 

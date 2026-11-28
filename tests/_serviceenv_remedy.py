@@ -49,10 +49,10 @@ EMPTY_CLASS_STEP = (
 )
 
 #: Printed after ``EMPTY_CLASS_STEP`` where the OIDC client key, which takes either a key or its
-#: path, is named empty (vault BACKLOG #5394).
+#: path, is named empty and not listed as set (vault BACKLOG #5394).
 EMPTY_PATH_FORM_STEP = (
-    "An entry that sets MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY to the path of its key file holds no "
-    "secret and is not refused: keep it"
+    "Where an entry sets MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY to the path of its key file, that "
+    "entry holds no secret and is not refused: keep it"
 )
 
 #: Printed last, only where a refused value runs on into a directory entry and no directory

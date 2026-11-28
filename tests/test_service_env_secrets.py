@@ -541,7 +541,7 @@ def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str)
     assert posture.empty_class_names == (key,)
     refusal = service_env_refusal(posture)
     located = (
-        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of the registry string that sets it)"
+        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of the registry string that names it)"
     )
     assert refusal is not None and f"{located} is named with nothing set in it" in refusal
 
