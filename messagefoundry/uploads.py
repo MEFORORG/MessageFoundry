@@ -661,7 +661,8 @@ def _outage_fault(exc: BaseException) -> str | None:
     """:func:`_unreachable_fault`, for a check of a name that was just there: a
     ``FileNotFoundError`` :func:`~messagefoundry.path_reach.is_name_absent` does not read as the
     name missing, such as a Windows missing folder (3) or drive (15) above it, is an outage too,
-    so only a missing final name reads as gone (BACKLOG #5388)."""
+    so on Windows only a missing final name reads as gone; on POSIX a missing folder above it reads
+    as the name missing too (BACKLOG #5388)."""
     fault = _unreachable_fault(exc)
     if fault is None and isinstance(exc, FileNotFoundError) and not is_name_absent(exc):
         return codec_safe_str(exc)
@@ -3837,9 +3838,11 @@ class UploadStore:
         except (OSError, UnicodeDecodeError) as exc:
             # Only an absent body is missing, and only when a fresh lstat says its final name is
             # gone (_known_absent): a share that cannot be reached raises a FileNotFoundError too
-            # on Windows, with no winerror on a read, as does a missing folder or drive above the
-            # name, and that body may still be under the OLD key, so it is a skip below, never a
-            # lost one a re-run would not count (BACKLOG #5388).
+            # on Windows, with no winerror on a read, as does a Windows missing folder or drive
+            # above the name, and that body may still be under the OLD key, so it is a skip below,
+            # never a lost one a re-run would not count. On POSIX a missing folder above the name
+            # reads as the name missing, so the body half is lost there and its pair counts as a
+            # skip only because its sidecar is unreadable too (BACKLOG #5388).
             missing = (
                 kind == "body"
                 and isinstance(exc, OSError)

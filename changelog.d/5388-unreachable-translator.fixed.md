@@ -8,11 +8,11 @@
   missing final name counts as gone, so a missing folder or drive above it is an outage: the check
   of a cancelled save's pair, the `rotate-key` replace, the `rotate-key` decision that a body is
   lost, and the Windows check after an open. On POSIX a missing folder above the name still reads as
-  the name missing, so an uploads root removed during `rotate-key` still counts bodies as lost. Not
-  covered, at least: elsewhere a Windows missing folder or drive still reads as absence, including
-  the by-id reads' first check, the re-check after a failed open, the prune's and the delete's body
-  unlink, and the body size check `rotate-key` asks of a sidecar's body. On POSIX a dropped mount
-  whose mount point still answers reads every name under it as missing. The sidecar listing reads a
-  root it cannot reach as empty, and the cleanup after a failed save and the temporary file's
-  cleanup still swallow an outage.
+  the name missing, so with the uploads root removed during `rotate-key` each body is logged as one
+  no key can read, though its pair counts as a skip. Not covered, at least: elsewhere a Windows
+  missing folder or drive still reads as absence, including the by-id reads' first check, the
+  re-check after a failed open, the prune's and the delete's body unlink, and the body size check
+  `rotate-key` asks of a sidecar's body. On POSIX a dropped mount whose mount point still answers
+  reads every name under it as missing. The sidecar listing reads a root it cannot reach as empty,
+  and the cleanup after a failed save and the temporary file's cleanup still swallow an outage.
   (`BACKLOG #5388`)
