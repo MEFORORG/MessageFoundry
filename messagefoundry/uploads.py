@@ -9,14 +9,17 @@ connection-decoupled, and **AES-256-GCM-encrypted at rest** through the *same* `
 cipher the message store uses (identity/plaintext-on-disk only when no key is configured — the same
 at-rest tier as the File-connector spill dirs, documented in ``docs/PHI.md`` §2).
 
-This is a **leaf** module: it imports only the pure ``store.crypto`` cipher seam + the pure
-``parsing.split``/``parsing.peek`` HL7 library, and ``config.atomic_edit``'s cross-process file lock
-(:func:`_pair_lock`). It never imports the store instance, a transport, a
-connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
-cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
+This is a **leaf** module. From this package it imports the pure ``store.crypto`` cipher seam and
+``store.content_search`` row matcher, the pure ``parsing.split``/``parsing.peek``/``parsing.sniff``
+HL7 library, ``config.atomic_edit``'s cross-process lock primitives (``edit_lock``,
+``lock_path_for`` and ``LOCK_FILE_NAME``, which :func:`_pair_lock` here builds on), its link test
+and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_reach`` and
+``redaction``. The import block is the list of record. It never imports the store instance, a
+transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph.
+The cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
-no store module is imported. All disk + crypto + split work runs **off the event loop**
-(``asyncio.to_thread``).
+no store module beyond the two pure ones above is imported. All disk + crypto + split work runs
+**off the event loop** (``asyncio.to_thread``).
 
 **PHI.** An uploaded file is real HL7 PHI at rest. Bodies are never logged at INFO+; every access is
 gated + audited by the API layer. The on-disk **identity** is a random 32-hex ``file_id`` — the
@@ -48,10 +51,16 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISDIR, S_ISLNK, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TypeGuard
 
-from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
+from messagefoundry.config.atomic_edit import (
+    _REFUSED,
+    LOCK_FILE_NAME,
+    _names_a_link,
+    edit_lock,
+    lock_path_for,
+)
 from messagefoundry.controlchars import (
     has_lone_surrogate,
     scrub_log_argument,
@@ -350,25 +359,101 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
     return False
 
 
-def _root_fault(root: Path) -> str | None:
-    """The reason the uploads root's own ``stat`` failed, or ``None`` when it answers. A failure
-    is read as the root being lost, which an entry's own error cannot show: a dangling link can
-    raise the codes a lost share does. An answer proves nothing about the entries under it: a POSIX
-    mount that dropped leaves a mount point that still answers. Text and not the exception, whose
-    traceback would hold the sweep's frame, and so its whole listing, until a cyclic collection."""
+def _root_fault(
+    root: Path, pinned: os.stat_result, memo: _OncePerInterval | None = None
+) -> str | None:
+    """Why the uploads root does not read as the folder the sweep pinned, whose ``stat`` was
+    ``pinned``, taken before the listing, or ``None`` when it does. Its own ``stat`` failed,
+    which is read as the root being lost, since an entry's own error cannot show that: a dangling
+    link can raise the codes a lost share does. Or it answers with another identity
+    (``os.path.samestat``), as a share remounted, or a folder swapped in, under the root's name does
+    when that lands after the pin and before this call (BACKLOG #8341 item 2). It sees nothing that
+    lands at another time, at least before the pin or after this call. An answer proves nothing
+    about the entries under it. A file system that reports no stable identity, such as one that
+    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``.
+
+    A read that answers both ``st_ino`` and ``st_dev`` as 0, as a Windows ``stat`` that falls back
+    to reading the parent's directory entry can, carries no identity. When exactly one of the pin
+    and this read does, the two cannot be compared, and this call returns
+    :data:`_ROOT_UNCOMPARED`, which stops the pass as a swap does, so a folder swapped in whose
+    attributes the service account cannot read does not pass. When both do, this call cannot tell
+    a swap from the same folder and returns ``None``, logging a DEBUG line at most once per
+    interval of ``memo`` when one is given, so the removal proceeds: that is a residual. A file
+    system that mints an identity on the client, at least a CIFS mount with ``noserverino`` or a
+    FUSE mount without stable inode numbers, can stop a sound pass, which then removes nothing
+    more, and can do so pass after pass, leaving orphans past retention; so can a one-sided
+    identity of 0 that recurs. Text and not the exception, whose traceback would hold the sweep's
+    frame, and so its whole listing, until a cyclic collection."""
     try:
-        root.stat()
+        now = root.stat()
     except OSError as exc:
-        return exc.strerror or type(exc).__name__
+        return f"stopped answering ({exc.strerror or type(exc).__name__})"
+    now_none, pinned_none = _no_identity(now), _no_identity(pinned)
+    if now_none and pinned_none:
+        # Neither read carries an identity, so there is nothing to compare: the residual.
+        if memo is not None and memo.first("orphan sweep root identity 0"):
+            _log.debug(
+                "uploaded-logs orphan sweep: both reads of the uploads root answered a file "
+                "identity of 0, so its identity check gives no swap verdict"
+            )
+        return None
+    if now_none or pinned_none:
+        # samestat would be False even for the same folder, so this is no proven swap; but it
+        # cannot show the root is the folder pinned either, so the pass stops under a true reason.
+        return _ROOT_UNCOMPARED
+    if not os.path.samestat(now, pinned):
+        return _ROOT_SWAPPED
     return None
 
 
-def _names_a_link(info: os.stat_result) -> bool:
-    """Whether an ``lstat`` result is a symbolic link or a name-surrogate reparse point."""
-    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
-    return S_ISLNK(info.st_mode) or bool(
-        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
-    )
+def _no_identity(st: os.stat_result) -> bool:
+    """Whether a ``stat`` answered no file identity: ``st_ino`` and ``st_dev`` both 0."""
+    return st.st_ino == 0 and st.st_dev == 0
+
+
+#: :func:`_root_fault`'s reason for a root whose identity is not the one pinned. It names the pin,
+#: the ``stat`` taken before the listing, and not the listing: a swap between the two leaves the
+#: root answering as the folder listed, which is still not the folder pinned. It says identity, not
+#: folder, because ``samestat`` proves no more: the root may now be a file, or a mount that mints
+#: identities on the client may answer the same folder under a new one.
+_ROOT_SWAPPED = (
+    "now answers with a different file identity than the one the sweep read before its listing"
+)
+
+#: :func:`_root_fault`'s reason for a root whose identity could not be compared on this read:
+#: exactly one of the pin and the check answered ``st_ino`` and ``st_dev`` as 0. It claims no swap,
+#: only that the check could not show the root is still the folder pinned.
+_ROOT_UNCOMPARED = (
+    "could not have its file identity compared on this read, because exactly one of this read "
+    "and the one before the listing answered no identity (st_ino and st_dev 0)"
+)
+
+
+def _root_never_made(root: Path) -> bool:
+    """Whether an uploads root whose pinning ``stat`` answered absence reads as one no save has
+    made yet: its name is not there, and the nearest folder above it that answers is a folder.
+    ``False`` when the root's own name is there, as a link, junction or mount point whose target is
+    lost is; when an ancestor's name is there but does not answer, as a dangling link; when none
+    answers, as above a drive letter that is no longer mapped; when one answers as something else;
+    or when an ancestor's ``stat`` fails for any other cause. The sweep then raises rather than
+    reports a clean pass, unless the root answers as a folder by the time it checks again, which
+    :meth:`UploadStore._sweep_orphans_sync` reads as a save having just made it (BACKLOG #8341
+    item 4). At least these still read as a root never made: a root deleted after
+    its first save; a root under a POSIX mount point whose share dropped, since that mount point
+    still answers; and a root, or an ancestor whose ``stat`` reads as absence, whose ``lstat`` then
+    fails for a cause other than absence, as on a flapping share, since ``os.path.lexists``, which
+    reads whether a name is there, answers no for any ``lstat`` failure."""
+    if os.path.lexists(root):
+        return False
+    for parent in root.absolute().parents:
+        try:
+            info = parent.stat()
+        except OSError as exc:
+            if is_absent(exc) and not os.path.lexists(parent):
+                continue
+            return False
+        return S_ISDIR(info.st_mode)
+    return False
 
 
 #: The reparse tags of Windows files that ``lstat`` reports as regular by ``st_mode`` but that an
@@ -4444,18 +4529,45 @@ class UploadStore:
         rotated-away key can no more destroy data here than it can in the age pass.
 
         **A fault whose code does not mean a missing name keeps the body (BACKLOG #6575).** The root
-        is listed once, whole, before anything is removed. A listing error
-        :func:`~messagefoundry.path_reach.is_absent` reads as no root is an empty pass, and any
-        other raises with nothing removed. A body the listing shows with no sidecar goes only once
-        it is past the floor and :func:`_sidecar_is_absent`, asked right before the unlink, reports
-        the sidecar not there.
+        is listed once, whole, before anything is removed, and its ``stat``, the pin, is taken
+        first. A pin error :func:`~messagefoundry.path_reach.is_absent` reads as absence is an
+        empty pass, returning 0 with no log, in exactly two cases: :func:`_root_never_made` reads
+        the root as one no save has made yet, under a folder that answers (BACKLOG #8341 item 4),
+        or ``Path.is_dir`` then reads the root as a folder, as when a save makes it between the pin
+        and that check, which a root that flaps back as a folder in that gap passes too. Any other
+        pin error raises with nothing removed, and :meth:`prune_expired` logs it, so at least a
+        drive letter that is no longer mapped, and a linked root whose target is lost, are not a
+        clean pass while they stay lost. At least these still are: the roots
+        :func:`_root_never_made` names, and a lost root whose pin still answers, such as a root that
+        is itself a POSIX mount point whose share dropped, whose empty listing is a pass that
+        removes nothing and logs nothing. Once the pin has succeeded, every listing error raises,
+        absence included. A temp or body goes only
+        once it is past the floor and the root, checked right before its unlink, answers with the
+        identity the pin read before the listing (:func:`_root_fault`, BACKLOG #8341 item 2), with
+        one exception: when both the pin and that check answer no identity, ``st_ino`` and
+        ``st_dev`` both 0, the check cannot tell a swap from the same folder and the unlink
+        proceeds. That is a residual, one of at least those named below. When only one of the two
+        answers no identity, the pass stops. A
+        body the listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just
+        before that check, also reports the sidecar not there.
 
         **That report is the file system's answer, not proof that no sidecar exists.**
         :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
-        missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. Any
-        of them can send a body whose sidecar still exists to the unlink. The check narrows the
-        race with a sidecar landing after the listing and does not close it: one can land between
-        that check and the unlink. Neither that check nor the unlink holds :func:`_pair_lock`.
+        missing parent, a stale client cache and the unmeasured Access-Based Enumeration case. The
+        root's identity check covers only a root that answers with another identity at the moment
+        it is checked, after the sidecar check, so it catches a share remounted under its name only
+        when the remount lands after the pin and before that check, while a temp leftover or a body
+        whose sidecar reads as absent, past the floor, is still to come, or before the root check
+        that follows an entry's own ``stat``, sidecar check or unlink raising. At least these are
+        not caught: a remount before the pass, which the pin reads as the root; one during the pass
+        with no such entry left to check; one between that check and the unlink; and one that
+        flaps back before that check. A stale cache, a hidden
+        name, or a share that answers the same identity can still send a body whose sidecar exists
+        to the unlink, which writes no audit row, only the WARNING below. The check narrows the race
+        with a sidecar landing after the listing and does not close it: one can land between that
+        check and the unlink, and the root ``stat`` :func:`_root_fault` takes between the two widens
+        that window by as long as that ``stat`` takes. Neither that check nor the unlink holds
+        :func:`_pair_lock`.
 
         **The floor reads an mtime, which proves less than "abandoned".** ``stat`` follows a link,
         so a new link to an old file is past the floor the moment it appears, as is a body restored
@@ -4463,8 +4575,14 @@ class UploadStore:
         the stamp the file system recorded, and it is compared with this host's clock. Which clock
         stamped it can differ by file system and is not asserted here.
 
-        A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
-        too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
+        A fault on one entry leaves that entry for the next pass. The pass stops and returns what
+        it removed, logged with the reason, at ERROR when :func:`_root_fault` reports the root lost
+        or swapped and at WARNING when it reports the root's identity could not be compared, at
+        either of two points: right before an entry's unlink, or after an
+        entry's own ``stat``, sidecar check or unlink raised. An entry skipped before
+        that, as a live write, inside the floor, or with a sidecar that reads as there, triggers
+        no root check. A fault on the
+        pin or the listing raises instead, as above.
         :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
         interval is as long, so a lasting fault can log on every scheduled pass.
 
@@ -4488,9 +4606,10 @@ class UploadStore:
         success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
         and not how long it can stall, so an hour is a margin against this and not a bar to it.
 
-        ``abort`` is :meth:`prune_expired`'s. It is checked before the listing and before each entry
-        once the listing has been read, so a slow sweep over a large dir does not hold a stop past
-        its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
+        ``abort`` is :meth:`prune_expired`'s. It is checked before the pin, again between the pin
+        and the listing, so a stop set while a slow pin ``stat`` hangs skips the listing, and before
+        each entry once the listing has been read, so a slow sweep over a large dir does not hold a
+        stop past its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
         ``Path.iterdir`` reads the whole directory before it returns on this Python, so a stop set
         meanwhile takes effect when that read ends. The pass's audit rows are already written when
         this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the next one
@@ -4500,18 +4619,47 @@ class UploadStore:
         if stop.is_set():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
-        # The one listing, read whole before anything goes, so a failure at any point removes
-        # nothing. An error is_absent reads as no root ends the pass at 0, and any other raises;
-        # prune_expired logs that and keeps its result (BACKLOG #6575).
+        # The root's identity is pinned first, so a file goes only while the root is still this
+        # folder. A pin error is_absent reads as no root ends the pass at 0 only when the root
+        # reads as never made, or is a folder by now; any other raises, and prune_expired logs
+        # that and keeps its result (BACKLOG #6575, #8341 item 4).
         try:
-            entries = list(root.iterdir())
+            pinned = root.stat()
         except OSError as exc:
-            if is_absent(exc):
-                return 0  # read as no root yet, as a lost drive or parent also is
+            # A save may make the root between the failed pin and this check, so a root that is
+            # now a folder is an empty pass too, and the next one lists it.
+            if is_absent(exc) and (_root_never_made(root) or root.is_dir()):
+                return 0  # no root answered the pin, and none was there or a save just made it
             raise
+        if stop.is_set():
+            return 0  # a stop set while the pin hung; the listing could take as long again
+        # The one listing, read whole before anything goes, so a failure at any point removes
+        # nothing. The pin proved a root answered, so any error here, absence included, raises.
+        entries = list(root.iterdir())
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
         names = {entry.name for entry in entries}
         removed = 0
+
+        def _root_lost(name: str) -> bool:
+            """Whether the root no longer reads as the folder pinned, logging the stop if so."""
+            why = _root_fault(root, pinned, self._link_logged)
+            if why is None:
+                return False
+            # One memo key per cause, so a swap after a lost root inside the interval still logs.
+            cause = {_ROOT_SWAPPED: "swapped", _ROOT_UNCOMPARED: "uncompared"}.get(why, "lost")
+            # An uncompared root is no proven fault, so it is a WARNING rather than an ERROR.
+            level = logging.WARNING if why == _ROOT_UNCOMPARED else logging.ERROR
+            _log.log(
+                level
+                if self._link_logged.first(f"orphan sweep stopped {cause}")
+                else logging.DEBUG,
+                "uploaded-logs orphan sweep stopped at %s: the uploads root %s; no further file "
+                "was removed and the next pass retries",
+                name,
+                why,
+            )
+            return True
+
         for entry in entries:
             if stop.is_set():
                 break
@@ -4534,21 +4682,17 @@ class UploadStore:
                 if entry.stat().st_mtime > cutoff:
                     continue  # inside the floor; being past it does not prove it abandoned
                 # The listing is a snapshot and a share can return a short one with no error, so
-                # ask again, last, before the unlink.
+                # ask again, just before the root check and the unlink.
                 if sidecar is not None and not _sidecar_is_absent(sidecar):
                     continue
+                # The unlink acts on a name in whatever folder answers for the root now, and an
+                # absent sidecar answer is about a name there too, so a temp or a body goes only
+                # while that is the folder pinned (BACKLOG #8341 item 2).
+                if _root_lost(name):
+                    break
                 entry.unlink()
             except OSError as exc:
-                if (root_fault := _root_fault(root)) is not None:
-                    _log.log(
-                        logging.ERROR
-                        if self._link_logged.first("orphan sweep stopped")
-                        else logging.DEBUG,
-                        "uploaded-logs orphan sweep stopped at %s: the uploads root stopped "
-                        "answering (%s); no further file was removed and the next pass retries",
-                        name,
-                        root_fault,
-                    )
+                if _root_lost(name):
                     break
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
@@ -5254,12 +5398,6 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
                 with _unlocked_logged_lock:
                     _unlocked_logged.discard(_lock_name(path))
         yield
-
-
-#: The reparse-tag bit of a Windows reparse point that names another path, such as a symbolic
-#: link or a junction (``IO_REPARSE_TAG_NAME_SURROGATE``), as ``pipeline/dr_backup.py`` tests it. A
-#: cloud-files, dedup or tiering placeholder lacks it and names no other path.
-_NAME_SURROGATE_TAG = 0x20000000
 
 
 def _refuse_a_planted_link(lock: Path) -> None:

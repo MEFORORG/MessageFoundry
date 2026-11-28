@@ -173,8 +173,8 @@ _TARGETS = (_ALPHABET, _C0_DEL)
 _EXEMPT: dict[tuple[str, str], str] = {
     # THE definition
     ("messagefoundry/controlchars.py", "_is_control_char"): "compare",
-    # byte-wise density count
-    ("messagefoundry/parsing/sniff.py", "nontext_upload_reason"): "compare",
+    # the bytes nontext_upload_reason's byte-wise density count deletes
+    ("messagefoundry/parsing/sniff.py", "_DENSITY_CONTROLS"): "compare",
     # importer-droppable leads, harness-mirrored
     ("messagefoundry/spreadsheet.py", "_LEADING_NOISE"): "range",
 }

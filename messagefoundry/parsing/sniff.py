@@ -216,6 +216,11 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 # the MLLP frame bytes (0x0b start-block, 0x1c/0x1d end-block/segment markers) an HL7 capture may carry.
 # Every other C0 control byte (and DEL, 0x7f) counts toward the non-text density.
 _TEXT_ALLOWED_CONTROLS = frozenset(b"\t\n\r\x0b\x0c\x1c\x1d")
+#: The bytes the density counts, deleted by ``translate`` so the count runs at C speed. Built once
+#: at import, not on every call (BACKLOG #5552 item 8).
+_DENSITY_CONTROLS = bytes(
+    b for b in range(256) if (b < 0x20 or b == 0x7F) and b not in _TEXT_ALLOWED_CONTROLS
+)
 # >30% control bytes in one 8 KiB window => not plausibly text. Loose on purpose: real .hl7/.txt/.xml logs
 # sit far below it (segment/line terminators are the allowed set), and it is not there to police
 # odd-but-textual logs.
@@ -250,17 +255,13 @@ def nontext_upload_reason(data: bytes) -> str | None:
             return f"body is a {mime} container; the uploaded-logs feature accepts only plain-text logs"
     if b"\x00" in data:
         return "body contains NUL bytes; the uploaded-logs feature accepts only plain-text logs"
-    # The bytes the density counts, deleted by ``translate`` so the count runs at C speed.
-    counted = bytes(
-        b for b in range(256) if (b < 0x20 or b == 0x7F) and b not in _TEXT_ALLOWED_CONTROLS
-    )
     size = len(data)
     for start in range(0, size, _TEXT_WINDOW_BYTES):
         end = start + _TEXT_WINDOW_BYTES
         # A last partial window is the body's final whole window instead, overlapping the one before
         # it, so a few trailing control bytes are never judged on their own.
         window = data[start:end] if end <= size else data[-_TEXT_WINDOW_BYTES:]
-        controls = len(window) - len(window.translate(None, counted))
+        controls = len(window) - len(window.translate(None, _DENSITY_CONTROLS))
         if controls / len(window) > _CONTROL_DENSITY_LIMIT:
             return (
                 "body has a high density of control characters; the uploaded-logs feature accepts "

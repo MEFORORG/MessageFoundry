@@ -66,8 +66,9 @@ WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591).
 the one place both can reach. Nothing else about that move is load-bearing; the other files cite
 this paragraph.
 
-DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py``'s ``nontext_upload_reason`` counts the same code
-points, but it is a different predicate. It works on bytes, not characters. It also subtracts its
+DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py``'s ``_DENSITY_CONTROLS``, the bytes its
+``nontext_upload_reason`` density count deletes, spells the same code points, but it is a different
+predicate. It works on bytes, not characters. It also subtracts its
 own allowlist of controls a text file may carry. Folding it in would change its behaviour. The same
 file's archive member-name check does import :func:`has_control_char`; only the density count is
 carved out.
