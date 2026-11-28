@@ -240,7 +240,7 @@ reusable Qt widgets moved to the harness (BACKLOG #103, ADR 0032 retired).
 **Beyond the engine packages** (separate components, not `messagefoundry.*`): the **code-first config**
 an operator authors (their `--config` modules + [`environments/`](../environments/) value overrides),
 the **web ops console** ([`messagefoundry_webconsole/`](../messagefoundry_webconsole/), a
-separately-versioned second wheel `messagefoundry-webconsole` mounted same-origin under `/ui` — ADR
+separately released second wheel `messagefoundry-webconsole` mounted same-origin under `/ui` — ADR
 0065, [WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)),
 the **IDE extension** ([`ide/`](../ide/)), the **test harness** ([`harness/`](../harness/)), the
 sample config + message corpus ([`samples/`](../samples/)), the **Windows service** scripts

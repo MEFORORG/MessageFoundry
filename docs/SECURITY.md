@@ -4709,7 +4709,7 @@ before anyone enrolls a passkey. Credentials are pinned to their mint-time `rp_i
 
 ### Off-loopback browser console (L5b, ADR 0068 §8)
 
-> The `/ui` browser console is now served by the separately-versioned **`messagefoundry-webconsole`**
+> The `/ui` browser console is now served by the separately released **`messagefoundry-webconsole`**
 > package (Option B, [ADR 0065](adr/0065-web-ops-dashboard.md)), which the engine **mounts same-origin,
 > in-process** — it was previously the in-engine `messagefoundry/api/webui/` tree. The **same-origin
 > security model is unchanged by that move**: the whole security core (the console's
@@ -7325,7 +7325,7 @@ connection sets `intake_auth` to something other than its default `none`; MLLP i
 `tls_client_subjects` (unset by default) with `tls` and `tls_ca_file`.
 
 **A second gate applies to the three browser legs.** `POST /ui/login`, `GET /ui/sso` and the three
-`/ui/oidc/*` routes are registered by the separately versioned web-console wheel, which is mounted
+`/ui/oidc/*` routes are registered by the separately released web-console wheel, which is mounted
 only when `[security].serve_web_console` is on (default on, but `serve` flips it off **in place** when
 the console package is absent, and again when a non-explicit console would be exposed off-loopback).
 Local and Kerberos survive that on their JSON routes (`POST /auth/login`, `POST /auth/negotiate`), so

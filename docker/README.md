@@ -11,7 +11,7 @@ The **headless engine** runs cleanly as an OCI container (ADR 0017 "container fa
 directory holds the image, a Topology-A `compose.yaml`, minimal Kubernetes manifests, and a CI smoke.
 
 **Only the headless engine containerizes** (asyncio/uvicorn/SQLite, no GUI dependency). The operator
-console is the browser web console at `/ui`, a **separately-versioned optional wheel**
+console is the browser web console at `/ui`, a **separately released optional wheel**
 (`messagefoundry-webconsole`) that these images do **not** install — a container serve therefore
 soft-degrades to the JSON API only, with a warning (ADR 0143); an **explicit**
 `[security].serve_web_console=true` against an image without that wheel is refused at startup instead of
