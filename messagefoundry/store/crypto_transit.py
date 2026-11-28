@@ -617,7 +617,8 @@ class TransitCipher(_UnmarkedPolicy):
 
     encrypts = True
     #: Every call is a Transit HTTP round trip, so :func:`~messagefoundry.store.row_seal.cipher_call`
-    #: runs it on the row-seal Transit pool rather than inline (BACKLOG #3929).
+    #: runs it on the row-seal Transit pool rather than inline, and ``cipher_bulk_call`` on the
+    #: Transit bulk pool (BACKLOG #3929).
     blocks_on_io = True
     #: This cipher cannot name the keys it holds, and its UnauthenticatedCipherError is Vault's
     #: AEAD refusal of the value itself, never a key it lacks, so

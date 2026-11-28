@@ -173,7 +173,7 @@ def test_a_nonsensical_bulk_pool_size_is_refused(value: object) -> None:
         checked_transit_bulk_workers(value)
     with pytest.raises(ValueError):
         configure_transit_bulk_workers(value)
-    assert row_seal._bulk_workers == TRANSIT_BULK_WORKERS_DEFAULT  # a refusal changes nothing
+    assert row_seal._BULK_POOL.size == TRANSIT_BULK_WORKERS_DEFAULT  # a refusal changes nothing
 
 
 @pytest.mark.parametrize("value", [1, TRANSIT_BULK_WORKERS_MAX])
@@ -199,7 +199,7 @@ def test_the_setting_matches_the_pool_constants() -> None:
 def test_building_the_transit_cipher_sizes_the_bulk_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_fake(monkeypatch)
     build_transit_cipher(StoreSettings(transit_bulk_workers=5))
-    assert row_seal._bulk_workers == 5
+    assert row_seal._BULK_POOL.size == 5
 
 
 async def test_shutdown_waits_for_a_running_call_off_the_loop_then_rebuilds() -> None:
@@ -290,6 +290,57 @@ def test_the_server_backends_route_their_bulk_walks_to_the_bulk_pool() -> None:
         lines = list(_source_lines(getattr(cls, name)))
         assert any("await cipher_bulk_call(" in line for line in lines), (cls.__name__, name)
         assert not any("await cipher_call(" in line for line in lines), (cls.__name__, name)
-    roll = list(_source_lines(store_module.roll_audit_key_range))
-    walk_at = next(i for i, line in enumerate(roll) if "verify_audit_rows," in line)
-    assert "await cipher_bulk_call(" in roll[walk_at - 2]
+    # The roll's walk: the call that opens before its verify_audit_rows argument is the bulk one.
+    roll = inspect.getsource(store_module.roll_audit_key_range)
+    before_walk = roll[: roll.index("verify_audit_rows,")]
+    assert before_walk.rfind("await cipher_bulk_call(") > before_walk.rfind("await cipher_call(")
+
+
+async def test_a_bounded_shutdown_leaves_a_running_walk_to_finish() -> None:
+    gate = _Gate()
+    walk = asyncio.create_task(cipher_bulk_call(_HeldTransitCipher(gate), gate.hold))
+    await gate.until_running(1)
+    pool = row_seal._transit_bulk_pool()
+    try:
+        assert await shutdown_transit_pools(0.05) is False
+        assert not walk.done()
+        with pytest.raises(RuntimeError):
+            pool.submit(int)  # detached and shut: it takes nothing new
+    finally:
+        gate.release.set()
+        await walk
+    assert await shutdown_transit_pools(0.05) is True  # nothing left to wait for
+
+
+async def test_the_engine_stop_shuts_the_pools_down_after_the_store_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import engine as engine_module
+    from messagefoundry.pipeline.engine import Engine
+
+    order: list[str] = []
+    eng = await Engine.create(
+        tmp_path / "s.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    real_close = eng.store.close
+
+    async def close() -> None:
+        order.append("store closed")
+        await real_close()
+
+    async def shutdown(timeout: float | None = None) -> bool:
+        order.append(f"pools shut down within {timeout}")
+        return False
+
+    monkeypatch.setattr(eng.store, "close", close)
+    monkeypatch.setattr(engine_module, "shutdown_transit_pools", shutdown)
+    try:
+        await eng.stop()
+    finally:
+        if order[:1] != ["store closed"]:
+            await real_close()
+    assert order == [
+        "store closed",
+        f"pools shut down within {engine_module._TRANSIT_POOL_DRAIN_SECONDS}",
+    ]

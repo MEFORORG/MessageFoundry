@@ -195,6 +195,10 @@ _STOP_WAIT_SHARE_SECONDS = 0.3
 #: Under a stop budget: what is kept back for the store's close, which no budget cuts, since a
 #: store left open keeps a non-daemon worker thread alive (BACKLOG #2087). An estimate, not a bound.
 _STOP_CLOSE_ALLOWANCE_SECONDS = 0.5
+#: How long stop waits, after the store closes, for Transit calls still running on the seal and
+#: bulk pools (BACKLOG #3929). Under a stop budget it gets what is left, at least the floor. A call
+#: still running then is left to finish, so the stop does not wait out a whole bulk walk.
+_TRANSIT_POOL_DRAIN_SECONDS = 2.0
 
 
 class _StopBudget:
@@ -4542,7 +4546,16 @@ class Engine:
                 log.exception("the store close failed after an engine stop step failed")
         try:
             # After the store close, so no store call is still handing work to them (BACKLOG #3929).
-            await shutdown_transit_pools()
+            # The wait is bounded; a bulk walk still running past it keeps its thread, and the
+            # process exit waits for it.
+            drained = await shutdown_transit_pools(
+                budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0)
+            )
+            if not drained:
+                log.warning(
+                    "Transit calls were still running when the engine stopped; the process exit "
+                    "waits for them, each bounded by the Vault client's own timeout"
+                )
         except asyncio.CancelledError:
             cancelled = True
         except Exception:

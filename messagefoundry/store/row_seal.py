@@ -577,72 +577,98 @@ TRANSIT_BULK_WORKERS_MAX: Final = 64
 #: The name every thread of the bulk pool's name starts with.
 TRANSIT_BULK_THREAD_PREFIX: Final = "mefor-transit-bulk"
 
-# The bulk pool's size, and the pool, built on first use like the seal pool. A size set after the
-# pool is built applies to the next one, built after :func:`shutdown_transit_pools`.
-_bulk_workers: int = TRANSIT_BULK_WORKERS_DEFAULT
-_bulk_pool: ThreadPoolExecutor | None = None
-_bulk_pool_lock: Final = threading.Lock()
+
+class _LazyPool:
+    """A thread pool built on first use, so a process that never calls Transit builds none, and
+    detached by :func:`shutdown_transit_pools`, after which the next use builds a new one."""
+
+    def __init__(self, size: int, prefix: str) -> None:
+        self.size = size
+        self._prefix = prefix
+        self._lock = threading.Lock()
+        self._pool: ThreadPoolExecutor | None = None
+        self._built_size = 0
+
+    def get(self) -> ThreadPoolExecutor:
+        with self._lock:
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(
+                    max_workers=self.size, thread_name_prefix=self._prefix
+                )
+                self._built_size = self.size
+            return self._pool
+
+    def resize(self, size: int) -> int | None:
+        """Set the size of the next pool built; the size of the one already built, if any."""
+        with self._lock:
+            self.size = size
+            return None if self._pool is None else self._built_size
+
+    def detach(self) -> ThreadPoolExecutor | None:
+        with self._lock:
+            pool, self._pool = self._pool, None
+            return pool
 
 
-@functools.cache
+_SEAL_POOL: Final = _LazyPool(TRANSIT_SEAL_WORKERS, TRANSIT_SEAL_THREAD_PREFIX)
+_BULK_POOL: Final = _LazyPool(TRANSIT_BULK_WORKERS_DEFAULT, TRANSIT_BULK_THREAD_PREFIX)
+
+
 def _transit_pool() -> ThreadPoolExecutor:
-    # Built on first use, so a process that never seals through Transit builds no pool.
-    return ThreadPoolExecutor(
-        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix=TRANSIT_SEAL_THREAD_PREFIX
-    )
+    return _SEAL_POOL.get()
+
+
+def _transit_bulk_pool() -> ThreadPoolExecutor:
+    return _BULK_POOL.get()
 
 
 def checked_transit_bulk_workers(value: object) -> int:
     """``value`` as a bulk pool size, or :class:`ValueError` when it is not an int from 1 to
-    :data:`TRANSIT_BULK_WORKERS_MAX`. A bool is refused, though Python counts it as an int."""
+    :data:`TRANSIT_BULK_WORKERS_MAX`. A bool is refused, though Python counts it as an int. The
+    settings load refuses the same values first; this holds for a caller that skips it."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"the Transit bulk pool size must be an int, not {type(value).__name__}")
     if not 1 <= value <= TRANSIT_BULK_WORKERS_MAX:
-        raise ValueError(
-            f"the Transit bulk pool size must be from 1 to {TRANSIT_BULK_WORKERS_MAX}, not {value}"
-        )
+        raise ValueError(f"the Transit bulk pool size must be from 1 to {TRANSIT_BULK_WORKERS_MAX}")
     return value
 
 
 def configure_transit_bulk_workers(value: object) -> None:
     """Size the bulk pool (``[store].transit_bulk_workers``), refusing what
-    :func:`checked_transit_bulk_workers` refuses. A pool already built keeps its size until
-    :func:`shutdown_transit_pools`; the next one built takes this one."""
-    global _bulk_workers
+    :func:`checked_transit_bulk_workers` refuses. The pool is process-wide: one already built
+    keeps its size until :func:`shutdown_transit_pools`, the next one built takes this one, and a
+    WARNING says so when the two differ."""
     checked = checked_transit_bulk_workers(value)
-    with _bulk_pool_lock:
-        _bulk_workers = checked
+    built = _BULK_POOL.resize(checked)
+    if built is not None and built != checked:
+        log.warning(
+            "the Transit bulk pool already runs %d threads; transit_bulk_workers = %d takes effect "
+            "when the engine next starts",
+            built,
+            checked,
+        )
 
 
-def _transit_bulk_pool() -> ThreadPoolExecutor:
-    global _bulk_pool
-    with _bulk_pool_lock:
-        if _bulk_pool is None:
-            _bulk_pool = ThreadPoolExecutor(
-                max_workers=_bulk_workers, thread_name_prefix=TRANSIT_BULK_THREAD_PREFIX
-            )
-        return _bulk_pool
+async def shutdown_transit_pools(timeout: float | None = None) -> bool:
+    """Shut down the seal pool and the bulk pool; each is built again on its next use. Returns
+    whether every call they held finished within ``timeout`` seconds (None waits for them all).
 
-
-async def shutdown_transit_pools() -> None:
-    """Shut down the seal pool and the bulk pool; each is built again on its next use.
-
-    Each pool's queued and running calls finish first. The wait runs in a worker thread, so the
-    event loop keeps serving while a Transit call still running completes, each bounded by the
-    Vault client's own timeout. A call handed to a pool after this detached it goes to a new pool;
-    one handed over while the detach runs can be refused, which reads as an outage
-    (:class:`~messagefoundry.store.crypto.CipherUnavailableError`)."""
-    global _bulk_pool
-    pools: list[ThreadPoolExecutor] = []
-    if _transit_pool.cache_info().currsize:
-        pools.append(_transit_pool())
-        _transit_pool.cache_clear()
-    with _bulk_pool_lock:
-        if _bulk_pool is not None:
-            pools.append(_bulk_pool)
-            _bulk_pool = None
-    # Drained at once, so the stop waits for the slower pool, not for the sum of both.
-    await asyncio.gather(*(asyncio.to_thread(pool.shutdown, wait=True) for pool in pools))
+    Neither pool takes a new call once detached here, and each still runs the calls it already
+    holds, queued ones included. A bulk call can make many round trips, each bounded only by the
+    Vault client's own timeout, so the wait for them is bounded here, never the calls: one still
+    running past ``timeout`` keeps its thread, and interpreter exit waits for it. The wait runs in
+    worker threads, so the event loop keeps serving. A call handed to a pool while the detach runs
+    can be refused, which reads as an outage
+    (:class:`~messagefoundry.store.crypto.CipherUnavailableError`); a later one gets a new pool."""
+    pools = [pool for pool in (_SEAL_POOL.detach(), _BULK_POOL.detach()) if pool is not None]
+    for pool in pools:
+        pool.shutdown(wait=False)
+    if not pools:
+        return True
+    # Drained at once, so the wait is for the slower pool, not for the sum of both.
+    joins = [asyncio.ensure_future(asyncio.to_thread(pool.shutdown, wait=True)) for pool in pools]
+    _done, pending = await asyncio.wait(joins, timeout=timeout)
+    return not pending
 
 
 async def _in_pool[**P, T](

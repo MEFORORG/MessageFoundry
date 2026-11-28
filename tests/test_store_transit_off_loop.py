@@ -169,6 +169,7 @@ async def test_an_in_process_cipher_runs_inline_on_the_loop(
         raise AssertionError("an in-process cipher call was handed to the Transit pool")
 
     monkeypatch.setattr(row_seal, "_in_transit_pool", refuse)
+    monkeypatch.setattr(row_seal, "_in_transit_bulk_pool", refuse)
     threads: list[int] = []
     encrypt_threads: list[int] = []
     real_encrypt = AesGcmCipher.encrypt

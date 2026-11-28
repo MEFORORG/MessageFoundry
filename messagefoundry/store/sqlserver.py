@@ -10480,7 +10480,7 @@ class SqlServerStore(ServerCipherWalk):
         self, rows: Sequence[Mapping[str, Any]]
     ) -> tuple[dict[str, MutableMapping[str, Any]], dict[str, str]]:
         """The decrypt half of :meth:`_read_active_reference_snapshots`. Synchronous, so the
-        whole read decrypts in one :func:`cipher_call` (BACKLOG #3929)."""
+        whole read decrypts in one :func:`cipher_bulk_call` (BACKLOG #3929)."""
         cache: dict[str, MutableMapping[str, Any]] = {}
         versions: dict[str, str] = {}
         for r in rows:
