@@ -79,6 +79,7 @@ __all__ = [
     "CellTagSink",
     "CorruptCellError",
     "NonTextCellError",
+    "NonTextListedCellError",
     "SealedBlankCellError",
     "UnmarkedCellError",
     "UnreadableParentMetadataError",
@@ -361,6 +362,17 @@ class NonTextCellError(CellTagError):
             f"a {self.table}.{self.column} cell is not text, which the store never writes"
             f" (row {self.row_ref})"
         )
+
+
+class NonTextListedCellError(CipherError):
+    """A cell of a table this module does not tag, opened by :func:`open_listed_cell`, holds a value
+    that is not text, a planted BLOB say (BACKLOG #5650). Such a table has no tag-failed audit row
+    or alert, so the failed read is the signal, and this class names the case where a log records
+    the class alone."""
+
+    def __init__(self, table: str) -> None:
+        self.table = table
+        super().__init__(f"a {table} cell is not text, which the store never writes")
 
 
 def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[CellTagError] | None:
@@ -734,13 +746,13 @@ def open_listed_cell(cipher: Cipher, stored: object, aad: bytes, *, table: str) 
     store does not hold cannot be told from a key genuinely not held, so it is withheld
     (:func:`refused_for_key` names the cases).
 
-    A value that is not text, a planted BLOB say, raises :class:`CipherError` on a keyed and a
-    keyless store alike, failing the read, rather than a ``TypeError`` out of the cipher or a
+    A value that is not text, a planted BLOB say, raises :class:`NonTextListedCellError` on a keyed
+    and a keyless store alike, failing the read, rather than a ``TypeError`` out of the cipher or a
     non-text value back to the caller (BACKLOG #5650). The store writes these cells as text only."""
     if stored is None:
         return None
     if not isinstance(stored, str):
-        raise CipherError(f"a {table} cell is not text, which the store never writes")
+        raise NonTextListedCellError(table)
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:

@@ -5,13 +5,16 @@ or in a cell a list-shaped read opens (``queue.last_error`` on ``GET /dead-lette
 
 The store writes these cells as text only, so a non-text value was written outside the store. A
 keyed cipher handed one raised ``TypeError``, which escaped every ``CipherError`` containment: a
-claim did not dead-letter the row and a list read failed with an unhandled error. A keyless cipher
-returned the bytes unchanged, so a non-text value reached the caller.
+claim dead-lettered the row only through its catch-all, with no tag-failed audit row and no alert,
+and a list read failed with an unhandled ``TypeError``. A keyless cipher returned the bytes
+unchanged, so a claim handed them to delivery and a list read handed them back.
 
 Now :func:`open_queue_cell` raises :class:`QueueTagError` with cause ``non-text``, drift, as a blank
-payload is, so a claim dead-letters the row with its audit row and alert. :func:`open_listed_cell`
-raises a :class:`CipherError`, which fails the read as every refusal other than a key the store does
-not hold does (owner ruling 2026-11-19, BACKLOG #5970). Synthetic data only.
+payload is, so a claim dead-letters the row with its audit row, and on a keyed store its alert (a
+keyless cipher has no alert hook). :func:`open_listed_cell` raises
+:class:`NonTextListedCellError`, a :class:`CipherError`, which fails the read as every refusal other
+than a key the store does not hold does (owner ruling 2026-11-19, BACKLOG #5970). Synthetic data
+only.
 """
 
 from __future__ import annotations
@@ -25,13 +28,20 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStore
-from messagefoundry.store.cell_tag import open_listed_cell
-from messagefoundry.store.crypto import CipherError, cell_aad, generate_key, make_cipher
+from messagefoundry.store.cell_tag import NonTextListedCellError, open_listed_cell
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    CipherError,
+    cell_aad,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.queue_tag import (
     QUEUE_TAG_CAUSES,
     QUEUE_TAG_FAILED_ACTION,
     QueueTagError,
     open_queue_cell,
+    queue_row_aad,
 )
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG5650|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -60,13 +70,17 @@ def test_a_non_text_queue_payload_is_a_queue_tag_error(keyed: bool, body_ref: st
     assert refused.value.drift and refused.value.cause == "non-text"
     assert refused.value.cause in QUEUE_TAG_CAUSES
     assert "PLANTED" not in str(refused.value)
+    # CONTROL: a text payload the cipher sealed for the same row still opens.
+    row = _row(body_ref=body_ref)
+    sealed = cipher.encrypt(body_ref or "SYNTH-BODY", aad=queue_row_aad(row))
+    assert open_queue_cell(cipher, {**row, "payload": sealed}) == (body_ref or "SYNTH-BODY")
 
 
 @pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
 def test_a_non_text_listed_cell_fails_the_read_as_a_cipher_error(keyed: bool) -> None:
     cipher = make_cipher(generate_key() if keyed else None, write_v2=True)
     aad = cell_aad("queue", "last_error", "row-5650")
-    with pytest.raises(CipherError) as refused:
+    with pytest.raises(NonTextListedCellError) as refused:
         open_listed_cell(cipher, BLOB, aad, table="queue")
     assert "PLANTED" not in str(refused.value)
     # CONTROL: the same open of a text cell the cipher wrote still opens.
@@ -82,9 +96,17 @@ def _plant(db: pathlib.Path, column: str) -> None:
         side.close()
 
 
-async def test_a_planted_blob_payload_is_dead_lettered_by_the_claim(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_a_planted_blob_payload_is_dead_lettered_by_the_claim(
+    tmp_path: pathlib.Path, keyed: bool
+) -> None:
     db = tmp_path / "blob_payload.db"
-    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    cipher = make_cipher(generate_key() if keyed else None, write_v2=True)
+    alerts: list[str] = []
+    if keyed:
+        assert isinstance(cipher, AesGcmCipher)
+        cipher.set_tag_failure_hook(lambda _table, reason: alerts.append(reason))
+    store = await MessageStore.open(db, cipher=cipher)
     try:
         await store.enqueue_message(
             channel_id="IB_A", raw=RAW, deliveries=[("OB_A", "p")], now=10.0
@@ -95,8 +117,9 @@ async def test_a_planted_blob_payload_is_dead_lettered_by_the_claim(tmp_path: pa
         assert [d["destination_name"] for d in dead] == ["OB_A"]
     finally:
         await store.close()
-    # The claim dead-lettered the row before the fix too, through its catch-all for an
-    # undecryptable row, but as a TypeError: no tag-failed audit row and no alert.
+    # A keyed claim dead-lettered the row before the fix too, through its catch-all for an
+    # undecryptable row, but as a TypeError: no tag-failed audit row and no alert. A keyless claim
+    # delivered the bytes.
     side = sqlite3.connect(db, timeout=30)
     try:
         details = [
@@ -108,6 +131,8 @@ async def test_a_planted_blob_payload_is_dead_lettered_by_the_claim(tmp_path: pa
     finally:
         side.close()
     assert [d["cause"] for d in details] == ["non-text"]
+    words = QUEUE_TAG_CAUSES["non-text"]
+    assert len(alerts) == (1 if keyed else 0) and all(words in a for a in alerts), alerts
 
 
 async def test_a_planted_blob_last_error_fails_the_dead_letter_list_as_a_cipher_error(
