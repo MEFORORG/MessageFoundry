@@ -1029,7 +1029,7 @@ def test_the_last_faults_of_a_burst_are_said_at_the_next_flush_and_at_close(
 
 
 def test_the_stdout_sink_says_a_bursts_last_faults_at_the_next_record(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The test above, on the stdout sink, whose emit writes through the guard's own write and
     # never calls the handler's flush: that write must itself say an interval that has passed.
@@ -1135,7 +1135,7 @@ _UNENCODABLE = "caf\xe9 \u4e2d \U0001f600"
 
 
 def test_a_line_the_stream_cannot_encode_is_escaped_not_a_sink_failure(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The stdout sink on a strict cp1252 stream, which is also the live sys.stdout, so a roll
     # re-resolves to the same stream. The record formats; the stream has no byte for a character in
@@ -1237,7 +1237,7 @@ def test_an_unencodable_line_on_a_broken_stream_still_reaches_stage_2(
 
 
 def test_a_codec_whose_round_trip_maps_a_character_is_not_rewritten(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # cp932, the Japanese Windows ANSI code page, encodes U+00A2 but decodes its byte back as
     # U+FFE0. The line encodes, so it is written as it came and no escape is counted.
@@ -1345,7 +1345,7 @@ def test_a_failed_write_is_not_retried_by_handle_error(monkeypatch: pytest.Monke
 
 
 def test_a_stream_whose_encoding_cannot_be_read_gets_ascii_escapes_and_a_signal(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A proxy whose encoding property raises: the line is escaped for ASCII, which the stream
     # takes, the sink stays healthy, and the stderr format-fault line says why.
@@ -1385,7 +1385,7 @@ def test_a_stream_whose_encoding_cannot_be_read_gets_ascii_escapes_and_a_signal(
 
 
 def test_an_encoding_property_raising_attribute_error_is_unreadable_not_missing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A delegating proxy whose target is gone raises AttributeError from its property, which a
     # plain getattr default would read as "no encoding": the line would go raw to a replacing
@@ -1538,7 +1538,7 @@ def test_classifying_an_odd_stream_class_never_fails_the_write(
 
 
 def test_an_unreadable_encoding_is_printed_when_the_write_fails(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The cause is counted before the write, and stage 2 says every counted fault at once, inside
     # the report interval too, so a write that then fails does not hide it from stderr.
@@ -1580,7 +1580,7 @@ def test_an_unreadable_encoding_is_printed_when_the_write_fails(
 
 
 def test_a_dead_sink_says_its_faults_once_not_per_record(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The forced report at stage 2 runs on the transition only. Later records on the dead sink
     # go back to the rated line: said once an interval has passed, never once per record.
@@ -1616,7 +1616,7 @@ def test_a_dead_sink_says_its_faults_once_not_per_record(
 
 
 def test_a_flap_bound_trip_says_a_pending_cause(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The roll that trips the flap bound sends the sink to stage 2, and that forces the report
     # too, so a cause counted inside the interval is on stderr with the stage-2 line.
@@ -1698,7 +1698,7 @@ def test_an_encoding_that_reads_back_as_no_str_is_escaped_and_counted(
 
 
 def test_a_classify_failure_still_counts_an_ascii_escape(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A classify failure does not make the escape, so a line the strict stream refuses, and the
     # ASCII fallback lands, is counted as an escape too.
@@ -1725,6 +1725,46 @@ def test_a_classify_failure_still_counts_an_ascii_escape(
     err = capsys.readouterr().err
     assert logging_guard._CLASSIFY_FAULT in err
     assert logging_guard._ESCAPED_FAULT in err
+
+
+def test_an_unnameable_non_str_encoding_is_said_once_per_interval(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An encoding of a type whose name cannot be rendered is counted on the rated format-fault
+    # line under its own entry, so many log lines inside one interval make one stderr line.
+    # NEGATIVE CONTROL: with the name rendered through _type_name, each log line wrote its own
+    # unrated "an exception's type name could not be rendered" line.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Unnameable(type):
+        @property
+        def __name__(cls) -> str:  # type: ignore[override]
+            raise RuntimeError("no name")
+
+    weird = _Unnameable("Weird", (), {})()
+
+    class _Writer(io.StringIO):
+        encoding = weird
+
+    stream = _Writer()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    for _ in range(5):
+        handler.emit(_record("caf%s", chr(0xE9)))
+    first = capsys.readouterr().err
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("caf%s", chr(0xE9)))
+    second = capsys.readouterr().err
+
+    assert stream.getvalue().splitlines() == ["caf" + "\\" + "u00e9"] * 6
+    for err in (first, second):
+        assert err.count("\n") == 1
+        assert logging_guard._ENCODING_TYPE_UNNAMEABLE_FAULT in err
+        assert "exception's type name could not be rendered" not in err
 
 
 def test_an_unhashable_str_encoding_does_not_fail_the_write(
@@ -1754,7 +1794,7 @@ def test_an_unhashable_str_encoding_does_not_fail_the_write(
 
 
 def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Past the bound every roll writes the stage-2 line again (repeat), but only the first one
     # moved the sink into stage 2, so only that one forces the format-fault report.
@@ -1802,7 +1842,7 @@ def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
 
 
 def test_a_stream_class_that_cannot_be_classified_is_said(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A class whose MRO cannot be read is read as having no encoding, so the write is never
     # failed, and the classification failure is counted on the rated stderr line.
@@ -1836,7 +1876,7 @@ def test_a_stream_class_that_cannot_be_classified_is_said(
 
 
 def test_a_formatter_fault_stage_2_says_a_pending_cause(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The formatter-fault path into stage 2 forces the report too, so an unreadable-encoding
     # cause counted inside the interval is on stderr when the sink goes down.
@@ -2018,7 +2058,7 @@ def test_a_lone_surrogate_on_the_utf8_file_sink_is_written_as_the_log_spells_it(
 
 
 def test_serves_hardened_stdout_writes_the_escape_not_a_question_mark(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # serve hardens its console streams to errors="replace" before logging is configured
     # (console_streams.harden_console_streams), so that stream never raises, and a guard that

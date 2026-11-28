@@ -881,6 +881,13 @@ _ENCODING_UNREADABLE_FAULT = "the sink's stream encoding could not be read"
 #: so a line written to it was escaped for ASCII (BACKLOG #5813). The entry names the type read.
 _ENCODING_NOT_STR_FAULT = "the sink's stream encoding is not a str"
 
+#: The entry for a stream whose ``encoding`` read back as neither a str nor ``None``, of a type
+#: whose name could not be rendered (BACKLOG #5813).
+_ENCODING_TYPE_UNNAMEABLE_FAULT = (
+    "the sink's stream encoding is not a str, and its type's name could not be rendered; lines "
+    "to it are escaped for ASCII"
+)
+
 #: The stderr format-fault line's entry for a line the sink's stream could not encode, written
 #: escaped (BACKLOG #5813). The record formatted; it is counted on that line all the same.
 _ESCAPED_FAULT = (
@@ -1127,8 +1134,8 @@ class _GuardedSinkMixin(_SinkBase):
 
     def _note_format_fault(self, detail: str) -> None:
         """Count one format fault of the kind ``detail`` names, for :meth:`_report_format_faults`.
-        ``detail`` is built from literals and :func:`_type_name` output, and carries nothing from
-        the record. Past :data:`_FORMAT_FAULT_KINDS` distinct kinds, a new kind is counted under
+        ``detail`` is built from literals, :func:`_type_name` output and the ``ascii()`` of a type
+        name, and carries nothing from the record. Past :data:`_FORMAT_FAULT_KINDS` distinct kinds, a new kind is counted under
         one catch-all kind, so a burst of varied faults cannot grow this without bound."""
         faults = self._format_faults
         if detail not in faults and len(faults) >= _FORMAT_FAULT_KINDS:
@@ -1317,10 +1324,18 @@ class _GuardedSinkMixin(_SinkBase):
             codec = None
         else:
             codec = "ascii"
-            unreadable = _type_name(encoding)
-            self._note_format_fault(
-                f"{_ENCODING_NOT_STR_FAULT} ({unreadable}); lines to it are escaped for ASCII"
-            )
+            # Rendered here, not by _type_name: its fallback writes an unrated stderr line naming
+            # an exception, and this runs per log line. A name that cannot be rendered is counted
+            # on the rated format-fault line under its own literal entry instead.
+            try:
+                unreadable = ascii(type(encoding).__name__)
+            except Exception:
+                unreadable = _RECORD_LABEL_DROPPED
+                self._note_format_fault(_ENCODING_TYPE_UNNAMEABLE_FAULT)
+            else:
+                self._note_format_fault(
+                    f"{_ENCODING_NOT_STR_FAULT} ({unreadable}); lines to it are escaped for ASCII"
+                )
         written = line
         if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
             try:
