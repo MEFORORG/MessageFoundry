@@ -574,11 +574,15 @@ _PER_BYTE_READ = "Ren\\XC3A9\\E"
         ("UTF-8", _UTF8_READ),
         ("utf-8", _UTF8_READ),
         (" Utf-8  ", _UTF8_READ),
-        # Only spaces are stripped, so a tab around the name is part of it.
+        # Only ASCII spaces are stripped, so a tab or a no-break space is part of the name.
         ("\tUTF-8", _PER_BYTE_READ),
-        # The value read is MSH-18.1, the first component, so a later component is not read.
+        ("UTF-8\u00a0", _PER_BYTE_READ),
+        # The value read is MSH-18.1, the whole first component, so a later component is not
+        # read, but a subcomponent is part of it. It is read unescaped.
         ("UNICODE UTF-8^", _UTF8_READ),
         ("UTF-8^x", _UTF8_READ),
+        ("UTF-8&x", _PER_BYTE_READ),
+        ("UTF\\X2D\\8", _UTF8_READ),
         # Only the first repetition names the message's own character set; a later one names an
         # alternate set a \C..\ escape may switch to.
         ("UNICODE UTF-8~8859/1", _UTF8_READ),

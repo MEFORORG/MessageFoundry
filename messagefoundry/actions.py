@@ -145,10 +145,13 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     is the text a hex escape carries. Title case still reads the character before a letter to
     decide whether it starts a word: an escape's decoded text, except that the bytes of a run of
     adjacent hex escapes are read as UTF-8, where they end in a valid UTF-8 character, if the
-    message reads as UTF-8. It does when ``MSH-18.1``, the first component of the first
-    repetition, with leading and trailing spaces removed and compared case-insensitively, is empty,
-    ``UTF-8`` or HL7 table 0211's ``UNICODE UTF-8``; an absent ``MSH-18`` counts as empty. Under
-    any other value each byte is its own character. A no-op on an absent field; raises
+    message reads as UTF-8. It does when ``MSH-18.1``, the whole first component of the first
+    repetition (subcomponents included), unescaped, with leading and trailing ASCII spaces removed
+    and compared case-insensitively, is empty, ``UTF-8`` or HL7 table 0211's ``UNICODE UTF-8``; an
+    absent ``MSH-18`` counts as empty. HL7 says an empty ``MSH-18`` declares ASCII, whose bytes read
+    the same either way; the UTF-8 reading there is the owner's ruling of 2026-11-27 (BACKLOG
+    #5928), for senders that send UTF-8 without declaring it. Under any other value each byte is
+    its own character. A no-op on an absent field; raises
     :class:`ValueError` on an unknown mode (fail loud rather than silently leaving the value), or
     on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
     # A tuple test, not a dict one, so an unhashable mode from config raises the documented
@@ -157,7 +160,7 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
         raise ValueError(f"convert_case mode must be 'upper', 'lower', or 'title', got {mode!r}")
     convert = _CASE_CONVERTERS[mode]
     # Only title case reads the character before a run, so only it reads MSH-18.
-    utf8_hex = mode == "title" and _declares_utf8(msg)
+    utf8_hex = mode == "title" and _reads_hex_as_utf8(msg)
     _edit_value(
         msg,
         path,
@@ -166,18 +169,19 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     )
 
 
-#: The ``MSH-18.1`` values, spaces stripped and case-folded, that read as UTF-8 (owner ruling
-#: 2026-11-27, BACKLOG #5928). The rule is :func:`convert_case`'s docstring.
-_UTF8_CHARSETS = frozenset({"", "utf-8", "unicode utf-8"})
+#: The ``MSH-18.1`` values, case-folded, that name UTF-8. The rule is :func:`convert_case`'s
+#: docstring.
+_UTF8_CHARSET_NAMES = frozenset({"utf-8", "unicode utf-8"})
 
 
-def _declares_utf8(msg: Message) -> bool:
-    """Whether a hex escape's bytes read as UTF-8 under :func:`convert_case`'s rule.
+def _reads_hex_as_utf8(msg: Message) -> bool:
+    """Whether title case reads a hex run's bytes as UTF-8, under :func:`convert_case`'s rule.
 
-    A later repetition of ``MSH-18`` names an alternate set a ``\\C..\\`` escape may switch
-    to, so only the first is read, and only its first component."""
-    first = msg.field("MSH-18.1") or ""
-    return first.strip(" ").casefold() in _UTF8_CHARSETS
+    Not a test of the declared character set: an empty ``MSH-18`` declares ASCII, and passes. A
+    later repetition of ``MSH-18`` names an alternate set a ``\\C..\\`` escape may switch to,
+    so only the first is read."""
+    first = (msg.field("MSH-18.1") or "").strip(" ")
+    return not first or first.casefold() in _UTF8_CHARSET_NAMES
 
 
 # Each converter also takes whether the character before the run is cased. Only title case
