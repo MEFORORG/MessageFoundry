@@ -500,12 +500,17 @@ than a path is not checked
   check refuses such a mount on its path too, under either enforcement setting. The list of types
   is open: it does not judge at least a type it does not name, a `9p`, `virtiofs` or
   `fuse-overlayfs` mount at `/`, as a sandbox's root can be, a network file system beneath an
-  overlay mount, or a file in the secrets directory that is a mount of its own. Where that file
-  reads but lists no mount under a part of the path, as in a chroot whose root is not a mount, or
-  the path ends on an automount point not mounted yet, or only one of the check's reads of that
-  file before and after its walk succeeds, or the path or the mounts on it still change after a
-  second walk, the path is answered as not fully checked, as where the file cannot be read (vault
-  BACKLOG #5636). Keep key files on a local file system. It reads no
+  overlay mount, or a file in the secrets directory that is a mount of its own. On Linux, unless
+  the check refuses the path for something else, the path is answered as not fully checked, as
+  where that file cannot be read (vault BACKLOG #5636), in at least these cases: the file reads
+  but lists no mount under a part of the path, as in a chroot whose root is not a mount; the path
+  ends on an automount point not mounted yet; only one of the check's two reads of that file,
+  before and after its walk, succeeds; or those two reads place the path on different mounts, and
+  then the second walk this sets off visits different folders or files than the first, or a third
+  read of the file fails or places the second walk's path on different mounts than the second read
+  did. It does not detect at least a link on the path re-pointed after its last walk, a mount on
+  the path made or removed after its last read of that file, or a mount made and removed again
+  between two of its reads. Keep key files on a local file system. It reads no
   access list itself, so it can pass a key that a file system of a type it does not judge, or an
   access list such as an NFSv4 or macOS one, lets another account reach. Check
   those yourself. A directory a group or other account may write is accepted
