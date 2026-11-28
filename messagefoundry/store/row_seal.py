@@ -643,7 +643,7 @@ def configure_transit_bulk_workers(value: object) -> None:
     if built is not None and built != checked:
         log.warning(
             "the Transit bulk pool already runs %d threads; transit_bulk_workers = %d takes effect "
-            "when the engine next starts",
+            "when the pools are next built, after the last engine in this process stops",
             built,
             checked,
         )
@@ -657,11 +657,15 @@ def _join_in_own_thread(pool: ThreadPoolExecutor) -> asyncio.Event:
     ended = asyncio.Event()
 
     def join() -> None:
-        pool.shutdown(wait=True)
         try:
-            loop.call_soon_threadsafe(ended.set)
-        except RuntimeError as exc:  # the loop closed first, so nobody waits for this any more
-            log.info("a Transit pool ended after its event loop closed: %s", exc)
+            pool.shutdown(wait=True)
+        except Exception:  # noqa: BLE001 - logged; the waiter below is still told, in the finally
+            log.exception("a Transit pool's threads could not be joined")
+        finally:
+            try:
+                loop.call_soon_threadsafe(ended.set)
+            except RuntimeError as exc:  # the loop closed first, so nobody waits for this any more
+                log.info("a Transit pool ended after its event loop closed: %s", exc)
 
     threading.Thread(target=join, name="mefor-transit-pool-join", daemon=True).start()
     return ended
@@ -681,11 +685,25 @@ async def shutdown_transit_pools(timeout: float | None = None) -> bool:
     as an outage (:class:`~messagefoundry.store.crypto.CipherUnavailableError`); a later one gets a
     new pool. A process with more than one user of the pools releases them through
     :class:`TransitPoolLease` instead, so the last user's release is the one that shuts them."""
+    return await _drain_pools(_detach_pools(), timeout)
+
+
+def _detach_pools() -> list[ThreadPoolExecutor]:
+    """Detach both pools and stop each taking calls, its queued ones cancelled; the next use of
+    either builds a new one."""
     pools = [pool for pool in (_SEAL_POOL.detach(), _BULK_POOL.detach()) if pool is not None]
     for pool in pools:
         pool.shutdown(wait=False, cancel_futures=True)
+    return pools
+
+
+async def _drain_pools(pools: list[ThreadPoolExecutor], timeout: float | None) -> bool:
+    """Whether the calls still running on ``pools``, already detached, end within ``timeout``. A
+    ``timeout`` of 0 or less waits for nothing, and is False where there were pools."""
     if not pools:
         return True
+    if timeout is not None and timeout <= 0:
+        return False
     # Drained at once, so the wait is for the slower pool, not for the sum of both.
     ended = [_join_in_own_thread(pool) for pool in pools]
     try:
@@ -722,8 +740,10 @@ class TransitPoolLease:
                 return True
             self._held = False
             _leases -= 1
-            last = _leases == 0
-        return await shutdown_transit_pools(timeout) if last else True
+            # Detached under the lock, so a lease taken after this decision gets new pools and
+            # never a pool this release is shutting down.
+            pools = _detach_pools() if _leases == 0 else []
+        return await _drain_pools(pools, timeout)
 
 
 async def _in_pool[**P, T](

@@ -4381,10 +4381,43 @@ class Engine:
 
         A tight budget can cut those waits to :data:`_STOP_WAIT_FLOOR_SECONDS` and lose the work
         they wait for (the owner ruled on 2026-11-22 that the budget wins).
-        docs/SERVICE.md, *Start / stop / status*, says what each cut loses."""
+        docs/SERVICE.md, *Start / stop / status*, says what each cut loses.
+
+        Last, on every way out, this engine's lease on the Transit pools is released, once
+        (BACKLOG #3929). It waits for their running calls only when the steps ended or raised an
+        ordinary error; a cancel, KeyboardInterrupt or SystemExit gets no wait."""
+        budget = _StopBudget(budget_seconds)
+        raised: BaseException | None = None
+        try:
+            await self._stop_steps(budget)
+        except BaseException as exc:
+            raised = exc
+            raise
+        finally:
+            waits = raised is None or isinstance(raised, Exception)
+            drain = budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0) if waits else 0.0
+            await self.release_transit_pools(drain)
+
+    async def release_transit_pools(self, timeout: float) -> None:
+        """Release this engine's lease on the Transit pools, once; later calls do nothing. Where it
+        was the last lease, the pools are shut down and their running calls waited for up to
+        ``timeout`` seconds, after which they are left to finish (BACKLOG #3929). The failed-start
+        unwind, which never stops the engine, calls this too."""
+        try:
+            drained = await self._transit_pool_lease.release(timeout)
+        except RuntimeError:  # a join thread that could not start; logged, the stop goes on
+            log.exception("the Transit call pools did not shut down cleanly")
+            return
+        if not drained and timeout > 0:
+            log.warning(
+                "Transit calls were still running when the engine stopped; the process exit "
+                "waits for them to finish"
+            )
+
+    async def _stop_steps(self, budget: _StopBudget) -> None:
+        """:meth:`stop`'s steps, up to and including the store's close."""
         log.info("engine stopping")
         self._stopping = True
-        budget = _StopBudget(budget_seconds)
         # Kept back, at each budgeted wait, for the waits after it and the store's close: each
         # later budgeted wait its share, the watch's cancel wait its floor, and the config-write
         # drain the bound it will use, or nothing when the gate is closed and no write runs.
@@ -4547,20 +4580,6 @@ class Engine:
                 failure = exc
             else:
                 log.exception("the store close failed after an engine stop step failed")
-        try:
-            # After the store close (BACKLOG #3929). The pools are shut only when this engine held
-            # the last lease. The wait is bounded, and skipped on a stop already cancelled; a call
-            # still running past it keeps its thread, and the process exit waits for it.
-            drain = 0.0 if cancelled else budget.wait(_TRANSIT_POOL_DRAIN_SECONDS, kept=0.0)
-            if not await self._transit_pool_lease.release(drain):
-                log.warning(
-                    "Transit calls were still running when the engine stopped; the process exit "
-                    "waits for them to finish"
-                )
-        except asyncio.CancelledError:
-            cancelled = True
-        except RuntimeError:  # a join thread that could not start; logged, the stop goes on
-            log.exception("the Transit call pools did not shut down cleanly")
         cancelled = cancelled or (me is not None and me.cancelling() > baseline)
         if failure is not None and not isinstance(failure, Exception):
             raise failure  # SystemExit, KeyboardInterrupt: never swallowed by a cancel

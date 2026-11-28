@@ -334,12 +334,12 @@ async def test_the_engine_stop_shuts_the_pools_down_after_the_store_closes(
         order.append("store closed")
         await real_close()
 
-    async def shutdown(timeout: float | None = None) -> bool:
+    async def drain(pools: Any, timeout: float | None) -> bool:
         order.append(f"pools shut down within {timeout}")
         return False
 
     monkeypatch.setattr(eng.store, "close", close)
-    monkeypatch.setattr(row_seal, "shutdown_transit_pools", shutdown)
+    monkeypatch.setattr(row_seal, "_drain_pools", drain)
     try:
         await eng.stop()
     finally:
@@ -416,3 +416,107 @@ async def test_a_queued_call_is_cancelled_at_shutdown_and_never_runs() -> None:
     with pytest.raises(asyncio.CancelledError):
         await queued
     assert ran == []
+
+
+class _CancelledDrain:
+    """An alert sink whose state drain is cancelled, so the stop runs on as a cancelled stop."""
+
+    async def drain_state(self, timeout: float) -> None:
+        raise asyncio.CancelledError
+
+
+async def test_a_cancelled_stop_logs_no_still_running_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item A: a cancelled stop does not wait, so it has no running calls to report; before, it
+    waited 0 seconds and reported idle pools as still running."""
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    eng = await _engine(tmp_path / "c.db")
+    await TransitRowSealer(FakeBackend(), clock=Clock()).seal_async(USER_KIND, FIELDS)  # a pool
+    eng._alert_sink = _CancelledDrain()
+    with pytest.raises(asyncio.CancelledError):
+        await eng.stop()
+    assert "still running" not in caplog.text
+    assert row_seal._leases == 0
+
+
+@pytest.mark.parametrize("raised", [asyncio.CancelledError, KeyboardInterrupt])
+async def test_the_lease_is_released_when_the_store_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: type[BaseException]
+) -> None:
+    """Item B: a cancel or interrupt during the store close still releases the lease."""
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    eng = await _engine(tmp_path / "k.db")
+    real_close = eng.store.close
+
+    async def close() -> None:
+        await real_close()
+        raise raised
+
+    monkeypatch.setattr(eng.store, "close", close)
+    with pytest.raises(raised):
+        await eng.stop()
+    assert row_seal._leases == 0
+
+
+async def test_the_failed_start_unwind_releases_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item B: the failed-start unwind never stops the engine, and still releases its lease."""
+    from messagefoundry.api import app as app_module
+
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    eng = await _engine(tmp_path / "u.db")
+    await app_module._unwind_failed_start(eng.store, None, eng)
+    assert row_seal._leases == 0
+
+
+async def test_a_lease_taken_after_the_last_release_never_gets_a_pool_being_shut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item F: a lease taken just after the last lease's release decided to shut the pools gets
+    a new pool, never the one being shut. The hook runs where that release hands over to the
+    shutdown (``shutdown_transit_pools`` before, ``_drain_pools`` after)."""
+    monkeypatch.setattr(row_seal, "_leases", 0)
+    last = row_seal.TransitPoolLease()
+    row_seal._transit_pool()
+    taken: list[Any] = []
+
+    def take_one() -> None:
+        taken.append(row_seal.TransitPoolLease())
+        taken.append(row_seal._transit_pool())
+
+    real_shutdown = row_seal.shutdown_transit_pools
+    real_drain = row_seal._drain_pools
+
+    async def shutdown(timeout: float | None = None) -> bool:
+        take_one()
+        return await real_shutdown(timeout)
+
+    async def drain(pools: Any, timeout: float | None) -> bool:
+        take_one()
+        return await real_drain(pools, timeout)
+
+    monkeypatch.setattr(row_seal, "shutdown_transit_pools", shutdown)
+    monkeypatch.setattr(row_seal, "_drain_pools", drain)
+    await last.release(1.0)
+    new_lease, pool = taken
+    pool.submit(int).result(5)  # the new lease's pool still takes calls
+    assert row_seal._leases == 1
+    monkeypatch.undo()
+    await new_lease.release(1.0)
+
+
+async def test_a_join_that_raises_still_ends_the_wait() -> None:
+    """Item G: the join thread tells its waiter in a finally, so a join that raises does not leave
+    the shutdown waiting forever."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    class _Unjoinable(ThreadPoolExecutor):
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            super().shutdown(wait=False, cancel_futures=cancel_futures)
+            if wait:
+                raise RuntimeError("synthetic join failure")
+
+    row_seal._SEAL_POOL._pool = _Unjoinable(max_workers=1)
+    assert await asyncio.wait_for(shutdown_transit_pools(None), 3.0) is True
