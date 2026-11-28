@@ -41,6 +41,7 @@ from messagefoundry.api.models import (
     UploadedMessageSearchRequest,
     UploadResendRequest,
 )
+from messagefoundry.api.outlive import OperationInterrupted
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import STEP_UP_ACTION_UPLOAD_RESEND
 
@@ -165,6 +166,7 @@ UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 KEY_SERVICE_BUSY_CODE = "key_service_busy"
 STORAGE_UNREACHABLE_CODE = "storage_unreachable"
 DELETE_UNCONFIRMED_CODE = "delete_unconfirmed"
+DELETE_INTERRUPTED_CODE = "delete_interrupted"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
@@ -336,6 +338,13 @@ DELETE_UNCONFIRMED_NOTICE = (
     "folder on the server."
 )
 
+#: A delete whose unlink and row were cut off before they answered, for example by an engine
+#: shutdown (BACKLOG #5903). The outcome is unknown, so the text claims neither.
+DELETE_INTERRUPTED_NOTICE = (
+    "That delete was interrupted before it answered, so the file may or may not be gone. Reload "
+    "this list to see whether it is still listed, and check the audit log before deleting it again."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -360,6 +369,7 @@ _LIST_NOTICES: dict[str, str] = {
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
     STORAGE_UNREACHABLE_CODE: STORAGE_UNREACHABLE_NOTICE,
     DELETE_UNCONFIRMED_CODE: DELETE_UNCONFIRMED_NOTICE,
+    DELETE_INTERRUPTED_CODE: DELETE_INTERRUPTED_NOTICE,
     # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
     # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
     # the store is back, so a banner saying it is missing would be false there.
@@ -620,6 +630,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             return HTMLResponse(
                 pages.uploaded_logs_upload(error=str(exc.detail)), status_code=exc.status_code
+            )
+        except OperationInterrupted as exc:
+            # BACKLOG #5903: the creation row was cut off before it answered, so whether the file
+            # stayed stored is unknown. Not an HTTPException, so it would reach the browser as JSON.
+            return HTMLResponse(
+                pages.uploaded_logs_upload(error=exc.operator_detail), status_code=503
             )
         return RedirectResponse("/ui/uploaded-logs", status_code=303)
 
@@ -979,4 +995,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if code is None:
                 raise
             return _refused_by_engine("delete", file_id, exc.status_code, code)
+        except OperationInterrupted:
+            # BACKLOG #5903: the unlink and its row were cut off before they answered. A fixed
+            # notice, like every delete outcome here, and logged as the refusals are.
+            return _refused_by_engine(
+                "delete", file_id, status.HTTP_503_SERVICE_UNAVAILABLE, DELETE_INTERRUPTED_CODE
+            )
         return RedirectResponse("/ui/uploaded-logs", status_code=303)

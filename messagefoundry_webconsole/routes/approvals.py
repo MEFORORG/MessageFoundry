@@ -17,6 +17,7 @@ from messagefoundry.api.models import (
     ApprovalResolveRequest,
     ResolveOutcome,
 )
+from messagefoundry.api.outlive import OperationInterrupted
 from messagefoundry.api.validation import ResourceId
 from messagefoundry.auth import Identity, Permission
 
@@ -109,6 +110,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except HTTPException as exc:
             return _refused(exc)
+        except OperationInterrupted as exc:
+            # BACKLOG #5903: not an HTTPException, so it would reach the browser as the app's raw
+            # JSON 503. Not a refusal either: the outcome is unknown.
+            return HTMLResponse(pages.approval_interrupted(exc.operator_detail), status_code=503)
         return HTMLResponse(pages.approval_approved(result))
 
     @app.post("/ui/approvals/{approval_id}/reject")

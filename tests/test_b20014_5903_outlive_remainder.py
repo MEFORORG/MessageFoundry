@@ -27,15 +27,7 @@ from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
 from messagefoundry.api.security import public_route
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
-
-_WAIT_S = 10.0
-_APPROVAL_SENTENCE = "It ran as an approval's release"
-
-
-async def _hangs(started: asyncio.Event) -> None:
-    started.set()
-    await asyncio.Event().wait()
-
+from tests.test_b616_5903_outlive_drain_cancel import _WAIT_S, _hangs
 
 # --- step 2: the helper itself, both directions ---------------------------------------------------
 
@@ -199,5 +191,4 @@ async def test_an_ungated_route_whose_operation_is_drained_names_no_approval(
     detail = response.json()["detail"]
     assert detail.startswith("DR release was interrupted before it answered")
     assert "Check the audit log and the state it changes before running it again." in detail
-    assert _APPROVAL_SENTENCE not in detail
     assert "approval" not in detail
