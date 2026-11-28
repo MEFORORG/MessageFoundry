@@ -456,3 +456,48 @@ def test_a_stop_set_while_the_pin_hangs_skips_the_listing(
     removed = store._sweep_orphans_sync(now=time.time(), abort=abort)
 
     assert removed == 0 and listed == [] and (store._root / name).exists()
+
+
+def _zero_identity(st: os.stat_result) -> os.stat_result:
+    """``st`` with ``st_ino`` and ``st_dev`` 0, as a Windows ``stat`` fallback answers."""
+    fields = list(st[:10])
+    fields[1] = fields[2] = 0
+    return os.stat_result(fields)
+
+
+@pytest.mark.parametrize("zero_on", ["check", "pin", "both"])
+def test_a_root_identity_of_zero_on_either_read_is_no_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    zero_on: str,
+) -> None:
+    # BACKLOG #6575: before the fix, a pin with real ids and a check answering 0 made samestat
+    # False, so a sound pass stopped with a false swap ERROR and kept the orphan.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    body = store._root / f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    body.write_text("SYNTHETIC", encoding="utf-8")
+    _backdate(body)
+    real = Path.stat
+    root_stats: list[int] = []
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        st = real(self, follow_symlinks=follow_symlinks)
+        if self == store._root:
+            root_stats.append(1)
+            first = len(root_stats) == 1
+            if zero_on == "both" or (zero_on == "pin") == first:
+                return _zero_identity(st)
+        return st
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.uploads"):
+        removed = store._sweep_orphans_sync(now=time.time())
+
+    assert len(root_stats) == 2, "the unlink was not preceded by a root-identity check"
+    assert removed == 1 and not body.exists(), "a sound pass stopped on an identity of 0"
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not any("different file identity" in r.getMessage() for r in caplog.records)
+    notes = [r for r in caplog.records if "a file identity of 0" in r.getMessage()]
+    assert len(notes) == 1 and notes[0].levelno == logging.DEBUG

@@ -6,7 +6,8 @@
   checks that the root still answers with the identity it read before its listing. A share
   remounted under the root with another identity stops the sweep with a logged error only when the
   remount lands after that first read and before one of these checks, while a temp leftover or a
-  body whose sidecar reads as absent, past the age floor, is still to come. At least a remount
+  body whose sidecar reads as absent, past the age floor, is still to come, or before the root
+  check that follows a candidate's own read, sidecar check or removal failing. At least a remount
   before the pass, one during the pass with no such entry left, and one between a check and its
   removal are not caught. Some lost roots still read as a clean pass, at least a root deleted
   after its first save, one under a POSIX mount point whose share dropped, and one that is itself

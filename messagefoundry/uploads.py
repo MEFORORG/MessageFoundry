@@ -344,7 +344,9 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
     return False
 
 
-def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
+def _root_fault(
+    root: Path, pinned: os.stat_result, memo: _OncePerInterval | None = None
+) -> str | None:
     """Why the uploads root no longer reads as the folder the sweep pinned, whose ``stat`` was
     ``pinned``, taken before the listing, or ``None`` when it still does. Its own ``stat`` failed,
     which is read as the root being lost, since an entry's own error cannot show that: a dangling
@@ -353,9 +355,12 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
     when that lands after the pin and before this call (BACKLOG #8341 item 2). It sees nothing that
     lands at another time, at least before the pin or after this call. An answer proves nothing
     about the entries under it. A file system that reports no stable identity, such as one that
-    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``. One that
-    answers ``st_dev`` as 0 too on both reads, as a Windows ``stat`` that falls back to reading the
-    parent's directory entry can, shows no swap at all. One that mints an identity on the client, at
+    answers every ``st_ino`` as 0, cannot show a swap that keeps the same ``st_dev``. A read that
+    answers both ``st_ino`` and ``st_dev`` as 0, as a Windows ``stat`` that falls back to reading the
+    parent's directory entry can, carries no identity, so when either the pin or this read does,
+    this call gives no swap verdict: it returns ``None``, the pass goes on, and no swap is logged,
+    only a DEBUG line at most once per interval of ``memo``, when one is given. So a fallback on
+    one read only does not stop a sound pass, and one on both shows no swap at all. One that mints an identity on the client, at
     least a CIFS mount with ``noserverino`` or a FUSE mount without stable inode numbers, can stop a
     sound pass, which then removes nothing more, and can do so pass after pass, leaving orphans past
     retention. Text and not the exception, whose traceback would hold the sweep's frame, and so its
@@ -364,9 +369,22 @@ def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
         now = root.stat()
     except OSError as exc:
         return f"stopped answering ({exc.strerror or type(exc).__name__})"
+    if _no_identity(now) or _no_identity(pinned):
+        # A one-sided fallback would make samestat False for the same folder, a false swap.
+        if memo is not None and memo.first("orphan sweep root identity 0"):
+            _log.debug(
+                "uploaded-logs orphan sweep: the uploads root answered a file identity of 0, so "
+                "its identity check gives no swap verdict"
+            )
+        return None
     if not os.path.samestat(now, pinned):
         return _ROOT_SWAPPED
     return None
+
+
+def _no_identity(st: os.stat_result) -> bool:
+    """Whether a ``stat`` answered no file identity: ``st_ino`` and ``st_dev`` both 0."""
+    return st.st_ino == 0 and st.st_dev == 0
 
 
 #: :func:`_root_fault`'s reason for a root whose identity is not the one pinned. It names the pin,
@@ -4370,8 +4388,9 @@ class UploadStore:
         root's identity check covers only a root that answers with another identity at the moment
         it is checked, after the sidecar check, so it catches a share remounted under its name only
         when the remount lands after the pin and before that check, while a temp leftover or a body
-        whose sidecar reads as absent, past the floor, is still to come. At least these are not
-        caught: a remount before the pass, which the pin reads as the root; one during the pass
+        whose sidecar reads as absent, past the floor, is still to come, or before the root check
+        that follows an entry's own ``stat``, sidecar check or unlink raising. At least these are
+        not caught: a remount before the pass, which the pin reads as the root; one during the pass
         with no such entry left to check; one between that check and the unlink; and one that
         flaps back before that check. A stale cache, a hidden
         name, or a share that answers the same identity can still send a body whose sidecar exists
@@ -4453,7 +4472,7 @@ class UploadStore:
 
         def _root_lost(name: str) -> bool:
             """Whether the root no longer reads as the folder pinned, logging the stop if so."""
-            why = _root_fault(root, pinned)
+            why = _root_fault(root, pinned, self._link_logged)
             if why is None:
                 return False
             # One memo key per cause, so a swap after a lost root inside the interval still logs.
