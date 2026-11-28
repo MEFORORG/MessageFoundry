@@ -257,13 +257,14 @@ def test_a_name_set_to_nothing_refuses_as_an_empty_entry() -> None:
     its name into the entry after it, so the empty entry refuses on its own (vault BACKLOG #5394,
     the deferred scope of engine PR 3134). The remedy says to delete it, not to move it."""
     posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "Path=C:\\x"])
-    assert posture.listed == ("MEFOR_STORE_ENCRYPTION_KEY", "MEFOR_STORE_PASSWORD")
-    assert posture.empty_class_names == posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
+    # Named, not set, so neither is in ``listed``.
+    assert posture.listed == ()
+    assert posture.empty_class_names == ("MEFOR_STORE_ENCRYPTION_KEY", "MEFOR_STORE_PASSWORD")
     assert (
-        "MEFOR_STORE_ENCRYPTION_KEY, MEFOR_STORE_PASSWORD is named in the service's lists with "
-        "nothing set in it" in refusal
+        "MEFOR_STORE_ENCRYPTION_KEY, MEFOR_STORE_PASSWORD is named with nothing set in it in"
+        in refusal
     )
     # Nothing to move, so no step says to move either.
     assert "protect-key" not in refusal
@@ -538,7 +539,7 @@ def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str)
     posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
     assert posture.empty_class_names == (key,)
     refusal = service_env_refusal(posture)
-    assert refusal is not None and f"{key} is named in the service's lists with nothing" in refusal
+    assert refusal is not None and f"{key} is named with nothing set in it" in refusal
 
 
 def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses() -> None:

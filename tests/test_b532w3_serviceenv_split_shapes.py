@@ -337,7 +337,7 @@ def test_an_empty_secret_kept_on_a_later_line_reads_the_line_below_it_too() -> N
     name = "MEFOR_STORE_PASSWORD"
     posture = _read([f"PATH=x\n{KEY_CLASS_NAMES[0]}=\n{name}=\nWinter=2026!"])
     # The password is set to the line below it; the key above it is named with nothing in it.
-    assert posture.listed == (name, KEY_CLASS_NAMES[0])
+    assert posture.listed == (name,)
     assert posture.empty_class_names == (KEY_CLASS_NAMES[0],)
 
 
@@ -479,8 +479,8 @@ def test_a_value_name_set_to_equals_signs_does_not_run_on(item: str) -> None:
     posture = _read(["MEFOR_VALUE_X==", item])
     # A secret-class name alone in its own item is named with nothing in it, which refuses on
     # its own (vault BACKLOG #5394); it is not taken into the value above.
+    assert posture.listed == ("MEFOR_VALUE_X",), item
     alone = (item,) if item == "MEFOR_STORE_PASSWORD" else ()
-    assert posture.listed == ("MEFOR_VALUE_X", *alone), item
     assert posture.empty_class_names == alone, item
     assert not posture.value_runs_on, item
 
@@ -521,9 +521,10 @@ def test_an_upper_case_path_form_key_still_ends_an_empty_secret() -> None:
     """The control: the engine's own name in upper case is a variable of its own, a path, so it
     is not listed, and the password above it is read as empty, not as set to it. An entry that
     names a secret-class variable with nothing in it refuses on its own (vault BACKLOG #5394),
-    so only the password is listed, as one."""
+    so the password is named as one."""
     posture = _read(["MEFOR_STORE_PASSWORD=", f"{_PEM}=C:\\k.pem"])
-    assert posture.listed == posture.empty_class_names == ("MEFOR_STORE_PASSWORD",)
+    assert posture.listed == ()
+    assert posture.empty_class_names == ("MEFOR_STORE_PASSWORD",)
 
 
 def test_a_secret_name_alone_in_a_later_item_below_a_value_name_alone_is_kept() -> None:
@@ -552,5 +553,5 @@ def test_a_lower_case_secret_name_below_an_empty_key_is_still_named() -> None:
     Windows compares names, so the refusal names it and gives its own remedy."""
     posture = _read([f"{KEY_CLASS_NAMES[0]}=", "mefor_store_password=hunter2"])
     # The key above it is named with nothing in it, which refuses on its own (vault BACKLOG #5394).
-    assert posture.listed == ("MEFOR_STORE_PASSWORD", KEY_CLASS_NAMES[0])
+    assert posture.listed == ("MEFOR_STORE_PASSWORD",)
     assert posture.empty_class_names == (KEY_CLASS_NAMES[0],)

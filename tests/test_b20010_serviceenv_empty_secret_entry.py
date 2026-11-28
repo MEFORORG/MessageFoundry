@@ -26,7 +26,8 @@ from tests.test_service_env_secrets import _service
 
 _KEY = KEY_CLASS_NAMES[0]
 _PASSWORD = "MEFOR_STORE_PASSWORD"
-_EMPTY_SENTENCE = "is named in the service's lists with nothing set in it"
+_EMPTY_SENTENCE = "is named with nothing set in it"
+_EMPTY_STEP = "A secret-class name with nothing set in it refuses because"
 
 #: Empty secret-class entries, each shape the reader reads as naming the variable with nothing
 #: in it, beside an item that ends the empty value, so no value is joined to it.
@@ -48,8 +49,12 @@ def test_an_empty_secret_class_entry_refuses(shape: str) -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None, shape
     assert len(posture.empty_class_names) == 1, shape
-    assert posture.empty_class_names == posture.listed, shape
-    assert _EMPTY_SENTENCE in refusal, shape
+    # Named, not set: ``listed`` holds only names set to something.
+    assert posture.listed == (), shape
+    assert f"{posture.empty_class_names[0]} {_EMPTY_SENTENCE}" in refusal, shape
+    assert _EMPTY_STEP in refusal, shape
+    # Nothing moves to a secrets directory, so no step says to add one back with `nssm set`.
+    assert "`nssm set`" not in refusal, shape
     # Read as empty, not as set to the item after it, so no step says its value runs on.
     assert not posture.value_runs_on, shape
     assert "runs on past its own entry" not in refusal, shape
@@ -73,7 +78,18 @@ def test_an_empty_entry_for_a_name_that_is_no_secret_refuses_nothing(entries: li
     nothing before this change and still refuses nothing, so this test passes on both."""
     posture = _service(entries)
     assert service_env_refusal(posture) is None, entries
-    assert not any(name.startswith("MEFOR_STORE") for name in posture.listed), entries
+    assert not set(posture.listed) - {"MEFOR_SECRETS_DIRECTORY"}, entries
+    assert getattr(posture, "empty_class_names", ()) == (), entries
+
+
+def test_a_path_set_in_one_entry_and_an_empty_entry_beside_it_is_not_called_empty() -> None:
+    """A path-form OIDC key is set to something, so an empty entry of it beside that one is
+    not the one sign of a split secret, and neither refuses, as before this change (code review
+    round 1 on this change: "named with nothing set in it" would have been false there)."""
+    name = "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY"
+    posture = _service([f"{name}=C:\\k.pem", "Path=C:\\x", f"{name}="])
+    assert posture.empty_class_names == ()
+    assert service_env_refusal(posture) is None
 
 
 def test_a_name_set_in_one_entry_and_empty_in_another_is_set() -> None:
@@ -91,7 +107,7 @@ def test_an_empty_key_has_nothing_to_move_unless_the_process_holds_one() -> None
     """An empty store key has no key to protect, so the protect-key step does not print; a
     store key that still reaches this process keeps it, as for any listed key."""
     empty = service_env_refusal(_service([f"{_KEY}=", "Path=C:\\x"]))
-    assert empty is not None and _EMPTY_SENTENCE in empty
+    assert empty is not None and f"{_KEY} {_EMPTY_SENTENCE}" in empty
     assert "messagefoundry protect-key" not in empty
     held = service_env_refusal(
         _service([f"{_KEY}=", "Path=C:\\x"], **{_KEY: "synthetic-store-key"})

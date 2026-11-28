@@ -412,15 +412,16 @@ def test_the_first_line_shapes_the_readings_once_differed_on_now_agree(
         _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]),
         _read([f"{key}=", item]),
     ):
-        assert posture.listed_keys == (key,), item
+        assert posture.listed_keys == (() if empty else (key,)), item
         assert posture.empty_class_names == empty, item
+        assert service_env_refusal(posture) is not None, item
 
 
 def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_above() -> None:
     posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=C:\\s"]
     posture = _read(posture_items)
     # The password stays empty, an entry that refuses on its own (vault BACKLOG #5394).
-    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY", "MEFOR_STORE_PASSWORD")
+    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
     assert posture.empty_class_names == ("MEFOR_STORE_PASSWORD",)
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
     # Without the directory item, the same refusal says no entry names it: the control.

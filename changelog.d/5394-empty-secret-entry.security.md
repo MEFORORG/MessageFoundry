@@ -4,6 +4,6 @@
   refuses `serve`, `supervise` and the API app factories, as a set one does. A secret can be
   written apart from its name, into the entry after it, and the reader cannot always tell that
   entry from an ordinary variable, so the empty entry was the one sign of it left and refused
-  nothing. The refusal says to delete the empty entry, and the entry after it where that holds
-  the secret. An empty entry for a name that is not an engine secret still refuses nothing.
-  (`BACKLOG #5394`)
+  nothing. The refusal says to delete the empty entry, and the entry or line after it where that
+  holds the secret. An empty entry for an ordinary variable, such as `HTTP_PROXY=`, still refuses
+  nothing. (`BACKLOG #5394`)
