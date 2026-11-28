@@ -247,10 +247,6 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // reply is then for a page that no longer exists, and is dropped (postToSameRender).
           // The reply echoes the request's page and id, so the page draws only its latest request's
           // answer.
-          // A closed panel has no page to answer, before the rebuild or after it.
-          if (disposed) {
-            return;
-          }
           const asked = requestToken(m);
           const reply = await fieldsReply(ws, {
             transport: m.transport,

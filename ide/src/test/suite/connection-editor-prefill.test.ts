@@ -187,7 +187,7 @@ function load(opts: {
     window,
     posted,
     deliver(data): void {
-      // A "fields" reply echoes the page nonce, id, transport and direction of the request it
+      // A "fields" reply echoes the page id, request id, transport and direction of the request it
       // answers, as both hosts do (fieldsReply in connectionEditor.ts); one given none answers the
       // latest request.
       let message = data;

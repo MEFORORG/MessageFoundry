@@ -358,8 +358,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // This page load's id, sent with every request and echoed with every answer. VS Code rebuilds a
     // hidden panel from the same html and token, and the new page restarts its request ids, so an
     // answer meant for the page before it can carry a live request id: only the page id tells the
-    // two apart. It is not a CSP nonce and guards nothing; it only has to differ between loads, and
-    // 64 bits of crypto.getRandomValues make two loads match only by a 2^-64 chance.
+    // two apart. It is not a CSP nonce and no security control, but it is what keeps an earlier
+    // instance's answers off this page. It only has to differ between loads, and 64 bits of
+    // crypto.getRandomValues make two loads match only by a 2^-64 chance.
     const FIELDS_PAGE = (() => {
       const words = new Uint32Array(2);
       crypto.getRandomValues(words);
@@ -752,10 +753,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // A "fields" reply echoes its request's page id and request id (page, seq) and the transport and
     // direction its groups were built for (fieldsReply in connectionEditor.ts). An "error" answering
     // a fields request the host could not rebuild carries that request's page and id too; other
-    // errors carry neither.
+    // errors carry neither. One carrying only one of the two is refused as malformed, so a host that
+    // half-labels an error is reported instead of leaving the page waiting.
     const DIRECTIONS = ['inbound', 'outbound'];
     const SHAPES = {
-      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt) && mfOpt(d.page, mfStr),
+      error: (d) => mfStr(d.message) && mfOpt(d.seq, mfInt) && mfOpt(d.page, mfStr) &&
+        (d.seq === undefined) === (d.page === undefined),
       fields: (d) => mfInt(d.seq) && mfStr(d.page) && mfStr(d.transport) && mfOneOf(d.direction, DIRECTIONS) &&
         mfArrOf(d.groups, (g) => mfObj(g) && mfStr(g.title) && mfBool(g.collapsed) &&
         mfOpt(g.description, mfStr) && mfArrOf(g.fields, mfFieldDescriptor)),

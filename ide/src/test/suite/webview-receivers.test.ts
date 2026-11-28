@@ -443,13 +443,16 @@ const connection: Receiver = {
     );
     return p;
   },
-  // An error answering a fields request the host could not rebuild carries that request's id.
+  // An error answering a fields request the host could not rebuild carries that request's page id
+  // and request id, both or neither.
   wellFormed: { error: [ERROR_OK, { ...ERROR_OK, seq: 1, page: FIELDS_OK.page }], fields: [FIELDS_OK, FIELDS_BARE] },
   malformed: {
     error: [
       ...badMessages(ERROR_OK),
       ["seq is a string", { ...ERROR_OK, seq: "1" }],
       ["page is a number", { ...ERROR_OK, seq: 1, page: 5 }],
+      ["seq with no page", { ...ERROR_OK, seq: 1 }],
+      ["page with no seq", { ...ERROR_OK, page: FIELDS_OK.page }],
       ["seq is a fraction", { ...ERROR_OK, seq: 0.5 }],
     ],
     fields: [

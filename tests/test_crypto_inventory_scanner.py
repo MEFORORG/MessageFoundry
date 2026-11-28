@@ -183,7 +183,8 @@ def _ts_repo(tmp_path: Path, files: dict[str, str], *, with_anchor: bool = True)
 
     Every declared non-Python walk root the caller did not write into gets one inert placeholder, so
     the missing-root and empty-walk refusals stay armed for the root under test without firing on the
-    others."""
+    others. ``with_anchor`` seeds the anchor and a stub for every other shipped inventory row, so no
+    row reads as stale; with it False, every shipped row the caller did not write reads as stale."""
     written = dict(files)
     if with_anchor:
         written.setdefault(_ANCHOR_REL, _ANCHOR_SRC)

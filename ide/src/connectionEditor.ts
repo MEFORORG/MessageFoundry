@@ -199,10 +199,6 @@ export async function openConnectionEditor(
         // rather than being reimplemented in webview script.
         // Answered only while the page that asked is still the one showing (postToSameRender).
         // The reply echoes the request's page and id, so the page draws only its latest request's answer.
-        // A closed panel has no page to answer, before the rebuild or after it.
-        if (disposed) {
-          return;
-        }
         const asked = requestToken(m);
         const reply = await fieldsReply(ws, {
           transport: m.transport,
