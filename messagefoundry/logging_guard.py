@@ -79,7 +79,6 @@ from __future__ import annotations
 import codecs
 import contextlib
 import functools
-import inspect
 import logging
 import logging.handlers
 import os
@@ -832,20 +831,22 @@ def _encodes_ascii(encoding: str) -> bool:
     return _encodable(_ALL_ASCII, encoding) == _ALL_ASCII
 
 
-#: The sentinel :func:`inspect.getattr_static` returns for a stream with no ``encoding``.
-_NO_ATTRIBUTE = object()
-
-
-@functools.lru_cache(maxsize=64)
 def _encoding_read_can_fail(cls: type) -> bool:
-    """Whether an ``AttributeError`` from reading ``encoding`` on a ``cls`` stream means a read
-    that failed rather than an attribute that is not there: ``cls`` defines ``encoding`` (other
-    than an empty ``__slots__`` member), or forwards attributes through ``__getattr__``, as a
-    delegating proxy does. Decided once per type, so a stream with no ``encoding`` pays it once."""
-    found = inspect.getattr_static(cls, "encoding", _NO_ATTRIBUTE)
-    if found is not _NO_ATTRIBUTE and not isinstance(found, types.MemberDescriptorType):
-        return True
-    return inspect.getattr_static(cls, "__getattr__", _NO_ATTRIBUTE) is not _NO_ATTRIBUTE
+    """Whether an ``AttributeError`` from reading ``encoding`` on a ``cls`` stream is a read that
+    failed rather than an attribute that is not there: a class on ``cls``'s own MRO defines
+    ``encoding``, other than an empty ``__slots__`` member, so a property raised it. The metaclass
+    is not searched, and a proxy forwarding through ``__getattr__`` or ``__getattribute__`` does
+    not count: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not.
+    Never raises; any failure while classifying reads as "no encoding", so classifying can never
+    turn a healthy stream into a failed write. Walked per call, with no cache to hold classes."""
+    try:
+        for klass in cls.__mro__:
+            found = vars(klass).get("encoding")
+            if found is not None:
+                return not isinstance(found, types.MemberDescriptorType)
+    except Exception:  # an exotic class whose MRO or namespace cannot be read
+        return False
+    return False
 
 
 #: The start of the stderr format-fault line's entry for a stream whose ``encoding`` could not be
@@ -1045,6 +1046,10 @@ class _GuardedSinkMixin(_SinkBase):
                     self._sink_label,
                     reason=f"{reason}; the replacement failed too: {_safe_reason(roll_exc)}",
                 )
+                # Say every counted fault now, the interval notwithstanding: the sink is dead, so no
+                # later write will, and a fault counted on the way here (an unreadable encoding,
+                # say) can be the cause the operator needs.
+                self._report_format_faults(force=True)
                 return
             self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
         finally:
@@ -1131,9 +1136,9 @@ class _GuardedSinkMixin(_SinkBase):
         self.acquire()
         try:
             self._report_format_faults()
-            self._flush_stream()
         finally:
             self.release()
+        super().flush()
 
     def close(self) -> None:
         """Say any format faults not yet said, then close the sink."""
@@ -1233,8 +1238,7 @@ class _GuardedSinkMixin(_SinkBase):
             # escaped for ASCII, which almost every text stream takes, and the cause is counted
             # before the write, so a write that then fails does not hide it. A stream that refuses
             # even that line (cp864 has no byte for ``%``) fails the write; the stages decide.
-            stream_type: type = type(self.stream)  # typed so mypy sees a hashable cache key
-            if isinstance(exc, AttributeError) and not _encoding_read_can_fail(stream_type):
+            if isinstance(exc, AttributeError) and not _encoding_read_can_fail(type(self.stream)):
                 encoding = None
             else:
                 encoding = "ascii"

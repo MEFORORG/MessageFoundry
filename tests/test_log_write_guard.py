@@ -25,6 +25,7 @@ per_lane halt the internal stages by different mechanisms.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import io
 import json
 import logging
@@ -1463,48 +1464,14 @@ def test_a_stream_with_no_encoding_is_written_as_the_line_came(
     assert counted == []
 
 
-def test_a_getattr_proxy_whose_target_is_gone_is_unreadable_not_missing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # The usual delegating proxy forwards through __getattr__, which no static lookup sees. Its
-    # target gone, reading encoding raises AttributeError, and it is read as unreadable.
-    # NEGATIVE CONTROL: with _encoding_read_can_fail ignoring __getattr__, the line went raw to
-    # the replacing stream, with "?" for the CJK character, and nothing was said.
-    raw, inner = _strict_cp1252()
-    inner.reconfigure(errors="replace")
-
-    class _Proxy:
-        _target: object = None
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._target, name)
-
-        def write(self, text: str) -> int:
-            return inner.write(text)
-
-        def flush(self) -> None:
-            inner.flush()
-
-    stream = _Proxy()
-    monkeypatch.setattr(sys, "stdout", stream)
-    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    capsys.readouterr()
-
-    handler.emit(_record("order %s", "caf\xe9 \u4e2d"))
-
-    assert raw.getvalue().decode("cp1252").splitlines() == ["order caf\\u00e9 \\u4e2d"]
-    assert (
-        f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('AttributeError')" in capsys.readouterr().err
-    )
-
-
-def test_an_unreadable_encoding_is_said_even_when_the_write_fails(
+def test_a_codecs_stream_writer_is_written_as_utf8_with_no_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The cause is counted before the write, so a write that then fails, and takes the sink to
-    # stage 2, does not hide it.
-    # NEGATIVE CONTROL: with the cause counted only after a write that lands, nothing was counted.
+    # codecs.getwriter('utf-8')(buf), the classic stdout-wrapping idiom, forwards attributes
+    # through __getattr__ to a target with no encoding. It is a stream with no encoding, not one
+    # whose read failed, so the line goes out as UTF-8 and no fault is counted.
+    # NEGATIVE CONTROL: with a class defining __getattr__ read as an unreadable encoding (head
+    # 2364d685424 of this branch did so), the line was escaped for ASCII and a fault counted.
     counted: list[str] = []
     real = logging_guard._GuardedSinkMixin._note_format_fault
 
@@ -1513,32 +1480,99 @@ def test_an_unreadable_encoding_is_said_even_when_the_write_fails(
         real(self, detail)
 
     monkeypatch.setattr(logging_guard._GuardedSinkMixin, "_note_format_fault", spy)
+    buf = io.BytesIO()
+    stream = codecs.getwriter("utf-8")(buf)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
 
-    class _Broken:
+    handler.emit(_record("caf%s ok", chr(0xE9)))
+
+    assert buf.getvalue() == "caf\xe9 ok\n".encode()
+    assert counted == []
+
+
+def test_classifying_an_odd_stream_class_never_fails_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stream class with an unhashable metaclass, and one whose metaclass forwards attributes:
+    # classifying either must not raise, nor read it as unreadable. Both are written as they came.
+    # NEGATIVE CONTROL: with the classification cached by lru_cache, the unhashable class raised
+    # TypeError from every write and the sink reached stage 2.
+    class _Unhashable(type):
+        def __eq__(cls, other: object) -> bool:
+            return cls is other
+
+        __hash__ = None  # type: ignore[assignment]
+
+    class _Forwarding(type):
+        def __getattr__(cls, name: str) -> object:
+            raise AttributeError(name)
+
+    def _writer(meta: type) -> object:
+        def write(self: object, text: str) -> int:
+            written.append(text)
+            return len(text)
+
+        return meta("Writer", (), {"write": write})()
+
+    for meta in (_Unhashable, _Forwarding):
+        written: list[str] = []
+        stream = _writer(meta)
+        events: list[LogSinkEvent] = []
+        guard = LogWriteGuard()
+        guard.set_escalation(events.append)
+        handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.emit(_record("caf%s", chr(0xE9)))
+        assert events == []
+        assert written == ["caf\xe9\n"]
+
+
+def test_an_unreadable_encoding_is_printed_when_the_write_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The cause is counted before the write, and stage 2 says every counted fault at once, inside
+    # the report interval too, so a write that then fails does not hide it from stderr.
+    # NEGATIVE CONTROL: with stage 2 not forcing the report, the second line's cause was not on
+    # stderr, since the first was said less than the interval before.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Breaks:
+        broken = False
+
         @property
         def encoding(self) -> str:
             raise RuntimeError("encoding unavailable")
 
         def write(self, text: str) -> int:
-            raise OSError(5, "EIO")
+            if self.broken:
+                raise OSError(5, "EIO")
+            return len(text)
 
-    stream = _Broken()
+    stream = _Breaks()
     monkeypatch.setattr(sys, "stdout", stream)
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
     handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
     handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
 
-    handler.emit(_record("hello"))
+    handler.emit(_record("first"))  # said at once, which starts the interval
+    assert logging_guard._ENCODING_UNREADABLE_FAULT in capsys.readouterr().err
+    clock.now += 1
+    stream.broken = True
+    handler.emit(_record("second"))
 
     assert [e.stage for e in events] == ["unwritable"]
-    assert any(d.startswith(logging_guard._ENCODING_UNREADABLE_FAULT) for d in counted)
+    err = capsys.readouterr().err
+    assert f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('RuntimeError')" in err
 
 
 def test_a_falsy_stream_is_still_flushed() -> None:
-    # The guard's write and the handler's own flush both flush the stream whatever its
-    # truthiness: a stream's __bool__ is not a liveness test.
+    # The guard's write flushes the stream whatever its truthiness: a stream's __bool__ is not a
+    # liveness test. The handler's own flush() is the stdlib's, which skips a falsy stream.
     # NEGATIVE CONTROL: with _flush_stream testing the stream's truthiness as
     # StreamHandler.flush does, a stream whose __len__ is 0 was never flushed.
     class _Falsy(io.StringIO):
@@ -1555,11 +1589,9 @@ def test_a_falsy_stream_is_still_flushed() -> None:
     handler.setFormatter(logging.Formatter("%(message)s"))
 
     handler._write_line("hello\n")
-    assert _Falsy.flushes == 1
-    handler.flush()
 
     assert stream.getvalue() == "hello\n"
-    assert _Falsy.flushes == 2
+    assert _Falsy.flushes == 1
 
 
 def test_a_roll_notice_whose_reason_the_stream_cannot_encode_is_escaped(
