@@ -364,6 +364,21 @@ class NonTextCellError(CellTagError):
         )
 
 
+class KeylessSealedCellError(CipherError):
+    """A keyless store read a sealed (``mfenc:``) preset criteria cell, which a keyed store wrote
+    and this one has no key to open (BACKLOG #5523 item 7). The identity cipher hands such a cell
+    back unchanged, so without this refusal the layered search read the ciphertext as malformed
+    criteria. A plain :class:`CipherError`, so the route answers it as a cell the store's keys
+    cannot open."""
+
+    def __init__(self, table: str, column: str) -> None:
+        self.table = table
+        super().__init__(
+            f"a {table}.{column} cell is sealed under a store key, but this store opened with no "
+            "key configured"
+        )
+
+
 class NonTextListedCellError(CipherError):
     """A cell of a table this module does not tag, opened by :func:`open_listed_cell`, holds a value
     that is not text, a planted BLOB say (BACKLOG #5650). Such a table has no tag-failed audit row
@@ -487,12 +502,17 @@ def open_preset_criteria(
     :class:`NonTextCellError`, on a keyed and a keyless store alike, and a sealed cell that opens to
     an empty string raises :class:`SealedBlankCellError` (BACKLOG #5523). Each is drift:
     logged here, alerted here on a keyed store only, and audited by the store's read, before the
-    caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
+    caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check.
+
+    A sealed cell on a keyless store raises :class:`KeylessSealedCellError` rather than returning
+    the ciphertext as criteria (BACKLOG #5523 item 7)."""
     if stored is None or stored == "":
         # Not opened: a keyed cipher passes a blank value through.
         refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
         _alert(cipher, refused)
         raise refused
+    if isinstance(stored, str) and not cipher.encrypts and cipher.is_encrypted(stored):
+        raise KeylessSealedCellError("search_presets", "criteria")
     # open_tagged_cell refuses a non-text cell, and returns None only for a None cell, refused above.
     opened = cast(
         str,

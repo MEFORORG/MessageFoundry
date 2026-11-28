@@ -5102,7 +5102,9 @@ the composed layers writes no such row. A refusal row has `refused` in its detai
 from a search that ran. A NULL, empty or non-text criteria cell, and a sealed one that opens to an
 empty string, are refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
-`integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
+`integrity_drift` alert, as for a moved preset. A sealed criteria cell that a store opened with no
+key reads is refused too, as a cell the store's keys cannot open: a 423 with the route's refusal
+row and its ERROR, and no store row or alert. The store rate-limits its WARNING, alert and
 `integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its
 refusal logs, including the failed-write ERROR. These limits are best effort and held in memory per
 engine process, and the AlertSink's per-subject re-alert cooldown applies on top, so the operator

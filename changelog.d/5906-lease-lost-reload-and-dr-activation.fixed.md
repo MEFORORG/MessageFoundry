@@ -16,5 +16,7 @@
   demotion stopped the graph during the step, which before was recorded active with nothing
   bound. A lease lost after the runner's second read while the graph runs is still not refused.
   A graph stopped during the run-profile step on a node that holds the lease, or on a single
-  node, is refused too, with kind `profile`; such a node is otherwise unchanged.
+  node, is refused too, with kind `profile`, and its reason says the graph is not running and
+  nothing was bound, not that the engine could not bind the priority feeds; such a node is
+  otherwise unchanged.
   (`BACKLOG #5906`)
