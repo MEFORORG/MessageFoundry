@@ -75,6 +75,7 @@ import {
   pickPartSeed,
   readEditMessage,
   readPickPartMessage,
+  readProjection,
   releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
@@ -509,19 +510,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // The drain is delegated to the pure `drainEdits` so an UNEXPECTED applyEdit rejection (NOT the
     // CLI-refusal path, which `applyOne` handles inline) releases the slot AND keeps draining the queue
     // rather than stranding a pending second edit until the user types again.
-    const onEditError = (err: unknown): void => {
+    const showEditError = (err: unknown): void => {
       void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${errorText(err)}`);
-      void render(); // revert the optimistic webview change to the true projection
     };
-    const applyEdit = (msg: EditMessage): Promise<void> =>
-      drainEdits(
-        guard,
-        msg,
-        applyOne,
-        onEditError,
-        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
-        rebaseOptions,
-      );
     // Both drains' rebase (#5943): an edit on a row rewritten since the last projection is carried over
     // that rewrite when the rebaser can prove the row text the edit was posted against.
     const rebaseOptions = {
@@ -529,6 +520,18 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       readSource: () => document.getText(),
       log: (text: string) => console.warn(text),
     };
+    const applyEdit = (msg: EditMessage): Promise<void> =>
+      drainEdits(
+        guard,
+        msg,
+        applyOne,
+        (err) => {
+          showEditError(err);
+          void render(); // revert the optimistic webview change to the true projection
+        },
+        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
+        rebaseOptions,
+      );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
     // so every row coordinate the webview holds becomes stale — the op must run ALONE (never batched with
@@ -611,7 +614,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         );
         return;
       }
-      await drainEdits(guard, { ...msg, pick: true }, applyOne, onEditError, scheduleRerender, rebaseOptions);
+      // An unexpected rejection is only reported here: the render below re-projects once the drain ends.
+      await drainEdits(guard, { ...msg, pick: true }, applyOne, showEditError, scheduleRerender, rebaseOptions);
       if (disposed) {
         return;
       }
@@ -795,10 +799,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             lineEnd: m.lineEnd,
             name: m.name,
             expectSrc: m.expectSrc,
-            // The page the pick was requested on (#5943); only a safe integer is kept.
-            ...(typeof m.projection === "number" && Number.isSafeInteger(m.projection)
-              ? { projection: m.projection }
-              : {}),
+            projection: readProjection(m), // the page the pick was requested on (#5943)
           };
           const seed = typeof m.value === "string" ? m.value : "";
           void pickThenApply(coords, m.mode === "segment" ? "segment" : "path", seed, (picked) => picked);

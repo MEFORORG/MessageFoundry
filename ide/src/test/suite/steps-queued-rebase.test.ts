@@ -263,7 +263,7 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     r.record(noId, { before: after, after: after2 });
     assert.strictEqual(r.rebase(edit("B"), () => after2).expectSrc, afterRow);
     const stale = edit("B");
-    assert.strictEqual(r.rebase(stale, () => after), stale, "the live buffer must be the chain's last");
+    assert.strictEqual(r.rebase(stale, () => `${after2}\n# typed`), stale, "the live buffer must be a chain buffer");
   });
 
   test("a recorded write whose input is neither the chain's output nor its projection's buffer ends the chain", () => {
@@ -294,7 +294,7 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     assert.strictEqual(r.rebase(e2, () => e1After.join("\n")), e2, "E2 is sent as posted, so F7 refuses it");
   });
 
-  test("an in-chain projection keeps the one before it; an older or out-of-chain one is dropped", () => {
+  test("a projection keeps the one before it; one two projections back is dropped", () => {
     const r = fresh();
     r.record(edit("A"), { before, after });
     r.project(2, after); // a re-projection mid-drain, of the buffer A wrote
@@ -306,9 +306,14 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     assert.strictEqual(r.rebase(old, () => after2), old, "projection 1 is two projections back: dropped");
     const fromTwo = edit("C", "value", afterRow, 2);
     assert.strictEqual(r.rebase(fromTwo, () => after2).expectSrc, '    msg.set("PID-5", "B")');
-    // A structural op's layout: the chain ends, and an undo back to `after2` does not revive it.
-    r.project(4, `# moved\n${after2}`);
+    // CHANGED (b20008 C2): main ended the chain on a projection outside it. Now a structural op's page is
+    // kept, but its buffer is in no chain, so its edits are sent as posted; and projection 2, two back
+    // again, is dropped, so an undo back to `after2` does not revive it.
+    const moved = `# moved\n${after2}`;
+    r.project(4, moved);
     assert.strictEqual(r.rebase(fromTwo, () => after2), fromTwo);
+    const fromMoved = edit("C", "value", afterRow, 4);
+    assert.strictEqual(r.rebase(fromMoved, () => moved), fromMoved, "a layout outside the chain is not rebased");
   });
 
   test("the live buffer is read only when the edit's projection is in the chain", () => {
@@ -437,7 +442,8 @@ suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
     const project = render.indexOf("rebaser.project(projection, source);");
     assert.ok(id >= 0 && html > id && project > html, "the id is minted, stamped, then reported");
     assert.ok(src.includes('<meta name="mf-projection" content="${projection}" />'));
-    assert.ok(/readSource: \(\) => document\.getText\(\)/.test(src.slice(src.indexOf("const applyEdit = (msg"))));
+    // CHANGED (b20008 C2): the rebase option is declared once, above applyEdit, for both drains.
+    assert.ok(/readSource: \(\) => document\.getText\(\)/.test(src.slice(src.indexOf("const rebaseOptions = {"))));
   });
 
   test("both edit posts and both field-pick posts in the page echo the projection id", () => {

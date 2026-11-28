@@ -10,6 +10,7 @@ import {
   drainEdits,
   physicalLines,
   readPickPartMessage,
+  readProjection,
   type AppliedRewrite,
   type EditMessage,
 } from "../../stepsModel";
@@ -133,14 +134,18 @@ suite("b20008 C2 #5943 item 42 -- a typed edit queued behind a field pick", () =
     const end = src.indexOf("const refuseAnchor = ", start);
     assert.ok(start >= 0 && end > start, "applyPickedEdit and the declaration after it were found");
     const body = src.slice(start, end);
+    // showEditError only reports: the pick path re-projects once, after the drain (round 1 finding 3).
     assert.ok(
-      /await drainEdits\(guard, \{ \.\.\.msg, pick: true \}, applyOne, onEditError, scheduleRerender, rebaseOptions\);/.test(body),
+      /await drainEdits\(guard, \{ \.\.\.msg, pick: true \}, applyOne, showEditError, scheduleRerender, rebaseOptions\);/.test(body),
       "the pick drain runs through drainEdits, marked as a pick, with the typed drain's rebase",
     );
     assert.ok(!/await applyOne\(/.test(body), "no queued edit is sent past the rebaser");
     assert.ok(/if \(guard\.isEditing\) \{/.test(body), "a busy slot is declined before the drain");
+    const report = src.slice(src.indexOf("const showEditError = "), src.indexOf("const rebaseOptions = {"));
+    assert.ok(report.length > 0 && !/render\(/.test(report), "the pick's error handler starts no render");
     const applyEdit = src.slice(src.indexOf("const applyEdit = (msg"), src.indexOf("const applyStructural = async"));
     assert.ok(/\r?\n {8}rebaseOptions,\r?\n/.test(applyEdit), "the typed drain passes the same rebase");
+    assert.ok(src.indexOf("const rebaseOptions = {") < src.indexOf("const applyEdit = (msg"), "declared before use");
   });
 
   test("a typed edit on another field of the picked row is carried over the pick", async () => {
@@ -336,6 +341,61 @@ suite("b20008 C2 #5943 -- no false refusal on a retyped value, a reappearing buf
   });
 });
 
+suite("b20008 C2 #5943 review round 1 -- undo after a pick, a toggled value, a base the page never showed", () => {
+  const S0 = source();
+
+  test("finding 1: an undo of a pick back to a chain buffer still carries an edit over the writes before it", async () => {
+    // Main never recorded a pick, so after an undo of one its live buffer was its last write's output
+    // again and a typed edit from the older page was carried. Recording the pick must not lose that.
+    const ed = new FakeEditor(S0);
+    await ed.drain(edit("value", "A", rowOf(S0), 1));
+    const S1 = ed.text;
+    await ed.drain(pick("path", "PID-9", rowOf(S0), 1));
+    ed.text = S1; // undo the pick, outside the recorded writes
+    await ed.drain(edit("path", "PID-7", rowOf(S0), 1));
+    assert.deepStrictEqual(ed.refused, []);
+    assert.strictEqual(rowOf(ed.text), row("PID-7", "A"));
+  });
+
+  test("finding 1: an undo to a buffer that is not a chain buffer after the base is still sent as posted", () => {
+    const r = new QueuedEditRebaser();
+    r.project(1, S0);
+    const S1 = source("PID-5", "A");
+    r.record(edit("value", "A", rowOf(S0), 1), { before: S0, after: S1 });
+    const sent = edit("path", "PID-7", rowOf(S0), 1);
+    assert.strictEqual(r.rebase(sent, () => S0), sent, "undone to the base itself: the row already reads S0");
+    assert.strictEqual(r.rebase(sent, () => `${S1}\n# split`), sent, "a buffer no write made");
+  });
+
+  test("finding 2: a value toggled back and forth, a render after each write, keeps the chain bounded", () => {
+    const r = new QueuedEditRebaser();
+    const A = source("PID-5", "A");
+    r.project(1, S0);
+    let id = 1;
+    let cur = S0;
+    for (let i = 0; i < 50; i++) {
+      const next = cur === S0 ? A : S0;
+      r.record(edit("value", next === A ? "A" : "OLD", rowOf(cur), id), { before: cur, after: next });
+      cur = next;
+      r.project(++id, cur);
+    }
+    const chain = (r as unknown as { chain: unknown[] }).chain;
+    assert.ok(chain.length <= 3, `the chain holds ${chain.length} buffers after 50 toggles`);
+  });
+
+  test("finding 4: an expectSrc that is not its own projection's row is sent as posted", () => {
+    const r = new QueuedEditRebaser();
+    const S1 = source("PID-5", "A");
+    const S2 = source("PID-5", "B");
+    r.project(1, S0);
+    r.record(edit("value", "A", rowOf(S0), 1), { before: S0, after: S1 });
+    r.record(edit("value", "B", rowOf(S1), 1), { before: S1, after: S2 });
+    // Page 1 never showed S1's row, so an edit claiming it has no base the rebaser can prove.
+    const sent = edit("path", "PID-7", rowOf(S1), 1);
+    assert.strictEqual(r.rebase(sent, () => S2), sent);
+  });
+});
+
 suite("b20008 C2 #5943 -- the pick posts and readers carry the page's projection id", () => {
   const coords = { handler: "h", lineStart: LINE, lineEnd: LINE, name: "value", expectSrc: rowOf(source()) };
 
@@ -350,13 +410,14 @@ suite("b20008 C2 #5943 -- the pick posts and readers carry the page's projection
   });
 
   test("the provider's pickPath reader keeps only a safe-integer projection id", () => {
+    assert.strictEqual(readProjection({ projection: 7 }), 7);
+    for (const bad of [1.5, "7", Number.NaN, 2 ** 60, null, undefined]) {
+      assert.strictEqual(readProjection({ projection: bad }), undefined, `projection ${String(bad)} is dropped`);
+    }
     const src = fs.readFileSync(VIEW_TS, "utf8");
     const at = src.indexOf('m?.command === "pickPath"');
     const body = src.slice(at, src.indexOf("pickThenApply(coords", at));
-    assert.ok(
-      body.includes('...(typeof m.projection === "number" && Number.isSafeInteger(m.projection)'),
-      "pickPath copies the projection id only when it is a safe integer",
-    );
+    assert.ok(body.includes("projection: readProjection(m),"), "pickPath reads the id with readProjection");
   });
 
   test("webview: a pickPath post echoes the page's projection id", () => {
