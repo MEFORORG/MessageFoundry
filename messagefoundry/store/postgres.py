@@ -4065,7 +4065,8 @@ class PostgresStore(ServerCipherWalk):
         return {t: frozenset(c) for t, c in found.items()}
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
-        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
+        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the catalog
+        shows the table with both columns this reads."""
         row = await self._fetchone(
             "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
         )
