@@ -9977,9 +9977,10 @@ class RegistryRunner:
 
         On a running graph that :attr:`lease_lost` reads as lease-lost, it raises
         :class:`RunnerLeaseLostError` with no lane changed (BACKLOG #5906). The coordinator's
-        ``is_leader()`` is read twice: once this method holds the reload lock, which is after
-        ``Engine.reload_detail`` has loaded the config and run its preflights, and again just
-        before step 1. Each read is point in time: leadership lost after the second read is not
+        ``is_leader()`` is read twice here: once this method holds the reload lock, and again just
+        before step 1. The engine reads it first for an ungated reload (``Engine.reload_detail``)
+        and a DR activation's profile step, before their preflights; a released reload reaches
+        this lock after its preflights and the load. Each read is point in time: leadership lost after the second read is not
         refused, and steps 1 to 3a then run on this node until ``Engine._stop_graph``, which waits
         on the same lock, takes them down.
         """

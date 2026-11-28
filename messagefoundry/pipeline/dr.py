@@ -60,7 +60,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Final, NoReturn
 
 from messagefoundry import proctree
 from messagefoundry.auth.trust_anchors import trust_anchor_cause
@@ -150,6 +150,10 @@ _REQUEST_ARCHIVE_REFUSED = (
 _OLD_SEED_FLAG = (
     "; add --allow-old-archive for a seed taken more than 7 days ago or one that does not say when"
 )
+
+
+#: The advice both lease refusals give (BACKLOG #5906).
+_RUN_ON_THE_LEASE_HOLDER: Final = "run the activation on the node that holds the lease"
 
 
 class DrProfileNotLeading(RuntimeError):
@@ -254,13 +258,13 @@ class DrCoordinator:
         after_release: Callable[[], Awaitable[None]] | None = None,
         hop_posture: HopPosture | None = None,
         instance: Callable[[], str | None] | None = None,
-        lease_lost: Callable[[], bool] | None = None,
+        not_leading: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
-        # Whether this cluster node lost its lease while its graph runs (BACKLOG #5906). The
-        # profile's reload refuses there, so an activation asks first and aborts before its store
-        # recovery and takeover hook act on a node about to stand by. None reads as False.
-        self._lease_lost = lease_lost
+        # Whether this node is a cluster node that does not hold the lease (BACKLOG #5906). The
+        # profile's reload refuses there, so an activation asks before each step that acts on the
+        # shared store or the address, and aborts first. None reads as False.
+        self._not_leading = not_leading
         self._settings = settings
         # The engine's identity, ``shard:<id>`` or ``node:<id>``, or None for a lone engine
         # (Engine.instance_identity). Read at each use: it is known once the engine holds its
@@ -586,20 +590,10 @@ class DrCoordinator:
     ) -> DrResult:
         """Steps 1 to 4 of :meth:`activate`, run under its lock. ``progress`` records the step
         reached, for the cancellation arm there."""
-        if self._lease_lost is not None and self._lease_lost():
-            # BACKLOG #5906: before step 1, so neither the store recovery, which re-pends the rows
-            # the leader has in flight in the shared store, nor the takeover hook runs here.
-            await self._record_aborted(
-                "lease",
-                "DR activation refused: this node no longer holds the cluster lease, so nothing "
-                "was recovered, no takeover hook ran and the box stays passive; run the activation "
-                "on the node that holds the lease",
-                actor,
-                now,
-            )
         seed = archive or self._settings.seed_archive
         if archive:
             seed = await self._confine_request_archive(archive, actor, now)
+        await self._refuse_if_not_leading(actor, now)
 
         # (1) Cold-seed restore-verify — FAIL-CLOSED, BEFORE any VIP step (AC-9/AC-14). A missing
         # seed path is itself an abort: a DR box must never promote onto an unverified store.
@@ -631,6 +625,8 @@ class DrCoordinator:
         # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
         # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
         progress.step = "store"
+        # Read again: the seed checks above can take a while (BACKLOG #5906).
+        await self._refuse_if_not_leading(actor, now)
         try:
             await self._store.reset_stale_inflight(
                 owned=self._owned_lanes() if self._owned_lanes is not None else None
@@ -648,6 +644,7 @@ class DrCoordinator:
         # non-LB topology; an ADR-0047 LB deployment omits it (the passive LB moves the VIP once the
         # listeners bind in step 4). A hook failure/timeout ABORTS before any listener serves the VIP.
         progress.step = "vip"
+        await self._refuse_if_not_leading(actor, now)
         # _run_vip_hook marks the attempt once the hook's process starts, so the abort a failed or
         # killed hook writes says it ran.
         await self._run_vip_hook(
@@ -691,8 +688,8 @@ class DrCoordinator:
                 # failed to bind, and an operator reload here would be refused the same way.
                 reason = (
                     "DR run-profile activation refused: this node no longer holds the cluster "
-                    "lease, so its reload bound no listener and the box stays passive; run the "
-                    "activation on the node that holds the lease"
+                    "lease, so its reload bound no listener and the box stays passive; "
+                    f"{_RUN_ON_THE_LEASE_HOLDER}"
                 )
             else:
                 reason = (
@@ -1586,6 +1583,20 @@ class DrCoordinator:
                         reason,
                     )
         return True
+
+    async def _refuse_if_not_leading(self, actor: str, now: float) -> None:
+        """Abort with kind ``lease`` (a 503) when this is a cluster node that does not hold the
+        lease (BACKLOG #5906), before a step that would recover the shared store's in-flight rows
+        or run the takeover hook. A point in time read; the profile's reload refuses a lease lost
+        after the last one, as :class:`DrProfileNotLeading`."""
+        if self._not_leading is not None and self._not_leading():
+            await self._record_aborted(
+                "lease",
+                "DR activation refused: this node does not hold the cluster lease, so the box "
+                f"stays passive; {_RUN_ON_THE_LEASE_HOLDER}",
+                actor,
+                now,
+            )
 
     async def _record_aborted(
         self,

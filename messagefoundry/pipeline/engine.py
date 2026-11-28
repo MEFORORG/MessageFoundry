@@ -1264,7 +1264,7 @@ class Engine:
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
                 hop_posture=self._hop_posture,
-                lease_lost=self._lease_lost,
+                not_leading=self._dr_not_leading,
             )
         return self._dr_coordinator
 
@@ -1273,6 +1273,12 @@ class Engine:
         so it follows a reload that swaps the runner."""
         rr = self._registry_runner
         return rr is not None and rr.lease_lost
+
+    def _dr_not_leading(self) -> bool:
+        """Whether a DR activation must refuse here (BACKLOG #5906): the runner reads this node as
+        lease-lost, or it is a cluster follower, whose graph is down and whose store recovery
+        would re-pend the leader's in-flight rows. A single node always leads."""
+        return self._lease_lost() or not self._coordinator.is_leader()
 
     async def _dr_config_fingerprint(self) -> str | None:
         """The config digest a DR activation's seed marker records, or ``None`` when there is none.
@@ -1351,6 +1357,10 @@ class Engine:
         # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
         # DR decision is never a cluster-wide config bump.
         close_failures: tuple[tuple[str, str], ...] = ()
+        if self._lease_lost():
+            # BACKLOG #5906: before the preflight reads the anchors and writes their rows, as
+            # reload_detail refuses first. Nothing is changed yet, so nothing is rolled back.
+            raise DrProfileNotLeading(str(RunnerLeaseLostError.for_reload()))
         try:
             lookups: FhirLookupAnchorPass | None = None
             if rr is not None:
@@ -3076,8 +3086,8 @@ class Engine:
         initiator_digest = self._initiator_digest(version)
         try:
             if self._lease_lost():
-                # BACKLOG #5906: reload_detail refuses this too, before it reads anything; refused
-                # here as well so the failure hook sees it without reload_detail being entered.
+                # BACKLOG #5906: refused before reload_detail, which would refuse it too but only
+                # after its target check, since this pass is retried every interval.
                 raise RunnerLeaseLostError.for_reload()
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -3786,8 +3796,8 @@ class Engine:
         (no digest to check) or ``WiringError`` (invalid / empty config / unresolved env value / a
         config directory or environment value file this reload could not read), or the runner's
         ``RunnerLeaseLostError`` (a cluster node that lost its lease while its graph runs, BACKLOG
-        #5906; a non-dry-run reload refuses it first, before anything is read) — the caller maps
-        these to HTTP errors.
+        #5906; an ungated non-dry-run reload refuses it right after the target check, before the
+        preflights and the load) — the caller maps these to HTTP errors.
         Every one of them is raised BEFORE the swap, so a raise from this method always means the
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
@@ -3802,11 +3812,14 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
-        if not dry_run and self._lease_lost():
+        if not dry_run and approval is None and self._lease_lost():
             # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
-            # here, before the preflights read the anchors and the load runs the config modules,
-            # on every path that applies a reload: the inline route, a released hold and
-            # convergence. A dry run swaps nothing, so it still runs.
+            # here, before the settings preflight reads the anchors and the load runs the config
+            # modules, for the inline route and convergence. The target check still runs first, so
+            # a directory outside the reload roots is still refused and audited as denied. A dry
+            # run swaps nothing, so it still runs. A released reload is left to the gate's
+            # before-claim check and the runner's, so its refusal still follows its digest check.
+            await self._existing_reload_target(config_dir)
             raise RunnerLeaseLostError.for_reload()
         try:
             if not dry_run:
