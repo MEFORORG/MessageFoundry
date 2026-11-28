@@ -144,7 +144,8 @@ def test_gh_pr_create_naming_batch_20014_prints_the_done_reminder(
     assert f'--note "engine PR 3410 ({sha}) open"' in text
     assert '--row 5850="In engine PR 3410 (batch 20014)"' in text
     assert '--holder "<the text you gave --take>"' in text
-    assert r" C:\skills\batch\read_batch.py --done 20014 " in text
+    # A Bash tool call: paths single-quoted, since bash eats an unquoted backslash.
+    assert r" 'C:\skills\batch\read_batch.py' --done 20014 " in text
     assert "--state MERGED" in text and "PARTIAL" in text
 
 
@@ -267,6 +268,17 @@ def test_a_missing_interpreter_still_exits_0(repo: Path, tmp_path: Path) -> None
     proc = run_hook(repo, tmp_path, payload(repo, 'gh pr create -t "batch 20014"', ok()), env)
     assert proc.returncode == 0
     assert proc.stdout == ""
+    assert "no interpreter at" in proc.stderr, "the missing-interpreter branch did not run"
+
+
+def test_a_multi_line_create_and_a_powershell_call_are_read(repo: Path, tmp_path: Path) -> None:
+    cmd = 'gh pr create \\\n  --title "Batch 52: x (BACKLOG #5850)" \\\n  --body x'
+    text = context(run_hook(repo, tmp_path, payload(repo, cmd, ok())))
+    assert "--done 52 " in text and "--row 5850=" in text
+    ps = 'gh pr create `\n  --title "Batch 7: y" `\n  --body x'
+    text = context(run_hook(repo, tmp_path, payload(repo, ps, ok(), tool="PowerShell")))
+    assert "--done 7 " in text
+    assert r" C:\skills\batch\read_batch.py --done 7 " in text, "PowerShell paths stay bare"
 
 
 def test_the_off_switch_silences_it(repo: Path, tmp_path: Path) -> None:
@@ -327,6 +339,30 @@ def test_flags_are_read_from_the_create_segment_only() -> None:
     seg = "gh api -X POST repos/o/r/pulls -f title='move head=main' -f head=builder/x"
     m = mod.API_HEAD.search(seg)
     assert m is not None and m.group(1) == "builder/x"
+
+
+def test_a_mention_in_another_programs_argument_is_not_the_create() -> None:
+    mod = _helper()
+    found = mod.find_create(
+        'git commit -m "docs: explain gh pr create" && git push && gh pr create -t "Batch 52"'
+    )
+    assert found is not None and "Batch 52" in found[1] and "commit" not in found[1]
+
+
+def test_batches_take_ranges_and_several_batches_fill_in_no_rows() -> None:
+    mod = _helper()
+    assert mod.batches_in("Batches 118-120") == [118, 119, 120]
+    assert mod.batches_in("Batch 7: x") == [7]
+    pr = mod.Created("MEFORORG", "MessageFoundry", 1)
+    text = mod.message(pr, [20014, 20015], [], [5850, 5851], None, "py", "rb.py")
+    assert text is not None and "--row 5850" not in text and "--row <ROW>=" in text
+
+
+def test_a_rest_head_sha_comes_from_the_response() -> None:
+    mod = _helper()
+    body = json.dumps({"number": 1, "head": {"sha": "0123456789abcdef0123456789abcdef01234567"}})
+    assert mod.head_sha("rest", "gh api -X POST repos/o/r/pulls", None, body) == "0123456789a"
+    assert mod.head_sha("rest", "gh api -X POST repos/o/r/pulls", None, "{}") is None
 
 
 def test_gh_called_by_path_is_recognised() -> None:

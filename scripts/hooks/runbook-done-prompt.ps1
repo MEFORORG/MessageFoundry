@@ -9,8 +9,9 @@
 .DESCRIPTION
     WHY IT EXISTS. Owner instruction 2026-11-28, in a Manager's chat: nothing reminded a session to
     run `read_batch.py --done NN --state "PR OPEN"` when it opened a batch's pull request, so the
-    owner's runbook dashboard went stale. runbook-take-prompt.ps1 covers the --take half; this covers
-    the --done half. The work is done by runbook_done_prompt.py beside it, whose header says what it
+    owner's runbook dashboard went stale. This covers the --done half. A separate take prompt,
+    runbook-take-prompt.ps1, is proposed on its own branch (engine PR 3405, not merged when this was
+    written) for the --take half; until it lands nothing here reminds a session to run --take. The work is done by runbook_done_prompt.py beside it, whose header says what it
     matches and what it prints.
 
     WHY PostToolUse. That is the event that sees both the command and its result, so a create that
@@ -37,9 +38,9 @@
     On the claims path the helper resolves the claims directory through coord_root.py, which may
     probe the shared root's server and write its own down-cache, as every claims reader does.
 
-    OVERRIDES: MEFOR_RUNBOOK_PYTHON (the interpreter, shared with runbook-take-prompt.ps1),
-    MEFOR_RUNBOOK_READ_BATCH (the read_batch.py the printed command names). Opt out with
-    MEFOR_RUNBOOK_PROMPT = 'off', the same switch as runbook-take-prompt.ps1.
+    OVERRIDES: MEFOR_RUNBOOK_PYTHON (the interpreter), MEFOR_RUNBOOK_READ_BATCH (the read_batch.py
+    the printed command names). Opt out with MEFOR_RUNBOOK_PROMPT = 'off'. PR 3405's take prompt
+    reads the same two names, MEFOR_RUNBOOK_PYTHON and MEFOR_RUNBOOK_PROMPT.
 #>
 [CmdletBinding()]
 param()
@@ -96,12 +97,18 @@ try {
         if (-not (Test-Path -LiteralPath $readBatch -PathType Leaf)) { $readBatch = '<account skills dir>\batch\read_batch.py' }
     }
 
+    # git resolved from PATH here, absolute, so the helper never runs a git.exe from the session's
+    # worktree, which Windows would search before PATH.
+    $git = Get-Command git -CommandType Application -EA SilentlyContinue | Select-Object -First 1
+    $gitPath = if ($git) { [string]$git.Source } else { '' }
+
     $psi = [System.Diagnostics.ProcessStartInfo]::new($runPy)
+    $psi.WorkingDirectory = $PSScriptRoot
     foreach ($a in @(
             '-I', (Join-Path $PSScriptRoot 'runbook_done_prompt.py'),
             '--worktree', $root, '--session', $sessionId,
             '--python', $py, '--read-batch', $readBatch,
-            '--temp-dir', [System.IO.Path]::GetTempPath())) {
+            '--temp-dir', [System.IO.Path]::GetTempPath(), '--git', $gitPath)) {
         $psi.ArgumentList.Add([string]$a)
     }
     $psi.UseShellExecute = $false
@@ -123,8 +130,8 @@ try {
     if ($wrote) { try { $proc.StandardInput.Close() } catch { Write-Reason "closing the helper's stdin failed: $($_.Exception.Message)" } }
     $left = [Math]::Max(0, $HelperTimeoutMs - [int]$started.ElapsedMilliseconds)
     if (-not $proc.WaitForExit($left)) {
-        try { $proc.Kill($true) } catch { }
-        Write-Reason "the helper ran past $HelperTimeoutMs ms and was stopped"
+        try { $proc.Kill($true); Write-Reason "the helper ran past $HelperTimeoutMs ms and was stopped" }
+        catch { Write-Reason "the helper ran past $HelperTimeoutMs ms and could not be stopped: $($_.Exception.Message)" }
         exit 0
     }
     $err = [string]$errTask.Result

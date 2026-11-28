@@ -58,8 +58,13 @@ MAX_ROWS = 12
 MAX_BATCHES = 6
 GIT_TIMEOUT_SECONDS = 3
 
-# A gh called by bare name or by path (C:\\...\\gh.exe, /usr/bin/gh), quoted or not.
-_GH = r"(?<![\w.-])gh(?:\.exe)?['\"]?"
+# gh as the segment's own program: first word, after any PowerShell call operator and VAR=value
+# prefixes, called by bare name or by path (C:\\...\\gh.exe, /usr/bin/gh), quoted or not. A "gh pr
+# create" inside another program's argument (a commit message) is not a call.
+_GH = (
+    r"\A\s*(?:&\s*)?(?:\w+=\S*\s+)*"
+    r"(?:\"[^\"]*[\\/]|'[^']*[\\/]|[^\s'\"]*[\\/])?gh(?:\.exe)?['\"]?"
+)
 PR_CREATE = re.compile(_GH + r"\s+pr\s+create(?![\w-])", re.IGNORECASE)
 API_CALL = re.compile(_GH + r"\s+api(?![\w-])", re.IGNORECASE)
 # The pulls collection itself, never one PR under it (/pulls/12/comments).
@@ -76,13 +81,15 @@ PR_URL = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d{1,7})(?![
 BARE_NUMBER = re.compile(r"\A\s*(\d{1,7})\s*\Z")
 ALREADY_EXISTS = re.compile(r"already exists", re.IGNORECASE)
 
-# "batch 20014", "Batch #52", "batch-20014"; a list only after the plural, "batches 20014 and
-# 20015", so "batch 20014, 5850 and 5851" names one batch and two other numbers.
-BATCH = re.compile(r"(?<![\w])batch[\s#:_-]*(\d{2,6})(?![\w])", re.IGNORECASE)
+# "batch 7", "Batch #52", "batch-20014"; a list or range only after the plural, "batches 20014 and
+# 20015", "batches 118-120", so "batch 20014, 5850 and 5851" names one batch and two other numbers.
+BATCH = re.compile(r"(?<![\w])batch[\s#:_-]*(\d{1,6})(?![\w])", re.IGNORECASE)
 BATCHES = re.compile(
-    r"(?<![\w])batches[\s#:_-]*(\d{2,6}(?:\s*(?:,|&|\band\b)\s*#?\d{2,6})*)(?![\w])",
+    r"(?<![\w])batches[\s#:_-]*(\d{1,6}(?:\s*(?:,|&|-|\band\b|\bto\b)\s*#?\d{1,6})*)(?![\w])",
     re.IGNORECASE,
 )
+_RANGE = re.compile(r"(\d{1,6})\s*(?:-|\bto\b)\s*#?(\d{1,6})")
+RANGE_MAX = 30
 # "BACKLOG #5973", "BACKLOG #5973, #5936", "BACKLOG 5973 and #5936".
 BACKLOG = re.compile(
     r"(?<![\w])BACKLOG\s*#?(\d{1,6}(?:\s*(?:,|&|\band\b)\s*#\d{1,6})*)(?![\w])",
@@ -127,23 +134,33 @@ class Created:
         return REPO_LABELS.get(self.repo.lower(), self.repo)
 
 
-def segments(command: str) -> list[str]:
-    """The command split at ``;``, ``&``, ``|`` and line breaks that sit outside quotes. Inside
-    double quotes a backslash or backtick escapes the next character, as bash and PowerShell read
-    it. A rough reading, and it only has to be good enough to keep one call's flags apart from the
-    next call's."""
+def segments(command: str, shell: str = "bash") -> list[str]:
+    """The command split at ``;``, ``&``, ``|`` and line breaks that sit outside quotes.
+
+    The escape character is the shell's: backslash for bash (outside quotes and inside double
+    quotes), backtick for PowerShell (likewise). An escaped line break is a line continuation, so it
+    joins the lines rather than splitting them. A rough reading, and it only has to be good enough
+    to keep one call's flags apart from the next call's; ``$(...)`` nesting is not followed."""
+    esc = "`" if shell == "pwsh" else "\\"
     out: list[str] = []
     cur: list[str] = []
     quote = ""
     i = 0
-    while i < len(command):
+    n = len(command)
+    while i < n:
         c = command[i]
+        if c == esc and quote != "'" and i + 1 < n:
+            nxt = command[i + 1]
+            if nxt in "\r\n":
+                # A continuation: the line break and a CR LF pair read as one space.
+                i += 3 if command[i + 1 : i + 3] == "\r\n" else 2
+                cur.append(" ")
+                continue
+            cur.append(c + nxt)
+            i += 2
+            continue
         if quote:
             cur.append(c)
-            if quote == '"' and c in "\\`" and i + 1 < len(command):
-                cur.append(command[i + 1])
-                i += 2
-                continue
             if c == quote:
                 quote = ""
         elif c in "'\"":
@@ -161,9 +178,9 @@ def segments(command: str) -> list[str]:
 
 def classify(segment: str) -> str | None:
     """'cli' for gh pr create, 'rest' for a POST to a pulls collection, else None."""
-    if PR_CREATE.search(segment):
+    if PR_CREATE.match(segment):
         return "cli"
-    if API_CALL.search(segment) and PULLS_PATH.search(segment):
+    if API_CALL.match(segment) and PULLS_PATH.search(segment):
         if POST.search(segment):
             return "rest"
         if FIELD.search(segment) and not GET.search(segment):
@@ -171,9 +188,9 @@ def classify(segment: str) -> str | None:
     return None
 
 
-def find_create(command: str) -> tuple[str, str] | None:
+def find_create(command: str, shell: str = "bash") -> tuple[str, str] | None:
     """The kind and the segment of the first pull request creation in the command, or None."""
-    for segment in segments(command):
+    for segment in segments(command, shell):
         kind = classify(segment)
         if kind is not None:
             return kind, segment
@@ -243,10 +260,22 @@ def _numbers(groups: Iterable[str]) -> list[int]:
     return out
 
 
+def _expand(group: str) -> str:
+    """A batches list with each short range written out: "118-120" reads as "118 119 120"."""
+
+    def one(m: re.Match[str]) -> str:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo < hi <= lo + RANGE_MAX:
+            return " ".join(str(x) for x in range(lo, hi + 1))
+        return m.group(0)
+
+    return _RANGE.sub(one, group)
+
+
 def batches_in(text: str) -> list[int]:
     found = sorted(
         [(m.start(), m.group(1)) for m in BATCH.finditer(text)]
-        + [(m.start(), m.group(1)) for m in BATCHES.finditer(text)]
+        + [(m.start(), _expand(m.group(1))) for m in BATCHES.finditer(text)]
     )
     return _numbers(g for _, g in found)[:MAX_BATCHES]
 
@@ -313,15 +342,25 @@ def body_texts(
         try:
             with path.open("rb") as fh:
                 out.append(fh.read(BODY_CAP_BYTES).decode("utf-8", errors="replace"))
-        except OSError:
-            continue
+        except OSError as exc:
+            _note(f"body file not read: {type(exc).__name__}")
     return out
+
+
+def _note(text: str) -> None:
+    """A reason on stderr, which the wrapper passes on; the model never sees it."""
+    print(f"runbook-done-prompt: {text}", file=sys.stderr)
+
+
+# The git the wrapper resolved from PATH, absolute, so a git.exe sitting in the session's worktree
+# is never the one that runs (install-gate.ps1 records the hazard). Bare "git" only when unset.
+GIT = "git"
 
 
 def _git_run(cwd: str, *argv: str) -> tuple[int, str]:
     try:
         proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
-            ["git", "-C", cwd, *argv],
+            [GIT, "-C", cwd, *argv],
             capture_output=True,
             text=True,
             check=False,
@@ -337,18 +376,30 @@ def _git(cwd: str, *argv: str) -> str:
     return out if code == 0 else ""
 
 
-def head_sha(kind: str, command: str, cwd: str | None) -> str | None:
-    """The short SHA of the PR's head, read from the local clone, or None."""
-    if not cwd or not os.path.isdir(cwd):
+_OTHER_REPO = re.compile(r"(?<![\w-])(?:-R|--repo)(?:\s+|=)")
+
+
+def head_sha(kind: str, command: str, cwd: str | None, response: str) -> str | None:
+    """The short SHA of the PR's head: a REST create's own ``head.sha``, else the pushed branch in
+    the local clone. None when the clone may be another repository's (a REST create, or ``-R``)."""
+    if kind == "rest":
+        try:
+            obj = json.loads(response.strip())
+        except ValueError:
+            return None
+        head = obj.get("head") if isinstance(obj, dict) else None
+        sha = head.get("sha") if isinstance(head, dict) else None
+        return sha[:11] if isinstance(sha, str) and _SHA.match(sha) else None
+    if not cwd or not os.path.isdir(cwd) or _OTHER_REPO.search(command):
         return None
-    m = (CLI_HEAD if kind == "cli" else API_HEAD).search(command)
-    ref = m.group(1) if m else ("HEAD" if kind == "cli" else None)
-    if not ref:
-        return None
+    m = CLI_HEAD.search(command)
+    ref = m.group(1) if m else "HEAD"
     ref = ref.split(":", 1)[-1]
     if not _SAFE_REF.match(ref) or ref.startswith("-"):
         return None
-    for candidate in (ref, f"origin/{ref}"):
+    # The pushed branch first: the PR's head is what is on origin, not local commits after it.
+    candidates = (ref,) if ref == "HEAD" else (f"origin/{ref}", ref)
+    for candidate in candidates:
         sha = _git(cwd, "rev-parse", "--verify", "--quiet", "--short=11", f"{candidate}^{{commit}}")
         if _SHA.match(sha):
             return sha
@@ -383,7 +434,8 @@ def claimed_rows(
             continue
         try:
             rec = json.loads(Path(entry.path).read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError, RecursionError):
+        except (OSError, ValueError, RecursionError) as exc:
+            _note(f"claim {entry.name} not read: {type(exc).__name__}")
             continue
         if not isinstance(rec, dict):
             continue
@@ -399,8 +451,9 @@ def claimed_rows(
 
 
 def is_primary(own_local_root: Path | None, worktree: str) -> bool:
-    """Whether ``worktree`` is the primary checkout, given its ``<git-common-dir>/mefor-coord``
-    (or None, which counts as primary so nothing is read)."""
+    """Whether ``worktree`` is the primary checkout, given what coord_root.local_root() names for it
+    (or None, which counts as primary so nothing is read). That directory sits in the common dir,
+    whose parent is the primary checkout."""
     if own_local_root is None:
         return True
     return _real(Path(own_local_root).parent.parent) == _real(Path(worktree))
@@ -434,14 +487,23 @@ def session_claimed_rows(worktree: str) -> set[int]:
     return claimed_rows(Path(resolved.path), worktree, cr.record_is_here)
 
 
-def _q(path: str) -> str:
-    # Bare unless it has a space. A quoted first word is a string in PowerShell, not a command, so
-    # done_command adds the call operator then.
+def _q(path: str, shell: str) -> str:
+    # Bash eats an unquoted backslash, so a path is always single-quoted there. PowerShell keeps it
+    # bare unless it has a space; a quoted first word is a string there, so done_command then adds
+    # the call operator.
+    if shell == "bash":
+        return "'" + path.replace("'", "'\\''") + "'"
     return f'"{path}"' if " " in path else path
 
 
 def done_command(
-    python: str, read_batch: str, batch: str, pr: Created, sha: str | None, rows: list[int]
+    python: str,
+    read_batch: str,
+    batch: str,
+    pr: Created,
+    sha: str | None,
+    rows: list[int],
+    shell: str = "pwsh",
 ) -> str:
     sha_text = sha or "<head sha>"
     note = f"{pr.label} PR {pr.number} ({sha_text}) open"
@@ -450,9 +512,9 @@ def done_command(
         if rows
         else '--row <ROW>="<where it stands>"'
     )
-    lead = "& " if " " in python else ""
+    lead = "& " if shell == "pwsh" and " " in python else ""
     return (
-        f'{lead}{_q(python)} {_q(read_batch)} --done {batch} --holder "<the text you gave --take>" '
+        f'{lead}{_q(python, shell)} {_q(read_batch, shell)} --done {batch} --holder "<the text you gave --take>" '
         f'--state "PR OPEN" --note "{note}" {row_args}'
     )
 
@@ -460,7 +522,8 @@ def done_command(
 AFTER = (
     "Give --holder the same text you gave --take. --done refuses until every row of the batch "
     "still reading Not started or In progress has a --row, and refuses a row that is not in the "
-    "batch, so run read_batch.py with the batch number to list its rows. Run --done again when "
+    "batch, so run read_batch.py with the batch number to list its rows, and drop or add --row "
+    "arguments to match; the rows above are the ones the PR cites. Run --done again when "
     "the PR merges, with --state MERGED. A row recorded PARTIAL (in its --row text or its Rows "
     "tab Status) makes --state MERGED refuse, so a batch with a PARTIAL row is never recorded "
     "MERGED: leave it at PR OPEN so --next still offers the remainder. This reminder read only "
@@ -476,12 +539,16 @@ def message(
     sha: str | None,
     python: str,
     read_batch: str,
+    shell: str = "pwsh",
 ) -> str | None:
-    shown_rows = rows[:MAX_ROWS]
+    # With several batches, which cited row is in which is unknown here, and --done refuses a row
+    # from another batch, so no row is filled in.
+    shown_rows = rows[:MAX_ROWS] if len(batches) <= 1 else []
     if batches:
         names = ", ".join(str(b) for b in batches)
         cmds = "\n".join(
-            "  " + done_command(python, read_batch, str(b), pr, sha, shown_rows) for b in batches
+            "  " + done_command(python, read_batch, str(b), pr, sha, shown_rows, shell)
+            for b in batches
         )
         return (
             f"[runbook] This command opened {pr.label} PR {pr.number} ({pr.url}), and its title "
@@ -491,7 +558,7 @@ def message(
         )
     if held:
         cited = ", ".join(f"#{r}" for r in held[:MAX_ROWS])
-        cmd = done_command(python, read_batch, "<NN>", pr, sha, held[:MAX_ROWS])
+        cmd = done_command(python, read_batch, "<NN>", pr, sha, held[:MAX_ROWS], shell)
         return (
             f"[runbook] This command opened {pr.label} PR {pr.number} ({pr.url}). It names no "
             f"runbook batch, but it cites BACKLOG {cited}, which this session holds claims on, so "
@@ -511,7 +578,8 @@ def run(args: argparse.Namespace, raw: str) -> str | None:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict) or not isinstance(tool_input.get("command"), str):
         return None
-    found = find_create(tool_input["command"][:COMMAND_CAP_CHARS])
+    shell = "pwsh" if payload.get("tool_name") == "PowerShell" else "bash"
+    found = find_create(tool_input["command"][:COMMAND_CAP_CHARS], shell)
     if found is None:
         return None
     kind, command = found
@@ -543,8 +611,8 @@ def run(args: argparse.Namespace, raw: str) -> str | None:
         held = [r for r in rows if r in mine]
     if not batches and not held:
         return None
-    sha = head_sha(kind, command, cwd)
-    return message(pr, batches, held, rows, sha, args.python, args.read_batch)
+    sha = head_sha(kind, command, cwd, text)
+    return message(pr, batches, held, rows, sha, args.python, args.read_batch, shell)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -555,9 +623,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--read-batch", default="read_batch.py")
     ap.add_argument("--temp-dir", default="")
     ap.add_argument("--claims-dir", default="")
+    ap.add_argument("--git", default="")
     try:
         args = ap.parse_args(argv)
-        raw = sys.stdin.buffer.read(4 * COMMAND_CAP_CHARS).decode("utf-8", errors="replace")
+        global GIT
+        if args.git:
+            GIT = args.git
+        # Read whole: the input carries the tool's output too, and a cut one is not JSON.
+        raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
         text = run(args, raw)
     except SystemExit:
         return 0
