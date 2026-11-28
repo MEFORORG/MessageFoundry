@@ -881,12 +881,9 @@ _ENCODING_UNREADABLE_FAULT = "the sink's stream encoding could not be read"
 #: so a line written to it was escaped for ASCII (BACKLOG #5813). The entry names the type read.
 _ENCODING_NOT_STR_FAULT = "the sink's stream encoding is not a str"
 
-#: The entry for a stream whose ``encoding`` read back as neither a str nor ``None``, of a type
-#: whose name could not be rendered (BACKLOG #5813).
-_ENCODING_TYPE_UNNAMEABLE_FAULT = (
-    "the sink's stream encoding is not a str, and its type's name could not be rendered; lines "
-    "to it are escaped for ASCII"
-)
+#: The entry for a type name that could not be rendered, so the entry it was for names the
+#: placeholder instead of a type (BACKLOG #5813).
+_TYPE_UNNAMEABLE_FAULT = "a type name could not be rendered; a placeholder was substituted"
 
 #: The stderr format-fault line's entry for a line the sink's stream could not encode, written
 #: escaped (BACKLOG #5813). The record formatted; it is counted on that line all the same.
@@ -907,19 +904,6 @@ _FORMAT_FAULT_REPORT_SECONDS = 60.0
 #: it is counted under :data:`_FORMAT_FAULT_OTHER`.
 _FORMAT_FAULT_KINDS = 16
 _FORMAT_FAULT_OTHER = "format faults of other kinds"
-
-
-def _type_name(exc: object) -> str:
-    """The type name of ``exc``, an exception or any other value, through ``ascii()``, or a
-    placeholder, which is said on the stderr last-resort line. Never raises."""
-    try:
-        return ascii(type(exc).__name__)
-    except Exception:
-        _last_resort(
-            "an exception's type name could not be rendered for the log write guard; "
-            "a placeholder was substituted"
-        )
-        return _RECORD_LABEL_DROPPED
 
 
 def _safe_reason(exc: BaseException | None) -> str:
@@ -1003,7 +987,7 @@ class _GuardedSinkMixin(_SinkBase):
                 try:
                     stand_in_line = self._notice_line(notice)
                 except Exception as format_exc:
-                    notice_kind = _type_name(format_exc)
+                    notice_kind = self._type_name(format_exc)
                     self._note_format_fault(
                         f"could not format a record ({kind}), nor the notice standing in for it "
                         f"({notice_kind}); nothing was written for it"
@@ -1108,7 +1092,7 @@ class _GuardedSinkMixin(_SinkBase):
         except Exception as exc:
             # The exception's TYPE only: its message can quote the record's format string or an
             # argument, and this notice goes below every handler filter.
-            kind = _type_name(exc)
+            kind = self._type_name(exc)
             # Quoted by hand, not with ``!r``: the label is already escaped, and ``repr`` would
             # escape its backslashes a second time.
             notice = (
@@ -1132,10 +1116,21 @@ class _GuardedSinkMixin(_SinkBase):
             )
             return _RECORD_LABEL_DROPPED
 
+    def _type_name(self, obj: object) -> str:
+        """The type name of ``obj``, an exception or any other value, through ``ascii()``, or a
+        placeholder. A name that cannot be rendered is counted on the rated format-fault line
+        (:data:`_TYPE_UNNAMEABLE_FAULT`), not said on an unrated one, since this runs per record.
+        Never raises."""
+        try:
+            return ascii(type(obj).__name__)
+        except Exception:
+            self._note_format_fault(_TYPE_UNNAMEABLE_FAULT)
+            return _RECORD_LABEL_DROPPED
+
     def _note_format_fault(self, detail: str) -> None:
         """Count one format fault of the kind ``detail`` names, for :meth:`_report_format_faults`.
-        ``detail`` is built from literals, :func:`_type_name` output and the ``ascii()`` of a type
-        name, and carries nothing from the record. Past :data:`_FORMAT_FAULT_KINDS` distinct kinds, a new kind is counted under
+        ``detail`` is built from literals and :meth:`_type_name` output, and carries nothing from
+        the record. Past :data:`_FORMAT_FAULT_KINDS` distinct kinds, a new kind is counted under
         one catch-all kind, so a burst of varied faults cannot grow this without bound."""
         faults = self._format_faults
         if detail not in faults and len(faults) >= _FORMAT_FAULT_KINDS:
@@ -1298,14 +1293,14 @@ class _GuardedSinkMixin(_SinkBase):
                     # An exotic class: read as "no encoding", never a failed write, but said.
                     read_failed = False
                     self._note_format_fault(
-                        f"{_CLASSIFY_FAULT} ({_type_name(classify_exc)}); its lines are read as "
+                        f"{_CLASSIFY_FAULT} ({self._type_name(classify_exc)}); its lines are read as "
                         "having no encoding"
                     )
             if not read_failed:
                 encoding = None
             else:
                 encoding = "ascii"
-                unreadable = _type_name(exc)
+                unreadable = self._type_name(exc)
                 self._note_format_fault(
                     f"{_ENCODING_UNREADABLE_FAULT} ({unreadable}); lines to it are escaped for "
                     "ASCII"
@@ -1324,18 +1319,10 @@ class _GuardedSinkMixin(_SinkBase):
             codec = None
         else:
             codec = "ascii"
-            # Rendered here, not by _type_name: its fallback writes an unrated stderr line naming
-            # an exception, and this runs per log line. A name that cannot be rendered is counted
-            # on the rated format-fault line under its own literal entry instead.
-            try:
-                unreadable = ascii(type(encoding).__name__)
-            except Exception:
-                unreadable = _RECORD_LABEL_DROPPED
-                self._note_format_fault(_ENCODING_TYPE_UNNAMEABLE_FAULT)
-            else:
-                self._note_format_fault(
-                    f"{_ENCODING_NOT_STR_FAULT} ({unreadable}); lines to it are escaped for ASCII"
-                )
+            self._note_format_fault(
+                f"{_ENCODING_NOT_STR_FAULT} ({self._type_name(encoding)}); lines to it are "
+                "escaped for ASCII"
+            )
         written = line
         if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
             try:

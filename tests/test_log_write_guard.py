@@ -1727,44 +1727,67 @@ def test_a_classify_failure_still_counts_an_ascii_escape(
     assert logging_guard._ESCAPED_FAULT in err
 
 
-def test_an_unnameable_non_str_encoding_is_said_once_per_interval(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+class _Unnameable(type):
+    """A metaclass whose classes' ``__name__`` cannot be read."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name")
+
+
+class _UnnameableError(Exception, metaclass=_Unnameable):
+    pass
+
+
+class _RaisesUnnameable(io.StringIO):
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        raise _UnnameableError
+
+
+class _UnnameableEncoding(io.StringIO):
+    encoding = _Unnameable("Weird", (), {})()
+
+
+@pytest.mark.parametrize(
+    ("stream_class", "entry"),
+    [
+        (_RaisesUnnameable, logging_guard._ENCODING_UNREADABLE_FAULT),
+        (_UnnameableEncoding, logging_guard._ENCODING_NOT_STR_FAULT),
+    ],
+    ids=["exception-type", "encoding-type"],
+)
+def test_an_unnameable_type_is_said_once_per_interval(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    stream_class: type[io.StringIO],
+    entry: str,
 ) -> None:
-    # An encoding of a type whose name cannot be rendered is counted on the rated format-fault
-    # line under its own entry, so many log lines inside one interval make one stderr line.
-    # NEGATIVE CONTROL: with the name rendered through _type_name, each log line wrote its own
-    # unrated "an exception's type name could not be rendered" line.
+    # A type name that cannot be rendered, the exception's or the encoding's, is counted on the
+    # rated format-fault line, so five log lines inside one interval make one stderr line.
+    # NEGATIVE CONTROL: with _type_name's fallback writing its own unrated stderr line, as on
+    # a1d573a835b for the exception type, the five lines wrote five lines inside the interval.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
-
-    class _Unnameable(type):
-        @property
-        def __name__(cls) -> str:  # type: ignore[override]
-            raise RuntimeError("no name")
-
-    weird = _Unnameable("Weird", (), {})()
-
-    class _Writer(io.StringIO):
-        encoding = weird
-
-    stream = _Writer()
+    stream = stream_class()
     monkeypatch.setattr(sys, "stdout", stream)
     handler = GuardedStreamHandler(stream, guard=LogWriteGuard())
     handler.setFormatter(logging.Formatter("%(message)s"))
+    # The first fault is said at once and starts the interval.
+    handler.emit(_record("primer"))
     capsys.readouterr()
 
     for _ in range(5):
         handler.emit(_record("caf%s", chr(0xE9)))
-    first = capsys.readouterr().err
     clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
-    handler.emit(_record("caf%s", chr(0xE9)))
-    second = capsys.readouterr().err
+    handler.flush()
+    err = capsys.readouterr().err
 
-    assert stream.getvalue().splitlines() == ["caf" + "\\" + "u00e9"] * 6
-    for err in (first, second):
-        assert err.count("\n") == 1
-        assert logging_guard._ENCODING_TYPE_UNNAMEABLE_FAULT in err
-        assert "exception's type name could not be rendered" not in err
+    assert stream.getvalue().splitlines()[1:] == ["caf" + "\\" + "u00e9"] * 5
+    assert err.count("\n") == 1
+    assert f"{entry} (<unnameable>)" in err
+    assert f"{logging_guard._TYPE_UNNAMEABLE_FAULT} (x5)" in err
+    assert "no name" not in err
 
 
 def test_an_unhashable_str_encoding_does_not_fail_the_write(
@@ -2374,7 +2397,7 @@ def test_revalidate_never_answers_true_while_a_latch_set_during_its_probe_holds(
     assert answer is guard.can_log()
 
 
-def test_a_type_name_that_cannot_be_rendered_is_said_on_stderr(
+def test_a_type_name_that_cannot_be_rendered_is_counted_and_said(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # NEGATIVE CONTROL: on 0a71e8b23f the fault was swallowed and stderr stayed empty.
@@ -2383,13 +2406,16 @@ def test_a_type_name_that_cannot_be_rendered_is_said_on_stderr(
     def broken_ascii(value: object) -> str:
         raise RuntimeError("cannot render")
 
+    handler = GuardedStreamHandler(io.StringIO(), guard=LogWriteGuard())
     monkeypatch.setattr(logging_guard, "ascii", broken_ascii, raising=False)
     capsys.readouterr()
 
-    assert logging_guard._type_name(ValueError("x")) == "<unnameable>"
+    assert handler._type_name(ValueError("x")) == "<unnameable>"
+    monkeypatch.undo()
+    handler.close()
 
     err = capsys.readouterr().err
-    assert "type name could not be rendered" in err
+    assert f"{logging_guard._TYPE_UNNAMEABLE_FAULT} (x1)" in err
     assert "cannot render" not in err
 
 

@@ -493,9 +493,8 @@ carry `?` with nothing said, except where classifying failed, below. That covers
 `__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose class inherits no
 `encoding` definition, when its target has none or is gone. An `io.TextIOBase` subclass proxy inherits an `encoding` property that returns `None`, so one
 forwarding through `__getattr__` is written raw whatever its target's encoding, a target that
-names a codec included; one forwarding through `__getattribute__`
-reaches the next rule only when the forwarded read raises `AttributeError`; one whose target's
-`encoding` reads `'ascii'` or `None` is classified by the first rule, as that value. A read
+names a codec included; for one forwarding through `__getattribute__`, the proxy is
+classified by whatever its forwarded read returns or raises. A read
 that raises `AttributeError` counts as missing, unless a class on the stream's MRO defines
 `encoding` as something other than a member descriptor. A member descriptor is a `__slots__` member
 or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything else, raises
@@ -503,7 +502,8 @@ or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything else
 mock standing in for a stream) is unreadable. An unreadable stream is
 written with everything outside ASCII escaped. Each line to it is counted on the stderr
 format-fault line described below, naming the exception's type or the type read back, whether
-or not the write lands. If
+or not the write lands; where that type's name cannot be rendered, the entry names no type but a placeholder, and
+the unrendered name is counted on the same line under an entry of its own. If
 classifying the stream's class fails, the stream is read as having no `encoding`, and that failure
 is counted on the same line. Each time the sink goes into stage 2 from another state, that line is
 said at once, inside
