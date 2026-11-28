@@ -1419,6 +1419,123 @@ def test_an_encoding_property_raising_attribute_error_is_unreadable_not_missing(
     )
 
 
+def test_a_stream_with_no_encoding_is_written_as_the_line_came(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The other side of the test above: a writer with no encoding at all, a __slots__ one whose
+    # encoding was never set included, is not a proxy whose read failed, so nothing is escaped
+    # and nothing counted.
+    # NEGATIVE CONTROL: with every AttributeError read as unreadable, both lines were escaped for
+    # ASCII and the unreadable-encoding cause was counted twice.
+    counted: list[str] = []
+    real = logging_guard._GuardedSinkMixin._note_format_fault
+
+    def spy(self: logging_guard._GuardedSinkMixin, detail: str) -> None:
+        counted.append(detail)
+        real(self, detail)
+
+    monkeypatch.setattr(logging_guard._GuardedSinkMixin, "_note_format_fault", spy)
+
+    class _Plain:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, text: str) -> int:
+            self.text += text
+            return len(text)
+
+    class _Slotted:
+        __slots__ = ("encoding", "text")
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, text: str) -> int:
+            self.text += text
+            return len(text)
+
+    for stream in (_Plain(), _Slotted()):
+        handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.emit(_record("caf%s", chr(0xE9)))
+        assert stream.text == "caf\xe9\n"
+
+    assert counted == []
+
+
+def test_a_getattr_proxy_whose_target_is_gone_is_unreadable_not_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The usual delegating proxy forwards through __getattr__, which no static lookup sees. Its
+    # target gone, reading encoding raises AttributeError, and it is read as unreadable.
+    # NEGATIVE CONTROL: with _encoding_read_can_fail ignoring __getattr__, the line went raw to
+    # the replacing stream, with "?" for the CJK character, and nothing was said.
+    raw, inner = _strict_cp1252()
+    inner.reconfigure(errors="replace")
+
+    class _Proxy:
+        _target: object = None
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._target, name)
+
+        def write(self, text: str) -> int:
+            return inner.write(text)
+
+        def flush(self) -> None:
+            inner.flush()
+
+    stream = _Proxy()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("order %s", "caf\xe9 \u4e2d"))
+
+    assert raw.getvalue().decode("cp1252").splitlines() == ["order caf\\u00e9 \\u4e2d"]
+    assert (
+        f"{logging_guard._ENCODING_UNREADABLE_FAULT} ('AttributeError')" in capsys.readouterr().err
+    )
+
+
+def test_an_unreadable_encoding_is_said_even_when_the_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cause is counted before the write, so a write that then fails, and takes the sink to
+    # stage 2, does not hide it.
+    # NEGATIVE CONTROL: with the cause counted only after a write that lands, nothing was counted.
+    counted: list[str] = []
+    real = logging_guard._GuardedSinkMixin._note_format_fault
+
+    def spy(self: logging_guard._GuardedSinkMixin, detail: str) -> None:
+        counted.append(detail)
+        real(self, detail)
+
+    monkeypatch.setattr(logging_guard._GuardedSinkMixin, "_note_format_fault", spy)
+
+    class _Broken:
+        @property
+        def encoding(self) -> str:
+            raise RuntimeError("encoding unavailable")
+
+        def write(self, text: str) -> int:
+            raise OSError(5, "EIO")
+
+    stream = _Broken()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    handler.emit(_record("hello"))
+
+    assert [e.stage for e in events] == ["unwritable"]
+    assert any(d.startswith(logging_guard._ENCODING_UNREADABLE_FAULT) for d in counted)
+
+
 def test_a_falsy_stream_is_still_flushed() -> None:
     # The guard's write and the handler's own flush both flush the stream whatever its
     # truthiness: a stream's __bool__ is not a liveness test.

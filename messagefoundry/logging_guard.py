@@ -86,6 +86,7 @@ import os
 import sys
 import threading
 import time
+import types
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, TextIO
@@ -834,6 +835,19 @@ def _encodes_ascii(encoding: str) -> bool:
 #: The sentinel :func:`inspect.getattr_static` returns for a stream with no ``encoding``.
 _NO_ATTRIBUTE = object()
 
+
+@functools.lru_cache(maxsize=64)
+def _encoding_read_can_fail(cls: type) -> bool:
+    """Whether an ``AttributeError`` from reading ``encoding`` on a ``cls`` stream means a read
+    that failed rather than an attribute that is not there: ``cls`` defines ``encoding`` (other
+    than an empty ``__slots__`` member), or forwards attributes through ``__getattr__``, as a
+    delegating proxy does. Decided once per type, so a stream with no ``encoding`` pays it once."""
+    found = inspect.getattr_static(cls, "encoding", _NO_ATTRIBUTE)
+    if found is not _NO_ATTRIBUTE and not isinstance(found, types.MemberDescriptorType):
+        return True
+    return inspect.getattr_static(cls, "__getattr__", _NO_ATTRIBUTE) is not _NO_ATTRIBUTE
+
+
 #: The start of the stderr format-fault line's entry for a stream whose ``encoding`` could not be
 #: read, so a line written to it was escaped for ASCII (BACKLOG #5813). The entry names the type
 #: of the exception the read raised.
@@ -1092,8 +1106,9 @@ class _GuardedSinkMixin(_SinkBase):
         """Say on the stderr last-resort line the format faults counted since the last such line,
         each kind with its count, at most once per :data:`_FORMAT_FAULT_REPORT_SECONDS` unless
         ``force``. Faults counted inside that interval wait for the next call after it: the next
-        fault, the next ``flush`` (every record a stream handler emits ends in one) or ``close``,
-        which forces it. Called under the handler's lock. Never raises."""
+        fault, the next guard write (:meth:`_write_line` ends in this call, and the stdout sink
+        writes every record through it), the next ``flush`` (a file sink record ends in one) or
+        ``close``, which forces it. Called under the handler's lock. Never raises."""
         # ``getattr``: logging can flush or close a handler whose constructor raised before
         # ``_init_guard`` ran.
         faults: dict[str, int] | None = getattr(self, "_format_faults", None)
@@ -1203,28 +1218,31 @@ class _GuardedSinkMixin(_SinkBase):
         ``UnicodeEncodeError``, as a stream with no
         ``encoding`` or one that does not name the encoder it uses can, the line is written again
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
-        propagates. A stream whose ``encoding`` cannot be read is escaped for ASCII, and a line
-        that lands so is counted under that cause instead. A write whose line was escaped is counted for the stderr format-fault line.
-        Called under the handler's lock, which that count needs."""
+        propagates. A stream whose ``encoding`` cannot be read is escaped for ASCII, and each
+        line is counted under that cause instead of as an escape, whether or not it lands. A
+        write whose line was escaped is counted for the stderr format-fault line. Called under the
+        handler's lock, which that count needs."""
         unreadable: str | None = None
         encoding: object
         try:
             encoding = self.stream.encoding
-        except AttributeError as exc:
-            # Missing, or a property that raised AttributeError (a delegating proxy whose target
-            # is gone): only a static lookup tells the two apart, and only this rare path pays it.
-            missing = inspect.getattr_static(self.stream, "encoding", _NO_ATTRIBUTE)
-            encoding = None if missing is _NO_ATTRIBUTE else "ascii"
-            if encoding is not None:
-                unreadable = _type_name(exc)
         except Exception as exc:
-            # A proxy whose ``encoding`` property raises. Not a failed write, and not "no
-            # encoding" either: on a replacing stream that would write ``?`` unseen. So the line is
-            # escaped for ASCII, which almost every text stream takes, and the fault is said once
-            # the line lands. A stream that refuses even that (cp864 has no byte for ``%``) fails
-            # the write, which the two stages decide.
-            encoding = "ascii"
-            unreadable = _type_name(exc)
+            # A stream that has no ``encoding`` is written as the line came. Any other failure is a
+            # proxy whose ``encoding`` cannot be read: not a failed write, and not "no encoding"
+            # either, since on a replacing stream that would write ``?`` unseen. So the line is
+            # escaped for ASCII, which almost every text stream takes, and the cause is counted
+            # before the write, so a write that then fails does not hide it. A stream that refuses
+            # even that line (cp864 has no byte for ``%``) fails the write; the stages decide.
+            stream_type: type = type(self.stream)  # typed so mypy sees a hashable cache key
+            if isinstance(exc, AttributeError) and not _encoding_read_can_fail(stream_type):
+                encoding = None
+            else:
+                encoding = "ascii"
+                unreadable = _type_name(exc)
+                self._note_format_fault(
+                    f"{_ENCODING_UNREADABLE_FAULT} ({unreadable}); lines to it are escaped for "
+                    "ASCII"
+                )
         written = line
         if isinstance(encoding, str) and not (line.isascii() and _encodes_ascii(encoding)):
             try:
@@ -1240,14 +1258,8 @@ class _GuardedSinkMixin(_SinkBase):
                 raise
             self._write_raw(ascii_only)
             written = ascii_only
-        # Counted only once the line has landed, and once per line: an unreadable encoding is
-        # what made the escape, so it is not also counted as an escape.
-        if unreadable is not None:
-            self._note_format_fault(
-                f"{_ENCODING_UNREADABLE_FAULT} ({unreadable}); a line was written with everything "
-                "outside ASCII escaped"
-            )
-        elif written != line:
+        # An unreadable encoding is what made the escape, so it is not also counted as one.
+        if unreadable is None and written != line:
             self._note_format_fault(_ESCAPED_FAULT)
         # After the count, so an escape made now is said with any whose interval has passed.
         self._report_format_faults()
@@ -1260,12 +1272,10 @@ class _GuardedSinkMixin(_SinkBase):
 
     def _flush_stream(self) -> None:
         """Flush the stream as StreamHandler.flush does, skipping one with no flush rather than
-        failing a write that landed, and one that is ``None`` (a closed file sink), but without its
-        truthiness test: a stream's ``__bool__`` is not a liveness test. Caller holds the lock."""
-        stream = self.stream
-        if stream is None:
-            return
-        flush = getattr(stream, "flush", None)
+        failing a write that landed (``None``, a closed file sink, has none either), but without
+        its truthiness test: a stream's ``__bool__`` is not a liveness test. Caller holds the
+        lock."""
+        flush = getattr(self.stream, "flush", None)
         if flush is not None:
             flush()
 
