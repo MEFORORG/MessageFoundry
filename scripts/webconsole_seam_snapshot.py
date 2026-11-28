@@ -3,7 +3,7 @@
 """Emit a STABLE, deterministic text snapshot of the engine-side seam contract the web console
 (``messagefoundry-webconsole``, Option B / ADR 0065) depends on.
 
-This is the enforced version-skew HANDSHAKE. The console is separately versioned and pins itself
+This is the enforced version-skew HANDSHAKE. The console is separately installed and pins itself
 against ``api._ui_seam.ENGINE_UI_SEAM``; a silent, incompatible change to the injected contract
 (a renamed handler field, a re-signatured ``api.security`` dep, a DTO field the console renders that
 was renamed) would break the console at RUNTIME within a supported seam -- mypy at the engine's
@@ -655,7 +655,7 @@ def _route_gate_rows(console: Any) -> list[tuple[str, str]]:
         # cookie authorizer from ui_ws_authorize), so it renders in full. It is told by the SLOT the
         # engine reads, not by the function's own name, which a rename would change. Any other
         # hook, such as the CSP or a fragment renderer, is the console's own presentation and
-        # renders as its type, so a change to it stays a package-only release.
+        # renders as its type, so a change to it stays a package-only change.
         authorizer = "authorize" in name
         rendered = _render_callable(value, known) if authorizer else type(value).__name__
         rows.append((f"app.state.{name}", rendered))

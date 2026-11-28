@@ -931,7 +931,7 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
         )
 
 
-# --- the separately-versioned web console (ASVS 15.2.4) --------------------------------------------
+# --- the separately released web console (ASVS 15.2.4) ---------------------------------------------
 
 
 @functools.cache
@@ -946,13 +946,17 @@ def _jobs() -> dict:
 
 
 def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
-    """The console is SEPARATELY VERSIONED (its own ``__version__`` root, changelog and PyPI cadence —
-    docs/WEBCONSOLE-PACKAGE.md), so it fires on ``webconsole-v*`` while the engine fires on ``v*``.
+    """The console is a separate wheel with its own ``__version__`` literal, changelog and release
+    job, so it fires on ``webconsole-v*`` while the engine fires on ``v*``. Its number is the engine's
+    (owner ruling 2026-11-28; docs/WEBCONSOLE-PACKAGE.md), but its tag is pushed only once the engine
+    is on PyPI, because its engine floor must resolve there.
 
-    If the two guards ever overlap the damage is silent and asymmetric: an engine tag would publish the
-    console at a version nobody chose, and a console tag would publish the ENGINE at the console's
-    version. Both are wrong in a way the version-check steps cannot catch, because each checks its own
-    wheel against the same tag.
+    If the two guards ever overlap, an engine tag would publish the console inside the engine's run,
+    where its engine floor may not yet resolve from PyPI, and a console tag would start the ENGINE
+    release from whatever commit the console tag names. Behind these guards, each job's
+    tag-spelling step refuses the other namespace's tag (tests/test_release_tag_spelling.py), and
+    the engine's version check cannot parse a console tag; but the console's version check would
+    pass an engine tag, since the numbers are the same by rule. This test holds the first guard.
 
     Mutation: drop either ``startsWith(github.ref_name, 'webconsole-')`` clause. Red here.
     """
@@ -967,17 +971,18 @@ def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
 
 
 def test_the_console_release_does_not_depend_on_the_engine_release() -> None:
-    """``release-harness`` is deliberately lockstep and so carries ``needs: release``. The console is
-    deliberately NOT: an engine release must not drag it along, and a console release must not wait on
-    one. A ``needs`` on any engine job would silently couple two cadences the design separates.
+    """``release-harness`` rides the engine tag and so carries ``needs: release``. The console carries
+    the engine's version too (owner ruling 2026-11-28), but it runs on its own tag, pushed after the
+    engine's publish, so no engine job runs in its workflow run. A ``needs`` on one would make the
+    console job wait on, or skip with, a job that never runs on a console tag.
 
-    It does need ``tag-provenance`` (vault BACKLOG #2631), which belongs to neither cadence: it
+    It does need ``tag-provenance`` (vault BACKLOG #2631), which runs on both tag namespaces: it
     checks the tagged commit, whichever namespace the tag is in. That is the ONLY job it may need.
     """
     needs = needs_of(_jobs()["release-webconsole"])
     assert needs == ["tag-provenance"], (
         f"release-webconsole needs {needs}; it must need the provenance gate and nothing else -- "
-        "the console has its own cadence, so it must not depend on the engine release"
+        "no engine job runs on a console tag, so the console must not depend on one"
     )
 
 
@@ -1515,7 +1520,7 @@ _ENGINE_DIST = "messagefoundry"
 #: The toolkit distribution (ADR 0201), built and smoked inside the engine's `release` job.
 _TOOLKIT_DIST = "messagefoundry-toolkit"
 
-#: The separately-versioned console distribution (ASVS 15.2.4).
+#: The separately released console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
 #: A ``python -m build`` call. ``python3`` and ``python3.14`` count too. Used only to COUNT calls,
@@ -2494,8 +2499,8 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     so the built wheel is the last place the claim is checkable before the PyPI upload burns the
     version forever. The harness smoke already holds the metadata open, so it asks.
 
-    Job-specific: the console is deliberately NOT lockstep (its own version root, its own cadence),
-    so its dependency on the engine is correctly unpinned and its script does not look.
+    Job-specific: the console carries the engine's version but pins the engine with a floor, not
+    an exact ``==`` (docs/WEBCONSOLE-PACKAGE.md says why), so its script does not look for this pin.
     """
     script, dist, pkg, exe, purelib = _prepared("messagefoundry-harness", venv_template, tmp_path)
     _write_install(

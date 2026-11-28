@@ -386,7 +386,7 @@ vault = ["hvac>=2.3.0,<3", "requests>=2.32.2"]
 # the one pinned, sticky toolchain nothing audits. The escape hatch if it ever fires is the one used
 # throughout that step: `--ignore-vuln <ID>` with the triage reason beside it.
 fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
-# The browser ops console ([security].serve_web_console, ADR 0065/0143) is a separately-versioned
+# The browser ops console ([security].serve_web_console, ADR 0065/0143) is a separately released
 # second wheel (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin
 # in-process via mount_ui. That wheel IS on PyPI: the first webconsole-v* release claimed the name on
 # 2026-07-29. There is still no [webconsole] extra here, because re-adding it is an owner release step

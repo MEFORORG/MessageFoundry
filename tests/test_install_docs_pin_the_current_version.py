@@ -237,6 +237,8 @@ def _bump_edits() -> frozenset[str]:
     "path",
     [
         "messagefoundry/__init__.py",
+        "messagefoundry_webconsole/__init__.py",
+        "packaging/messagefoundry-webconsole/CHANGELOG.md",
         "packaging/messagefoundry-harness/pyproject.toml",
         "packaging/messagefoundry-toolkit/pyproject.toml",
         "docs/INSTALL-GUIDE.md",

@@ -17,7 +17,7 @@ version: ``assemble`` appends every fragment under ``[Unreleased]`` and deletes 
 WHY IN-REPO AND NOT towncrier. The job is a couple of hundred lines of stdlib. A new dependency
 costs a vet note, a lock entry and a supply-chain review (CLAUDE.md section 7); this costs none.
 
-SCOPE. The ENGINE changelog only. The web console is separately versioned and keeps its own
+SCOPE. The ENGINE changelog only. The web console is a separate wheel and keeps its own
 ``packaging/messagefoundry-webconsole/CHANGELOG.md``, edited directly as before.
 
 FRAGMENT RULES. The name is ``<name>.<category>.md``:

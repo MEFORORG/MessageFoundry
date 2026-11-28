@@ -16,8 +16,9 @@
 Context: the console is a second distribution, at the engine's version, mounted same-origin onto
 the engine (Option B, [ADR 0065](../../docs/adr/0065-web-ops-dashboard.md)). Architecture, the
 version rule, the seam, and the version-skew gate are documented in
-[`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md). Each console release carries
-the version of the engine release it pairs with. The number is not what the engine checks: the
+[`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md), whose section 1 states the
+version rule: the console is released with every engine release, at the engine's version. The
+number is not what the engine checks: the
 **`ENGINE_UI_SEAM` handshake** is, so keep the floors and the two seam digests honest. Nobody
 chooses a seam value: it is derived (BACKLOG #1220), and `docs/WEBCONSOLE-PACKAGE.md` carries the
 procedure for moving it.
@@ -31,17 +32,26 @@ console's floor names an engine that must already be on PyPI (step 2).
 
 ## 0. Decide version + compatibility
 
-- [ ] Set `messagefoundry_webconsole/__init__.py` `__version__` to the version of the engine
-      release this console pairs with.
-- [ ] Confirm `SUPPORTED_ENGINE_SEAMS` equals `{ENGINE_UI_SEAM}` — one seam, the engine this
-      build was released against (BACKLOG #279). A test enforces it; do not widen without also
-      landing the cross-seam CI matrix.
+- [ ] Confirm `messagefoundry_webconsole/__init__.py` `__version__` equals the engine's, at the
+      engine tag `v<version>` this console is released with. The engine version bump moves both
+      ([CONTRIBUTING.md](../../CONTRIBUTING.md), *Bumping the engine version*), and
+      `tests/test_packaging.py::test_each_lockstep_distribution_ships_at_the_engine_version` fails
+      a tree where they differ.
+- [ ] Confirm `SUPPORTED_ENGINE_SEAMS` equals `{ENGINE_UI_SEAM}` **as the paired engine tag
+      carries it** — one seam, the engine this build is released with (BACKLOG #279). Read the
+      engine's value with `git show v<version>:messagefoundry/api/_ui_seam.py`, its
+      `ENGINE_UI_SEAM` line, and the console's from the commit you will tag. Do not compare against
+      `main`'s or your checkout's `ENGINE_UI_SEAM`: a seam that moved on `main` after the engine tag
+      would match there and ship a console that the released engine refuses at startup. The in-tree
+      test enforces only the in-tree pair; do not widen the set without also landing the
+      cross-seam CI matrix.
 - [ ] Choose the two **floors** for the pair. X is the first engine release that carries the seam in
       `SUPPORTED_ENGINE_SEAMS`; the console gets `messagefoundry>=X`. A is this console release; the
       engine gets `messagefoundry-webconsole>=A`. Set **no ceiling** on either side.
       [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md#the-engine-requirement-is-a-floor-with-no-ceiling) gives
       the reasons (BACKLOG #1585).
-- [ ] Update [`CHANGELOG.md`](CHANGELOG.md) with the release entry.
+- [ ] Confirm [`CHANGELOG.md`](CHANGELOG.md) has this release's entry. The engine version bump
+      adds it (CONTRIBUTING.md item 5), and no test checks that it did.
 
 ## 1. Re-add the engine `[webconsole]` extra
 
@@ -103,8 +113,16 @@ console's floor names an engine that must already be on PyPI (step 2).
 
 ## 6. Tag + publish (the button)
 
-- [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
-      `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
+- [ ] Tag the release `webconsole-vA.B.C`, where `A.B.C` is the engine release's version, on every
+      engine release, once that engine is on PyPI (step 2). **Check PyPI first**: no job waits for
+      the engine, so a console tag pushed beside the engine tag can publish a console whose floor
+      names an engine that is not there yet. Until this tag publishes, the console pins in the
+      engine's own README name a console that is not on PyPI, so push it as soon as the engine is
+      up. There is no console release between engine releases and no `.postN` console tag. A
+      pre-release takes the engine's spelling, so
+      `v0.6.0-rc1` pairs with `webconsole-v0.6.0-rc1`. The `release-webconsole` job, its tag-spelling
+      check and its engine floor gate run only on that tag namespace; the spelling check refuses
+      any tag that is not `webconsole-` followed by an engine tag spelling.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft at least until that job, `publish-pypi-webconsole`, succeeds;
       `publish-github-release-webconsole` then publishes it. With `PUBLISH_WEBCONSOLE` set, the job

@@ -151,8 +151,10 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"  # pre-releases: v0.1.0-rc1, …
-      # The web console is SEPARATELY VERSIONED (its own __version__, changelog and PyPI cadence —
-      # docs/WEBCONSOLE-PACKAGE.md), so it gets its own tag namespace rather than riding an engine tag.
+      # The web console is a separate wheel with its own __version__ literal, changelog and release
+      # job, so it gets its own tag namespace rather than riding an engine tag. It is NOT on its own
+      # cadence: every engine release also tags the console, at the engine's version, after the
+      # engine is on PyPI (owner ruling 2026-11-28; docs/WEBCONSOLE-PACKAGE.md).
       # It lives in THIS workflow rather than its own file because the PyPI Trusted Publisher for
       # messagefoundry-webconsole is registered against `release.yml`; a separate file would not match it.
       - "webconsole-v[0-9]+.[0-9]+.[0-9]+"
@@ -369,8 +371,9 @@ jobs:
     # was already flipped to `==` at the cutover; release.yml was missed.
     #
     # `==` is also the safe form now: a fork, or the retired private vault, still cannot release.
-    # NOT on a console tag: the console has its own job below and its own version root, so an
-    # engine release built from `webconsole-v*` would ship the engine at the console's version.
+    # NOT on a console tag: the console has its own job below, run on its own tag. This `if:` keeps
+    # a `webconsole-v*` tag out; behind it, the tag-spelling step below refuses any `webconsole-`
+    # tag, and the version check, which strips only a leading `v`, cannot parse one either.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     # The two engine SBOMs it signs; the comment above `sbom-linux` says why they are built apart.
     # And the provenance gate, so nothing here is built from a commit that is not on main.
@@ -1537,10 +1540,12 @@ jobs:
 
   release-webconsole:
     # Build + publish the SEPARATE `messagefoundry-webconsole` distribution (the browser ops console,
-    # packaging/messagefoundry-webconsole/). Unlike release-harness this is NOT lockstep with the engine:
-    # the console has its own __version__ root, changelog and PyPI cadence (docs/WEBCONSOLE-PACKAGE.md),
-    # so it fires on its OWN `webconsole-v*` tag and has NO `needs: release` — an engine release must not
-    # drag the console along, and a console release must not wait on one.
+    # packaging/messagefoundry-webconsole/). It carries the engine's version and every engine release
+    # ships it (owner ruling 2026-11-28; docs/WEBCONSOLE-PACKAGE.md), but unlike release-harness it
+    # does not ride the engine tag: it fires on its OWN `webconsole-v*` tag, pushed after the engine
+    # release is on PyPI, and has NO `needs: release`. The console wheel declares an engine floor
+    # (RELEASE.md step 2) that must resolve from PyPI, so the console tag follows the engine's
+    # publish rather than running inside the engine's workflow run.
     #
     # ASVS 15.2.4 (dependency confusion). `messagefoundry-webconsole` is REGISTERED on PyPI -- the first
     # `webconsole-v*` run of this job created the project on 2026-07-29 -- so this job now republishes a
@@ -1550,8 +1555,8 @@ jobs:
     # and tests/test_install_instruction_provenance.py fails if any tracked text drifts back to the
     # pre-claim claim.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
-    # The provenance gate only, never `release`: the console's cadence is its own (see above), but a
-    # console tag must name a commit on main as much as an engine tag must.
+    # The provenance gate only, never `release`: the console tag follows the engine's publish (see
+    # above), but a console tag must name a commit on main as much as an engine tag must.
     needs: [tag-provenance]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1572,6 +1577,18 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
+
+      # The engine job's tag-spelling guard (BACKLOG #2534), on the console tag: `--prefix` makes
+      # the script require `webconsole-` and check the rest as an engine spelling. The trigger
+      # accepts any `webconsole-vX.Y.Z-*` tag, so without this `webconsole-v0.5.3-post1` would run
+      # the job, and the release step below marks any hyphenated tag a GitHub pre-release. A
+      # `.postN` console release is what the version rule forbids (docs/WEBCONSOLE-PACKAGE.md),
+      # and no engine tag can pair with that spelling. The prefix is required, never stripped
+      # where present, so a plain engine tag fails here too if the job's `if:` ever lets one in.
+      # Runs first, before anything is built.
+      - name: The tag is spelled webconsole-vX.Y.Z or webconsole-vX.Y.Z-(a|b|rc)N
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        run: python scripts/release/tag_spelling.py --prefix webconsole- "$GITHUB_REF_NAME"
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
@@ -1742,8 +1759,10 @@ jobs:
           PYSMOKE
           )
           echo "console wheel version: $built"
-          # Compared against the CONSOLE's version root, never the engine's — that is the whole point of
-          # the separate tag namespace. PEP 440 comparison because hatchling normalises the version
+          # Compared against the CONSOLE's version root, the artifact this job publishes. The rule
+          # that it equals the engine's is held on main by tests/test_packaging.py
+          # (test_each_lockstep_distribution_ships_at_the_engine_version), not here, since this job
+          # never sees the engine wheel. PEP 440 comparison because hatchling normalises the version
           # (tag webconsole-v0.3.0-rc1 -> 0.3.0rc1), so a string compare could never match a pre-release.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#webconsole-v}"
@@ -1872,8 +1891,8 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           ver="${tag#webconsole-v}"
-          # Notes come from the CONSOLE's own changelog, not the engine's — separate cadence, separate
-          # version root, separate release notes.
+          # Notes come from the CONSOLE's own changelog, not the engine's — the same version number,
+          # but a separate wheel with its own release notes.
           awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}'             packaging/messagefoundry-webconsole/CHANGELOG.md > notes.md || true
           [ -s notes.md ] || echo "MessageFoundry web console $tag" > notes.md
           # The same 125,000-character ceiling as the engine release step above.

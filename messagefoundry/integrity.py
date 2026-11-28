@@ -20,7 +20,7 @@ code is not the only way to neuter a control in place: emptying the bundled comm
 turns breach screening into a no-op with no ``.py`` touched at all.
 
 It attests the **web console** too, when this process has loaded it (BACKLOG #1802). The console is a
-separate, separately versioned wheel (``messagefoundry-webconsole``) mounted in-process, so its bytes
+separate, separately installed wheel (``messagefoundry-webconsole``) mounted in-process, so its bytes
 run with the engine's own privileges while the engine's ``RECORD`` never lists them. It gets its own
 arm, :func:`attest_console`, run against the console distribution's own ``RECORD`` under the same
 classifier and the same posture below. A console this process never imported is not attested: its

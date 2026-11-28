@@ -5,7 +5,7 @@
 # MessageFoundry headless ENGINE image (ADR 0017 "container fast-follow").
 #
 # This image is the headless ENGINE only: a pure asyncio/uvicorn/SQLite service with no GUI dependency
-# (see docs/CONTAINER-EXPOSURE-EVALUATION.md). The browser ops console is a separately-versioned optional
+# (see docs/CONTAINER-EXPOSURE-EVALUATION.md). The browser ops console is a separately released optional
 # wheel (messagefoundry-webconsole) that is NOT installed here, so a container serve soft-degrades to the
 # JSON API only with a warning (ADR 0143). PySide6 is never in the image either — it now backs only the
 # standalone test harness, a host-side GUI client that reaches the engine over the HTTP API.

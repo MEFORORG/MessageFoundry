@@ -410,7 +410,7 @@ jobs:
 
           # WHICH TAG. Deliberately NOT `/releases/latest`: that endpoint excludes pre-releases, and
           # release.yml publishes pre-release `-*` tags to PRODUCTION PyPI -- so its default answers a
-          # narrower question than the one asked. The web console is separately versioned under a
+          # narrower question than the one asked. The web console is tagged separately under a
           # `webconsole-v*` namespace and ships no engine runtime lock, so it is excluded by shape.
           # Enumerate, filter, and PRINT the rule applied plus every candidate considered.
           if [ -n "${TAG_OVERRIDE:-}" ]; then

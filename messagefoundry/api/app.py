@@ -12243,7 +12243,7 @@ def create_app(
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).
     # The web console — its /ui routes, rendering, the mf_session cookie auth (which the JSON API never
     # reads; the cookie is set at Path=/ so the /ws/stats browser handshake carries it), and the write-
-    # action registry — lives in the separately-versioned messagefoundry_webconsole package, mounted
+    # action registry — lives in the separately released messagefoundry_webconsole package, mounted
     # same-origin in-process via one mount_ui(app, deps) call (Option B, ADR 0065). The /ui routes are
     # CLIENTS of the JSON handlers above — mount_ui wires them to the reused handlers through the typed
     # UiDeps bundle, so the single audited PHI path + per-channel RBAC + view_summary redaction are
