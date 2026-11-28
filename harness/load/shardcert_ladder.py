@@ -3592,8 +3592,8 @@ async def run_engine_ladder(
     stop_poll_grace: float = 10.0,
     post_drain_grace: float = 8.0,
     soak_timeout: float = 900.0,
-    #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every shard PROCESS. None ⇒ resolve from the
-    #: ambient env, else the PRODUCT default (40) — never the old hardcoded 8.
+    #: ARTIFACT 2: the EFFECTIVE MEFOR_STORE_POOL_SIZE for every engine shard PROCESS. None
+    #: ⇒ resolve from the ambient env, else the PRODUCT default (40) — never the old hardcoded 8.
     store_pool_size: int | None = None,
     #: BACKLOG #5953 (S27-74): run a pool at/over the ADR 0062 cliff anyway (``--force-store-pool-size``).
     force_store_pool_size: bool = False,
