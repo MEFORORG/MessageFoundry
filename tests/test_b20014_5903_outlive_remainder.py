@@ -60,6 +60,7 @@ async def test_the_helper_hands_a_cancelled_caller_its_cancel_and_leaves_the_tas
     assert caller.cancelled()
     assert not task.done()
     task.cancel()
+    await asyncio.wait((task,), timeout=_WAIT_S)
 
 
 async def test_the_helper_keeps_the_cancel_of_a_caller_cancelling_when_the_task_is_cancelled() -> (
@@ -174,8 +175,8 @@ async def test_an_interrupted_release_is_marked_and_its_text_names_the_approval(
     detail = info.value.operator_detail
     assert detail.startswith("released config reload was interrupted before it answered")
     assert (
-        "It ran as an approval's release, so resolve that approval rather than approving it again."
-        in detail
+        "It ran as an approval's release: read that approval's state before approving it or "
+        "requesting the operation again, and resolve it if it reads interrupted." in detail
     )
 
 
@@ -212,7 +213,7 @@ async def test_an_outcome_write_cut_off_after_the_release_ran_is_marked_too(
         await store.close()
     assert ran == [True]
     assert info.value.released is True
-    assert "resolve that approval" in info.value.operator_detail
+    assert "It ran as an approval's release" in info.value.operator_detail
 
 
 async def test_a_claim_cut_off_under_an_approve_answers_its_own_503(

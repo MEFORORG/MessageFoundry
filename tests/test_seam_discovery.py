@@ -65,6 +65,7 @@ _RETIRED_APP_STATE = (
     "public_origin",
     "ui_connections_render",
     "ui_csp",
+    "ui_interrupted_render",
     "ui_ws_authorize",
     "webauthn_rp_from_request",
 )

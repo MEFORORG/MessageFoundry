@@ -17,6 +17,7 @@ from messagefoundry.api.models import (
     ConnectionFlagRequest,
     PendingApprovalResponse,
 )
+from messagefoundry.api.outlive import OperationInterrupted
 from messagefoundry.api.security import ConfigWriteNotRecorded, client_ip
 from messagefoundry.api.validation import ConnectionName
 from messagefoundry.auth import Identity, Permission
@@ -203,6 +204,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 outcomes.append((name, f"applied (running={result['running']})"))
             except HTTPException as exc:
                 outcomes.append((name, f"{exc.status_code}: {exc.detail}"))
+            except OperationInterrupted as exc:
+                # BACKLOG #5903: cut off before it answered, so not an "error": unknown.
+                outcomes.append((name, f"outcome unknown: {exc.operator_detail}"))
             except Exception:  # noqa: BLE001 - capture-and-continue; one bad target never aborts the batch
                 _log.exception("bulk control %s failed for %r", action, name)
                 outcomes.append((name, "error"))
@@ -371,6 +375,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     outcomes.append((value, f"purged {result.cancelled}"))
             except HTTPException as exc:
                 outcomes.append((value, f"{exc.status_code}: {exc.detail}"))
+            except OperationInterrupted as exc:
+                # BACKLOG #5903: cut off before it answered, so not an "error": unknown.
+                outcomes.append((value, f"outcome unknown: {exc.operator_detail}"))
             except Exception:  # noqa: BLE001 - capture-and-continue; one bad dest never aborts the batch
                 _log.exception("bulk purge failed for %r", value)
                 outcomes.append((value, "error"))

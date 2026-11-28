@@ -997,12 +997,17 @@ from typing import Any
 #: ``c5417861cbb1bd67`` to ``46614ee1fc6617d6``, and over the merge with BACKLOG #6886 above, from
 #: ``7802871bd39526f1`` to ``2fdef0ec34ace13d``.
 #:
+#: BACKLOG #5903: the console installs ``app.state.ui_interrupted_render``, the page the app's
+#: ``OperationInterrupted`` handler renders for a ``/ui`` path. An engine built against the old seam
+#: never reads it, and answers that path with JSON. Re-derived with ``--write``, from
+#: ``2fdef0ec34ace13d`` to ``605d329d7e840bb8``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2fdef0ec34ace13d"
+ENGINE_UI_SEAM: str = "605d329d7e840bb8"
 
 
 @dataclass(frozen=True, slots=True)

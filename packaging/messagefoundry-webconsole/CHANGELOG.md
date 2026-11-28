@@ -23,6 +23,14 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Added
+
+- **An operation cut off before it answered is a page, not raw JSON.** The console installs
+  `app.state.ui_interrupted_render`, an "Outcome unknown" page, and the engine's
+  `OperationInterrupted` handler renders it for a `/ui` path, at least after the shutdown drain
+  cancels an outliving operation while its request still waits. A seam change: the hook moves the
+  engine UI seam. (`BACKLOG #5903`)
+
 ## [0.5.3] — 2026-11-27 — Early Access
 
 **Requires engine 0.5.3. Supported engine UI seam: `2fdef0ec34ace13d`**, the value engine 0.5.3

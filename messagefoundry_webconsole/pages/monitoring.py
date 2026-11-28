@@ -72,6 +72,7 @@ def operation_interrupted(detail: str) -> Markup:
         ),
         el("h2", "Engine message (status 503)"),
         el("p", detail),
+        el("p", el("a", "Back to the console", href="/ui")),
         class_="card detail-card",
     )
     return page(headline, body)

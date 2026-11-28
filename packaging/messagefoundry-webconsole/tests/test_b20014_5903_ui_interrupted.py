@@ -27,7 +27,7 @@ from messagefoundry.api.security import public_route
 from messagefoundry.auth import Role
 from messagefoundry.pipeline import Engine
 
-_RELEASE_SENTENCE = "resolve that approval rather than approving it again"
+_RELEASE_SENTENCE = "resolve it if it reads interrupted"
 
 
 def _assert_page(r: httpx.Response, label: str) -> str:
@@ -114,3 +114,41 @@ async def test_a_json_path_on_the_same_app_keeps_its_json(engine: Engine, tmp_pa
     assert r.status_code == 503, r.text
     assert r.headers["content-type"].startswith("application/json")
     assert r.json()["detail"].startswith("DR release was interrupted before it answered")
+
+
+async def test_an_interrupted_target_in_a_bulk_control_reads_outcome_unknown(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 2: a bulk route's capture-and-continue arm caught the interruption as a plain
+    "error". It now names the outcome as unknown, and the batch still answers."""
+    from test_ui_bulk_control_client import _ALLOWED, _post_pairs, _row_key, _scoped_operator
+    from test_ui_bulk_control_client import _client as _bulk_client
+    from test_ui_bulk_control_client import _login as _bulk_login
+    from test_ui_bulk_control_client import _service as _bulk_service
+
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    async def _cut(self: Any, name: str) -> None:
+        raise OperationInterrupted("connection stop")
+
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(_ALLOWED, ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await _bulk_service(engine)
+    await _scoped_operator(service)
+    monkeypatch.setattr(RegistryRunner, "stop_inbound", _cut)
+    async with _bulk_client(engine, service) as c:
+        await _bulk_login(c)
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _row_key("source", _ALLOWED))],
+        )
+    assert r.status_code == 200, r.text
+    assert "outcome unknown: connection stop was interrupted before it answered" in r.text
+    assert ">error<" not in r.text

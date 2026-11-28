@@ -562,8 +562,8 @@ class OperationInterrupted(Exception):
         detail = f"{self}. Check the audit log and the state it changes before running it again."
         if self.released:
             detail += (
-                " It ran as an approval's release, so resolve that approval rather than approving "
-                "it again."
+                " It ran as an approval's release: read that approval's state before approving it "
+                "or requesting the operation again, and resolve it if it reads interrupted."
             )
         return detail
 
@@ -686,8 +686,10 @@ class ApprovalGate:
             raise
         except OperationInterrupted:
             # The write was cancelled under a caller that was not (BACKLOG #5903). It has ended, so
-            # ``orphaned`` logs it now, as it would have for a cancelled caller.
-            orphaned(task, approval_id)
+            # ``orphaned`` logs it now, as it would have for a cancelled caller. One the write
+            # raised itself is the caller's to answer, and is not a cancelled write.
+            if task.cancelled():
+                orphaned(task, approval_id)
             raise
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
@@ -1823,10 +1825,12 @@ class ApprovalGate:
             )
             raise
         except OperationInterrupted as exc:
-            # The claim itself was cancelled while this approve was not (BACKLOG #5903), at least
-            # by a store closing under it. The executor never started. Its COMMIT may still have
-            # landed, so the row can read 'executing', and its audit row may be lost, so it is
-            # paged as a store fault is, under its own cause.
+            # The claim itself was cancelled while this approve was not (BACKLOG #5903). Nothing
+            # in the tree is known to do that; this arm keeps such a cancel from reaching the
+            # caller bare. The executor never started. Its COMMIT may still have landed, so the
+            # row can read 'executing', and its audit row may be lost, so it is paged as a store
+            # fault is, under its own cause. Nothing settles the row here: the claim's result is
+            # gone, so whether it landed is unknown.
             log.error(
                 "approval %s: the claim was cancelled before it answered; the operation did not "
                 "run, and if its COMMIT landed the request reads 'executing'",
@@ -1836,7 +1840,8 @@ class ApprovalGate:
             raise ApprovalError(
                 503,
                 "the claim of this release was interrupted before it answered. The operation did "
-                "not run. If the request still reads pending, approve it again",
+                "not run. If the request still reads pending, approve it again. If it reads "
+                "executing, it is stranded with nothing run",
             ) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             # Mapped here rather than inside the claim's future: a cancelled claim's settle logs
