@@ -85,6 +85,8 @@ const SCHEMA = {
         },
       },
     },
+    // The schema read does not check a parameter's shape, so building this one's form throws.
+    broken: { doc: "Broken.", params: { bad: null } },
   },
   directionKeys: {
     inbound: ["name", "transport", "settings", "router"],
@@ -249,6 +251,18 @@ hostSuite("both connection form hosts echo the fields request's id (BACKLOG #824
       assert.ok(error, `the failed request got no answer; posts: ${JSON.stringify(posts)}`);
       assert.strictEqual(error.seq, 4, "the error does not name the request it answers");
       assert.match(String(error.message), /file transport: synthetic schema failure/, "the error does not say why");
+    });
+
+    test(`${name}: a form build that throws is answered with an error naming the request's id`, async () => {
+      const token = await open();
+      posts = [];
+      // Caught here, so a handler that rejects fails on the missing answer, not on the rejection.
+      await handler!({ command: "fields", seq: 9, transport: "broken", direction: "inbound", settings: {}, __mfChannel: token })
+        .catch(() => undefined);
+      const error = posts.find((p) => p.command === "error");
+      assert.ok(error, `the throwing build got no answer; posts: ${JSON.stringify(posts)}`);
+      assert.strictEqual(error.seq, 9);
+      assert.match(String(error.message), /broken transport: /);
     });
 
     test(`${name}: a request with no valid id gets no reply, since the page would discard it`, async () => {

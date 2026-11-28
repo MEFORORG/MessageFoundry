@@ -220,8 +220,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         // A recorded value outside the choices gets its own option, so it shows and an untouched
         // save keeps it, rather than the select going blank and the save dropping the key. A table
         // matches a table choice by content, whatever its key order; a scalar by its text.
-        const recordedChoice = f.value == null ? undefined : choices.find((c) =>
-          c !== null && typeof c === 'object' ? canon(c) === canon(f.value) : displayValue(c) === displayValue(f.value));
+        const recordedChoice = f.value == null ? undefined : choices.find((c) => sameChoice(c, f.value));
         if (f.value != null && recordedChoice === undefined) options.push(f.value);
         for (const c of options) {
           const o = document.createElement('option');
@@ -350,9 +349,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // in their reply (fieldsReply in connectionEditor.ts), with the transport and direction the
     // groups were built for. The page draws only the reply to its latest request, so a reply to an
     // older one can neither drop nor bring back a setting (BACKLOG #8243 items 18 and 20).
-    // FIELDS_ANSWERED is the id of the latest request answered. While the two differ, the drawn
-    // fields were built for another transport or direction than the pickers show, so Save waits
-    // (fieldsPending). ASKED_SETTINGS is what the latest request sent, as JSON.
+    // FIELDS_ANSWERED is the id of the latest request answered; while the two differ a request is
+    // in flight (fieldsPending). Save waits then, unless the pickers are back on the transport and
+    // direction the drawn fields were built for (savingWouldMismatch). ASKED_SETTINGS is what the
+    // latest request sent, as JSON.
     let FIELDS_SEQ = 0;
     let FIELDS_ANSWERED = 0;
     let ASKED_SETTINGS = null;
@@ -360,6 +360,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // so a request the host could not answer puts the pickers back where the fields are.
     let DRAWN_FOR = null;
     function fieldsPending() { return FIELDS_SEQ !== FIELDS_ANSWERED; }
+    function savingWouldMismatch() {
+      return fieldsPending() &&
+        (DRAWN_FOR.transport !== $('transport').value || DRAWN_FOR.direction !== $('direction').value);
+    }
     // How long a request waits for its answer before it counts as failed. A reply the page
     // discards as malformed, or a host that does not answer, would otherwise hold Save back for good.
     const FIELDS_WAIT_MS = 20000;
@@ -374,7 +378,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('direction').value = DRAWN_FOR.direction;
       refreshVisibility();
       LOADING_TEXT = null;
-      errorEl.textContent = reason + '. The transport and direction are back to what the form showed before.';
+      // The host's reason may already end in a period.
+      errorEl.textContent = reason.replace(/[.\\s]+$/, '') + '. The transport and direction are back to what the form showed before.';
       errorEl.style.display = '';
     }
 
@@ -411,6 +416,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canon(v[k])).join(',') + '}';
       }
       return JSON.stringify(v);
+    }
+    // Whether a select's choice is the recorded value: a table choice by content, whatever its key
+    // order; a scalar choice by its text, as its option shows it.
+    function sameChoice(c, v) {
+      return c !== null && typeof c === 'object' ? canon(c) === canon(v) : displayValue(c) === displayValue(v);
     }
 
     function refreshVisibility() {
@@ -692,8 +702,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
 
     $('save').addEventListener('click', () => {
       // The drawn fields belong to the transport and direction of the last answered request; until
-      // the latest one is answered, saving would post those fields under the pickers' transport.
-      if (fieldsPending()) {
+      // the latest one is answered, saving would post those fields under the pickers' transport,
+      // unless the pickers are back where the drawn fields are.
+      if (savingWouldMismatch()) {
         LOADING_TEXT = 'The fields for the ' + $('transport').value + ' transport are still loading; save once they show.';
         errorEl.textContent = LOADING_TEXT;
         errorEl.style.display = '';

@@ -555,14 +555,34 @@ suite("connection editor: only the reply to the latest fields request is drawn (
 
   test("an error for a request a newer one replaced changes nothing", () => {
     const p = load();
-    pick(p, "file");
     pick(p, "mllp");
+    pick(p, "file");
     const [older] = fieldsRequests(p);
-    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport", seq: older.seq });
+    p.deliver({ command: "error", message: "could not read the engine's fields for the mllp transport", seq: older.seq });
     assert.strictEqual(String(p.window.document.getElementById("error").textContent), "", "a superseded failure was shown");
+    assert.strictEqual(p.window.document.getElementById("transport").value, "file", "a superseded failure moved the picker");
     assert.strictEqual(saveClicks(p), 0, "the newer request is still loading");
     answerLatest(p);
-    assert.strictEqual(savedConn(p).transport, "mllp");
+    assert.strictEqual(savedConn(p).transport, "file");
+  });
+
+  test("Save works while a request is in flight once the pickers are back on the drawn fields' transport", () => {
+    const p = load();
+    pick(p, "file");
+    pick(p, "mllp");
+    const conn = savedConn(p);
+    assert.strictEqual(conn.transport, "mllp");
+    assert.deepStrictEqual(conn.settings, RECORD.settings);
+  });
+
+  test("a failure reason that ends in a period is not given a second one", () => {
+    const p = load();
+    pick(p, "file");
+    const [asked] = fieldsRequests(p);
+    p.deliver({ command: "error", message: "could not read the engine's fields for the file transport: synthetic cause. ", seq: asked.seq });
+    const shown = String(p.window.document.getElementById("error").textContent);
+    assert.ok(!shown.includes(".."), `the message has a doubled period: ${shown}`);
+    assert.match(shown, /synthetic cause\. The transport and direction are back/);
   });
 });
 
@@ -652,6 +672,17 @@ suite("connection editor: a select takes the picked choice itself (BACKLOG #8243
     assert.deepStrictEqual([...select.options].map((o: DomNode) => String(o.value)), ["", '{"a":1,"b":2}']);
     assert.strictEqual(select.value, '{"a":1,"b":2}', "the select does not show the recorded choice");
     assert.deepStrictEqual(saved(p).level, { b: 2, a: 1 });
+  });
+
+  test("a recorded string reading like a table choice stays the string when picked again", () => {
+    // Not a typedValue case: the recorded option shows the text it was drawn with, so picking it
+    // again is the untouched path, which writes the recorded value (collectSettings).
+    const p = selectPage([{ a: 1 }], '{"a":1}');
+    const select = control(p, "level");
+    assert.strictEqual(select.options.length, 3, "the recorded string has no option of its own");
+    select.value = "";
+    select.selectedIndex = 2;
+    assert.strictEqual(saved(p).level, '{"a":1}', "the recorded string was saved as the table choice");
   });
 
   test("a choice with surrounding spaces is posted as the choice", () => {

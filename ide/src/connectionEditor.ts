@@ -46,8 +46,8 @@ export async function formSchemaFor(
     const transports = Object.keys(schema.transports).sort();
     return { transports, groups: buildForm(schema, transport, direction, settings), transport, direction };
   } catch {
-    // The form still opens, on the free-text rows. The cause is not logged here; a rebuild's
-    // request gets it in its error reply (fieldsReply).
+    // The form still opens, on the free-text rows. The cause is neither shown nor logged for the
+    // load; only a rebuild's failure is reported, in its error reply (fieldsReply).
     return undefined;
   }
 }
@@ -65,9 +65,11 @@ export async function fieldsReply(
   if (!Number.isSafeInteger(m.seq)) {
     return undefined;
   }
-  let schema;
+  // Both the schema read and the build are inside the try: a throw from either is still an answer
+  // the page can act on, not an unhandled rejection that leaves it waiting.
+  let groups: FieldGroup[];
   try {
-    schema = await connectionSchema(cwd);
+    groups = buildForm(await connectionSchema(cwd), m.transport, m.direction, m.settings ?? {});
   } catch (e) {
     return {
       command: "error",
@@ -75,7 +77,6 @@ export async function fieldsReply(
       seq: m.seq,
     };
   }
-  const groups = buildForm(schema, m.transport, m.direction, m.settings ?? {});
   return { command: "fields", groups, transport: m.transport, direction: m.direction, seq: m.seq };
 }
 
