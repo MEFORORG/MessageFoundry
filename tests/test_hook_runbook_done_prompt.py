@@ -28,9 +28,12 @@ INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
 HOOK_REL = "scripts/hooks/runbook-done-prompt.ps1"
 TIMEOUT = 60
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("pwsh") is None or os.name != "nt", reason="the hook needs pwsh on Windows"
-)
+
+def _need_pwsh() -> None:
+    # Per test, not per module: the helper tests below run on every platform.
+    if shutil.which("pwsh") is None or os.name != "nt":
+        pytest.skip("the hook and the installer need pwsh on Windows")
+
 
 _SRC = INSTALLER.read_text(encoding="utf-8")
 _m = re.search(r"\$BATCH_DONE_MARKER\s*=\s*\"([^\"]+)\"", _SRC)
@@ -96,6 +99,7 @@ def payload(repo: Path, command: str, response: object, tool: str = "Bash", **ex
 def run_hook(
     repo: Path, tmp_path: Path, stdin: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
+    _need_pwsh()
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(HOOK)],
         input=stdin,
@@ -140,7 +144,7 @@ def test_gh_pr_create_naming_batch_20014_prints_the_done_reminder(
     assert f'--note "engine PR 3410 ({sha}) open"' in text
     assert '--row 5850="In engine PR 3410 (batch 20014)"' in text
     assert '--holder "<the text you gave --take>"' in text
-    assert r'"C:\skills\batch\read_batch.py"' in text
+    assert r" C:\skills\batch\read_batch.py --done 20014 " in text
     assert "--state MERGED" in text and "PARTIAL" in text
 
 
@@ -304,10 +308,89 @@ def test_the_helper_names_several_batches_and_ignores_pr_numbers() -> None:
     assert mod.backlog_rows_in("BACKLOG #5973, #5936 and PR #3383") == [5973, 5936]
 
 
+def test_flags_are_read_from_the_create_segment_only() -> None:
+    mod = _helper()
+    # rm's -f is no gh api field, so a GET listing followed by it is no create.
+    listing = "gh api repos/MEFORORG/MessageFoundry/pulls --jq 'length' ; rm -f tmp.txt"
+    assert mod.find_create(listing) is None
+    # A GET on another call does not hide the create after it.
+    found = mod.find_create(
+        "gh api -X GET repos/o/r/pulls/5 && gh api repos/o/r/pulls -f title='batch 20014' -f head=x"
+    )
+    assert found is not None and found[0] == "rest" and "pulls/5" not in found[1]
+    # A curl -H before the create is not the PR head.
+    assert (
+        mod.CLI_HEAD.search(mod.find_create('curl -H "Accept: x" u && gh pr create -t t')[1])
+        is None
+    )
+    # head= inside a title is not the head field.
+    seg = "gh api -X POST repos/o/r/pulls -f title='move head=main' -f head=builder/x"
+    m = mod.API_HEAD.search(seg)
+    assert m is not None and m.group(1) == "builder/x"
+
+
+def test_gh_called_by_path_is_recognised() -> None:
+    mod = _helper()
+    assert mod.find_create('& "C:\\Program Files\\GitHub CLI\\gh.exe" pr create -t x') is not None
+    assert mod.find_create("/usr/bin/gh pr create -t x") is not None
+
+
+def test_a_rest_create_whose_body_says_already_exists_is_still_a_create() -> None:
+    mod = _helper()
+    body = json.dumps(
+        {
+            "number": 9,
+            "html_url": "https://github.com/MEFORORG/MessageFoundry/pull/9",
+            "body": "Refuses when the claim file already exists.",
+        }
+    )
+    pr = mod.created_pr("rest", "gh api -X POST repos/o/r/pulls", body)
+    assert pr is not None and pr.number == 9
+
+
+def test_a_quoted_rest_body_file_with_a_space_is_read_whole() -> None:
+    mod = _helper()
+    m = mod.API_BODY_FILE.search('gh api -X POST repos/o/r/pulls -F "body=@C:\\My Files\\b.md"')
+    assert m is not None
+    assert next(g for g in m.groups() if g) == "C:\\My Files\\b.md"
+
+
+def test_a_body_file_is_not_read_without_a_worktree_or_from_a_unc_path(tmp_path: Path) -> None:
+    mod = _helper()
+    pad = tmp_path / "claude" / "h" / "sess-1" / "scratchpad"
+    pad.mkdir(parents=True)
+    (pad / "b.md").write_text("batch 20014", encoding="utf-8")
+    body = str(pad / "b.md")
+    assert mod.allowed_body_file(body, None, str(tmp_path), "sess-1", str(tmp_path)) is not None
+    assert mod.allowed_body_file(body, None, None, "sess-1", str(tmp_path)) is None
+    assert (
+        mod.allowed_body_file(r"\\host\share\b.md", None, str(tmp_path), "s", str(tmp_path)) is None
+    )
+
+
+def test_the_primary_checkout_holds_no_session_claims(tmp_path: Path) -> None:
+    mod = _helper()
+    primary = tmp_path / "repo"
+    linked = tmp_path / "repo-wt"
+    own = primary / ".git" / "mefor-coord"
+    assert mod.is_primary(own, str(primary)) is True
+    assert mod.is_primary(own, str(linked)) is False
+    assert mod.is_primary(None, str(linked)) is True
+
+
+def test_a_singular_batch_takes_one_number_and_a_spaced_python_gets_the_call_operator() -> None:
+    mod = _helper()
+    assert mod.batches_in("batch 20014, 5850 and 5851") == [20014]
+    pr = mod.Created("MEFORORG", "MessageFoundry", 1)
+    cmd = mod.done_command(r"C:\Program Files\py\python.exe", r"C:\rb.py", "52", pr, None, [])
+    assert cmd.startswith(r'& "C:\Program Files\py\python.exe" C:\rb.py --done 52 ')
+
+
 # ---------------------------------------------------------------------------- the installer row
 
 
 def _install(settings: Path, *args: str) -> None:
+    _need_pwsh()
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALLER)]
         + ["-SettingsPath", str(settings), *args],

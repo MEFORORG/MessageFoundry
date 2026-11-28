@@ -20,9 +20,10 @@
 
     IT NEVER BLOCKS AND NEVER FAILS. Every path exits 0, and it never prints a `decision`.
 
-    FAST ON EVERY OTHER COMMAND. It runs after every Bash and PowerShell call, so it reads the input
-    and stops at once unless the text holds "pr create" or "/pulls". Only then does it start Python.
-    The shim's own pwsh start is the cost every call still pays.
+    FAST ON EVERY OTHER COMMAND, BUT NOT FREE. It runs after every Bash and PowerShell call, so it
+    reads the input and stops at once unless the text holds "pr create" or "/pulls", before it loads
+    _hookinput.ps1 or starts Python. Every shell call still pays the installed shim's pwsh start and
+    its two git rev-parse calls.
 
     FAIL QUIET. No interpreter, a helper that runs past $HelperTimeoutMs, input it cannot read, or
     helper output that is not the one object: nothing on stdout. A reason goes to stderr, which Claude
@@ -32,7 +33,9 @@
     helper still reads the command, but reads no body file and no claims, since it cannot tell whose
     worktree they are in.
 
-    IT READS NO WORKBOOK AND MAKES NO NETWORK OR gh CALL, and it writes no file.
+    IT READS NO WORKBOOK, MAKES NO gh CALL AND SENDS NOTHING TO GITHUB. It writes no file itself.
+    On the claims path the helper resolves the claims directory through coord_root.py, which may
+    probe the shared root's server and write its own down-cache, as every claims reader does.
 
     OVERRIDES: MEFOR_RUNBOOK_PYTHON (the interpreter, shared with runbook-take-prompt.ps1),
     MEFOR_RUNBOOK_READ_BATCH (the read_batch.py the printed command names). Opt out with
@@ -53,11 +56,17 @@ try {
     # The workbook and read_batch.py live on the owner's machine; a cloud session has neither.
     if ($env:CLAUDE_CODE_REMOTE -eq 'true') { exit 0 }
     if (([string]$env:MEFOR_RUNBOOK_PROMPT).Trim().ToLowerInvariant() -eq 'off') { exit 0 }
-    . (Join-Path $PSScriptRoot '_hookinput.ps1')
-    $raw = Read-CcxHookInput
+    # Read as UTF-8 bytes and bounded in time, as Read-CcxHookInput does, but before _hookinput.ps1
+    # is loaded: almost every call stops at the gate below, and the library is not small.
+    if (-not [Console]::IsInputRedirected) { exit 0 }
+    $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false))
+    $read = $reader.ReadToEndAsync()
+    if (-not $read.Wait(2000)) { Write-Reason 'stdin was still open after 2000 ms'; exit 0 }
+    $raw = [string]$read.Result
     # The cheap gate. JSON escapes nothing in these two strings, so the raw text is enough.
     if ($raw -notmatch '(?i)pr\s+create|/pulls') { exit 0 }
 
+    . (Join-Path $PSScriptRoot '_hookinput.ps1')
     $session = Resolve-CcxHookSession -Text $raw -ReadOnly
     if ([string]$session.Event -cne 'PostToolUse') { exit 0 }
     $sessionId = [string]$session.SessionId
@@ -69,12 +78,15 @@ try {
     $home_ = [Environment]::GetFolderPath('UserProfile')
     $py = [string]$env:MEFOR_RUNBOOK_PYTHON
     if (-not $py) { $py = Join-Path $home_ '.claude-tools\py\Scripts\python.exe' }
+    # The helper needs only the standard library, so any python runs it; the printed command needs
+    # read_batch.py's openpyxl interpreter, so a stand-in from PATH is not named there.
+    $runPy = $py
     if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
         $cmd = Get-Command python -CommandType Application -EA SilentlyContinue | Select-Object -First 1
         if (-not $cmd) { Write-Reason "no interpreter at $py and none on PATH"; exit 0 }
         $runPy = [string]$cmd.Source
+        $py = '<the openpyxl interpreter>'
     }
-    else { $runPy = $py }
 
     $readBatch = [string]$env:MEFOR_RUNBOOK_READ_BATCH
     if (-not $readBatch) {
@@ -102,10 +114,15 @@ try {
     $proc = [System.Diagnostics.Process]::Start($psi)
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
+    # Written asynchronously, so a helper that never reads stdin cannot hold the hook past its bound.
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($raw)
-    try { $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length) } catch { }
-    try { $proc.StandardInput.Close() } catch { }
-    if (-not $proc.WaitForExit($HelperTimeoutMs)) {
+    $started = [Diagnostics.Stopwatch]::StartNew()
+    $write = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+    $wrote = $false
+    try { $wrote = $write.Wait($HelperTimeoutMs) } catch { Write-Reason "the helper's stdin failed: $($_.Exception.Message)" }
+    if ($wrote) { try { $proc.StandardInput.Close() } catch { Write-Reason "closing the helper's stdin failed: $($_.Exception.Message)" } }
+    $left = [Math]::Max(0, $HelperTimeoutMs - [int]$started.ElapsedMilliseconds)
+    if (-not $proc.WaitForExit($left)) {
         try { $proc.Kill($true) } catch { }
         Write-Reason "the helper ran past $HelperTimeoutMs ms and was stopped"
         exit 0

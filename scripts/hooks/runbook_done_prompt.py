@@ -7,24 +7,31 @@ tools, with the hook input on stdin. Owner instruction 2026-11-28, in a Manager'
 reminded a Manager to run ``read_batch.py --done NN --state "PR OPEN"`` when it opened a batch's
 pull request, so the owner's runbook dashboard kept reading TAKEN or FREE for a batch with a PR.
 
-WHAT IT MATCHES. A command that creates a pull request: ``gh pr create``, or ``gh api`` on a
-``.../pulls`` path with ``-X POST``/``--method POST`` (or with a field flag and no GET, which gh
-sends as a POST). The tool response must show that it succeeded: no failure flag, no "already
-exists", and one pull request named in the output (a ``.../pull/N`` URL, a REST JSON object with
-``number``, or a bare number printed by ``--jq .number``). Output sent to a file, or anything else it
-cannot read, means no reminder.
+WHAT IT MATCHES. One segment of the command (split at ``;``, ``&``, ``|`` and line breaks outside
+quotes) that creates a pull request: ``gh pr create``, or ``gh api`` on a ``.../pulls`` path with
+``-X POST``/``--method POST``, or with a field flag and no GET, which gh sends as a POST. Every flag
+it reads afterwards (body file, head, method) is read from that segment only. The tool response
+must show that it succeeded: no failure flag, no "already exists" from gh pr create, and one pull
+request named in the output (a ``.../pull/N`` URL, a REST JSON object with ``number``, or a bare
+number printed by ``--jq .number``). Output sent to a file, or anything else it cannot read, means
+no reminder.
 
 WHAT IT PRINTS. One JSON object, ``{"additionalContext": ...}``, which the wrapper puts in the
-event's hookSpecificOutput. It names every runbook batch the command text or its body file mentions
-("batch NN", "Batch NN", "batches NN and MM") and gives the exact ``--done`` command. With no batch
-named, it says so only when the PR cites ``BACKLOG #N`` rows this session's worktree holds claims on,
-since those rows may belong to a batch. Otherwise it prints nothing.
+event's hookSpecificOutput. It names every runbook batch that segment or its body file mentions
+("batch NN", "Batch NN", "batches NN and MM") and gives the exact ``--done`` command. A number after
+"batch" in prose ("batch 100 messages") reads as a batch too, so the text tells the session to check
+the batch with read_batch.py. With no batch named, it says so only when the PR cites ``BACKLOG #N``
+rows this session's worktree holds claims on, since those rows may belong to a batch. Otherwise it
+prints nothing.
 
-WHAT IT NEVER DOES. It never blocks, and every path exits 0. It never reads the workbook, and makes
-no network or gh call; the only child it starts is a local ``git rev-parse`` for the head SHA, and
-``git config`` for the claims registry hop that claim.ps1 follows. It writes no file. A body file is
-read only when it sits inside the session's worktree or its own scratchpad, and only its first
-``BODY_CAP_BYTES``.
+WHAT IT NEVER DOES. It never blocks, and every path exits 0. It never reads the workbook, makes no
+gh call and sends nothing to GitHub. The children it starts are a local ``git rev-parse`` for the
+head SHA and, on the claims path only, the ``git config`` and ``git rev-parse`` calls the claims
+registry hop needs. That path resolves the claims directory through coord_root.py, which may probe
+the shared root's server and write coord_root.py's own down-cache, as every claims reader does; this
+file writes nothing itself. A body file is read only when the session's worktree is known and the
+file sits inside it or the session's own scratchpad, only from a local (not UNC) path, and only its
+first ``BODY_CAP_BYTES``.
 
 Command and file content are DATA. Nothing read from them reaches the printed text except integers
 (batch, row and PR numbers), a repository name and a hex SHA, each held to a fixed pattern.
@@ -51,7 +58,8 @@ MAX_ROWS = 12
 MAX_BATCHES = 6
 GIT_TIMEOUT_SECONDS = 3
 
-_GH = r"(?<![\w.\\/-])gh(?:\.exe)?"
+# A gh called by bare name or by path (C:\\...\\gh.exe, /usr/bin/gh), quoted or not.
+_GH = r"(?<![\w.-])gh(?:\.exe)?['\"]?"
 PR_CREATE = re.compile(_GH + r"\s+pr\s+create(?![\w-])", re.IGNORECASE)
 API_CALL = re.compile(_GH + r"\s+api(?![\w-])", re.IGNORECASE)
 # The pulls collection itself, never one PR under it (/pulls/12/comments).
@@ -68,9 +76,11 @@ PR_URL = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d{1,7})(?![
 BARE_NUMBER = re.compile(r"\A\s*(\d{1,7})\s*\Z")
 ALREADY_EXISTS = re.compile(r"already exists", re.IGNORECASE)
 
-# "batch 20014", "Batch #52", "batch-20014", "batches 20014 and 20015", "batches 52, 53".
-BATCH = re.compile(
-    r"(?<![\w])batch(?:es)?[\s#:_-]*(\d{2,6}(?:\s*(?:,|&|\band\b)\s*#?\d{2,6})*)(?![\w])",
+# "batch 20014", "Batch #52", "batch-20014"; a list only after the plural, "batches 20014 and
+# 20015", so "batch 20014, 5850 and 5851" names one batch and two other numbers.
+BATCH = re.compile(r"(?<![\w])batch[\s#:_-]*(\d{2,6})(?![\w])", re.IGNORECASE)
+BATCHES = re.compile(
+    r"(?<![\w])batches[\s#:_-]*(\d{2,6}(?:\s*(?:,|&|\band\b)\s*#?\d{2,6})*)(?![\w])",
     re.IGNORECASE,
 )
 # "BACKLOG #5973", "BACKLOG #5973, #5936", "BACKLOG 5973 and #5936".
@@ -84,10 +94,13 @@ _NUM = re.compile(r"\d{1,7}")
 _PATH = r"(\"[^\"\x00-\x1f]+\"|'[^'\x00-\x1f]+'|[^\s'\";|&]+)"
 CLI_BODY_FILE = re.compile(r"(?<![\w-])(?:--body-file|-F)(?:\s+|=)(?![\w-]+=)" + _PATH)
 API_BODY_FILE = re.compile(
-    r"(?<![\w-])(?:(?:-F|--field)(?:\s+|=)['\"]?body=@|--input(?:\s+|=))" + _PATH
+    r"(?<![\w-])(?:(?:-F|--field)(?:\s+|=)"
+    r"(?:\"body=@([^\"\x00-\x1f]+)\"|'body=@([^'\x00-\x1f]+)'|body=@([^\s'\";|&]+))"
+    r"|--input(?:\s+|=)" + _PATH + ")"
 )
 CLI_HEAD = re.compile(r"(?<![\w-])(?:--head|-H)(?:\s+|=)['\"]?([\w./:-]+)")
-API_HEAD = re.compile(r"(?<![\w-])head=['\"]?([\w./:-]+)")
+# Only a head field, never "head=" inside another field's value.
+API_HEAD = re.compile(r"(?<![\w-])(?:-f|-F|--field|--raw-field)(?:\s+|=)['\"]?head=([\w./:-]+)")
 _SAFE_REF = re.compile(r"\A[\w./-]{1,200}\Z")
 _SHA = re.compile(r"\A[0-9a-f]{7,40}\Z")
 _SESSION_ID = re.compile(r"\A[A-Za-z0-9_-]{1,100}\Z")
@@ -114,15 +127,56 @@ class Created:
         return REPO_LABELS.get(self.repo.lower(), self.repo)
 
 
-def is_pr_create(command: str) -> str | None:
+def segments(command: str) -> list[str]:
+    """The command split at ``;``, ``&``, ``|`` and line breaks that sit outside quotes. Inside
+    double quotes a backslash or backtick escapes the next character, as bash and PowerShell read
+    it. A rough reading, and it only has to be good enough to keep one call's flags apart from the
+    next call's."""
+    out: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        c = command[i]
+        if quote:
+            cur.append(c)
+            if quote == '"' and c in "\\`" and i + 1 < len(command):
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in ";&|\r\n":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return [x for x in out if x.strip()]
+
+
+def classify(segment: str) -> str | None:
     """'cli' for gh pr create, 'rest' for a POST to a pulls collection, else None."""
-    if PR_CREATE.search(command):
+    if PR_CREATE.search(segment):
         return "cli"
-    if API_CALL.search(command) and PULLS_PATH.search(command):
-        if POST.search(command):
+    if API_CALL.search(segment) and PULLS_PATH.search(segment):
+        if POST.search(segment):
             return "rest"
-        if FIELD.search(command) and not GET.search(command):
+        if FIELD.search(segment) and not GET.search(segment):
             return "rest"
+    return None
+
+
+def find_create(command: str) -> tuple[str, str] | None:
+    """The kind and the segment of the first pull request creation in the command, or None."""
+    for segment in segments(command):
+        kind = classify(segment)
+        if kind is not None:
+            return kind, segment
     return None
 
 
@@ -150,7 +204,8 @@ def response_text(response: object) -> tuple[str, bool]:
 
 def created_pr(kind: str, command: str, text: str) -> Created | None:
     """The one pull request the output names, or None when it names none or several."""
-    if ALREADY_EXISTS.search(text):
+    # gh pr create's refusal; a REST response echoes the PR's own body, which may say anything.
+    if kind == "cli" and ALREADY_EXISTS.search(text):
         return None
     if kind == "rest":
         try:
@@ -189,7 +244,11 @@ def _numbers(groups: Iterable[str]) -> list[int]:
 
 
 def batches_in(text: str) -> list[int]:
-    return _numbers(m.group(1) for m in BATCH.finditer(text))[:MAX_BATCHES]
+    found = sorted(
+        [(m.start(), m.group(1)) for m in BATCH.finditer(text)]
+        + [(m.start(), m.group(1)) for m in BATCHES.finditer(text)]
+    )
+    return _numbers(g for _, g in found)[:MAX_BATCHES]
 
 
 def backlog_rows_in(text: str) -> list[int]:
@@ -217,7 +276,10 @@ def allowed_body_file(
     which is where the harness puts it. Relative paths resolve against the tool's cwd.
     """
     name = raw.strip().strip("'\"")
-    if not name or name == "-":
+    if not name or name == "-" or not worktree:
+        return None
+    # A UNC or device path would open a network connection inside realpath, before any check.
+    if name[:2] in ("\\\\", "//", "\\/", "/\\"):
         return None
     p = Path(name)
     if not p.is_absolute():
@@ -228,7 +290,7 @@ def allowed_body_file(
         real = _real(p)
     except (OSError, ValueError):
         return None
-    if worktree and _inside(real, _real(Path(worktree))):
+    if _inside(real, _real(Path(worktree))):
         return real
     scratch = _real(Path(temp_dir) / "claude")
     if _SESSION_ID.match(session) and _inside(real, scratch):
@@ -244,7 +306,8 @@ def body_texts(
     out: list[str] = []
     pattern = CLI_BODY_FILE if kind == "cli" else API_BODY_FILE
     for m in pattern.finditer(command):
-        path = allowed_body_file(m.group(1), cwd, worktree, session, temp_dir)
+        raw = next((g for g in m.groups() if g), "")
+        path = allowed_body_file(raw, cwd, worktree, session, temp_dir)
         if path is None:
             continue
         try:
@@ -255,7 +318,7 @@ def body_texts(
     return out
 
 
-def _git(cwd: str, *argv: str) -> str:
+def _git_run(cwd: str, *argv: str) -> tuple[int, str]:
     try:
         proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
             ["git", "-C", cwd, *argv],
@@ -265,8 +328,13 @@ def _git(cwd: str, *argv: str) -> str:
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+        return -1, ""
+    return proc.returncode, proc.stdout.strip()
+
+
+def _git(cwd: str, *argv: str) -> str:
+    code, out = _git_run(cwd, *argv)
+    return out if code == 0 else ""
 
 
 def head_sha(kind: str, command: str, cwd: str | None) -> str | None:
@@ -330,13 +398,25 @@ def claimed_rows(
     return out
 
 
+def is_primary(own_local_root: Path | None, worktree: str) -> bool:
+    """Whether ``worktree`` is the primary checkout, given its ``<git-common-dir>/mefor-coord``
+    (or None, which counts as primary so nothing is read)."""
+    if own_local_root is None:
+        return True
+    return _real(Path(own_local_root).parent.parent) == _real(Path(worktree))
+
+
 def session_claimed_rows(worktree: str) -> set[int]:
     """Rows this worktree's claims hold, read through coord_root.py as claim.ps1 resolves them,
     following one ``mefor.claimsRoot`` hop. Raises on what it cannot resolve."""
     cr = _load_coord_root()
     registry = worktree
-    hop = _git(worktree, "config", "--get", "mefor.claimsRoot")
-    if hop:
+    # Exit 1 is an unset key; anything else is a read that failed, and is not read as unset, as
+    # claim_check.py's _config refuses it: that would resolve a registry nothing writes.
+    code, hop = _git_run(worktree, "config", "--get", "mefor.claimsRoot")
+    if code not in (0, 1):
+        raise OSError(f"git config --get mefor.claimsRoot exited {code}")
+    if code == 0 and hop:
         top = _git(hop, "rev-parse", "--path-format=absolute", "--show-toplevel")
         if not top:
             raise OSError("mefor.claimsRoot names no repository")
@@ -346,8 +426,7 @@ def session_claimed_rows(worktree: str) -> set[int]:
         raise OSError("git could not name the common dir")
     # claim.ps1 records the checkout of the copy it ran from, so the primary's claims belong to
     # whichever sessions ran the primary's copy; they say nothing about a session there.
-    own = cr.local_root(worktree)
-    if own is None or _real(Path(own).parent) == _real(Path(worktree)):
+    if is_primary(cr.local_root(worktree), worktree):
         return set()
     resolved = cr.resolve("claims", registry, local=local)
     if resolved.path is None:
@@ -356,7 +435,9 @@ def session_claimed_rows(worktree: str) -> set[int]:
 
 
 def _q(path: str) -> str:
-    return f'"{path}"'
+    # Bare unless it has a space. A quoted first word is a string in PowerShell, not a command, so
+    # done_command adds the call operator then.
+    return f'"{path}"' if " " in path else path
 
 
 def done_command(
@@ -369,8 +450,9 @@ def done_command(
         if rows
         else '--row <ROW>="<where it stands>"'
     )
+    lead = "& " if " " in python else ""
     return (
-        f'{_q(python)} {_q(read_batch)} --done {batch} --holder "<the text you gave --take>" '
+        f'{lead}{_q(python)} {_q(read_batch)} --done {batch} --holder "<the text you gave --take>" '
         f'--state "PR OPEN" --note "{note}" {row_args}'
     )
 
@@ -403,8 +485,9 @@ def message(
         )
         return (
             f"[runbook] This command opened {pr.label} PR {pr.number} ({pr.url}), and its title "
-            f"or body names runbook batch {names}. Record it on the owner's runbook workbook now, "
-            f"as the /batch skill's Step 7 requires:\n{cmds}\n{AFTER}"
+            f"or body names runbook batch {names}. If that is a runbook batch (read_batch.py with "
+            "the number shows it), record the PR on the owner's runbook workbook now, as the "
+            f"/batch skill's Step 7 requires:\n{cmds}\n{AFTER}"
         )
     if held:
         cited = ", ".join(f"#{r}" for r in held[:MAX_ROWS])
@@ -428,10 +511,10 @@ def run(args: argparse.Namespace, raw: str) -> str | None:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict) or not isinstance(tool_input.get("command"), str):
         return None
-    command: str = tool_input["command"][:COMMAND_CAP_CHARS]
-    kind = is_pr_create(command)
-    if kind is None:
+    found = find_create(tool_input["command"][:COMMAND_CAP_CHARS])
+    if found is None:
         return None
+    kind, command = found
     text, failed = response_text(payload.get("tool_response"))
     if failed:
         return None
@@ -450,7 +533,7 @@ def run(args: argparse.Namespace, raw: str) -> str | None:
         ]
     )
     batches = batches_in(corpus)
-    rows = [r for r in backlog_rows_in(corpus) if r not in batches]
+    rows = backlog_rows_in(corpus)
     held: list[int] = []
     if not batches and rows and worktree:
         if args.claims_dir:
