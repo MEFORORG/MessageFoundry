@@ -18,6 +18,8 @@ export const GITIGNORE_ENTRIES = [
   "api-generated.lock",
   "api-generated-key.pem.renewing", // the pair a startup renewal stages before replacing the live one
   "api-generated-cert.pem.renewing",
+  "api-generated-key.pem.replaced", // the old pair a re-mint caused only by a bind's trailing dot keeps
+  "api-generated-cert.pem.replaced",
   "master.key", // the host key-custody blob and its hand-off copy beside a SQLite store
   "handoff.key", // (messagefoundry/engine_secrets.py CUSTODY_FILE_NAMES)
   ".env",

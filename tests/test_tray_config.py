@@ -741,6 +741,58 @@ def test_a_wildcard_bind_is_probed_on_loopback_and_stays_monitor_only(app_parame
     assert cfg.monitor_only is True
 
 
+@pytest.mark.parametrize(
+    ("host", "unspecified"),
+    [
+        # Read as the IPv6 wildcard, so it is held monitor-only as a wildcard is.
+        ("::ffff:0.0.0.0", True),
+        # Not an address to the tray, so a remote name, held monitor-only as a remote engine is.
+        ("0", False),
+    ],
+)
+def test_a_wildcard_spelling_windows_cannot_bind_stays_monitor_only(
+    host: str, unspecified: bool
+) -> None:
+    """BACKLOG #5936 item 2. ``::ffff:0.0.0.0`` and ``0`` spell a wildcard on some stacks. On
+    Windows, the tray's only platform, the first does not bind (the test below), so a tray reading
+    it as down is right. The second is not settled: the listener's lookup sends ``0`` to the
+    resolver, which on the box measured found nothing, while a numeric parse reads it as
+    ``0.0.0.0``, so whether an engine listens there depends on the resolver. Both must withhold
+    service control, each by its own path, whatever the probe shows."""
+    cfg = compose_config(None, ServiceRegistryInfo(app_parameters=f"serve --host {host}"))
+    assert cfg.monitor_only is True
+    assert cfg.bind_unspecified is unspecified
+
+
+def _listen_once(host: str) -> None:
+    """Open and close a listener on ``host``, as ``uvicorn.run`` reaches ``loop.create_server``."""
+    import asyncio
+
+    async def bind() -> None:
+        server = await asyncio.start_server(lambda _r, _w: None, host, 0)
+        server.close()
+        await server.wait_closed()
+
+    asyncio.run(bind())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
+def test_windows_refuses_a_listener_on_the_mapped_wildcard() -> None:
+    """A premise of the test above, measured where the tray runs: ``loop.create_server`` refuses
+    ``::ffff:0.0.0.0``, a numeric host, so no name lookup is involved. If this starts passing a
+    bind, the tray's handling of the spelling is a live question again. The control is
+    :func:`test_the_listener_helper_binds_loopback`: the same helper binds loopback, so the
+    refusal is about the spelling, not a box or runner that refuses every listener."""
+    with pytest.raises(OSError):
+        _listen_once("::ffff:0.0.0.0")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the tray runs on Windows only")
+def test_the_listener_helper_binds_loopback() -> None:
+    """The positive control for the test above. Loopback, so no firewall prompt is raised."""
+    _listen_once("127.0.0.1")
+
+
 def test_a_tray_toml_engine_url_clears_the_wildcard_hold() -> None:
     """An operator's loopback ``engine_url`` replaces the discovered bind, and with it the hold."""
     reg = ServiceRegistryInfo(app_parameters="serve --host 0.0.0.0 --port 8765")

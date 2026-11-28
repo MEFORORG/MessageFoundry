@@ -18,6 +18,8 @@ suite("Source-control setup ignores the engine's minted secrets (BACKLOG #5413)"
       "api-generated.lock",
       "api-generated-key.pem.renewing",
       "api-generated-cert.pem.renewing",
+      "api-generated-key.pem.replaced",
+      "api-generated-cert.pem.replaced",
       "bootstrap-admin.txt",
       "master.key",
       "handoff.key",

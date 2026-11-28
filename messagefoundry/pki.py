@@ -1984,16 +1984,24 @@ def _general_names(names: list[str]) -> list[x509.GeneralName]:
     return out
 
 
-def san_names(pem: bytes, name: str) -> bool:
+def san_names(pem: bytes, name: str, *, ignore_trailing_dot: bool = False) -> bool:
     """True when the certificate's SubjectAlternativeName holds ``name`` (BACKLOG #5973).
 
     ``name`` is classified as :func:`make_self_signed` classifies it (:func:`_general_names`), so a
     certificate that function minted for ``name`` always answers ``True``. An IP is compared by
-    address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case or a
-    trailing dot. ``False`` when the certificate has no readable SAN; ``True`` when ``name`` cannot
-    be classified at all, so a caller deciding whether to replace the certificate never replaces it
-    over a name the mint would refuse too. Raises ``ValueError`` when ``pem`` is not a parseable
+    address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case, but
+    with its trailing dot, because Python's hostname verification keeps it, which the tray, the CLI
+    and the harness use: a client dialling ``localhost.`` refuses a certificate naming only
+    ``localhost``, and the reverse (measured with ``ssl`` and ``httpx``; another TLS stack may
+    ignore the dot, and then this answer is only stricter than it needs). ``False`` when the
+    certificate has no readable SAN; ``True`` when ``name`` cannot be classified at all, so a
+    caller deciding whether to replace the certificate never replaces it over a name the mint
+    would refuse too. Raises ``ValueError`` when ``pem`` is not a parseable
     certificate. Reads only the public certificate.
+
+    ``ignore_trailing_dot`` compares DNS names without a trailing dot, the rule before #8291
+    item 1. The API's generated-pair re-mint uses it to tell a re-mint caused by the dot alone,
+    whose old key it keeps (``messagefoundry.api.tls``).
     """
     cert = x509.load_pem_x509_certificate(pem)
     try:
@@ -2012,8 +2020,12 @@ def san_names(pem: bytes, name: str) -> bool:
     if isinstance(wanted, x509.IPAddress):
         address = ipaddress.ip_address(str(wanted.value).split("%", 1)[0])
         return any(isinstance(g, x509.IPAddress) and g.value == address for g in held)
-    dns = str(wanted.value).rstrip(".").lower()
-    return any(isinstance(g, x509.DNSName) and g.value.rstrip(".").lower() == dns for g in held)
+
+    def spelled(dns: str) -> str:
+        return dns.rstrip(".").lower() if ignore_trailing_dot else dns.lower()
+
+    dns = spelled(str(wanted.value))
+    return any(isinstance(g, x509.DNSName) and spelled(g.value) == dns for g in held)
 
 
 def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]:

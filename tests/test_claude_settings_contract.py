@@ -71,6 +71,10 @@ _GITIGNORED_SECRETS: dict[str, tuple[str, ...]] = {
     "secrets/": ("secrets/**", "**/secrets/**"),
     "*.key": ("*.key",),
     "*.pem": ("*.pem",),
+    # The generated TLS pair's kept, prior and staged siblings beside the store (BACKLOG #5973).
+    "*.pem.replaced": ("*.pem.replaced",),
+    "*.pem.prior": ("*.pem.prior",),
+    "*.pem.renewing": ("*.pem.renewing",),
     "*.pfx": ("*.pfx",),
     "*.db": ("*.db",),
     "*.db-wal": ("*.db-wal",),
@@ -412,7 +416,7 @@ def test_every_gitignored_secret_key_is_still_a_gitignore_line() -> None:
 
     Line membership only: a later `!` negation of a key is not seen here.
     """
-    assert len(_GITIGNORED_SECRETS) >= 14, "the mapping lost entries; never shrink it"
+    assert len(_GITIGNORED_SECRETS) >= 17, "the mapping lost entries; never shrink it"
     gone = _keys_missing_from_gitignore((_ROOT / ".gitignore").read_text(encoding="utf-8"))
     assert not gone, (
         f"{gone} no longer appear in .gitignore. Update _GITIGNORED_SECRETS to the line that now "

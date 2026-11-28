@@ -4372,6 +4372,16 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway. A re-mint
         # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
+        # Hostname verification keeps a trailing dot, so a name with one and the same name without
+        # are two names a client dials (#8291 item 1). localhost. is dialled on loopback, so it
+        # keeps every loopback name the old pair named, localhost among them.
+        ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
+        ("localhost.", "localhost", ["localhost", "127.0.0.1", "::1"]),
+        ("myhost.example", "myhost.example.", ["myhost.example."]),
+        # A client that ignores the dot verified the old localhost. pair at localhost, so a
+        # re-mint for a bind dialled on loopback keeps localhost, as it did before the bind
+        # check kept the dot.
+        ("localhost.", "0.0.0.0", ["0.0.0.0", "127.0.0.1", "localhost"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
@@ -4419,6 +4429,209 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     assert again == []
 
 
+def _plant_engine_shaped_pair(state_dir: Path, names: list[str]) -> tuple[Path, Path]:
+    """A loadable, self-signed ``CA=false`` pair at the generated paths, a year from expiry."""
+    from messagefoundry import pki
+
+    cert, key = _generated_pair(state_dir)
+    cert_pem, key_pem = pki.make_self_signed(names[0], names[1:], 365)
+    cert.write_bytes(cert_pem)
+    write_restricted_file(key, key_pem)
+    return cert, key
+
+
+#: OpenSSL's ``X509_V_ERR_HOSTNAME_MISMATCH``, the ``verify_code`` of a refusal for the name.
+_X509_V_ERR_HOSTNAME_MISMATCH = 62
+
+
+@pytest.mark.parametrize(
+    ("old_names", "then"),
+    [
+        # Every name the bind check requires for ``then``, less only the dot.
+        (["localhost", "127.0.0.1", "::1"], "localhost."),
+        (["localhost.", "127.0.0.1", "::1"], "localhost"),
+        (["myhost.example"], "myhost.example."),
+    ],
+)
+def test_a_bind_move_across_a_trailing_dot_serves_a_pair_that_verifies_at_the_new_bind(
+    old_names: list[str], then: str, tmp_path: Path
+) -> None:
+    """#8291 item 1, under BACKLOG #5973. A client dials ``then`` as written, and its hostname
+    check keeps the trailing dot, so the pair the engine serves for that bind must name ``then``
+    with the dot or without it as ``then`` has it. The planted pair is one the engine minted, and
+    names everything the bind check requires except that. Before the fix the check ignored the
+    dot, reused the pair, and the pinned client refused it.
+
+    The control is the planted pair itself: the same handshake at ``then`` refuses it, so the pass
+    after the start is the re-mint's doing, not a hostname check that went away."""
+    old_cert, old_key = _plant_engine_shaped_pair(tmp_path, old_names)
+    old_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    old_server.load_cert_chain(old_cert, old_key)
+    with pytest.raises(ssl.SSLCertVerificationError) as refused:
+        _handshake(
+            old_server,
+            _verifying_client_ctx(old_cert),
+            client_cert=None,
+            server_hostname=then,
+        )
+    # Refused for the name, not for another reason the re-mint might also clear.
+    assert refused.value.verify_code == _X509_V_ERR_HOSTNAME_MISMATCH
+
+    events: list[GeneratedPairReplaced] = []
+    cert, key = ensure_api_tls_material(
+        ApiSettings(host=then), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["bind_changed"]
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = _verifying_client_ctx(Path(cert))
+    assert client_ctx.check_hostname
+    assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=then)
+
+
+@pytest.mark.parametrize(
+    ("old_names", "then"),
+    [
+        (["localhost", "127.0.0.1", "::1"], "localhost."),
+        (["localhost.", "127.0.0.1", "::1"], "localhost"),
+    ],
+)
+def test_a_re_mint_caused_only_by_a_trailing_dot_keeps_the_old_pair(
+    old_names: list[str], then: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#8291 item 1, under BACKLOG #5973 (Lander hold on PR 3383). The check before that item
+    ignored the dot, so it reused this pair and kept its key. The re-mint the dot now causes must
+    keep the old key at ``<key>.replaced``, written restricted, and the old certificate at
+    ``<cert>.replaced``, name both in its WARNING, and skip a later such re-mint rather than
+    overwrite a key it kept.
+
+    Mutation: replace the old key without the copy. Red: no ``<key>.replaced``. Mutation: drop the
+    write of ``<cert>.replaced``. Red: no ``<cert>.replaced``. Mutation: drop the skip. Red: the second
+    start re-mints and its events are not empty."""
+    cert, key = _plant_engine_shaped_pair(tmp_path, old_names)
+    old = _snapshot(cert, key)
+    kept_cert = cert.with_name(cert.name + ".replaced")
+    kept_key = key.with_name(key.name + ".replaced")
+
+    events: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        ensure_api_tls_material(ApiSettings(host=then), state_dir=tmp_path, replacements=events)
+
+    assert [e.reason for e in events] == ["bind_changed"]
+    assert key.read_bytes() != old[key]  # the live key is new
+    assert kept_key.read_bytes() == old[key]  # the old key survives, byte for byte
+    assert kept_cert.read_bytes() == old[cert]  # the old certificate is kept too
+    _load_pair(kept_cert, kept_key)  # and the two still load as one pair
+    if sys.platform != "win32":
+        assert kept_key.stat().st_mode & 0o077 == 0
+    assert not list(tmp_path.glob("*.prior")) and not list(tmp_path.glob("*.renewing"))
+    reminted = [
+        r.getMessage() for r in caplog.records if "re-minted the generated" in r.getMessage()
+    ]
+    assert len(reminted) == 1
+    assert str(kept_key) in reminted[0] and str(kept_cert) in reminted[0]
+
+    # A second dot-only pair, with a kept key already there: served as found, nothing written.
+    cert.unlink()
+    key.unlink()
+    cert, key = _plant_engine_shaped_pair(tmp_path, old_names)
+    before = _snapshot(cert, key, kept_cert, kept_key)
+    caplog.clear()
+    again: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        served = ensure_api_tls_material(
+            ApiSettings(host=then), state_dir=tmp_path, replacements=again
+        )
+    assert served == (str(cert), str(key))  # the start goes on
+    assert again == []
+    assert _snapshot(cert, key, kept_cert, kept_key) == before
+    assert any(
+        "not re-minting" in r.getMessage() and str(kept_key) in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("planted", ["cert", "key"])
+def test_a_dot_only_re_mint_skips_when_either_kept_file_exists(
+    planted: str, tmp_path: Path
+) -> None:
+    """A lone kept certificate blocks the re-mint as a lone kept key does, so a later re-mint never
+    writes over the certificate that belongs with a key an operator moved away."""
+    cert, key = _plant_engine_shaped_pair(tmp_path, ["localhost", "127.0.0.1", "::1"])
+    kept = (cert if planted == "cert" else key).with_name(
+        (cert if planted == "cert" else key).name + ".replaced"
+    )
+    kept.write_bytes(b"kept earlier")
+    before = _snapshot(cert, key, kept)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host="localhost."), state_dir=tmp_path, replacements=events)
+    assert events == []
+    assert _snapshot(cert, key, kept) == before
+    assert sorted(p.name for p in tmp_path.glob("*.replaced")) == [kept.name]
+
+
+@pytest.mark.parametrize("refused", ["cert", "key"])
+def test_a_failed_dot_only_re_mint_removes_the_kept_pair_it_wrote(
+    refused: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key replace refused and rolled back leaves the old pair live, so the kept copies go too,
+    or every later start would skip the re-mint over copies nothing needs.
+
+    Mutation: drop ``*written`` from either cleanup. Red: that row's ``.replaced`` files remain."""
+    import messagefoundry.api.tls as tls
+
+    cert, key = _plant_engine_shaped_pair(tmp_path, ["localhost", "127.0.0.1", "::1"])
+    before = _snapshot(cert, key)
+    real = tls._replace_generated
+
+    def refuse_the_key(staged: Path, live: Path) -> None:
+        if live == (cert if refused == "cert" else key):
+            raise PermissionError(13, "simulated refusal of the key replace")
+        real(staged, live)
+
+    monkeypatch.setattr(tls, "_replace_generated", refuse_the_key)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host="localhost."), state_dir=tmp_path, replacements=events)
+    assert events == []
+    assert _snapshot(cert, key) == before
+    assert not list(tmp_path.glob("*.replaced"))
+
+
+def test_a_re_mint_for_a_name_the_old_pair_lacks_keeps_nothing(tmp_path: Path) -> None:
+    """The control for the tests above: a re-mint the dot does not cause, here a bind moved to a
+    name the old certificate does not hold with or without one, replaces the pair, keeps no
+    ``.replaced`` file, and is not skipped for one already there.
+
+    Mutation: drop ``keep_old and`` from the skip. Red: the re-mint is skipped."""
+    cert, key = _plant_engine_shaped_pair(tmp_path, ["localhost", "127.0.0.1", "::1"])
+    kept_key = key.with_name(key.name + ".replaced")
+    kept_key.write_bytes(b"kept earlier")
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(
+        ApiSettings(host="myhost.example"), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["bind_changed"]
+    assert [p.name for p in tmp_path.glob("*.replaced")] == [kept_key.name]
+    assert kept_key.read_bytes() == b"kept earlier"
+
+
+def test_a_renewal_keeps_nothing_and_is_not_skipped_for_a_kept_key(tmp_path: Path) -> None:
+    """A renewal of a pair that names its bind is not a dot-only re-mint, so it replaces the pair as
+    before: no ``.replaced`` file is written, and one already there does not stop it.
+
+    Mutation: drop ``reason == "bind_changed" and`` from ``keep_old``. Red: the renewal is
+    skipped."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
+    kept_key = key.with_name(key.name + ".replaced")
+    kept_key.write_bytes(b"kept earlier")
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path, replacements=events)
+    assert [e.reason for e in events] == ["renewal"]
+    assert _snapshot(cert, key) != before
+    assert [p.name for p in tmp_path.glob("*.replaced")] == [kept_key.name]
+
+
 @pytest.mark.parametrize(
     ("first", "then", "renew"),
     [
@@ -4436,6 +4649,7 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         ("127.0.0.1", "[::1]", True),
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
+        ("myhost.", "MYHOST.", True),
         ("fe80::1%12", "fe80::1%12", True),
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
