@@ -176,8 +176,19 @@ _STAT_STEP = "stat it"
 _WINDOWS = sys.platform == "win32"
 
 #: The bit of a reparse tag that marks a name surrogate: a symbolic link, a junction or another
-#: link-like reparse point such as a WSL symlink. The value ``uploads._NAME_SURROGATE_TAG`` holds.
+#: link-like reparse point such as a WSL symlink (``IO_REPARSE_TAG_NAME_SURROGATE``). A cloud-files,
+#: dedup or tiering placeholder lacks it and names no other path.
 _NAME_SURROGATE_TAG = 0x20000000
+
+
+def _names_a_link(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symbolic link or a name-surrogate reparse point. The one
+    test this module and ``uploads.py`` share (BACKLOG #5552 item 8)."""
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(info.st_mode) or bool(
+        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    )
+
 
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -513,9 +524,7 @@ def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None)
         info = os.lstat(path)
     except OSError:
         return  # nothing there, or a stat the editors' own gates already answered for
-    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    surrogate = reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
-    if not (stat.S_ISLNK(info.st_mode) or surrogate):
+    if not _names_a_link(info):
         return
     message = (
         f"{path.name} was not changed: it is a link, and an edit would replace the link with a "
