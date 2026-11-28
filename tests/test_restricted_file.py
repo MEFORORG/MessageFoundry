@@ -1211,10 +1211,10 @@ def test_a_posix_walk_run_again_keeps_the_first_walks_finding() -> None:
             return PosixStat(0, stat.S_IFDIR | (0o775 if state["mounted"] else 0o755))
         return PosixStat(*tree[part]) if part in tree else PosixStat(*_key_tree_entry(part))
 
-    reads = [[("/", "ext4"), ("/srv/m", "ext4")], [("/", "ext4")]]
+    reads = [[("/", "ext4"), ("/srv/m", "ext4")], [("/", "ext4")], [("/", "ext4")]]
 
     def mounts_fn() -> list[tuple[str, str]]:
-        state["mounted"] = len(reads) == 2  # unmounted between the walk and the second read
+        state["mounted"] = len(reads) == 3  # unmounted between the walk and the second read
         return reads.pop(0)
 
     problem = restricted_file._posix_link_problem(
@@ -1242,7 +1242,84 @@ def test_a_posix_mount_table_read_only_once_of_twice_is_unchecked(unread_first: 
         mounts_fn=lambda: reads.pop(0),
     )
     assert isinstance(problem, restricted_file.UncheckedProblem)
-    assert problem == restricted_file.MOUNT_TABLE_UNREAD
+    # Not the unread table's text, whose remedy is to make the table readable at all.
+    assert problem == restricted_file.MOUNT_TABLE_UNSETTLED
+
+
+def test_a_posix_link_re_pointed_between_walks_keeps_the_first_walks_mount_refusal() -> None:
+    """Vault BACKLOG #5636, review round-5622bdd5 finding 1: the first walk runs through a link
+    onto an NFS mount the table after it lists, so the two tables differ and the path is walked
+    again; the link is re-pointed onto a local folder before that second walk. The first walk's
+    placement on the after table is still judged, so its refusal is kept."""
+    state = {"reads": 0}
+    tree = {
+        **_KEY_TREE,
+        "/srv": _ROOT_DIR,
+        "/srv/link": (0, stat.S_IFLNK | 0o777),
+        "/net": _ROOT_DIR,
+        "/net/keys": (_ENGINE_UID, stat.S_IFDIR | 0o700),
+        "/net/keys/k.key": (_ENGINE_UID, _KEY),
+    }
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part not in tree:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        return PosixStat(*tree[part])
+
+    def readlink_fn(part: str) -> str:
+        assert part == "/srv/link"
+        return "/net/keys" if state["reads"] < 2 else "/private/tmp/keys"
+
+    def mounts_fn() -> list[tuple[str, str]]:
+        state["reads"] += 1
+        return [("/", "ext4")] if state["reads"] == 1 else [("/", "ext4"), ("/net", "nfs")]
+
+    problem = restricted_file._posix_link_problem(
+        "/srv/link/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lstat_fn,
+        readlink_fn=readlink_fn,
+        mounts_fn=mounts_fn,
+    )
+    assert problem is not None and "on a mount of type nfs" in problem
+    assert state["reads"] == 3
+
+
+@pytest.mark.parametrize(
+    ("third", "settled"),
+    [
+        ([("/", "ext4"), ("/private", "ext4")], True),
+        ([("/", "ext4")], False),
+        (None, False),
+    ],
+)
+def test_a_posix_mount_table_that_moves_again_after_the_second_walk_is_unchecked(
+    third: list[tuple[str, str]] | None, settled: bool
+) -> None:
+    """Vault BACKLOG #5636: where the tables before and after the walk differ, the table is read a
+    third time after the second walk. A third read that places the path as the second did passes;
+    one that fails, or places it on a different mount again, is answered as not fully checked,
+    never passed."""
+    reads: list[list[tuple[str, str]] | None] = [
+        [("/", "ext4")],
+        [("/", "ext4"), ("/private", "ext4")],
+        third,
+    ]
+    problem = restricted_file._posix_link_problem(
+        "/private/tmp/keys/k.key",
+        cwd="/",
+        euid=_ENGINE_UID,
+        lstat_fn=lambda part: PosixStat(*_key_tree_entry(part)),
+        readlink_fn=lambda _part: "",
+        mounts_fn=lambda: reads.pop(0),
+    )
+    assert not reads
+    if settled:
+        assert problem is None
+    else:
+        assert isinstance(problem, restricted_file.UncheckedProblem)
+        assert problem == restricted_file.MOUNT_TABLE_UNSETTLED
 
 
 def test_a_posix_link_finding_is_answered_before_an_unchecked_mount_table() -> None:

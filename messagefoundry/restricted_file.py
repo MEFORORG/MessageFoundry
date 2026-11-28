@@ -1255,6 +1255,21 @@ MOUNT_TABLE_INCOMPLETE: Final = (
     "a folder below an automount point rather than the point itself. " + _MOUNT_TABLE_NOT_CLEARED
 )
 
+#: What :func:`broad_access_problem` answers, as an :class:`UncheckedProblem`, on Linux where
+#: ``/proc/self/mountinfo`` did not give one settled answer while the path was walked: only one of
+#: the reads before and after the walk succeeded, or the two placed a part of the path on different
+#: mounts and the read after the second walk failed or placed it elsewhere again
+#: (:func:`_posix_link_problem` states the rule, vault BACKLOG #5636). Answered, like
+#: :data:`MOUNT_TABLE_UNREAD`, only where the rest of the POSIX check finds nothing, and worded for
+#: a refusal and a warning alike.
+MOUNT_TABLE_UNSETTLED: Final = (
+    "/proc/self/mountinfo did not give the same answer each time it was read while the checked "
+    "path was walked: a read of it failed, or a mount on the path was made or removed between the "
+    "reads, so the type of the file system there was not judged against a settled table. This "
+    "clears once every read of /proc/self/mountinfo succeeds and the mounts on the checked path "
+    "stop changing, for example on the next check. " + _MOUNT_TABLE_NOT_CLEARED
+)
+
 
 def _posix_link_problem(
     path: str,
@@ -1281,11 +1296,15 @@ def _posix_link_problem(
     called before the walk and again after it, since the walk's own reads can make a mount, such as
     an automount below a folder it passes, and a mount can also go between the two reads (vault
     BACKLOG #5636). Where the two tables place a visited part on different mounts, the walk runs
-    again, since the owner and mode it read at that point may be from before the mount was made;
-    the findings of both walks are kept. Where only one of the two calls answers ``None``, the walk
-    could not be checked against both, so where nothing else is found the answer is
-    :data:`MOUNT_TABLE_UNREAD`. Each table judges the walked parts by
-    :func:`_posix_mounts_judged`: a type either table refuses is refused, since the owner and mode
+    again, since the owner and mode it read at that point may be from before the mount was made,
+    and the table is read a third time. The findings of both walks are kept, and the first walk's
+    parts are still judged on both tables, so a link re-pointed between the walks cannot hide a
+    refusal only the first walk's placement shows. Where only one of the first two calls answers
+    ``None``, or the third answers ``None`` or places the second walk's parts on different mounts
+    than the second call did, the walk could not be checked against a settled table, so where
+    nothing else is found the answer is :data:`MOUNT_TABLE_UNSETTLED`, never a pass. Each
+    placement is judged by :func:`_posix_mounts_judged`: a type any table refuses is refused, since
+    the owner and mode
     bits this whole check reads are not what decides who reaches the file there (vault BACKLOG
     #5657 step 6 (f)), and where the last table read leaves a part with no type judged, and nothing
     else is found, the answer is :data:`MOUNT_TABLE_INCOMPLETE`. A local mount that a later mount
@@ -1316,21 +1335,33 @@ def _posix_link_problem(
     def place(parts: list[str], table: list[tuple[str, str]]) -> _Placed:
         return [(part, mount_of(part, table)) for part in parts]
 
-    before = None if mounts_fn is None else mounts_fn()
+    def read() -> list[tuple[str, str]] | None:
+        return None if mounts_fn is None else mounts_fn()
+
+    before = read()
     walks = [walk()]
-    after = None if mounts_fn is None else mounts_fn()
+    after = read()
     judged: list[_Placed] = []
+    unsettled = (before is None) != (after is None)
     if before is not None:
         judged.append(place(walks[0][2], before))
     if after is not None:
         judged.append(place(walks[0][2], after))
         if before is not None and judged[0] != judged[1]:
+            # Appended, never in place of walk 1's: a link re-pointed between the walks must not
+            # hide a refusal only walk 1's placement on the after table shows.
             walks.append(walk())
-            judged[1] = place(walks[1][2], after)
+            judged.append(place(walks[1][2], after))
+            settled = read()
+            if settled is None:
+                unsettled = True
+            else:
+                judged.append(place(walks[1][2], settled))
+                unsettled = judged[-1] != judged[-2]
     refused: str | None = None
     unjudged = False
     for placed in judged:
-        # Either table's refusal stands; the last table read decides what was not judged.
+        # Any table's refusal stands; the last table read decides what was not judged.
         found, unjudged = _posix_mounts_judged(placed)
         refused = refused or found
 
@@ -1348,8 +1379,8 @@ def _posix_link_problem(
         problem = _posix_walk_problem(verdict, walked_links)
         if problem is not None:
             return problem
-    if (before is None) != (after is None):
-        return UncheckedProblem(MOUNT_TABLE_UNREAD)
+    if unsettled:
+        return UncheckedProblem(MOUNT_TABLE_UNSETTLED)
     return UncheckedProblem(MOUNT_TABLE_INCOMPLETE) if unjudged else None
 
 
