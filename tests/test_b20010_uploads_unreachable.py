@@ -168,30 +168,58 @@ class _ReadFails:
         self._handle.close()
 
     def read(self, size: int = -1) -> bytes:
+        self.failed = True
         raise self._fault
 
+    failed = False
 
-def _read_fails(monkeypatch: pytest.MonkeyPatch, target: Path, fault: OSError) -> None:
+
+def _read_fails(monkeypatch: pytest.MonkeyPatch, target: Path, fault: OSError) -> list[_ReadFails]:
+    """The read of ``target`` meets ``fault``; returns the handles it made, to tell when it did."""
     real = uploads._open_plain
+    made: list[_ReadFails] = []
 
     def _open(path: Path) -> tuple[Any, os.stat_result]:
         handle, info = real(path)
         if path == target:
-            return _ReadFails(handle, fault), info
+            made.append(_ReadFails(handle, fault))
+            return made[-1], info
         return handle, info
 
     monkeypatch.setattr(uploads, "_open_plain", _open)
+    return made
 
 
-@pytest.mark.parametrize("fault", list(_NOT_FNF))
+#: A read's error as CPython raises it: it names no path, and on Windows it carries no winerror,
+#: since the read's errno comes from the C runtime. A dropped Windows share is then EINVAL or,
+#: for ERROR_BAD_NETPATH, a FileNotFoundError.
+_READ_FAULTS: dict[str, Callable[[], OSError]] = {
+    "estale": lambda: _stale(None),
+    "windows-einval": lambda: OSError(errno.EINVAL, "Invalid argument"),
+    "windows-enoent": lambda: FileNotFoundError(errno.ENOENT, "No such file or directory"),
+}
+
+
+@pytest.mark.parametrize("fault", list(_READ_FAULTS))
 @pytest.mark.parametrize("op", ["get_meta", "read_bytes"])
 async def test_an_outage_during_the_read_answers_unreachable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op: str, fault: str
 ) -> None:
-    # 8401eaff finding 5: a read-time outage was re-raised, a server error. A read's error names
-    # no path, so it was never checked again either.
+    # 8401eaff finding 5: a read-time outage was re-raised, a server error, or for ENOENT read as
+    # a missing upload. A read's error names no path, so it was never checked again either.
     store, fid, blob, sidecar = await _saved(tmp_path)
-    _read_fails(monkeypatch, blob if op == "read_bytes" else sidecar, _NOT_FNF[fault](None))
+    target = blob if op == "read_bytes" else sidecar
+    made = _read_fails(monkeypatch, target, _READ_FAULTS[fault]())
+    if fault == "windows-einval":
+        # The name's own check after the read meets the dropped share, as it would.
+        real = os.lstat
+
+        def _lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if made and made[-1].failed and Path(path) == target:
+                raise _share_down(target)
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", _lstat)
     with pytest.raises(UploadStorageUnreachableError):
         await _call(store, op, fid)
 
@@ -251,6 +279,43 @@ async def test_the_prune_does_not_age_a_pair_whose_body_the_share_hides(
     with caplog.at_level(logging.WARNING, logger=uploads.__name__):
         assert store._aged_on_disk_sync(fid) is None
     assert any("could not age the pair" in r.getMessage() for r in caplog.records)
+    monkeypatch.undo()
+    blob.unlink()
+    aged = store._aged_on_disk_sync(fid)  # control: an absent body still ages, at size 0
+    assert aged is not None and aged.size == 0
+
+
+async def test_the_prune_logs_a_sidecar_the_share_hides_after_the_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # missing_ok swallowed the outage on the sidecar's unlink, with no log.
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    meta = await store.get_meta(fid)
+    _unlink_fails(monkeypatch, sidecar, _share_down)
+    with caplog.at_level(logging.WARNING, logger=uploads.__name__):
+        assert store._prune_pair_sync(meta) is True
+    monkeypatch.undo()
+    assert not blob.exists() and sidecar.exists()
+    assert any("but not its sidecar" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("op", ["get_meta", "read_bytes"])
+async def test_an_open_that_says_absent_of_a_file_still_there_is_not_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    # Windows maps a dropped share to ENOENT with no winerror on an open. When the share is back
+    # for the re-check, the file is there, and the open's error was re-raised: a missing upload.
+    store, fid, blob, sidecar = await _saved(tmp_path)
+    target = blob if op == "read_bytes" else sidecar
+
+    def _open(path: Any, flags: int, *args: Any) -> int:
+        if Path(path) == target:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        return os.open(path, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_open))
+    with pytest.raises(UploadStorageUnreachableError):
+        await _call(store, op, fid)
 
 
 async def test_the_prune_keeps_the_sidecar_when_the_share_hides_the_body(
@@ -301,16 +366,35 @@ async def test_rotate_key_skips_a_body_the_share_hides_rather_than_count_it_lost
     _lstat_fails(monkeypatch, blob, _share_down)
     half = store._reseal_half(cast(Any, None), fid, blob, "body", gate=cast(Any, None))
     assert half is uploads._Half.SKIPPED
+    monkeypatch.undo()
+    blob.unlink()
+    # Control: a body that is absent is still a lost one.
+    half = store._reseal_half(cast(Any, None), fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.LOST
+
+
+async def test_rotate_key_skips_a_body_whose_read_says_enoent_while_it_is_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The read's ENOENT, as Windows gives a dropped share with no winerror, was read as a body
+    # that is gone, so the half was LOST while the body was on disk.
+    store, fid, blob, _sidecar = await _saved(tmp_path, keyed=True)
+    _read_fails(monkeypatch, blob, _READ_FAULTS["windows-enoent"]())
+    cipher = cast(Any, store._cipher)
+    half = store._reseal_half(cipher, fid, blob, "body", gate=cast(Any, None))
+    assert half is uploads._Half.SKIPPED
 
 
 async def test_rotate_keys_replace_raises_an_outage_rather_than_call_the_file_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A FileNotFoundError here was the file removed; an unreachable one reached the write's
+    # handler as a FileNotFoundError, which _root_gone could log as the uploads directory gone.
     _store, _fid, blob, _sidecar = await _saved(tmp_path)
     seen = blob.lstat()
     tmp = blob.with_name(blob.name + ".tmp")
     tmp.write_text("synthetic", encoding="utf-8")
     _lstat_fails(monkeypatch, blob, _share_down)
-    with pytest.raises(FileNotFoundError) as raised:
+    with pytest.raises(uploads._UnreachableError):
         uploads._replace_if_unchanged(tmp, blob, seen)
-    assert getattr(raised.value, "winerror", None) == 53
+    assert not uploads._root_gone(uploads._unreached(blob, "synthetic"), blob.parent / "gone")
