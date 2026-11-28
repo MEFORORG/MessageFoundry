@@ -239,3 +239,63 @@ async def test_the_cipher_audit_command_reads_this_store(
     rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
     out = capsys.readouterr().out
     assert rc == 4 and json.loads(out.strip().splitlines()[-1])["status"] == "KEY_MISMATCH", out
+
+
+async def test_a_keyless_run_over_a_keyed_store_with_an_empty_log_is_key_mismatch(
+    keyed: tuple[Any, str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1719 item 22, live: with the audit log emptied, the #1916 guard refuses the keyless
+    open, and the read-only probe behind it finds the keyed cells, so exit 4, KEY_MISMATCH, as
+    SQLite says it. With every table emptied the store is fresh, and the refusal stays exit 2."""
+    from messagefoundry.__main__ import main
+
+    store, _key = keyed
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    await store._execute("TRUNCATE audit_log RESTART IDENTITY")
+    rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 4 and json.loads(out.strip().splitlines()[-1])["status"] == "KEY_MISMATCH", out
+    count = await store._fetchval("SELECT COUNT(*) FROM audit_log")
+    assert count == 0, "the probe appended an audit row"
+
+    await _clear(store)
+    rc = await asyncio.to_thread(main, ["cipher-audit", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 2, out
+    assert "KEYLESS audit chain" in out, out
+
+
+async def test_row_level_security_is_read_as_the_server_applies_it(
+    keyed: tuple[Any, str],
+) -> None:
+    """BACKLOG #1719 item 35, live: the walk names ``messages`` whenever the server's own
+    ``row_security_active`` says row security applies to this role, under ENABLE and under FORCE,
+    and the rule's reading of the owner and the role flags agrees with it on a direct owner."""
+    store, _key = keyed
+    role = await store._fetchone(
+        "SELECT r.rolsuper, r.rolbypassrls,"
+        " (SELECT c.relowner FROM pg_catalog.pg_class c WHERE c.oid = 'messages'::regclass)"
+        " = r.oid AS owned FROM pg_catalog.pg_roles r WHERE r.rolname = current_user"
+    )
+    assert role is not None
+    if not role["owned"]:
+        pytest.skip("this leg's role does not own messages, so it cannot enable row security")
+    try:
+        for statement in (
+            "ALTER TABLE messages ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE messages FORCE ROW LEVEL SECURITY",
+        ):
+            await store._execute(statement)
+            active = bool(await store._fetchval("SELECT row_security_active('messages')"))
+            audit = await _audit(store)
+            named = "messages" in audit.row_filtered
+            assert named >= active, (statement, audit.row_filtered)
+            # The rule's own answer for this direct owner, which the server's must not contradict.
+            exempt = role["rolsuper"] or role["rolbypassrls"] or "FORCE" not in statement
+            assert named is (not exempt), (statement, dict(role), audit.row_filtered)
+    finally:
+        await store._execute("ALTER TABLE messages NO FORCE ROW LEVEL SECURITY")
+        await store._execute("ALTER TABLE messages DISABLE ROW LEVEL SECURITY")
+    audit = await _audit(store)
+    assert audit.row_filtered == [], audit.row_filtered

@@ -38,6 +38,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -164,6 +165,7 @@ from messagefoundry.store.store import (
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.cipher_cells import CipherCellSource
     from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
@@ -201,6 +203,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "KEY_NAMED_UNRESOLVED",
     "KeylessAuditChainRefused",
     "SCHEMA_SEED_FILTERS",
     "StoreNotFoundError",
@@ -215,6 +218,7 @@ __all__ = [
     "backend_supports_reference_sets",
     "check_walk_identifiers",
     "make_spec",
+    "open_cipher_walk_probe",
     "open_store",
     "probe_store_privileges",
     "server_store_schema_found_anywhere",
@@ -4796,6 +4800,13 @@ class SchemaProvisionResult:
     remedy: str | None = None
 
 
+#: The cause :class:`KeylessAuditChainRefused` names when the settings name a store key that the
+#: key provider did not resolve, shared with ``cipher-audit``'s KEY_MISMATCH behind that refusal.
+KEY_NAMED_UNRESOLVED: Final = (
+    "A store key is configured, but [store].key_provider resolved no key in this environment"
+)
+
+
 class KeylessAuditChainRefused(RuntimeError):
     """:func:`open_store` found a FRESH store with no keying secret, and the caller did not pass the
     audited opt-out's verdict (BACKLOG #1916). ``refused_by`` names the deciding setting.
@@ -4805,12 +4816,8 @@ class KeylessAuditChainRefused(RuntimeError):
     def __init__(self, path: str, refused_by: str, *, key_named: bool = False) -> None:
         self.path = path
         self.refused_by = refused_by
-        cause = (
-            "A store key is configured, but [store].key_provider resolved no key in this "
-            "environment, so the store opened keyless. "
-            if key_named
-            else ""
-        )
+        self.key_named = key_named
+        cause = f"{KEY_NAMED_UNRESOLVED}, so the store opened keyless. " if key_named else ""
         super().__init__(
             f"refusing to open {path} keyless: its audit log is empty, so the first audit row this "
             "command wrote would start a KEYLESS audit chain, and a keyed open later reports a "
@@ -4976,9 +4983,9 @@ def is_store_shape_error(exc: BaseException) -> bool:
 
 
 # --- the read-only cipher-cell walk the server stores share (BACKLOG #1719) --------------------
-# `cipher_cells.read_server_cipher_cells` reads a PostgreSQL or SQL Server store through four
-# methods, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
-# own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
+# `cipher_cells.read_server_cipher_cells` and its callers read a PostgreSQL or SQL Server store
+# through the methods of `cipher_cells.CipherCellSource`, for `messagefoundry cipher-audit`. Each
+# backend writes its catalog and chunk reads in its own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
 # once. Every identifier a walk read is given is a declared constant from `cipher_cells`, and only
 # values are bound as parameters. A read may run more than one statement. Each statement takes its
 # own connection borrow and ends its read transaction before it returns, so no read transaction
@@ -5493,6 +5500,24 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 
         return PostgresStore
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
+
+
+def open_cipher_walk_probe(
+    settings: StoreSettings, *, posture: HopPosture | None
+) -> AbstractAsyncContextManager[CipherCellSource]:
+    """A one-connection handle on a PostgreSQL or SQL Server store under the identity cipher, for
+    the walk's reads only, closed on exit (BACKLOG #1719 item 22).
+
+    For ``cipher-audit`` to tell, after :func:`~messagefoundry.store.base.open_store` refused its
+    keyless open as one that would start a keyless audit chain, a keyed store from a fresh one. It
+    is the backend's one-connection store that :func:`probe_store_privileges` reads through, not
+    :meth:`open`: it runs no schema step, binds no salt, loads no audit chain, and the handle it
+    yields is typed as the walk's reads, none of which writes, so it appends no audit row and
+    starts no chain. It never replaces that open: the refusal stands whatever it finds, and it
+    only names why."""
+    if settings.backend is StoreBackend.SQLITE:
+        raise ValueError("open_cipher_walk_probe: a server backend only, not sqlite")
+    return _server_store_class(settings.backend).cipher_walk_probe(settings, posture=posture)
 
 
 async def server_store_schema_found_anywhere(

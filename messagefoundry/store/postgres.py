@@ -71,7 +71,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
@@ -2093,6 +2093,36 @@ def _refuse_store_revocation(
     ).enforce_construction()
 
 
+def row_security_hides_rows(
+    *,
+    enabled: object,
+    forced: object,
+    owned: object,
+    superuser: object,
+    bypass: object,
+) -> bool:
+    """Whether PostgreSQL row-level security may hide some of a table's rows from the reading
+    role (BACKLOG #1719 item 35). ``enabled`` and ``forced`` are the table's ``relrowsecurity`` and
+    ``relforcerowsecurity``; ``owned`` whether the role owns it; ``superuser`` and ``bypass`` its
+    ``rolsuper`` and ``rolbypassrls``.
+
+    Row security is off for a table that has not enabled it. Where it is on, a superuser and a role
+    with BYPASSRLS read every row, and so does the owner unless the table forces row security on
+    its owner too. Only ``True`` or ``False`` counts as a reading: any other value, a NULL from the
+    catalog read among them, is a doubt, and a doubt answers ``True``, so a table is never read as
+    covered on a flag nobody read."""
+
+    if enabled is False:
+        return False
+    if enabled is not True:
+        return True
+    if superuser is True or bypass is True:
+        return False  # either alone exempts, whatever the other reads
+    if superuser is not False or bypass is not False:
+        return True
+    return not (owned is True and forced is False)
+
+
 class PostgresStore(ServerCipherWalk):
     """PostgreSQL-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -2541,6 +2571,14 @@ class PostgresStore(ServerCipherWalk):
         if row is None or row["found"] is None:
             return None
         return bool(row["found"])
+
+    @classmethod
+    def cipher_walk_probe(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AbstractAsyncContextManager[PostgresStore]:
+        """The one-connection store, for ``base.open_cipher_walk_probe``, which says what
+        it is for and what it never does (BACKLOG #1719 item 22)."""
+        return cls._one_connection_store(settings, posture=posture)
 
     @classmethod
     async def probe_privileges(
@@ -4063,6 +4101,51 @@ class PostgresStore(ServerCipherWalk):
         for r in rows:
             found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
         return {t: frozenset(c) for t, c in found.items()}
+
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+        """Those of ``tables`` whose rows row-level security may hide from this login (BACKLOG
+        #1719 item 35): :func:`row_security_hides_rows` over ``pg_class`` and ``pg_roles``, read in
+        the schema :meth:`cipher_walk_columns` reads. A table with no row there, a relation that
+        is not an ordinary or partitioned table (a view or a foreign table can filter rows that
+        no row-security flag shows), or a flag read as NULL, is named: a doubt reads as not
+        audited whole, never as covered.
+
+        A member of the owning role is read as not the owner, though PostgreSQL exempts one that
+        inherits the role's privileges: that errs toward naming the table. A failed read is
+        raised, for ``cipher_cells.server_row_filtered`` to judge."""
+        from messagefoundry.store.cipher_cells import RowFilterAnswer
+
+        names = list(dict.fromkeys(tables))
+        if not names:
+            return frozenset()
+        rows = await self._fetchall(
+            "SELECT t.name AS table_name, c.relkind::text AS relkind, c.relrowsecurity,"
+            " c.relforcerowsecurity,"
+            " (c.relowner = r.oid) AS owned, r.rolsuper, r.rolbypassrls"
+            " FROM unnest($1::text[]) AS t(name)"
+            " LEFT JOIN pg_catalog.pg_class c ON c.relname::text = t.name"
+            " AND c.relnamespace = (SELECT n.oid FROM pg_catalog.pg_namespace n"
+            " WHERE n.nspname = current_schema())"
+            " LEFT JOIN pg_catalog.pg_roles r ON r.rolname = current_user",
+            names,
+        )
+        # pg_class is unique on name and schema, so each table has at most one row. Only an
+        # ordinary ('r') or partitioned ('p') table is read by its flags; any other relation, or
+        # a name with no catalog row (a NULL relkind, or no row at all), is named as unseen.
+        kinds = {str(r["table_name"]): r["relkind"] for r in rows}
+        unseen = {t for t in names if kinds.get(t) not in ("r", "p")}
+        by_rule = {
+            str(r["table_name"])
+            for r in rows
+            if row_security_hides_rows(
+                enabled=r["relrowsecurity"],
+                forced=r["relforcerowsecurity"],
+                owned=r["owned"],
+                superuser=r["rolsuper"],
+                bypass=r["rolbypassrls"],
+            )
+        }
+        return RowFilterAnswer(unseen | (by_rule & set(names)), unseen)
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the catalog

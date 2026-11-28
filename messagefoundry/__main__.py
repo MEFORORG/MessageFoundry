@@ -1205,7 +1205,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "connection, an unreadable row or the key service), 2 could not start, 3 NOT_COVERED (a "
         "PostgreSQL or SQL Server store whose catalog does not show this login a table or column "
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
-        "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
+        "read; at least also a PostgreSQL table whose row-level security may hide rows from this "
+        "login, or whose row-security catalog read failed, so its rows may not all have been "
+        "read), 4 KEY_MISMATCH. With --json, row_filtered lists those tables, and is null where "
+        "no row filter was read, at least on SQLite, on SQL Server, and on a PostgreSQL open "
+        "refused as keyless before any catalog read. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
         "'vault_transit' values go to Transit in batches of up to 128 values and 524,288 "
         "characters of them, and a value past that bound alone (BACKLOG #1719, #6706)",
@@ -13953,11 +13957,21 @@ def _cipher_audit(args: argparse.Namespace) -> int:
 
     A server store's schema is the build's, so every cell of the inventory asked for must be
     visible in its catalog read. One that is not, a table or a column, was not read, at least
-    because the login lacks a grant on it: that is NOT_COVERED, never a PASS over the rest.
+    because the login lacks a grant on it: that is NOT_COVERED, never a PASS over the rest. So is
+    at least a PostgreSQL table whose row-level security may hide rows from the login, or one
+    whose row-security catalog read failed; it is read, and may not be read whole (BACKLOG #1719
+    item 35). ``--json`` names those tables in ``row_filtered``: a list where the row filter was
+    read, empty when none applies, and ``null`` where no row filter was read, at least on SQLite,
+    on SQL Server, whose security policies are not read, and on an open refused before any
+    catalog read. ``hidden`` lists the cells the catalog did not show.
 
-    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (a server store whose catalog hides an
-    expected cell), 4 KEY_MISMATCH (a sealed value and no key resolved, the usual cause being a
-    shell without the service's key). A FAIL or KEY_MISMATCH the visible cells earn leads 3."""
+    Exit 0 PASS, 1 FAIL, 2 could not start, 3 NOT_COVERED (at least a server store whose catalog
+    hides an expected cell, or whose rows a row filter may hide), 4 KEY_MISMATCH (a sealed value and
+    no key resolved, the usual cause being a shell without the service's key). A FAIL or
+    KEY_MISMATCH the visible cells earn leads 3. A keyless open of a server store whose audit log
+    is empty is refused as one that would start a keyless audit chain; where a read-only probe
+    then finds the store holds keyed cells, that is KEY_MISMATCH, as on SQLite, and otherwise the
+    refusal is could not start."""
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import safe_exc
@@ -13967,6 +13981,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         audit_chain_read_errors,
         build_store_cipher,
         is_store_shape_error,
+        open_cipher_walk_probe,
         open_store,
     )
     from messagefoundry.store.cipher_cells import (
@@ -13982,10 +13997,11 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         cell_present,
         connect_readonly,
         server_cell_present,
+        server_row_filtered,
         server_walk_tables,
         store_tables,
     )
-    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.crypto import CipherError, IdentityCipher, StoreKeylessError
 
     as_json = bool(args.json)
     cli: dict[str, dict[str, object]] = {}
@@ -14077,6 +14093,35 @@ def _cipher_audit(args: argparse.Namespace) -> int:
         label = _store_label(store)
         walk_errors = audit_chain_read_errors()
 
+        async def keyed_behind_the_refusal(
+            posture: HopPosture | None, refusal: KeylessAuditChainRefused
+        ) -> CipherAudit | None:
+            # A read-only walk under the identity cipher, on the probe handle, which writes
+            # nothing and starts no chain (`open_cipher_walk_probe`): its audit when its
+            # `keyed_surface` row or first sealed value found the key mismatch, with the cells
+            # and tables its catalog read could not cover, or None. A probe that fails before
+            # finding one says nothing, so the refusal is reported as it is. A close that fails
+            # after the walk found one keeps it, as `check-privileges` keeps an observed grant.
+            found: CipherAudit | None = None
+            try:
+                async with open_cipher_walk_probe(store, posture=posture) as probe:
+                    found = await audit_server_cipher_cells(
+                        probe, IdentityCipher(), cells=cells, chunk_rows=chunk_rows
+                    )
+            except Exception as exc:  # noqa: BLE001 -- the probe only names why; never exit 1
+                # Whatever it is, a link, a refusal or a defect, the refusal stands as exit 2,
+                # the probe's one other answer, and the class is logged for whoever looks.
+                logging.getLogger(__name__).warning(
+                    "cipher-audit: could not read whether the refused store holds keyed cells (%s)",
+                    type(exc).__name__,
+                )
+            if found is None or found.key_mismatch is None:
+                return None
+            found.key_mismatch = _keyed_refusal_mismatch(
+                found.key_mismatch, key_named=refusal.key_named
+            )
+            return found
+
         async def run_server() -> tuple[bool, CipherAudit, str | None] | None:
             _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
             # Bound, as `audit-verify` binds it, so the posture census reads the name it passes.
@@ -14099,12 +14144,18 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 # A keyless open of a keyed store refused by the open itself: the key, not the
                 # store, so KEY_MISMATCH as the SQLite branch and the full restore-verify say it.
                 return False, CipherAudit(key_mismatch=safe_exc(exc)), None
+            except KeylessAuditChainRefused as refusal:
+                # The #1916 guard refused, and stands. Only why is asked: a store holding keyed
+                # cells is the key's mistake, KEY_MISMATCH as SQLite says it, and a fresh one
+                # stays could not start (BACKLOG #1719 item 22).
+                keyed_audit = await keyed_behind_the_refusal(posture, refusal)
+                if keyed_audit is None:
+                    raise
+                return False, keyed_audit, None
             except (RuntimeError, ValueError) as exc:
                 # Nothing was read, so never the FAIL a dispatch floor's exit 1 would read as: at
                 # least a missing driver extra, or an engine refusal of this open. Could not start.
-                if isinstance(
-                    exc, (_StoreOpenRefused, KeylessAuditChainRefused, StoreNotFoundError)
-                ):
+                if isinstance(exc, (_StoreOpenRefused, StoreNotFoundError)):
                     raise
                 raise _StoreUnreachable() from exc
             try:
@@ -14116,6 +14167,9 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                     raise _StoreUnreachable() from exc
                 if not any(server_cell_present(c, columns) for c in cells):
                     return None
+                # After the visible-table check, so a store with nothing to audit says so. A read
+                # that fails names every table, so the run can still end NOT_COVERED, never PASS.
+                filtered = await server_row_filtered(source, cells, columns)
                 # Filled in place, so a walk that raises part way keeps what it had tallied, and
                 # the cells its catalog read hid (`CipherAudit.hidden`), and a failure found
                 # before the stop is still reported (BACKLOG #1719 items 1 and 9).
@@ -14127,6 +14181,7 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                         cells=cells,
                         chunk_rows=chunk_rows,
                         columns=columns,
+                        row_filtered=filtered,
                         into=found,
                     )
                 except walk_errors as exc:
@@ -14243,8 +14298,8 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     elif failing is not None:
         status, code = "FAIL", 1
         reason = failing[0]
-    elif audit.hidden:
-        # Not audited whole, so never a PASS: `CipherAudit.hidden` says why.
+    elif audit.not_whole:
+        # Not audited whole, so never a PASS: `CipherAudit.hidden` and `.row_filtered` say why.
         status, code = "NOT_COVERED", 3
         reason = (
             f"{audit.opened} sealed value(s) in the visible cells decrypted and authenticated, but "
@@ -14276,13 +14331,43 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     if audit.hidden:
         # On every verdict whose run read the catalog, so a key or a lost connection fixed first
         # does not hide a grant gap until a second run. An open the store refused as keyless
-        # read no catalog, so that KEY_MISMATCH names none.
+        # read no catalog, so that KEY_MISMATCH names none; the probe behind the keyless-chain
+        # refusal read one, so its KEY_MISMATCH names what it saw.
         reason += (
             f"; {len(audit.hidden)} expected cipher table(s) or cell(s) are not visible in the "
             f"catalog of {_store_label(store)} and were not read: {', '.join(audit.hidden)}. At "
             "least a missing grant on the table or one of its columns, or a schema behind this "
             "build, hides one: grant the login read on it, or let the service's open migrate the store, and run again"
         )
+    if audit.row_filtered and audit.row_filter == "failed":
+        # Beside the hidden cells, on every verdict whose run read the catalog, for the same
+        # reason. The read failed, so no role flag was learned: BYPASSRLS is not the fix.
+        reason += (
+            f"; the row-security catalog read of {_store_label(store)} failed, so every one of "
+            f"its {len(audit.row_filtered)} visible table(s) may hide rows from this login, and "
+            f"values in them may not have been read: {', '.join(audit.row_filtered)}. Grant the "
+            "login read on pg_catalog.pg_class and pg_catalog.pg_roles, check the link to the "
+            "store, and run again"
+        )
+    else:
+        # Named by the read, on every verdict whose run read the catalog: by the row-security
+        # rule, which a role can clear, or as unseen, which no role clears. Both where both.
+        by_rule = [t for t in audit.row_filtered if t not in audit.row_unseen]
+        if by_rule:
+            reason += (
+                f"; {len(by_rule)} table(s) of {_store_label(store)} may hide rows from this "
+                "login through row-level security, so values in them may not have been read: "
+                f"{', '.join(by_rule)}. Run it as a role that reads every row: a role with "
+                "BYPASSRLS, or the role that directly owns the table where the table does not "
+                "force row-level security; a superuser also does, but is not needed"
+            )
+        if audit.row_unseen:
+            reason += (
+                f"; {len(audit.row_unseen)} name(s) in {_store_label(store)} are a view, a "
+                "foreign table or another relation that is not an ordinary table, or have no "
+                "catalog row, so cipher-audit cannot see whether every row of them is read: "
+                f"{', '.join(audit.row_unseen)}. Audit the underlying tables instead"
+            )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
     # before the stop would read as the whole store's.
@@ -14299,6 +14384,12 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                 "blob": audit.blob if counted else None,
                 "unmarked": audit.unmarked if counted else None,
                 "legacy": audit.legacy if counted else None,
+                # What the run could not cover, by name, so a script need not parse the reason.
+                "hidden": list(audit.hidden),
+                # null where no row filter was read, so an empty list always means "read, none".
+                "row_filtered": (
+                    None if audit.row_filter == "unread" else list(audit.row_filtered)
+                ),
                 "cells": [
                     {
                         "cell": t.name,
@@ -15957,6 +16048,23 @@ def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
         # Setting a cause, by `raise ... from` or by assignment, also suppresses the context.
         link = None if link.__suppress_context__ else link.__context__
     return False
+
+
+def _keyed_refusal_mismatch(mismatch: str, *, key_named: bool) -> str:
+    """``cipher-audit``'s KEY_MISMATCH line behind the keyless-chain refusal (BACKLOG #1719 item
+    22): the refusal's configured-key cause first where it named one, then ``mismatch``'s own
+    line with what the refusal saw, an empty audit log, attached to it, and then any failure
+    line :func:`~messagefoundry.store.cipher_cells.with_first_failure` added after it."""
+    from messagefoundry.store.base import KEY_NAMED_UNRESOLVED
+    from messagefoundry.store.cipher_cells import FIRST_FAILURE_SEPARATOR
+
+    head, sep, tail = mismatch.partition(FIRST_FAILURE_SEPARATOR)
+    cause = f"{KEY_NAMED_UNRESOLVED}: " if key_named else ""
+    return (
+        f"{cause}{head}. The store's audit log also reads as empty to this login, though a keyed "
+        "store's holds at least its genesis row: the log may have been emptied, or its rows "
+        f"hidden from this login{sep}{tail}"
+    )
 
 
 def _emit_store_open_error(
