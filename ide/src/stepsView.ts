@@ -305,9 +305,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // What THIS panel's last render projected (BACKLOG #5843): read by the picker scope and the Router
     // role check, so a second open Steps editor can never answer for this one.
     const panelState = new StepsPanelProjection();
-    // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
-    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
-    // tells it which buffer each new webview was projected from.
+    // The rewrites applied since the webview was last projected, so an edit on one of their rows whose
+    // base it can prove is sent with the row's current source rather than refused as stale (BACKLOG
+    // #5943). render() tells it which buffer each new webview was projected from.
     const rebaser = new QueuedEditRebaser();
     let projectionId = 0;
 
@@ -509,21 +509,26 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // The drain is delegated to the pure `drainEdits` so an UNEXPECTED applyEdit rejection (NOT the
     // CLI-refusal path, which `applyOne` handles inline) releases the slot AND keeps draining the queue
     // rather than stranding a pending second edit until the user types again.
+    const onEditError = (err: unknown): void => {
+      void vscode.window.showErrorMessage(`MessageFoundry: could not apply the edit — ${errorText(err)}`);
+      void render(); // revert the optimistic webview change to the true projection
+    };
     const applyEdit = (msg: EditMessage): Promise<void> =>
       drainEdits(
         guard,
         msg,
         applyOne,
-        (err) => {
-          void vscode.window.showErrorMessage(
-            `MessageFoundry: could not apply the edit — ${errorText(err)}`,
-          );
-          void render(); // revert the optimistic webview change to the true projection
-        },
+        onEditError,
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
-        // Lets an edit on a row rewritten since the last projection carry its expectSrc over (#5943).
-        { rebaser, readSource: () => document.getText(), log: (text) => console.warn(text) },
+        rebaseOptions,
       );
+    // Both drains' rebase (#5943): an edit on a row rewritten since the last projection is carried over
+    // that rewrite when the rebaser can prove the row text the edit was posted against.
+    const rebaseOptions = {
+      rebaser,
+      readSource: () => document.getText(),
+      log: (text: string) => console.warn(text),
+    };
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
     // so every row coordinate the webview holds becomes stale — the op must run ALONE (never batched with
@@ -593,24 +598,20 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // would silently discard a still-valid edit, since the pick did not shift any row's coordinates). It
     // claims the single edit slot around the pick + drain, then ALWAYS re-projects — a picked value has no
     // optimistic DOM value to rely on (unlike a typed edit). The F7 `expect_src` stale guard rides through
-    // `applyOne` unchanged: a coordinate shifted by a raced edit is REFUSED, not mis-spliced.
+    // `applyOne` unchanged: a coordinate shifted by a raced edit is REFUSED, not mis-spliced. The drain is
+    // the typed edit's own `drainEdits` (BACKLOG #5943): the pick is carried over rewrites of its row's
+    // other params, its write is recorded, and a typed edit queued behind it is carried over it unless it
+    // sets the picked param. drainEdits releases through releaseEdit, so a save suppressed during the pick
+    // is deferred (#1759), and it never clears the queue, which would drop a still-valid typed edit.
     const applyPickedEdit = async (msg: EditMessage): Promise<void> => {
-      if (!guard.beginEdit()) {
+      // Checked here rather than left to the drain, so a busy slot gets this notice and no pick queues.
+      if (guard.isEditing) {
         void vscode.window.showInformationMessage(
           "MessageFoundry: an edit is in progress — try again in a moment.",
         );
         return;
       }
-      try {
-        let current: EditMessage | undefined = msg;
-        while (current) {
-          await applyOne(current); // applyOne handles its own error + revert-render
-          current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
-        }
-      } finally {
-        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#1759).
-        releaseEdit(guard, scheduleRerender);
-      }
+      await drainEdits(guard, { ...msg, pick: true }, applyOne, onEditError, scheduleRerender, rebaseOptions);
       if (disposed) {
         return;
       }
@@ -708,6 +709,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         toPosition?: "before" | "after";
         toSuite?: string;
         expectSrc?: string;
+        projection?: unknown; // the page's projection id (#5943), validated where it is read
         action?: string;
         itemId?: string; // ADR 0106 grouped Add menu — the ADD_MENU_BY_ID catalog id
         kind?: string;
@@ -793,6 +795,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             lineEnd: m.lineEnd,
             name: m.name,
             expectSrc: m.expectSrc,
+            // The page the pick was requested on (#5943); only a safe integer is kept.
+            ...(typeof m.projection === "number" && Number.isSafeInteger(m.projection)
+              ? { projection: m.projection }
+              : {}),
           };
           const seed = typeof m.value === "string" ? m.value : "";
           void pickThenApply(coords, m.mode === "segment" ? "segment" : "path", seed, (picked) => picked);

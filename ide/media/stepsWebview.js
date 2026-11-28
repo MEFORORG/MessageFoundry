@@ -202,8 +202,8 @@
       const n = Number(inp.value);
       return Number.isFinite(n) ? n : undefined;
     }
-    // The id of the projection this page shows (the mf-projection meta). Every edit echoes it, so the
-    // provider knows which projection's rows the edit was made on (BACKLOG #5943).
+    // The id of the projection this page shows (the mf-projection meta). Every edit and field pick echoes
+    // it, so the provider knows which projection's rows the edit was made on (BACKLOG #5943).
     function projectionId() {
       const meta = document.querySelector('meta[name="mf-projection"]');
       const n = Number(meta ? meta.getAttribute('content') : NaN);
@@ -288,6 +288,7 @@
           value: inp ? inp.value : '',
           expectSrc: b.dataset.expectSrc,
           mode: b.dataset.mode,
+          projection: projectionId(),
         });
       });
     }
@@ -356,7 +357,7 @@
           if (!fieldsReady(parts, index)) { setHint(box, true); return; }
           setHint(box, false);
           box.dataset.pickParts = JSON.stringify(parts);
-          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index }));
+          vscode.postMessage(Object.assign({ command: 'pickPart' }, coords(box), { parts: parts, index: index, projection: projectionId() }));
         }
         // A new, empty chip of `kind`: a clone of the renderer's own blank chip, so its markup has one
         // source, placed before the Add buttons.

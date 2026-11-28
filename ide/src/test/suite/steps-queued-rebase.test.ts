@@ -243,17 +243,27 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     assert.strictEqual(r.rebase(unknown, () => after), unknown);
   });
 
-  test("a write recorded with no projection id, or none of expectSrc, ends the chain", () => {
-    for (const bad of [
-      { ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: undefined },
-      { ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg", projection: undefined },
-    ]) {
-      const r = fresh();
-      r.record(edit("A"), { before, after });
-      r.record(bad, { before: after, after: after.replace("    return msg", "    return None") });
-      const queued = edit("B");
-      assert.strictEqual(r.rebase(queued, () => after), queued);
-    }
+  test("a write recorded with no expectSrc ends the chain", () => {
+    const r = fresh();
+    r.record(edit("A"), { before, after });
+    const bad = { ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: undefined };
+    const after2 = after.replace("    return msg", "    return None");
+    r.record(bad, { before: after, after: after2 });
+    const queued = edit("B");
+    assert.strictEqual(r.rebase(queued, () => after2), queued);
+  });
+
+  test("a write recorded with no projection id still extends the chain: the chain holds buffers", () => {
+    // CHANGED (b20008 C2): main ended the chain here. The write's input is the chain's last buffer and
+    // it rewrote one other row in place, so every line the queued edit names is where it was.
+    const r = fresh();
+    r.record(edit("A"), { before, after });
+    const noId = { ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg", projection: undefined };
+    const after2 = after.replace("    return msg", "    return None");
+    r.record(noId, { before: after, after: after2 });
+    assert.strictEqual(r.rebase(edit("B"), () => after2).expectSrc, afterRow);
+    const stale = edit("B");
+    assert.strictEqual(r.rebase(stale, () => after), stale, "the live buffer must be the chain's last");
   });
 
   test("a recorded write whose input is neither the chain's output nor its projection's buffer ends the chain", () => {
@@ -430,8 +440,8 @@ suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
     assert.ok(/readSource: \(\) => document\.getText\(\)/.test(src.slice(src.indexOf("const applyEdit = (msg"))));
   });
 
-  test("both edit posts in the page echo the projection id", () => {
+  test("both edit posts and both field-pick posts in the page echo the projection id", () => {
     const js = read("media", "stepsWebview.js");
-    assert.strictEqual((js.match(/projection: projectionId\(\)/g) ?? []).length, 2);
+    assert.strictEqual((js.match(/projection: projectionId\(\)/g) ?? []).length, 4);
   });
 });

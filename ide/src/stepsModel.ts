@@ -1249,6 +1249,10 @@ export interface EditMessage {
   // The id of the projection the edit was made on, echoed from the page's `<meta name="mf-projection">`.
   // Only the rebaser reads it (BACKLOG #5943); an edit without it is never rebased. Not sent to the engine.
   projection?: number;
+  // Set by the provider, never read from the page: this edit is a field pick (pickPath or pickPart),
+  // whose value was built from the row as the page showed it when the picker opened. The rebaser never
+  // carries a pick over a write to its own param, nor a typed edit over a pick of its param (#5943).
+  pick?: boolean;
 }
 
 /** The `lens rewrite` edit spec (mirror of messagefoundry_toolkit/lens.rewrite_source's contract). */
@@ -1400,6 +1404,11 @@ function readEditCoords(m: Record<string, unknown>): EditCoords | undefined {
   return { handler, lineStart, lineEnd, name, expectSrc };
 }
 
+/** The projection id an untrusted webview message echoes, or `undefined` unless it is a safe integer. */
+function readProjection(m: Record<string, unknown>): number | undefined {
+  return typeof m.projection === "number" && Number.isSafeInteger(m.projection) ? m.projection : undefined;
+}
+
 /** A webview `edit` message, read: the edit to apply, or why a well-addressed edit was refused. */
 export type EditMessageRead = { edit: EditMessage } | { refused: string };
 
@@ -1455,8 +1464,9 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
     };
   }
   const edit: EditMessage = { command: "edit", ...coords, value };
-  if (typeof m.projection === "number" && Number.isSafeInteger(m.projection)) {
-    edit.projection = m.projection;
+  const projection = readProjection(m);
+  if (projection !== undefined) {
+    edit.projection = projection;
   }
   return { edit };
 }
@@ -1471,6 +1481,8 @@ export interface PickPartMessage extends EditCoords {
   parts: TemplatePart[];
   /** The path part the pick replaces, or `parts.length` to append a new path part. */
   index: number;
+  /** The id of the projection the pick was requested on (BACKLOG #5943), when the page sent a valid one. */
+  projection?: number;
 }
 
 /**
@@ -1491,7 +1503,8 @@ export function readPickPartMessage(m: unknown): PickPartMessage | undefined {
   if (!appends && !(index >= 0 && index < parts.length && "path" in parts[index])) {
     return undefined;
   }
-  return { ...coords, parts, index };
+  const projection = readProjection(m);
+  return projection === undefined ? { ...coords, parts, index } : { ...coords, parts, index, projection };
 }
 
 /** The path a pick into `parts` at `index` starts from: the part's current path, or "" when appending. */
@@ -3026,13 +3039,15 @@ export class RerenderDebouncer<H = unknown> {
  * that an UNEXPECTED `apply` rejection never strands a queued edit — is unit-testable node-side.
  *
  * If an edit is already in flight, `first` is queued (coalesced by field) and this returns — the running
- * drain will pick it up. Otherwise it claims the slot and drains `first` then everything `takePending()`
- * yields. `apply` performs the actual `lens rewrite` + `WorkspaceEdit`; its OWN handled outcomes (a CLI
- * refusal) never throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is
- * caught, routed to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until
- * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
- * document change suppressed during the drain still gets its re-projection (BACKLOG #1759), including on
- * the rejected-apply path above. Never throws.
+ * drain will pick it up. A field pick (`first.pick`) is never queued: it would coalesce with a typed edit
+ * of its field, so it goes to `onError` instead, and the provider checks the slot before it calls this.
+ * Otherwise it claims the slot and drains `first` then everything `takePending()` yields. `apply`
+ * performs the actual `lens rewrite` + `WorkspaceEdit`; its OWN handled outcomes (a CLI refusal) never
+ * throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is caught, routed
+ * to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until the user types
+ * again. The slot is always released in `finally` — through {@link releaseEdit}, so a document change
+ * suppressed during the drain still gets its re-projection (BACKLOG #1759), including on the
+ * rejected-apply path above. Never throws.
  */
 export async function drainEdits(
   guard: EditLoopGuard,
@@ -3043,6 +3058,14 @@ export async function drainEdits(
   rebase?: { rebaser: QueuedEditRebaser; readSource: () => string; log?: (text: string) => void },
 ): Promise<void> {
   if (!guard.beginEdit()) {
+    if (first.pick === true) {
+      try {
+        onError?.(new Error("an edit is in progress"), first);
+      } catch {
+        // A throwing handler must not escape the drain.
+      }
+      return;
+    }
     guard.queue(first);
     return;
   }
@@ -3053,10 +3076,10 @@ export async function drainEdits(
   const failed = (stage: string, err: unknown): void => {
     rebase?.rebaser.latch();
     try {
-      rebase?.log?.(`Steps edit rebase ${stage} failed: ${err instanceof Error ? err.message : String(err)}`);
+      rebase?.log?.(`Steps edit rebase ${stage} failed: ${errorText(err)}`);
     } catch {
-      // A throwing logger, or an error String() cannot convert, must not escape the drain; the rebase is
-      // already latched off, which is all a failure needs.
+      // A throwing logger must not escape the drain; the rebase is already latched off, which is all a
+      // failure needs.
     }
   };
   const carry = (msg: EditMessage): EditMessage => {
@@ -3150,48 +3173,56 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
   return after.slice(lo, hi).join("\n");
 }
 
+/** What one recorded write changed: the row and the param it set, and whether it was a field pick. */
+interface RecordedWrite {
+  handler: string;
+  lineStart: number;
+  lineEnd: number;
+  name: string;
+  pick: boolean;
+}
+
 /**
- * Carries an edit's `expectSrc` forward over the typed rewrites applied since the webview it was made
- * on was projected (BACKLOG #5943). The webview's rows keep their projection-time source until the next
- * re-projection, so an edit on a row whose earlier rewrite has landed, queued behind that rewrite or
- * posted before the re-projection arrives, is sent with the row's old text, and the engine's stale
- * guard (F7) refuses it and the user's edit is reverted.
+ * Carries an edit's `expectSrc` forward over the rewrites of its row that landed after its page read the
+ * row (BACKLOG #5943). The webview's rows keep their projection-time source until the next re-projection.
+ * So an edit on a row whose earlier rewrite has landed (queued behind it, posted before the re-projection
+ * arrives, or a pick whose picker was open) carries the row's older text. The engine's stale guard (F7)
+ * would then refuse it, and the user's edit would be reverted.
  *
- * Every projection gets an id, which the webview echoes in each edit ({@link EditMessage.projection}).
- * The rebaser keeps one chain of recorded writes and the buffers they read and wrote. A write extends
- * the chain only when it rewrote its own row in place ({@link rowAfterRewrite}), read the chain's last
- * output, and was made on a projection whose buffer is in the chain. A write starts a new chain only
- * when it read exactly the buffer of the projection it was made on. Any other write, an unexpected
- * rejection, or a throw ends the chain ({@link latch}). So every buffer in a chain has the same lines
- * at the same numbers, except inside the rows the chain's writes rewrote.
+ * The rebaser keeps one chain of buffers. A recorded write appends its output. When its input is not the
+ * chain's last buffer, it starts a new chain from that input. Only an in-place rewrite of one row
+ * ({@link rowAfterRewrite}) is recorded; any other write, an unexpected rejection, or a throw ends the
+ * chain ({@link latch}). So every buffer in a chain has the same lines at the same numbers, except inside
+ * the rows the chain's writes rewrote.
  *
- * An edit's `expectSrc` is replaced with the live row's text only when all of these hold; otherwise it
- * is sent as posted, and the engine's stale guard decides exactly as it does with no rebaser:
+ * An edit's `expectSrc` is replaced with the live row's text only when the rebaser can prove the edit's
+ * base. Otherwise it is sent as posted, so the engine's stale guard decides exactly as it does with no
+ * rebaser. The base is proved when all of these hold:
  *
- *  - its projection id is one the rebaser still keeps, and that projection's buffer is in the chain;
- *  - its `expectSrc` is that buffer's text at the edit's line range;
- *  - the live buffer, read just before the edit is sent, is exactly the chain's last output. A change
- *    made between recorded writes (an undo, a structural op, a pick, another panel, split-view typing)
- *    leaves the edit unrebased. Split-view typing made while a rewrite is in flight is not covered:
- *    applyOne overwrites it with the rewrite's output, as on main, and the write is recorded as clean.
+ *  - its projection id is one the rebaser keeps, and that projection's buffer is in the chain;
+ *  - some chain buffer, at or after that projection's buffer, has `expectSrc` as the row's text. The
+ *    edit's base is the LATEST such buffer. A row's text is the whole of its state, so a value retyped
+ *    back puts the row back in that earlier state, whichever of the two buffers the page read;
+ *  - every recorded write after the base that touched the edit's lines rewrote exactly its row. Each set
+ *    another param, or set the same param with both writes typed. A field pick's value was built from the
+ *    row as the page showed it when the picker opened, and a page does not show a pick until it is
+ *    re-projected. So a pick is never carried over a write of its own param, and no typed edit is carried
+ *    over a pick of its param. A typed edit is what the user typed over the value the page showed, so it
+ *    is carried over an earlier typed write of its param, as before;
+ *  - the live buffer, read just before the edit is sent, is exactly the chain's last buffer. A change
+ *    made outside the recorded writes (an undo, a structural op, another panel, split-view typing) leaves
+ *    the edit unrebased. Split-view typing made while a rewrite is in flight is not covered: applyOne
+ *    overwrites it with the rewrite's output, as on main, and the write is recorded as clean.
  *
- * The provider owns one for the panel and calls {@link project} each time it replaces the webview. A
- * projection whose buffer is not in the chain ends the chain and keeps only itself. Otherwise the
- * rebaser keeps the new projection, and the previous one when its buffer is in the chain. It then
- * deletes the chain buffers that come before the older kept projection's buffer. Chain buffers are
- * ordered by last use, not by projection. So when a write reuses an older buffer (a value retyped back)
- * or renders finish out of order, this can delete the new projection's own buffer. Edits from that
- * projection are then sent as posted, and the engine refuses them as stale, as on main. An edit from a
- * projection no longer kept is sent as posted.
- *
- * Only the typed-edit drain records writes. The field picker's drain (`applyPickedEdit`) does not, so a
- * pick's write breaks the live-buffer condition: a typed template edit posted behind a pick carries the
- * parts as shown before the pick, and rebasing it would write the old path back over the picked one.
+ * The provider owns one for the panel and calls {@link project} each time it replaces the webview. The
+ * rebaser keeps the new projection and the one before it, whatever buffers they were projected from. So
+ * a projection whose buffer is not in the chain now is used again if a later chain holds that buffer. It
+ * then drops the chain buffers before the earliest one a kept projection was projected from, and never a
+ * kept projection's own buffer. An edit from a projection no longer kept is sent as posted.
  */
 export class QueuedEditRebaser {
-  private lastAfter: string | undefined;
-  // The current chain's buffers, oldest first: each recorded write's input and output.
-  private readonly chain = new Set<string>();
+  // The current chain's buffers, oldest first. Each but the first carries the write that produced it.
+  private chain: { buffer: string; write?: RecordedWrite }[] = [];
   // The projections an edit may still be rebased from: id to the buffer it was projected from.
   private projections = new Map<number, string>();
 
@@ -3199,76 +3230,94 @@ export class QueuedEditRebaser {
     return physicalLines(source).slice(msg.lineStart - 1, msg.lineEnd).join("\n");
   }
 
-  private push(buffer: string): void {
-    this.chain.delete(buffer); // keep the order of last use, which pruning relies on
-    this.chain.add(buffer);
+  /** Whether `msg` may be carried over `write`, a recorded write made after the row text `msg` read. */
+  private static mayCarry(msg: EditMessage, write: RecordedWrite): boolean {
+    if (write.lineEnd < msg.lineStart || write.lineStart > msg.lineEnd) {
+      return true; // another row: this row's text is unchanged by it
+    }
+    if (write.handler !== msg.handler || write.lineStart !== msg.lineStart || write.lineEnd !== msg.lineEnd) {
+      return false;
+    }
+    return write.name !== msg.name || (!write.pick && msg.pick !== true);
   }
 
   /** The webview now shows projection `id`, projected from `source`. */
   project(id: number, source: string): void {
-    if (!this.chain.has(source)) {
-      this.latch();
-      this.projections = new Map([[id, source]]);
-      return;
-    }
-    const kept = new Map<number, string>();
     const ids = [...this.projections.keys()];
     const prev = ids[ids.length - 1];
     const prevSource = prev === undefined ? undefined : this.projections.get(prev);
-    if (prev !== undefined && prevSource !== undefined && this.chain.has(prevSource)) {
+    const kept = new Map<number, string>();
+    if (prev !== undefined && prev !== id && prevSource !== undefined) {
       kept.set(prev, prevSource);
     }
     kept.set(id, source);
     this.projections = kept;
-    const oldest = kept.values().next().value as string;
-    for (const buffer of this.chain) {
-      if (buffer === oldest) {
-        break;
+    let start = this.chain.length - 1;
+    for (const buffer of kept.values()) {
+      const at = this.chain.findIndex((step) => step.buffer === buffer);
+      if (at >= 0 && at < start) {
+        start = at;
       }
-      this.chain.delete(buffer);
+    }
+    if (start > 0) {
+      this.chain = this.chain.slice(start);
     }
   }
 
-  /** Record what applying `msg` wrote (`undefined` when nothing was written). */
+  /**
+   * Record what applying `msg` wrote (`undefined` when nothing was written). The write's own projection
+   * id is not needed: the chain holds buffers, and an in-place rewrite of one row whose input is the
+   * chain's last buffer keeps every other line where it was, whichever page posted it.
+   */
   record(msg: EditMessage, write: AppliedRewrite | void): void {
     if (write === undefined) {
       return;
     }
-    const from = msg.projection === undefined ? undefined : this.projections.get(msg.projection);
-    if (from === undefined || rowAfterRewrite(msg, write) === undefined) {
+    if (rowAfterRewrite(msg, write) === undefined) {
       this.latch();
       return;
     }
-    if (this.lastAfter !== undefined && write.before === this.lastAfter && this.chain.has(from)) {
-      // Extends the chain.
-    } else if (write.before === from) {
-      this.chain.clear(); // a new chain, from a write that read its own projection's buffer
-      this.push(from);
-    } else {
-      this.latch();
-      return;
+    const last = this.chain[this.chain.length - 1];
+    if (last === undefined || last.buffer !== write.before) {
+      this.chain = [{ buffer: write.before }];
     }
-    this.push(write.after);
-    this.lastAfter = write.after;
+    const { handler, lineStart, lineEnd, name } = msg;
+    this.chain.push({ buffer: write.after, write: { handler, lineStart, lineEnd, name, pick: msg.pick === true } });
   }
 
   /** End the chain: no edit is rebased until a write starts a new one. */
   latch(): void {
-    this.chain.clear();
-    this.lastAfter = undefined;
+    this.chain = [];
   }
 
   /** `msg` with its `expectSrc` rebased onto the live row's text, or `msg` unchanged. */
   rebase(msg: EditMessage, readSource: () => string): EditMessage {
-    if (msg.expectSrc === undefined || msg.projection === undefined || this.lastAfter === undefined) {
+    if (msg.expectSrc === undefined || msg.projection === undefined || this.chain.length < 2) {
       return msg;
     }
     const from = this.projections.get(msg.projection);
-    if (from === undefined || !this.chain.has(from) || QueuedEditRebaser.rowText(from, msg) !== msg.expectSrc) {
+    const first = from === undefined ? -1 : this.chain.findIndex((step) => step.buffer === from);
+    if (first < 0) {
       return msg;
     }
+    let base = -1;
+    for (let i = this.chain.length - 1; i >= first; i--) {
+      if (QueuedEditRebaser.rowText(this.chain[i].buffer, msg) === msg.expectSrc) {
+        base = i;
+        break;
+      }
+    }
+    if (base < 0 || base === this.chain.length - 1) {
+      return msg; // no proved base, or the edit already reads the row's latest text
+    }
+    for (let i = base + 1; i < this.chain.length; i++) {
+      const write = this.chain[i].write;
+      if (write === undefined || !QueuedEditRebaser.mayCarry(msg, write)) {
+        return msg;
+      }
+    }
     const liveSource = readSource();
-    if (liveSource !== this.lastAfter) {
+    if (liveSource !== this.chain[this.chain.length - 1].buffer) {
       return msg;
     }
     const live = QueuedEditRebaser.rowText(liveSource, msg);
