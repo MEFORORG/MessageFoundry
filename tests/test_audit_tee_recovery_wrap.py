@@ -17,6 +17,7 @@ against the origin/main tee, whose line then holds the wrap (measured 2026-11-22
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sys
@@ -24,7 +25,7 @@ from math import nan as NAN
 
 import pytest
 
-from messagefoundry.redaction import _REDACT_WINDOW
+from messagefoundry.redaction import _REDACT_WINDOW, safe_text
 from messagefoundry.store import audit_tee
 from messagefoundry.store import store as store_module
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -105,9 +106,8 @@ def test_the_tee_line_withholds_the_wrap_and_keeps_the_rest(fmt: str, capsys) ->
 
 
 def test_the_wrap_is_withheld_where_the_length_bound_does_not_cut_it(monkeypatch) -> None:
-    """With the detail's length bound given room for the whole genesis detail, the copy still holds
-    no wrap."""
-    monkeypatch.setattr(audit_tee, "_DEFAULT_LIMIT", 4096)
+    """With ``safe_text`` given room for the whole genesis detail, the copy still holds no wrap."""
+    monkeypatch.setattr(audit_tee, "safe_text", functools.partial(safe_text, limit=4096))
     (line,) = _tee(_GENESIS)
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"])["recovery_wrap"] == "<withheld>"

@@ -49,12 +49,10 @@ from messagefoundry.logging_setup import (
     sink_readings,
 )
 from messagefoundry.redaction import (
-    _DEFAULT_LIMIT,
     _REDACT_WINDOW,
     _REDACTED,
-    _held_back,
     clamp_untrusted,
-    redact_bounded_head,
+    safe_text,
     safe_text_bound,
 )
 
@@ -317,8 +315,7 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     a value that chain already rewrote can still print here where ``old`` masks it. The line check
     then sees a word ``old`` hid, and :func:`_tee_line` ships the detail hidden whole: the safe
     direction, at the cost of the diagnostic."""
-    head, own = safe_text_bound(kept)
-    shipped = f"{_held_back(redact_bounded_head(head, own or note), _DEFAULT_LIMIT)}{own}{note}"
+    shipped = safe_text(kept, follows=note) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
     return shipped
@@ -641,12 +638,11 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # safe_text(tee_detail), built from its parts so the note is kept apart for a scrubbed detail,
-    # whose own window cut it off. The head is told the note follows it (BACKLOG #5925), so a value
-    # the cut left last is not judged as ending the text; _bounded_detail bounds a scrubbed one the
-    # same way.
-    head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
-    old_detail = _held_back(redact_bounded_head(head, note), _DEFAULT_LIMIT) + note
+    # safe_text tells the head its note follows (BACKLOG #5925), so a value the cut left last is
+    # not judged as ending the text. The note is read apart for a scrubbed detail, whose own window
+    # cut it off; _bounded_detail bounds that one the same way.
+    note = safe_text_bound(tee_detail)[1] if tee_detail else ""
+    old_detail = safe_text(tee_detail) if tee_detail else ""
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,

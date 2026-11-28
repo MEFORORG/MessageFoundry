@@ -1812,8 +1812,9 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     words before it are masked (``</family zqxP`` masks to ``</family xxxP``, and ``shared``
     stays whole); an end tag naming no open element whose name :func:`_stray_end_tag_name` keeps,
     at least an unprefixed one and one that ends the text (``</family:Zqxdoe`` with nothing
-    after it; with its ``>``, the local part is masked); and the text of an element that only a malformed end tag closes and
-    whose text opens with whitespace (``<family> Smith</family Kim``), which is read as prose.
+    after it; with its ``>``, the local part is masked); and the text of an element that only a
+    malformed end tag closes and whose text opens with whitespace (``<family> Smith</family
+    Kim``), which is read as prose.
 
     **A rest this module's trailing bound note follows does not end the text** (``noted``, BACKLOG
     #5925): the XML pass reads the text with the note set aside, but no caller's text can be glued
@@ -1886,24 +1887,26 @@ def _ends_in_camel_head(rest: str) -> bool:
     (``shared`` and a caller's ``accesskey=``), or from a camelCase capital after a lower-case
     letter or a digit (``zqxP`` and ``assword: x``)."""
     last = _GLUED_WORD.findall(rest)[-1]
-    return any(
-        (i == 0 or (last[i].isupper() and not last[i - 1].isupper()))
-        and any(label.startswith(last[i:].lower()) for label in _CAMEL_LABEL_WORDS)
-        for i in range(len(last))
+    return any(_camel_head_at(last, last.lower(), i) for i in range(len(last)))
+
+
+def _camel_head_at(word: str, lower: str, i: int) -> bool:
+    """Whether ``word`` (``lower`` is it lower-cased) ends, from ``i``, on the head of a credential
+    label word: from the word's start, or from a camelCase capital after a lower-case letter or a
+    digit, as :func:`_ends_in_camel_head` reads one."""
+    return (i == 0 or (word[i].isupper() and not word[i - 1].isupper())) and any(
+        label.startswith(lower[i:]) for label in _CAMEL_LABEL_WORDS
     )
 
 
 def _glue_head_start(word: str) -> int:
     """Where the end of ``word`` that text glued after it could complete starts: the first index
     from which ``word`` ends on a head of a word some pass reads with no boundary before it
-    (:data:`_UNBOUNDED_HEADS`, compared lower-cased), or on a head of a credential label word as
-    :func:`_ends_in_camel_head` reads one. ``len(word)`` where it ends on neither."""
+    (:data:`_UNBOUNDED_HEADS`, compared lower-cased), or on a head of a credential label word
+    (:func:`_camel_head_at`). ``len(word)`` where it ends on neither."""
     lower = word.lower()
-    for i in range(len(word)):
-        if lower[i:] in _UNBOUNDED_HEAD_SET or (
-            (i == 0 or (word[i].isupper() and not word[i - 1].isupper()))
-            and any(label.startswith(lower[i:]) for label in _CAMEL_LABEL_WORDS)
-        ):
+    for i in range(max(0, len(word) - _GLUE_HEAD_MAX), len(word)):
+        if lower[i:] in _UNBOUNDED_HEAD_SET or _camel_head_at(word, lower, i):
             return i
     return len(word)
 
@@ -1952,6 +1955,7 @@ def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool) -> str:
         not mask
         or local == tag.group(2)  # no prefix: an unprefixed name can be another pass's markup
         or local in _XML_STRUCTURE_NAMES
+        or len(local) > _GLUED_VALUE_MAX
         or text[tag.end() : tag.end() + 1] not in (">", " ", "\t", "\r", "\n")
     ):
         return whole
@@ -1992,12 +1996,11 @@ def _scrub_xml_element(
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
-            if not open_names.get(qname) and stack[-1][1] == _LEAF:
-                out.append(_stray_end_tag_name(text, tag, mask))
-            else:
-                out.append(tag.group())
+            is_open = open_names.get(qname)
+            stray = not is_open and stack[-1][1] == _LEAF
+            out.append(_stray_end_tag_name(text, tag, mask) if stray else tag.group())
             out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
-            if open_names.get(qname):
+            if is_open:
                 while stack:
                     name, _ = stack.pop()
                     open_names[name] -= 1
@@ -2560,6 +2563,10 @@ _CAMEL_LABEL_WORDS = (
     "secretkey",
     "authkey",
 )
+#: The longest head :func:`_glue_head_start` can find: no longer end of a word can open one.
+_GLUE_HEAD_MAX = max(len(word) for word in (*_UNBOUNDED_WORDS, *_CAMEL_LABEL_WORDS))
+
+
 #: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's
 #: heads that hold digits. A PHI last word that ends the answer is letters only, so it cannot end in
 #: these; a credential's may (code review round 2, #2968). They are not added above, since a quoted
@@ -2575,7 +2582,8 @@ def _glued_value(
 ) -> tuple[str, str] | None:
     """``(rest, mask)``: the rest of a PHI or credential value that the field run ``run`` cut
     through, when it is safe to mask, and what replaces it, of the same length. The rest is the
-    text after the token, up to the value's terminator. ``None`` leaves the plain scrub. ``body`` is ``text`` with this module's trailing bound note and its joiner set aside
+    text after the token, up to the value's terminator. ``None`` leaves the plain scrub. ``body``
+    is ``text`` with this module's trailing bound note and its joiner set aside
     (:func:`_without_trailing_note`). The end-tag arm reads only ``body``. The unquoted PHI arm and
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
@@ -2682,9 +2690,12 @@ def _glued_end_tag_rest(
     assert line is not None  # the pattern matches the empty string
     stop = line.end()
     rest = body[end:stop]
+    shape = rest.translate(_SHAPE)
+    if shape == rest:  # no letter or digit to mask
+        return None
     masked = _end_tag_rest(body, end, stop, True, noted=noted)
     # Only a mask in place is taken; the docstring says why.
-    if masked == rest or masked.translate(_SHAPE) != rest.translate(_SHAPE):
+    if masked == rest or masked.translate(_SHAPE) != shape:
         return None
     last = _GLUED_WORD.findall(rest)[-1]  # a rest the mask changed holds a word
     if not rest.endswith(" ") and field_run.match(body, stop - len(last)) is not None:
@@ -2965,7 +2976,7 @@ def _held_back(message: str, limit: int) -> str:
     return f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
 
 
-def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
+def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT, follows: str = "") -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
@@ -3014,9 +3025,13 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     out of band (:func:`_redact_noted`), not written into the head: a stand-in note in the text let
     a whole-text gate in :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which
     switched off a scrub the answer without it made. A text that fits the window has no note, and
-    is redacted as before. :func:`redact_bounded_head` holds this part."""
+    is redacted as before. :func:`redact_bounded_head` holds this part.
+
+    ``follows`` is a bound note the CALLER appends after the result, as the off-box audit tee
+    appends the note its own window cut off; the text is then redacted knowing a note follows it,
+    as with its own. It is not appended here."""
     head, note = safe_text_bound(text)
-    return f"{_held_back(redact_bounded_head(head, note), limit)}{note}"
+    return f"{_held_back(redact_bounded_head(head, note or follows), limit)}{note}"
 
 
 def redact_bounded_head(head: str, note: str) -> str:
