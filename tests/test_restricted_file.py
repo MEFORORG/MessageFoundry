@@ -16,7 +16,9 @@ from __future__ import annotations
 import dataclasses
 import errno
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import types
 from collections.abc import Mapping
@@ -2304,6 +2306,10 @@ def test_windows_an_unknown_drive_type_is_unreadable(monkeypatch: pytest.MonkeyP
     [
         "\\\\?\\{real}\\x\\..\\store.key",  # verbatim: the open reads the ``..`` as a name
         "\\\\.\\{drive}\\..\\UNC\\host\\share\\store.key",  # Win32 climbs out onto a share
+        # abspath trims the dot the open reads as part of the folder name (vault BACKLOG #5515).
+        "\\??\\UNC\\host\\share\\keys.\\store.key",
+        "\\\\?\\UNC\\host\\share\\keys.\\store.key",
+        "\\\\?\\Volume{{0000}}\\keys.\\store.key",
     ],
 )
 def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
@@ -2327,16 +2333,46 @@ def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
 
 
 @windows_only
-@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "\\??\\"])
 def test_windows_a_plain_device_spelling_is_still_walked(tmp_path: Path, prefix: str) -> None:
     """The control for the test above: a device prefix naming the same object as its plain
-    spelling is walked as before."""
+    spelling is walked as before. The open reads ``\\??\\C:\\...`` as the plain path too, where
+    ``os.path.abspath`` read it as a rooted name on the current drive (``D:\\??\\C:\\...``), so
+    the walk refused a key the open reads (vault BACKLOG #5515, engine PR 3347 finding B). Red on
+    that prefix under origin/main."""
     real = tmp_path / "real"
     real.mkdir()
     key = real / "store.key"
     write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
     host = _host_judging_only_under(tmp_path)
     assert restricted_file._windows_surroundings_problem(Path(prefix + str(key)), host) is None
+
+
+@windows_only
+def test_windows_a_key_under_a_folder_named_nul_is_refused(tmp_path: Path) -> None:
+    """Vault BACKLOG #5515 remainder. The open passes through a folder named ``NUL`` to the key, but
+    the walk probed and read the holder ``...\\NUL`` by its Win32 text, which opens
+    ``\\Device\\Null``. Measured on Windows 10.0.26300 under origin/main: with Everyone granted full
+    control on the real folder, this check passed, where the same folder under another name is
+    refused. Its control is that other name."""
+    verbatim = "\\\\?\\" + str(tmp_path)
+    try:
+        for name in ("NUL", "open"):
+            os.mkdir(verbatim + "\\" + name)
+            # Only the verbatim spelling reaches the folder named NUL.
+            write_restricted_file(Path(verbatim + "\\" + name + "\\store.key"), b"KEY-STAND-IN")
+            subprocess.run(
+                ["icacls", verbatim + "\\" + name, "/grant", "*S-1-1-0:(OI)(CI)F"],
+                check=True,
+                capture_output=True,
+            )
+        host = _host_judging_only_under(tmp_path)
+        surroundings = restricted_file._windows_surroundings_problem
+        assert surroundings(tmp_path / "open" / "store.key", host) is not None  # the control
+        problem = surroundings(tmp_path / "NUL" / "store.key", host)
+        assert problem is not None and "DOS device name" in problem
+    finally:
+        shutil.rmtree(verbatim + "\\NUL", ignore_errors=True)
 
 
 @windows_only

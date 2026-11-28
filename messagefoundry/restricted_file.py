@@ -63,6 +63,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 from messagefoundry.auth.anchor_path import (
+    _DEVICE_NAME,
     _DEVICE_PATH,
     _GRANTING_ACE_TYPES,
     _SHARED_SERVICE_SIDS,
@@ -80,6 +81,7 @@ from messagefoundry.auth.anchor_path import (
     WinSecurity,
     WinTrust,
     _drive_relative,
+    _is_dos_device_name,
     _strip_win_prefix,
     _win_probe,
     describe_sid,
@@ -843,19 +845,28 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     # abspath collapses ``.`` and ``..`` the open may read otherwise: as names after a verbatim
     # prefix, or, after a ``\\.\`` one, as climbing out of the drive. So a device prefix is judged
     # as written, by the walk's own rule (vault BACKLOG #5515), before abspath runs. A spelling that
-    # passes is walked as before.
+    # passes is walked as before, except an NT ``\??\`` one: the open reads it as the plain path,
+    # where abspath reads a rooted name on the current drive (``D:\??\C:\...``), so its stripped
+    # form is walked instead.
     text = os.fspath(path)
     if text[:4].replace("/", "\\") in ("\\\\.\\", "\\\\?\\", "\\??\\"):
         plain = _strip_win_prefix(text)
         if plain is None or _drive_relative(plain):
             return _windows_cause_problem(WalkCause.plain(_DEVICE_PATH))
+        if text.startswith("\\??\\"):
+            text = plain
     try:
-        full = Path(os.path.abspath(path))
+        full = Path(os.path.abspath(text))
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
     # The path's own name is not walked, so a stream name, or a name ending in a dot or a space, is
-    # not refused by the walk.
+    # not refused by the walk. The device-prefix guard above still refuses one, since it reads every
+    # name (an over-refusal for the last name, which only the open reads).
     walked = full if full.parent == full else full.parent
+    if walked != full and _is_dos_device_name(walked.name):
+        # The walk reads its own last name by its Win32 text, which opens the device, where the
+        # open passes through a folder of that name (vault BACKLOG #5515).
+        return _windows_cause_problem(WalkCause.plain(_DEVICE_NAME))
     substituted: list[str] = []
     remote: list[str] = []
 
