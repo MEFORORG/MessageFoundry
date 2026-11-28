@@ -209,17 +209,17 @@ async def _second_account(store: MessageStore) -> None:
 
 
 def _other_row_at_final_read(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str, *, after: int = _PASSES
 ) -> None:
-    """Past the raced passes, the key's reader answers ``u2``: the first account was renamed off
-    the key and another account took it before the lookup's final read."""
+    """Past ``after`` reads, the key's reader answers ``u2``: the first account was renamed off
+    the key and another account took it. By default that lands before the lookup's final read."""
     name = _READERS[key]
     original = getattr(store, name)
     reads = [0]
 
     async def swapped(*args: Any, **kw: Any) -> Any:
         reads[0] += 1
-        if reads[0] > _PASSES:
+        if reads[0] > after:
             return await store.get_user("u2")
         return await original(*args, **kw)
 
@@ -280,3 +280,34 @@ async def test_an_unverifiable_answer_propagates_unreported(
     with pytest.raises(TransitSealUnverifiableError):
         await _lookup(service, key)
     assert await store.list_audit(action=AUTHORITY_SEAL_UNVERIFIABLE_ACTION, limit=100) == []
+
+
+@pytest.mark.parametrize("key", _KEYS)
+async def test_a_row_only_the_last_pass_read_is_checked_not_reported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """RED when: the lookup reports the final read's row because the LAST pass read it, though the
+    earlier passes read another row. That row raced one check, the same evidence that leaves a
+    new holder at the final read unreported, so it is checked once more and served when it
+    passes."""
+    await _account(store)
+    await _second_account(store)
+    service = AuthService(store, AuthSettings())
+    _race_first(service, monkeypatch, races=_PASSES)
+    _other_row_at_final_read(store, monkeypatch, key, after=_PASSES - 1)
+    found = await _lookup(service, key)
+    assert found.user is not None and found.user.id == "u2"
+    assert await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=100) == []
+
+
+async def test_the_federated_loader_reports_a_row_that_raced_every_check(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the federated sign-in's loader, which returns the account alone: a row every
+    check read that still holds the pair is refused and reported, as for the other keys."""
+    await _account(store)
+    service = AuthService(store, AuthSettings())
+    _race_first(service, monkeypatch, races=_PASSES)
+    assert await service._load_user_by_federated_subject(_ISSUER, _SUBJECT) is None
+    rows = await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=100)
+    assert any("u1" in str(row["detail"]) for row in rows), rows

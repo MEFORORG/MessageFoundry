@@ -4349,8 +4349,8 @@ class _SealCheck:
 #: item 7), which reads again on a failed check too. What happens once every pass has raced is
 #: each reader's to say: the id's settled read answers refused and reports only what each
 #: ``_verified`` check reported, while :meth:`AuthService._checked_by_id` and the key lookups read
-#: once more and report a seal failure for the row the last check read, if it is still there; a
-#: key lookup that finds another row holding the key by then checks that row instead.
+#: once more and report a seal failure for a row every check read, if it is still there; a key
+#: lookup that finds any other row holding the key by then checks that row once instead.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -11636,8 +11636,10 @@ class AuthService:
             # BACKLOG #3069 note T3), with no verified id to name. NOT CLOSED HERE: the reconciler's
             # own ``held`` read still reads a seal-failed holder as None, so the pre-check is
             # skipped and the write's guard catches it instead; and ``refused`` also reads true for
-            # a holder whose every check raced a write and that still holds the name after them
-            # (``_settled_lookup``), a narrow window that still files this refusal.
+            # a holder whose every check raced a write and that still holds the name after them,
+            # and for a holder that took the name after another row's checks raced and whose own
+            # one check raced too, which is refused with no seal-failure report
+            # (``_settled_lookup``): narrow windows that still file this refusal.
             #
             # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
             # one rename for this pass rather than raising: a raise would end the pass before the
@@ -14233,31 +14235,33 @@ class AuthService:
         read decides, and one that finds no row by the key is gone. A record :meth:`_verified`
         established fails, the unreadable stand-in included, is refused at once, so a row gone
         from the key on a later read cannot clear it. Once every check raced, the key is read once
-        more. The row the last check read, still holding the key, is refused and reported as
+        more. A row that every check read, still holding the key, is refused and reported as
         :meth:`_checked_by_id` reports a row that raced every check: each of its checks failed
-        its seal, so it is handed to :meth:`_user_seal_failed`. A different row holding the key
-        by then was never checked, so it is not reported on that ground: it is checked once, and
-        answered as that check settles it. Where that check races too, it is refused, held and
-        unreported, since nothing established that its record fails. One gone from the key by
-        that read is gone.
+        its seal, so it is handed to :meth:`_user_seal_failed`. Any other row holding the key by
+        then, including one only some of the checks read, did not race every check, so it is not
+        reported on that ground: it is checked once, and answered as that check settles it. Where
+        that check races too, it is refused, held and unreported, since nothing established that
+        its record fails; a caller's refusal text may still name a failing seal for it. One gone
+        from the key by that read is gone.
 
         Unlike :meth:`_checked_by_id`, this lookup has no Vault transit arms: an Unverifiable or
         an Outage answer from :meth:`_verified` propagates to the caller unreported here. The
         directory reconciler's rename reads rely on that, logging an Unverifiable answer at ERROR
         with no page and paging an Outage once for the pass (vault BACKLOG #3069 item 1)."""
-        last_id = ""
+        raced_ids: set[str] = set()
         for _pass in range(_CHECKED_READ_PASSES):
             raw = await read_user_or_unreadable(read())
             check = await self._verified(raw)
             if raw is None or check.settled:
                 return _UserLookup(check.user, raw is not None)
-            last_id = raw.id
+            raced_ids.add(raw.id)
         still_there = await read_user_or_unreadable(read())
         if still_there is None:
             return _UserLookup(None, False)
-        if still_there.id != last_id:
-            # Another account took the key after the last check (a rename, then a new holder of
-            # the name): reporting it would file a seal failure against a record nobody checked.
+        if raced_ids != {still_there.id}:
+            # Another account held the key at some pass or took it after the last one (a rename,
+            # then a new holder of the name): reporting it would file a seal failure against a
+            # record that did not race every check.
             other = await self._verified(still_there)
             return _UserLookup(other.user, True)
         await self._user_seal_failed(still_there.id)
@@ -19951,8 +19955,9 @@ class AuthService:
     ) -> MfaReset:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
-        re-enroll. The always-available recovery for a locked-out passkey user. Raises
-        :class:`ValueError` for an unknown user.
+        re-enroll. The recovery for a locked-out passkey user whose record passes its seal. Raises
+        :class:`ValueError` for an unknown user, and for one whose record fails its seal, which
+        its loader reads as none.
 
         **IT COVERS A DIRECTORY ACCOUNT (BACKLOG #1144).** The non-local refusal that stood here was
         true while no directory account could hold an engine factor. Once one can, keeping it would

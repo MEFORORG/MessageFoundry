@@ -2005,8 +2005,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
         # SELF-EXCLUSION, AND IT BELONGS HERE RATHER THAN IN THE SERVICE (BACKLOG #1022).
         #
-        # `AuthService.admin_reset_mfa` is the ALWAYS-AVAILABLE RECOVERY for a locked-out passkey
-        # user and is deliberately unguarded (its own docstring, and ADR 0068 §2 via
+        # `AuthService.admin_reset_mfa` is the RECOVERY for a locked-out passkey user whose record
+        # passes its seal (a failing one is refused below) and is deliberately unguarded (its own docstring, and ADR 0068 §2 via
         # auth/webauthn.py). An actor check inside it would narrow the one path that exists when a
         # user has lost every factor. This route is the only caller today, so the distinction is
         # about WHICH CASE is refused, not about which function holds the line: cross-user recovery

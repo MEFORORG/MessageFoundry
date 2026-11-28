@@ -1832,11 +1832,13 @@ or federated pair cannot make it vanish from these reads. One that keeps changin
 `id` still can: a re-read by the old id finds nothing, so the row reads as gone under that id,
 unreported. Honest writes that race all three checks the same way would be a false alarm
 too. A sign-in, and at least provision-admin and the directory rename refresh, that looks an
-account up by username, directory id or federated pair is read the same way: a row that still
-holds the key after all three checks raced is refused and reported, under the same audit row and
-alert, so an operator can trace the refused sign-in to it; a different row holding the key by then
-is checked once instead and not reported unless that check fails. Unlike the admin reads, these
-lookups report nothing of their own for a Vault transit answer. **Two honest role writes to the account that commit across both of those reads
+account up by username, directory id or federated pair is read the same way: a row that all
+three checks read and that still holds the key after they all raced is refused and reported,
+under the same audit row and alert, so an operator can trace that refused sign-in to it. Any other
+row holding the key by then is checked once instead and reported only if that check fails; where
+that check races too, the sign-in is refused and nothing is reported, so not every refused
+sign-in has a row behind it. Unlike the admin reads, these lookups report nothing of their own for
+a Vault transit answer. **Two honest role writes to the account that commit across both of those reads
 are still answered as a failing record and reported**, a false alarm the reads cannot tell from
 tampering, because the role rows are read apart from the account's row. Since BACKLOG #5520,
 `PUT /users/{user_id}/roles`, and the console's `POST /ui/users/{user_id}/roles` that calls it,
@@ -4638,7 +4640,8 @@ write races.
   names an account whose only way past it was.
 - Without the `[webauthn]` extra no passkey is a way past: the gates and the census do not count
   one, and the sign-in treats an assertion as absent. `POST /users/{id}/reset-mfa` clears passkeys alongside TOTP — the
-always-available recovery, because passkeys mint **no recovery codes by design** (codes are phishable
+recovery for any target whose record passes its integrity seal (a failing one is refused, 423, as
+its table row says), because passkeys mint **no recovery codes by design** (codes are phishable
 knowledge secrets that would undercut the phishing-resistant tier). A covered local account that has TOTP
 keeps it beside its passkeys, since it cannot remove it, so TOTP is its fallback. On any other
 account, enroll a second passkey or keep TOTP.
