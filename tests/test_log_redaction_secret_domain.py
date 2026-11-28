@@ -393,6 +393,14 @@ FAMILIES: tuple[Family, ...] = (
         patterns=("_DSN_PASSWORD", "_WIDE_DSN_PASSWORD"),
     ),
     Family(
+        # A JDBC DSN with no user before its host: the narrow pattern takes the member's key, so
+        # only the member-tail pass before it hides the tail after the "@" (BACKLOG #5386).
+        name="dsn_member_tail",
+        line="jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss-Jdbc_Pass-57;",
+        secret="ss-Jdbc_Pass-57",
+        patterns=("_DSN_MEMBER_TAIL",),
+    ),
+    Family(
         # The exact shape resolve_env_settings emits on a cast failure. The producer is fixed too, but
         # the redactor is the backstop for every producer nobody has enumerated, so it must catch it.
         name="quoted_env_value_echo",
@@ -1147,6 +1155,7 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     assert not _unbounded_scan_repeats(scrub_mod._DSN_PASSWORD.pattern)
     assert not _unbounded_scan_repeats(redact_mod._DSN_PASSWORD.pattern)
     assert not _unbounded_scan_repeats(scrub_mod._WIDE_DSN_PASSWORD.pattern)
+    assert not _unbounded_scan_repeats(scrub_mod._DSN_MEMBER_TAIL.pattern)
     # THE LABEL START (BACKLOG #2999), both ways. Shipped, a word-only run after it is contained, as
     # after ``\b``. A lookbehind that can fire INSIDE a word run is not the same head, and is flagged.
     assert scrub_mod._LABEL_START == redact_mod._LABEL_START
@@ -1387,9 +1396,9 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
     NOT TRUE OF EVERY SHAPE. With no user before the host, as in
     ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``, the narrow pattern reads
     the host as the user and ``1433;user=svc;sslpassword=P`` as the password, since its password
-    class holds ";", so the member's label is inside its match and ``ss_Sec9`` prints. That pattern
-    predates BACKLOG #5386, and origin/main prints the same;
-    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail` pins it."""
+    class holds ";", so the member's label is inside its match. ``ss_Sec9`` printed there until
+    batch 20010, whose member-tail pass, run before the narrow one, hides it;
+    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail` holds that."""
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
@@ -1399,15 +1408,22 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
 
 
-def test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail() -> None:
-    """The residual the test above states, pinned so a fix shows up as a red here."""
+def test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail() -> None:
+    """The shape the test above states. The narrow pattern still takes the member's key; the
+    member-tail pass before it takes the key and the tail after the "@" (BACKLOG #5386, batch
+    20010). Until then ``ss_Sec9`` printed, and this test pinned that as a residual."""
     line = "jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;"
     match = scrub_mod._DSN_PASSWORD.search(line)
     assert match is not None and match.group(0) == (
         "sqlserver://db.invalid:1433;user=svc;sslpassword=P@"
     )
+    tail = scrub_mod._DSN_MEMBER_TAIL.search(line)
+    assert tail is not None and tail.group(0) == (
+        "sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9"
+    )
     for out in (redact_log_line(line), scrub_credentials(line)):
-        assert "ss_Sec9" in out and "sslpassword" not in out, out
+        assert "ss_Sec9" not in out and "sslpassword" not in out, out
+        assert out.startswith("jdbc:sqlserver://db.invalid:") and out.endswith("@;"), out
 
 
 @pytest.mark.parametrize(

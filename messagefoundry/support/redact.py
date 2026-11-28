@@ -58,6 +58,7 @@ from messagefoundry.secretscrub import (
     _BYTES_PROBE,
     _CONNECTION_STRING_FIRST_MEMBER,
     _CONNECTION_STRING_MEMBER,
+    _DSN_MEMBER_TAIL,
     _KEY_LINE,
     _KEY_SEPARATOR,
     _KV_TAILS,
@@ -722,6 +723,9 @@ def redact_log_line(line: str) -> str:
         body = _AUTH_SCHEME.sub(_keep_scheme, body)
         body = read(_CREDENTIAL_KV).sub(_keep_label, body)
         body = read(_KEY_MATERIAL).sub(_keep_label, body)
+        # secretscrub's JDBC member-tail pass, before the narrow copy takes the member's key.
+        if ";" in body and "@" in body and "://" in body:
+            body = _DSN_MEMBER_TAIL.sub(_keep_dsn_user, body)
         body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
         body = _redact_phi(body)  # shared engine PHI pass: HL7 segments/field runs + DOB + names
         # The second credential layer; see the comment above this function.

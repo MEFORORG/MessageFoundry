@@ -293,9 +293,12 @@ def test_a_lead_is_followed_by_the_empty_users_segment() -> None:
     assert wide.search("redis://ops:Kv9;w@cache") is not None
     match = wide.search("redis://ops:@Kv9w@cache")
     assert match is not None and match.group("lead") == "@", match
-    # After user@host a password that opens with "@", and an empty one, are not read: that branch
-    # has no group to keep the "@" signs in (code review).
-    for line in ("postgres://u@h:@pw@x", "smtp://u@h:@x"):
+    # After user@host a password that opens with "@" is read too since batch 20010, its "@" signs
+    # kept in group ``host_lead``. The segment after them is the empty user's, so a separator
+    # still ends the match, and a password that is only "@" signs is not read.
+    match = wide.search("postgres://u@h:@pw@x")
+    assert match is not None and match.group("host_lead") == "@", match
+    for line in ("smtp://u@h:@x", "postgres://u@h:@Kv9;w@x", "postgres://u@h:@@x"):
         assert wide.search(line) is None, line
 
 
@@ -336,22 +339,20 @@ _KNOWN_RESIDUALS = (
     ("x;PWD=P'Kv9_Sec;", "Kv9_Sec"),
     ("Server=h;Password=P'Kv9_Sec;Database=d", "Kv9_Sec"),
     ('x;pwd=P"Kv9_Sec;', "Kv9_Sec"),
-    # A JDBC DSN with no user before its host: the narrow match takes the member's key.
-    ("jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;", "ss_Sec9"),
-    # After user@host: a password opening with digits then a non-word character, a host word
-    # holding "_", and a user holding two "@".
+    # After user@host: a password opening with digits then a non-word character, and a host word
+    # holding "_". Three shapes this list held are hidden since batch 20010 and are held in
+    # ``tests/test_b20010_dsn_5386_remainder.py``: a JDBC DSN with no user before its host, a user
+    # holding two "@", and a password after user@host that opens with "@".
     ("postgres://ops@srv:12-Kv9Az@srv.example.invalid/x", "12-Kv9Az"),
     ("postgres://ops@srv_1:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
-    ("postgres://a@b@srv:Kv9_Az@srv.example.invalid/x", "Kv9_Az"),
     # After user@host or a lead, the segment is an empty user's, which stops at ";", "#", a quote,
-    # "," and the rest, and an all-digit password reads as a port; after user@host a password that
-    # opens with "@" is not read. The same password after a plain user is hidden.
+    # "," and the rest, and an all-digit password reads as a port. The same password after a plain
+    # user is hidden.
     ("x postgres://ops@srv:Kv9;x@db.invalid", "Kv9;x"),
     ("x postgres://ops@srv:Kv9#x@db.invalid", "Kv9#x"),
     ("x postgres://ops@srv:Kv9'x@db.invalid", "Kv9'x"),
     ("x postgres://ops@srv:Kv9,x@db.invalid", "Kv9,x"),
     ("x postgres://ops@srv:123456@db.invalid", "123456"),
-    ("x postgres://ops@srv:@Kv9x@db.invalid", "Kv9x"),
     ("x postgres://svc:@Kv9;x@db.invalid", "Kv9;x"),
 )
 
@@ -418,6 +419,21 @@ _SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("lead then bracket lookahead run", lambda n: "postgres://svc:@" + ("[aaaa" * n)[:n]),
     ("lead then equals run", lambda n: "postgres://svc:@" + ("a=" * n)[:n]),
     ("lead then separators", lambda n: "postgres://svc:@a" + ("=b|" * n)[:n]),
+    # Batch 20010: a user holding many "@", and a password after user@host opening with "@".
+    ("user holding at-sign hosts", lambda n: "postgres://u" + ("@h" * n)[:n] + ":x"),
+    ("host lead run", lambda n: "postgres://u@h:" + "@" * n),
+    ("host lead then letters", lambda n: "postgres://u@h:" + ("@a" * n)[:n] + " "),
+)
+
+#: The JDBC member-tail pass (batch 20010): segments with no key, a long key with no "=", a key
+#: before a tail with no terminator, and glued heads.
+_MEMBER_TAIL_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
+    ("semicolons with no key", lambda n: "jdbc:x://db:" + (";a" * n)[:n] + "@"),
+    ("one long key with no equals", lambda n: "jdbc:x://db:;" + "pass" * (n // 4) + "@"),
+    ("keys with no credential word", lambda n: "jdbc:x://db:" + (";a=b" * n)[:n] + "@"),
+    ("a tail with no terminator", lambda n: "jdbc:x://db:1;pwd=P@" + "a" * n + "'"),
+    ("a tail of label stops", lambda n: "jdbc:x://db:1;pwd=P@" + ("acc" * n)[:n] + "'"),
+    ("glued heads", lambda n: ("a://b:;pwd=" * n)[:n]),
 )
 
 _MEMBER_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
@@ -447,6 +463,7 @@ def test_the_dsn_and_member_patterns_grow_linearly_and_the_control_does_not() ->
     assert ratio > _MAX_GROWTH, f"the backtracking control grew only {ratio:.1f}x"
     for pattern, shapes in (
         (scrub_mod._WIDE_DSN_PASSWORD, _SHAPES),
+        (scrub_mod._DSN_MEMBER_TAIL, _MEMBER_TAIL_SHAPES),
         (scrub_mod._CONNECTION_STRING_MEMBER, _MEMBER_SHAPES),
         (scrub_mod._CONNECTION_STRING_FIRST_MEMBER, _FIRST_MEMBER_SHAPES),
     ):

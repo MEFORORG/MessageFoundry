@@ -4019,12 +4019,18 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     # that does not start with one, its first segment takes one character or more, each of them in
     # the arm's class, and past it the pattern adds only a run that cannot hold whitespace or "/",
     # then the "@", and after a placeholder optional tail groups that cannot hold either, each
-    # ending in an "@": so every such text it rewrites, the arm reads. A user holding an "@", or a
-    # password starting with one (wave 3), the arm read neither before the rewrite nor after it,
-    # which keeps the "@" signs; the behaviour arm below each assert holds that.
+    # ending in an "@": so every such text it rewrites, the arm reads. A user holding one "@" or
+    # more, or a password starting with one (wave 3; after user@host too, batch 20010), the arm
+    # read neither before the rewrite nor after it, which keeps the "@" signs; the behaviour arm
+    # below each assert holds that.
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
-    assert r"://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)?):" in wide
-    for before in ("x postgres://us@er:Kv9x@db", "x postgres://svc:@Kv9x@db"):
+    assert r"://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)*+):" in wide
+    for before in (
+        "x postgres://us@er:Kv9x@db",
+        "x postgres://svc:@Kv9x@db",
+        "x postgres://a@b@srv:Kv9x@db",
+        "x postgres://ops@srv:@Kv9x@db",
+    ):
         after = secretscrub.scrub_credentials(before)
         assert "Kv9x" not in after, after
         assert redaction._CREDENTIAL_AHEAD.search(before) is None, before
