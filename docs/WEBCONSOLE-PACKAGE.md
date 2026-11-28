@@ -2,7 +2,7 @@
 
 # The web console package (`messagefoundry-webconsole`)
 
-The browser ops console served under `/ui` is a **separately-versioned second distribution** —
+The browser ops console served under `/ui` is a **separately released second distribution** —
 `messagefoundry-webconsole` (import `messagefoundry_webconsole`) — that the engine **mounts in-process,
 same-origin**, rather than an in-tree part of the engine wheel. This is "Option B" of
 [ADR 0065](adr/0065-web-ops-dashboard.md): the console's routes, rendering, and write-action registry
@@ -11,8 +11,9 @@ engine version, while keeping the proven same-origin security model (the console
 in-engine `messagefoundry/api/webui/` tree).
 
 This is the authoritative doc for that package: its architecture, the injection **seam** the engine and
-package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (not version),
-how to develop and test it, and its **honest scope** (what the extraction does and does not decouple).
+package agree on, the **version-skew gate** that keeps the two in lockstep of *meaning* (a shared
+version number does not guarantee it), how to develop and test it, and its **honest scope** (what
+the extraction does and does not decouple).
 
 > **The wheel is published; the engine-side extra is still not wired.** The distribution name
 > `messagefoundry-webconsole` was registered on PyPI on 2026-07-29 by the first `webconsole-v*` release,
@@ -34,13 +35,18 @@ how to develop and test it, and its **honest scope** (what the extraction does a
   same mechanic that keeps `harness/` out of the engine wheel — so a plain `pip install messagefoundry`
   stays byte-identical. The console is on by default for a loopback bind (ADR 0143); with it absent,
   the engine serves the JSON API only and prints a warning at startup.
-- **Independent version root.** Unlike `messagefoundry-harness` (deliberately lockstep — it reads the
-  engine's `__version__`), the console has its **own** `__version__`, tag, changelog, and PyPI cadence.
+- **The console carries the engine's version.** Every MessageFoundry distribution, the engine, the
+  web console, the toolkit and the harness, carries the engine's version (owner ruling
+  2026-11-28), so each console release takes the number of the engine release it pairs with:
+  console 0.5.3 pairs with engine 0.5.3. The console still keeps its **own** `__version__` in
+  `messagefoundry_webconsole/__init__.py`, set by hand at each release rather than read from the
+  engine as `messagefoundry-harness` does, and its own `webconsole-v*` tag, changelog and release
+  job. No CI check compares the two numbers.
   It depends on the engine through a PEP 508 **floor with no ceiling** (`messagefoundry>=X`), not
-  lockstep; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
+  an exact pin; [the next section](#the-engine-requirement-is-a-floor-with-no-ceiling) says why. **The
   floor is raised at each console release, not as the engine moves.** Console 0.4.0 set the first
   one, `messagefoundry>=0.5.0`, console 0.5.0 raised it to `messagefoundry>=0.5.2`, and console
-  0.6.0 raised it to `messagefoundry>=0.5.3`; 0.3.0 and earlier declared a bare `messagefoundry`
+  0.5.3 raised it to `messagefoundry>=0.5.3`; 0.3.0 and earlier declared a bare `messagefoundry`
   dependency. Step 2
   of [`RELEASE.md`](../packaging/messagefoundry-webconsole/RELEASE.md) sets it, and the
   `release-webconsole` job refuses a console wheel whose engine requirement has no lower bound.
@@ -199,11 +205,12 @@ source ships **package-only**.
 
 ## 3. The version-skew gate
 
-Independent versioning is exactly what makes runtime skew possible, so the engine repo carries a
-**contract-snapshot gate**. Its purpose: a silent, incompatible change to the injected contract — a
-renamed handler field, a re-signatured `api.security` dep or `AuthService` method, or a renamed field on
-a **DTO the console renders** (which breaks render, not import, so `mypy` alone misses it) — must fail
-CI until `ENGINE_UI_SEAM` is regenerated.
+Two separately installed wheels are exactly what makes runtime skew possible, matching version
+numbers or not, so the engine repo carries a **contract-snapshot gate**. Its purpose: a silent,
+incompatible change to the injected contract — a renamed handler field, a re-signatured
+`api.security` dep or `AuthService` method, or a renamed field on a **DTO the console renders**
+(which breaks render, not import, so `mypy` alone misses it) — must fail CI until `ENGINE_UI_SEAM`
+is regenerated.
 
 **The surface is DISCOVERED, not enumerated** (BACKLOG #1220). It used to be five hand-maintained
 tuples in the generator, and three of them had drifted: a list like that cannot detect its own

@@ -8,11 +8,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [0.5.3] — 2026-11-27 — Early Access
 
-This engine pairs with web console 0.6.0, which is published after it under its own
-`webconsole-v0.6.0` tag. Its UI seam is `2fdef0ec34ace13d`, so with the console on it refuses to
+This engine pairs with web console 0.5.3, which is published after it under its own
+`webconsole-v0.5.3` tag. Its UI seam is `2fdef0ec34ace13d`, so with the console on it refuses to
 start beside console 0.5.0 or older. Upgrade the two together, or set
 `[security].serve_web_console = false`. A `BACKLOG #N` number cites the project's private planning
 ledger, so it has no public page.
+
+Corrected after the release: as first published, at least this section, the README and the install
+guides named the console as 0.6.0 and its tag as `webconsole-v0.6.0`, and the README said not to
+pin the console at the engine's version. The console was renumbered 0.5.3, the engine's version,
+before it was published, so the pin to use is `messagefoundry-webconsole==0.5.3`. The PyPI page
+for engine 0.5.3 is built from the README at the `v0.5.3` tag, so it still carries the old text.
 
 ### Added
 - **A slow credential-reminder rescan is a named security loosening.** `[cert_monitor]` and

@@ -123,25 +123,25 @@ pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP
 pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
-**Web console 0.6.0 is the one that pairs with engine 0.5.3.** The browser console
-(`/ui`) ships as its own wheel, `messagefoundry-webconsole`, with its own version numbers. It does
-not share the engine's version, so do not pin the console at the engine's version. The engine
+**Web console 0.5.3 is the one that pairs with engine 0.5.3.** The browser console
+(`/ui`) ships as its own wheel, `messagefoundry-webconsole`, at the engine's version, so pin the
+console at the version of your engine. The engine
 mounts a console only if it was built against this engine's UI seam, the version of the interface
-between the two. Console 0.6.0 was built against engine 0.5.3's seam, which differs from the seam
-engine 0.5.2 shared with console 0.5.0. Console 0.6.0 is published after engine 0.5.3, under its
-own `webconsole-v0.6.0` tag. Pin the pair: `messagefoundry==0.5.3` with
-`messagefoundry-webconsole==0.6.0`. Without that console, engine 0.5.3 behaves like this:
+between the two. Console 0.5.3 was built against engine 0.5.3's seam, which differs from the seam
+engine 0.5.2 shared with console 0.5.0. Console 0.5.3 is published after engine 0.5.3, under its
+own `webconsole-v0.5.3` tag. Pin the pair: `messagefoundry==0.5.3` with
+`messagefoundry-webconsole==0.5.3`. Without that console, engine 0.5.3 behaves like this:
 
 - **No console installed:** the engine serves the JSON API only and prints a warning at startup. If you
   set `[security].serve_web_console = true`, it refuses to start instead.
 - **Console 0.5.0 or older installed, console on:** the engine refuses to start. Those consoles were
   built for an older engine, so startup stops with an import error or a seam mismatch. The console is
-  on by default for a loopback bind. Upgrade the console to 0.6.0, or set
+  on by default for a loopback bind. Upgrade the console to 0.5.3, or set
   `[security].serve_web_console = false`.
 
 **What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
 the browser **web console** served same-origin at `/ui`, which ships as a separate wheel
-(`messagefoundry-webconsole`) with its own version, so a headless server, container, or adopter
+(`messagefoundry-webconsole`) at the engine's version, so a headless server, container, or adopter
 install stays lean. The engine mounts the console in-process, and the console must match the engine's
 UI seam (see above); `[security].serve_web_console` turns it on or off. (The former PySide6 desktop
 console was retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test

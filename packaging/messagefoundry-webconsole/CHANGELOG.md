@@ -3,14 +3,17 @@
 # Changelog — messagefoundry-webconsole
 
 All notable changes to the **web console** distribution (`messagefoundry-webconsole`) are documented
-here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). From 0.5.3 the
+version is the engine's, which follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html),
+so a console number can move by a patch step across a breaking console change, as 0.5.0 to 0.5.3
+did. Pin the console exactly rather than with a compatible-release range such as `~=0.5.0`.
 
-This package is **separately versioned** from the engine and pins itself to the engine's
-`api._ui_seam.ENGINE_UI_SEAM` via `SUPPORTED_ENGINE_SEAMS`; each entry records the supported engine
-seam. Entries from before BACKLOG #1220 quote the integer that shipped at the time. A release since
-then quotes the digest it shipped with. The Unreleased entry points at the constant instead, because
-nobody picks that value and it can move until the release is cut. See
+This package has its own changelog and `webconsole-v*` tag
+([`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md) states the version rule), and
+pins itself to the engine's `api._ui_seam.ENGINE_UI_SEAM` via `SUPPORTED_ENGINE_SEAMS`; each entry
+records the supported engine seam. Entries from before BACKLOG #1220 quote the integer that shipped
+at the time. A release since then quotes the digest it shipped with. The Unreleased entry points at
+the constant instead, because nobody picks that value and it can move until the release is cut. See
 [`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md) for the seam handshake and the
 engine compatibility range.
 
@@ -20,13 +23,18 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
-## [0.6.0] — 2026-11-27 — Early Access
+## [0.5.3] — 2026-11-27 — Early Access
 
 **Requires engine 0.5.3. Supported engine UI seam: `2fdef0ec34ace13d`**, the value engine 0.5.3
 ships as `messagefoundry.api._ui_seam.ENGINE_UI_SEAM`. With the console on, any other engine refuses
 to start. Console 0.5.0 does not work with engine 0.5.3, and this console does not work with engine
 0.5.2 or older, so upgrade the two together. The entries marked as seam changes below say why the
 digest moved.
+
+This release is numbered 0.5.3, the engine's version, under the rule that every MessageFoundry
+distribution carries the engine's version
+([`docs/WEBCONSOLE-PACKAGE.md`](../../docs/WEBCONSOLE-PACKAGE.md)). Text in the source tree named
+it 0.6.0 before it was published; no console 0.6.0 was ever published.
 
 ### Added
 
@@ -54,7 +62,7 @@ digest moved.
 - **The package requires `messagefoundry>=0.5.3`.** Console 0.5.0 required `messagefoundry>=0.5.2`.
   The floor still has no ceiling (`RELEASE.md` step 2), so beside an older engine pip upgrades the
   engine, and an unpinned upgrade takes the newest release, whose seam may differ. Pin both:
-  `messagefoundry==0.5.3` with `messagefoundry-webconsole==0.6.0`.
+  `messagefoundry==0.5.3` with `messagefoundry-webconsole==0.5.3`.
 - **The event log's kind filter reads the engine's one connection-event vocabulary.** The console
   no longer keeps its own list; it imports `CONNECTION_EVENT_KIND_ORDER` from the engine module
   `messagefoundry.connection_events`, and the choices and their order are unchanged. Needs an engine
@@ -1146,8 +1154,8 @@ two items sat under Unreleased.
   compat ranges, re-lock, add the release job) — see [`RELEASE.md`](RELEASE.md). It was not wired
   when this entry was written; the `release-webconsole` job published this wheel on 2026-07-29.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.6.0...HEAD
-[0.6.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.6.0
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/webconsole-v0.5.3...HEAD
+[0.5.3]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.5.3
 [0.5.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.5.0
 [0.4.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.4.0
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/webconsole-v0.3.0

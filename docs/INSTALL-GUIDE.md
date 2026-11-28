@@ -25,7 +25,7 @@ flowchart TB
   classDef devtool fill:#e0f2f1,stroke:#00796b,color:#06302b;
   classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
 
-  CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>its own version line"]:::opstool
+  CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>the engine's version"]:::opstool
   TOOLKIT["messagefoundry-toolkit<br/>authoring and development code moved out of the engine<br/>the engine's version"]:::devtool
   HARNESS["messagefoundry-harness<br/>synthetic send, receive, load and failover testing<br/>the engine's version"]:::devtool
 
@@ -62,9 +62,9 @@ Three facts about versions:
 - The toolkit and the harness each declare the engine at exactly their own version, and the
   harness declares the toolkit the same way, so installing the harness also installs the toolkit and
   its command. Install all three at one version, and upgrade them together.
-- The web console has its own version line. Its wheel declares a lowest engine version, but the
-  pair must also match. The engine checks the pair when it mounts the console and refuses a
-  mismatch. Section 7 names the console release to install.
+- The web console carries the engine's version too, but its wheel declares only a lowest engine
+  version, so pip does not hold the pair together. The engine checks the pair when it mounts the
+  console and refuses a mismatch. Section 7 names the console release to install.
 - Every distribution needs Python 3.14 or later.
 
 [ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
@@ -421,14 +421,14 @@ rules are in [SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs
 ### Launching the admin console (in a browser)
 
 Operators monitor and run an instance from the **browser web console** served same-origin at `/ui`.
-It ships as a separate wheel (`messagefoundry-webconsole`) on its **own version line** — deliberately
-*not* lockstep with the engine — that the engine mounts in-process. The pair is checked at startup
-against the engine's UI-seam version and a mismatched pair is **refused**, so install the console
-release built for the engine version you pinned. The console is **on by default**, so on a local
+It ships as a separate wheel (`messagefoundry-webconsole`), at the engine's version, that the
+engine mounts in-process. The pair is checked at startup against the engine's UI-seam version and
+a mismatched pair is **refused**, so install the console release built for the engine version you
+pinned. The console is **on by default**, so on a local
 instance installing it is all you need:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.6.0"    # the /ui web console for engine 0.5.3, into the same venv
+pip install "messagefoundry-webconsole==0.5.3"    # the /ui web console for engine 0.5.3, into the same venv
 # then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
 # [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```

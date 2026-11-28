@@ -280,10 +280,11 @@ version.
 
 What an engine bump does not move:
 
-- **The `messagefoundry-webconsole==` pins.** The console has its own version line, and the same
-  test holds the pins in the documents it sweeps to `__version__` in
-  `messagefoundry_webconsole/__init__.py`. They move when the console releases, not when the engine
-  does. A *for engine* phrase next to one still moves, under item 4.
+- **The `messagefoundry-webconsole==` pins.** The console carries the engine's version
+  ([`docs/WEBCONSOLE-PACKAGE.md`](docs/WEBCONSOLE-PACKAGE.md)), but the same test holds the pins in
+  the documents it sweeps to `__version__` in `messagefoundry_webconsole/__init__.py`, not to the
+  engine's. They move in the commit that sets the console's `__version__` to the new number. A
+  *for engine* phrase next to one still moves, under item 4.
 - **The early-access cautions** in `docs/INSTALL-GUIDE.md` and `docs/EARLY-ADOPTER-GUIDE.md`. They
   name no version on purpose; keep it that way.
 - Pre-release spelling examples such as `0.5.0rc1` and `v0.5.0-rc1`, and a version named as
