@@ -163,18 +163,19 @@ function prefixOf(head: string, segments: readonly string[], n: number): string 
  * it (a subst drive is UNMEASURED), or when a folder on its real path has the workspace folder's
  * {@link LinkFs.fileId}, which was measured to place a UNC loopback admin share: Node keeps a UNC spelling's server and share, so the real path
  * of `\\localhost\C$\ws` is that spelling and not `C:\ws`, while the device and file id are the same
- * (measured 2026-11-27 on Windows 11 with Node v24.20.0, through `\\localhost\D$` and
- * `\\127.0.0.1\D$`). An entry with no file id ({@link NO_FILE_ID}), the workspace folder's own
+ * (measured 2026-11-27 on Windows 11 with standalone Node v24.20.0, not the editor's Electron
+ * runtime, through `\\localhost\D$` and `\\127.0.0.1\D$`). An entry with no file id ({@link NO_FILE_ID}), the workspace folder's own
  * included, is placed by real path only, so where the workspace folder has none a UNC alias of it
  * is not placed (an open limit below). False when no folder on `target` is inside, the walk
  * stopping at the first that does not exist; undefined when the workspace folder cannot be read,
  * a folder on `target` is a dangling link, any other read fails, a spelling cannot be split into
  * its folders ({@link rootAndSegments}), or there is no `fileId`.
  *
- * Open limit: a real path follows every link at once, so an alias onto a folder that is itself a
- * link the repository holds is placed where that link leads, not in the workspace folder, and the
- * repository's link is not checked. Only a walk that follows each link one hop at a time would see
- * it pass through the folder.
+ * Open limit: a real path follows every link at once, so an alias whose target passes through a
+ * link the repository holds, at any depth, is placed where that link leads, not in the workspace
+ * folder, and the repository's link is not checked: an alias onto `ws\linked` or onto
+ * `ws\linked\deeper`, where `ws\linked` is the repository's link (measured). Only a walk that
+ * follows each link one hop at a time would see it pass through the folder.
  */
 function reachesWorkspace(
   root: string,
@@ -191,7 +192,7 @@ function reachesWorkspace(
       try {
         ids.set(p, fsx.fileId?.(p));
       } catch (e) {
-        if ((e as { code?: unknown }).code !== NO_FILE_ID) {
+        if (typeof e !== "object" || e === null || (e as { code?: unknown }).code !== NO_FILE_ID) {
           throw e;
         }
         ids.set(p, undefined);
@@ -252,6 +253,38 @@ function reachesWorkspace(
   return false;
 }
 
+/** The refusal for a user-set path {@link reachesWorkspace} could not read. */
+const UNREAD_PATH =
+  "messagefoundry.serviceConfig, set in user settings, names a path this check could not read to tell " +
+  "whether it reaches the workspace folder by another spelling: at least a folder on it that cannot be " +
+  "read, a dangling link on it, or a long-path or device prefix. Name a path whose folders can be read, " +
+  "spelled without such a prefix, or one inside the workspace folder";
+
+/** The refusal for a folder or file name in `rel` that Windows can open as another entry or a
+ *  device ({@link hasTrailingDotOrSpaceName}, {@link hasColonInName}, {@link hasReservedDeviceName}),
+ *  or undefined. `inWhere` names where the path is, with a leading space, or is empty. */
+function nameProblem(rel: string, inWhere: string): string | undefined {
+  if (hasTrailingDotOrSpaceName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that ends in ` +
+      "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space"
+    );
+  }
+  if (hasColonInName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that holds ` +
+      "a colon, which Windows opens as a stream on another entry. Remove the colon"
+    );
+  }
+  if (hasReservedDeviceName(rel)) {
+    return (
+      `messagefoundry.serviceConfig names a path${inWhere} with a folder or file name that is ` +
+      "a Windows device name such as nul or com1, which Windows can open as the device. Rename the folder or file"
+    );
+  }
+  return undefined;
+}
+
 /** Whether the workspace folder `root` lies inside the folder that holds the `.code-workspace` file
  *  `workspaceFile`, an absolute path, as spelled and by real path; any realpath error refuses. */
 function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: LinkFs): boolean {
@@ -307,11 +340,16 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    by real path; any realpath error refuses (BACKLOG #8237 item 57). And since the file may choose
  *    a folder below its own as the workspace folder, a user-set path spelled inside the file's
  *    folder but outside the workspace folder, that rule 3 places nowhere in the workspace folder,
- *    gets the name checks and the link walk above from the file's folder instead.
+ *    gets the name checks and the link walk above from the file's folder instead. A path spelled
+ *    outside the file's folder is placed in it as rule 3 places one in the workspace folder, by
+ *    real path and file id, with the same open limits.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
- *    and the folder itself is refused. Otherwise, once the case variant below is settled, each
- *    folder on its path is read, shallowest first and the drive or share root included, down to
+ *    and the folder itself is refused. Otherwise every folder and file name on its whole path gets
+ *    rule 2's name checks first, before any file-system call: a name ending in a dot or a space,
+ *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
+ *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
+ *    once the case variant below is settled, each folder on its path is read, shallowest first and the drive or share root included, down to
  *    the first that does not exist (BACKLOG #8237 item 16). The first that is inside the workspace
  *    folder by real path, or whose real path passes through a folder with the workspace folder's
  *    device and file id ({@link LinkFs.fileId}), means the path reaches the folder by another
@@ -337,16 +375,18 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
  * a caller that passes no `fileId` refuses then.
  *
- * Open limits. Rule 3's placement was measured on Windows 11 with Node v24.20.0 for a junction
- * and a directory symbolic link (by real path) and a UNC loopback admin share (by file id), and
- * nothing else: at least a subst or mapped drive, an 8.3 short name, a bind mount and a macOS
- * firmlink are UNMEASURED, and may be accepted as written with no link check. Where the
+ * Open limits. Rule 3's placement was measured on Windows 11 with standalone Node v24.20.0, not
+ * the editor's Electron runtime, for a junction and a directory symbolic link (by real path) and a
+ * UNC loopback admin share (by file id), and nothing else: at least a subst or mapped drive, an
+ * 8.3 short name, a bind mount and a macOS firmlink are UNMEASURED, and may be accepted as written
+ * with no link check. Where the
  * workspace folder reports no file id ({@link NO_FILE_ID}), a UNC alias of it is accepted as
  * written with no link check: a fail-open, though no looser than before #8237 item 16, when every
- * user-set path outside the folder was. A real path follows every link at once, so an alias onto
- * a folder that is itself a link the repository holds is placed where that link leads, and the
- * repository's link is not checked; following each link one hop at a time would be needed to see
- * it. Where the
+ * user-set path outside the folder was. A real path follows every link at once, so an alias whose
+ * target passes through a link the repository holds, at any depth, is placed where that link
+ * leads and the repository's link is not checked: measured for an alias onto `ws\linked\deeper`,
+ * where `ws\linked` is the repository's junction. Following each link one hop at a time would be
+ * needed to see it. Where the
  * native realpath fails, at least with EISDIR on some RAM disks and virtual drives, every user-set
  * path refuses, as every rule 2 path already did. Its reads are synchronous, so a user-set path on a slow share holds the extension host while they
  * run. Nor does this check cover the files the CLI creates beside the target, or a link made
@@ -386,6 +426,15 @@ export function securityConfigTarget(
               "in user settings",
       };
     }
+    // Every folder and file name on a user-set path outside the folder, before any read: Node reads
+    // `ws.` as written and finds nothing, while the CLI's Win32 open drops the dot, so an alias of
+    // the folder spelled that way would pass the walk below and reach the folder's links (BACKLOG
+    // #8237 item 16, review round-d1ff257d). Refused, never normalised and accepted.
+    const spelled = rootAndSegments(target);
+    const named = spelled === undefined ? undefined : nameProblem(spelled.segments.join(path.sep), "");
+    if (named !== undefined) {
+      return { ok: false, problem: named };
+    }
     if (variant !== undefined) {
       const same = isWorkspaceFolder(root, variant.head, fsx);
       if (same === undefined) {
@@ -404,25 +453,30 @@ export function securityConfigTarget(
     if (below === undefined) {
       const reached = reachesWorkspace(root, target, fsx);
       if (reached === undefined) {
-        return {
-          ok: false,
-          problem:
-            "messagefoundry.serviceConfig, set in user settings, names a path this check could not read to tell " +
-            "whether it reaches the workspace folder by another spelling: at least a folder on it that cannot be " +
-            "read, a dangling link on it, or a long-path or device prefix. Name a path whose folders can be read, " +
-            "spelled without such a prefix, or one inside the workspace folder",
-        };
+        return { ok: false, problem: UNREAD_PATH };
       }
       if (reached !== false) {
         below = reached.rest;
         aliasById = reached.byId;
       } else {
         // In a .code-workspace window the file's own folder is checked too, since the file may have
-        // chosen a folder below it as the workspace folder (BACKLOG #8237 item 57).
+        // chosen a folder below it as the workspace folder (BACKLOG #8237 item 57), and is placed
+        // the same way: by spelling, then by real path and file id.
         const home = scope.workspaceFile === undefined ? undefined : path.dirname(scope.workspaceFile);
-        below = home === undefined ? undefined : segmentsBelow(home, target);
-        if (home === undefined || below === undefined) {
+        if (home === undefined) {
           return { ok: true, path: target };
+        }
+        below = segmentsBelow(home, target);
+        if (below === undefined) {
+          const viaHome = reachesWorkspace(home, target, fsx);
+          if (viaHome === undefined) {
+            return { ok: false, problem: UNREAD_PATH };
+          }
+          if (viaHome === false) {
+            return { ok: true, path: target };
+          }
+          below = viaHome.rest;
+          aliasById = viaHome.byId;
         }
         base = home;
       }
@@ -434,29 +488,9 @@ export function securityConfigTarget(
     return { ok: false, problem: `messagefoundry.serviceConfig names ${where} itself, not a file` };
   }
   const rel = below.join(path.sep);
-  if (hasTrailingDotOrSpaceName(rel)) {
-    return {
-      ok: false,
-      problem:
-        `messagefoundry.serviceConfig names a path in ${where} with a folder or file name that ends in ` +
-        "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space",
-    };
-  }
-  if (hasColonInName(rel)) {
-    return {
-      ok: false,
-      problem:
-        `messagefoundry.serviceConfig names a path in ${where} with a folder or file name that holds ` +
-        "a colon, which Windows opens as a stream on another entry. Remove the colon",
-    };
-  }
-  if (hasReservedDeviceName(rel)) {
-    return {
-      ok: false,
-      problem:
-        `messagefoundry.serviceConfig names a path in ${where} with a folder or file name that is ` +
-        "a Windows device name such as nul or com1, which Windows can open as the device. Rename the folder or file",
-    };
+  const named = nameProblem(rel, ` in ${where}`);
+  if (named !== undefined) {
+    return { ok: false, problem: named };
   }
   if (base === root && scope.workspaceFile !== undefined && !insideWorkspaceFileFolder(root, scope.workspaceFile, fsx)) {
     return {

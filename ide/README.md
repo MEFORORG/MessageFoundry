@@ -245,13 +245,16 @@ and uses your user value or the default instead, until you trust the workspace (
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. A user-set path
-  that reaches the workspace folder or a folder below it through a junction or a directory symbolic
-  link outside the folder (by real path), or a UNC loopback admin share (by file id), gets the same
-  checks on the part below the folder; those three were measured on Windows with Node v24.20.0.
+  with a folder or file name anywhere on it that ends in a dot or a space, holds a colon or is a
+  device name is refused before any read. One that reaches the workspace folder or a folder below
+  it through a junction or a directory symbolic link outside the folder (by real path), or a UNC
+  loopback admin share (by file id), gets the same checks on the part below the folder; those three
+  were measured on Windows with standalone Node v24.20.0, not the editor's Electron runtime.
   Open limits: other spellings, a subst drive among them, are unmeasured and may be accepted as
   written; where the workspace folder reports no file id, a UNC alias of it is accepted as written,
-  no looser than before; and an alias onto a folder that is itself a link the repository holds is
-  followed where that link leads, unchecked. In a window opened from a `.code-workspace` file, which
+  no looser than before; and an alias whose target passes through a link the repository holds, at
+  any depth (an alias onto `ws\linked\deeper`, measured), is followed where that link leads,
+  unchecked. In a window opened from a `.code-workspace` file, which
   chooses the workspace folder, a path inside that folder, the default one included, is refused
   unless the folder lies inside the folder holding the file. The rules and the open limits are in the
   `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits

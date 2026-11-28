@@ -294,8 +294,83 @@ windowsSuite("b20008 F: aliases of a real workspace folder (#8237 item 16)", () 
     }
     const file = path.join(outside, "onto-held", "x.toml");
     assert.deepStrictEqual(securityConfigTarget(ws, file, user, real()), { ok: true, path: file });
+    // At any depth below the repository's link too: an alias onto ws\held\deeper.
+    fs.mkdirSync(path.join(victim, "deeper"));
+    fs.symlinkSync(path.join(ws, "held", "deeper"), path.join(outside, "onto-deeper"), "junction");
+    const deeper = path.join(outside, "onto-deeper", "x.toml");
+    assert.deepStrictEqual(securityConfigTarget(ws, deeper, user, real()), { ok: true, path: deeper });
     // The same link reached through the workspace folder's own spelling is refused.
     assert.strictEqual(securityConfigTarget(ws, path.join(ws, "held", "x.toml"), user, real()).ok, false);
+  });
+
+  test("a directory symbolic link outside the folder onto a folder below it is placed by real path", function () {
+    try {
+      fs.symlinkSync(path.join(ws, "sub"), path.join(outside, "symalias"), "dir");
+    } catch {
+      this.skip(); // a directory symbolic link needs a privilege or Developer Mode on Windows
+    }
+    fs.symlinkSync(outside, path.join(ws, "sub", "linked"), "junction");
+    const linked = securityConfigTarget(ws, path.join(outside, "symalias", "linked", "x.toml"), user, real());
+    assert.ok(!linked.ok && linked.problem.includes("passes through a link"), JSON.stringify(linked));
+    // THE CONTROL: a plain folder through the same symbolic link is the workspace's own file.
+    assert.deepStrictEqual(securityConfigTarget(ws, path.join(outside, "symalias", "plain", "x.toml"), user, real()), {
+      ok: true,
+      path: path.join(ws, "sub", "plain", "x.toml"),
+    });
+  });
+
+  test("an alias spelled with a trailing dot is refused, not walked (round-d1ff257d finding 1)", function () {
+    // Node reads `ws.` as written and finds nothing there; the CLI's Win32 open drops the dot and
+    // follows the repository's link out of the folder.
+    try {
+      fs.symlinkSync(outside, path.join(ws, "linked"), "junction");
+      fs.symlinkSync(ws, path.join(outside, "alias"), "junction");
+    } catch {
+      this.skip();
+    }
+    const unc = `\\\\localhost\\${ws[0]}$${ws.slice(2)}`;
+    for (const spelled of [`${ws}.\\linked\\x.toml`, `${outside}\\alias.\\linked\\x.toml`, `${unc}.\\linked\\x.toml`, `${ws} \\linked\\x.toml`]) {
+      const got = securityConfigTarget(ws, spelled, user, real());
+      assert.ok(!got.ok && got.problem.includes("dot or a space"), `${spelled} ${JSON.stringify(got)}`);
+    }
+    // THE CONTROL: the same alias without the dot reaches the folder and is refused by the link walk,
+    // and a plain folder through it is accepted.
+    const plainAlias = securityConfigTarget(ws, `${outside}\\alias\\linked\\x.toml`, user, real());
+    assert.ok(!plainAlias.ok && plainAlias.problem.includes("passes through a link"), JSON.stringify(plainAlias));
+    assert.ok(securityConfigTarget(ws, `${outside}\\alias\\sub\\plain\\x.toml`, user, real()).ok);
+  });
+});
+
+windowsSuite("b20008 F: every name on a user-set path is checked before any read (round-d1ff257d finding 1)", () => {
+  const none: LinkFs = {
+    lstat: () => {
+      throw new Error("lstat called");
+    },
+    realpath: () => {
+      throw new Error("realpath called");
+    },
+    fileId: () => {
+      throw new Error("fileId called");
+    },
+  };
+
+  test("a trailing dot or space, a colon or a device name anywhere on the path refuses with no file-system call", () => {
+    for (const [spelled, said] of [
+      ["C:\\ws.\\linked\\x.toml", "dot or a space"],
+      ["C:\\ws \\x.toml", "dot or a space"],
+      ["\\\\localhost\\C$\\ws.\\x.toml", "dot or a space"],
+      ["D:\\elsewhere\\cfg:s\\x.toml", "colon"],
+      ["D:\\elsewhere\\nul\\x.toml", "device name"],
+      ["D:\\elsewhere\\x.toml.", "dot or a space"],
+    ]) {
+      const got = securityConfigTarget("C:\\ws", spelled, user, none);
+      assert.ok(!got.ok && got.problem.includes(said), `${spelled} ${JSON.stringify(got)}`);
+    }
+  });
+
+  test("in a .code-workspace window, a trailing-dot spelling of the chosen folder is refused, not accepted", () => {
+    const got = securityConfigTarget("C:\\chosen", "C:\\chosen.\\messagefoundry.toml", inWindow(user, "C:\\repo\\p.code-workspace"), none);
+    assert.ok(!got.ok && got.problem.includes("dot or a space"), JSON.stringify(got));
   });
 });
 
@@ -324,6 +399,9 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
       const got = securityConfigTarget(chosen, "messagefoundry.toml", inWindow(scope, workspaceFile), real);
       assert.ok(!got.ok && got.problem.includes(".code-workspace"), JSON.stringify(got));
     }
+    // The chosen folder spelled with a trailing dot, which the CLI's open drops, is refused too.
+    const dotted = securityConfigTarget(chosen, `${chosen}.\\messagefoundry.toml`, inWindow(user, workspaceFile), real);
+    assert.ok(!dotted.ok, JSON.stringify(dotted));
     // An absolute user path outside the chosen folder is the operator's, and is not refused for it.
     const mine = path.join(base, "mine.toml");
     assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
@@ -382,6 +460,23 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     const chosen = path.join(repo, "empty");
     const got = securityConfigTarget(chosen, path.join(repo, "cfg", "messagefoundry.toml"), inWindow(user, workspaceFile), real);
     assert.ok(!got.ok && got.problem.includes("passes through a link"), JSON.stringify(got));
+    // An alias of the file's folder is placed in it as well (round-d1ff257d finding 3): a junction
+    // outside onto it, and the UNC loopback admin share where this box has one.
+    fs.mkdirSync(path.join(base, "out"));
+    fs.symlinkSync(repo, path.join(base, "out", "repo-alias"), "junction");
+    const viaJunction = securityConfigTarget(chosen, path.join(base, "out", "repo-alias", "cfg", "m.toml"), inWindow(user, workspaceFile), real);
+    assert.ok(!viaJunction.ok && viaJunction.problem.includes("passes through a link"), JSON.stringify(viaJunction));
+    const unc = `\\\\localhost\\${repo[0]}$${repo.slice(2)}`;
+    let shared = false;
+    try {
+      shared = statId(unc) === statId(repo);
+    } catch {
+      shared = false; // no admin share on this box
+    }
+    if (shared) {
+      const viaUnc = securityConfigTarget(chosen, `${unc}\\cfg\\m.toml`, inWindow(user, workspaceFile), real);
+      assert.ok(!viaUnc.ok && viaUnc.problem.includes("passes through a link"), JSON.stringify(viaUnc));
+    }
     // THE CONTROL: a plain folder in the file's folder is accepted, and outside it nothing changes.
     const plain = path.join(repo, "plain", "messagefoundry.toml");
     assert.deepStrictEqual(securityConfigTarget(chosen, plain, inWindow(user, workspaceFile), real), { ok: true, path: plain });
