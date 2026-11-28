@@ -858,7 +858,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     except OSError as exc:  # the working directory
         return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
     # The path's own name is not walked, so a stream name, or a name ending in a dot or a space, is
-    # not refused by the walk.
+    # not refused by the walk. The device-prefix guard above still refuses one, since it reads every
+    # name (an over-refusal for the last name, which only the open reads).
     walked = full if full.parent == full else full.parent
     substituted: list[str] = []
     remote: list[str] = []

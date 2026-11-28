@@ -465,12 +465,14 @@ def _strip_win_prefix(path: str) -> str | None:
             rest = path[len(prefix) :]
             if prefix != "\\\\.\\" and not _verbatim_rest_is_plain(rest):
                 return None
+            if ntpath.isreserved(rest):
+                # Stripped, a reserved name (``NUL``, ``ca.pem.``) would be read by Win32's rules,
+                # and by abspath's, not as the name the prefixed open reads.
+                return None
             if rest[:4].upper() == "UNC\\":
                 return "\\\\" + rest[4:]
             if len(rest) >= 2 and rest[1] == ":" and rest[0].isascii() and rest[0].isalpha():
-                # Stripped, a reserved name (``NUL``, ``COM1.pem`` before Windows 11, ``ca.pem.``)
-                # would be read by Win32's rules, not as the file the prefixed open reads.
-                return None if ntpath.isreserved(rest) else rest
+                return rest
             if rest[:7].lower() == "volume{":
                 return "\\\\?\\" + rest
             return None
@@ -496,7 +498,18 @@ def _strip_nt_target(target: str) -> str | None:
         target[:4] in ("\\\\?\\", "\\??\\") and _verbatim_rest_is_plain(target[4:])
     ):
         return None
-    return _strip_win_prefix(target)
+    plain = _strip_win_prefix(target)
+    # The kernel reads a link target as written, a relative or unprefixed one too, so a DOS device
+    # name in it (``NUL``) is the file of that name, where the walk's Win32 probe reads the device.
+    # Only device names: the walk refuses the other reserved shapes later, each by its own cause.
+    return None if plain is None or _holds_dos_device_name(plain) else plain
+
+
+def _holds_dos_device_name(path: str) -> bool:
+    """Whether a name in ``path`` is a DOS device name (``NUL``, ``com1.pem``), read as
+    ``ntpath.isreserved`` reads one: its part before the first dot, trailing spaces dropped."""
+    names = ntpath.splitroot(path)[2].replace("/", "\\").split("\\")
+    return any(ntpath.isreserved(name.partition(".")[0].rstrip(" ")) for name in names)
 
 
 #: A probe answers ``(kind, link target or None)`` for one path, without following a final link.
@@ -661,11 +674,15 @@ def windows_chain(
       after the GUID.
     - A link or ``subst`` target with a device prefix other than an all-backslash ``\\\\?\\`` or
       ``\\??\\``, or a verbatim one the first rule refuses.
-    - A path, link target or ``subst`` target whose device prefix strips to a drive path holding a
-      name ``ntpath.isreserved`` reports, in any folder or its last name: a DOS device name
-      (``NUL``, ``COM1.pem``), a name ending in a space or a dot, or one holding a ``:`` or a
-      wildcard. The prefix skips Win32's rules for those names, so the open reads a file named
-      ``NUL``, where the stripped path the walk reads opens the device.
+    - A device-prefixed path holding a name ``ntpath.isreserved`` reports, in any folder or its
+      last name: a DOS device name (``NUL``, and ``COM1.pem`` and the others that releases before
+      Windows 11 reserve), a name ending in a space or a dot, or one holding a ``:`` or a
+      wildcard. A link or ``subst`` target, prefixed or not, holding a DOS device name, or, when
+      prefixed, any name that check reports. A verbatim prefix and a link target skip Win32's
+      rules for those names, and a ``\\\\.\\`` prefix its device-name rule, so the open reads a
+      file named ``NUL`` where the walk's Win32 probe opens the device. This over-refuses: at
+      least a device name a ``..`` after it removes under ``\\\\.\\``, and, on Windows 11, the
+      names it no longer reserves.
     - A relative path under a working directory whose first four characters are a device prefix,
       in any slashes: a rooted one (``\\x``); one under a working directory that strips to a bare
       drive, or keeps a ``\\\\?\\`` prefix with nothing after its drive or volume part; and one

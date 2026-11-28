@@ -550,7 +550,8 @@ def test_a_device_path_normpath_would_read_as_another_object_is_not_walked(path:
         r"\\?\C:\certs\CONOUT$",
         "\\\\?\\C:\\certs\\LPT\u00b9.pem",
         r"\\?\C:\NUL\ca.pem",
-        # The other names ntpath.isreserved reports, which Win32 also rewrites once stripped.
+        # The other names ntpath.isreserved reports. A verbatim open reads them as written; the
+        # walk refused them before too, only later and by another cause.
         r"\\?\C:\certs\ca.pem.",
         r"\\.\C:\certs\ca.pem ",
         r"\\?\C:\certs\ca.pem:stream",
@@ -578,13 +579,25 @@ def test_a_name_that_is_not_a_device_name_or_has_no_prefix_is_still_walked(path:
     assert cause is None
 
 
-@pytest.mark.parametrize("target", [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem"])
-def test_a_link_to_a_verbatim_dos_device_name_is_not_walked(target: str) -> None:
-    """A link target is an NT path the kernel reads as written, so ``\\??\\C:\\real\\NUL`` is the
-    file named ``NUL``, where the splice would have walked the device. Red as above."""
+@pytest.mark.parametrize(
+    "target",
+    [r"\??\C:\real\NUL", r"\\?\C:\real\com1.pem", "NUL", r"..\real\NUL", r"C:\real\NUL"],
+)
+def test_a_link_to_a_dos_device_name_is_not_walked(target: str) -> None:
+    """A link target is an NT path the kernel reads as written, a relative or unprefixed one too,
+    so ``NUL`` there is the file named ``NUL``, where the splice would have walked the device.
+    Measured on Windows 10.0.26300 for a relative symlink to ``NUL``. Red as above."""
     links = {"C:\\certs\\lnk": target}
     _chain, cause = windows_chain("C:\\certs\\lnk", "C:\\cwd", _probe(links))
     assert cause is not None and cause.kind == "a link points at a path this check does not read"
+
+
+@pytest.mark.parametrize("target", [r"\??\C:\real\NULL.pem", r"\\?\C:\real\COM10", r"..\console.d"])
+def test_a_link_to_a_name_that_only_looks_like_a_device_name_is_still_walked(target: str) -> None:
+    """The must-not-trip twins of the test above."""
+    links = {"C:\\certs\\lnk": target}
+    _chain, cause = windows_chain("C:\\certs\\lnk", "C:\\cwd", _probe(links))
+    assert cause is None
 
 
 @pytest.mark.parametrize("target", [r"\??\C:\real\..\other", r"\\.\C:\real\..\other"])

@@ -2304,6 +2304,10 @@ def test_windows_an_unknown_drive_type_is_unreadable(monkeypatch: pytest.MonkeyP
     [
         "\\\\?\\{real}\\x\\..\\store.key",  # verbatim: the open reads the ``..`` as a name
         "\\\\.\\{drive}\\..\\UNC\\host\\share\\store.key",  # Win32 climbs out onto a share
+        # abspath trims the dot the open reads as part of the folder name (vault BACKLOG #5515).
+        "\\??\\UNC\\host\\share\\keys.\\store.key",
+        "\\\\?\\UNC\\host\\share\\keys.\\store.key",
+        "\\\\?\\Volume{{0000}}\\keys.\\store.key",
     ],
 )
 def test_windows_a_device_spelling_the_walk_refuses_is_refused_before_abspath(
