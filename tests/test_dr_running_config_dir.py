@@ -1154,6 +1154,10 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
     not_leading.leader = False
     monkeypatch.setattr(rr, "_coordinator", not_leading)
     assert rr.lease_lost
+    # BACKLOG #5906: an activation now reads the lease before step 1 and aborts there with kind
+    # "lease" (tests/test_runner_doors_not_running.py). This case is a lease lost after that read,
+    # which only the profile's reload sees, so that early read is made to pass.
+    monkeypatch.setattr(coord, "_lease_lost", lambda: False)
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
     monkeypatch.undo()

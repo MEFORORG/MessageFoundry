@@ -1264,13 +1264,13 @@ class Engine:
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
                 hop_posture=self._hop_posture,
-                lease_lost=self._dr_lease_lost,
+                lease_lost=self._lease_lost,
             )
         return self._dr_coordinator
 
-    def _dr_lease_lost(self) -> bool:
-        """Whether the runner reads this node as lease-lost (BACKLOG #5906), read at each
-        activation so it follows a reload that swaps the runner."""
+    def _lease_lost(self) -> bool:
+        """Whether the runner reads this node as lease-lost (BACKLOG #5906), read at each call
+        so it follows a reload that swaps the runner."""
         rr = self._registry_runner
         return rr is not None and rr.lease_lost
 
@@ -3075,11 +3075,9 @@ class Engine:
         shared row; read after the reload, a refresh could have moved the cache to a later bump."""
         initiator_digest = self._initiator_digest(version)
         try:
-            rr = self._registry_runner
-            if rr is not None and rr.lease_lost:
-                # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
-                # here, before the load runs the config modules and the preflights read the
-                # anchors, since the convergence runner retries it every interval.
+            if self._lease_lost():
+                # BACKLOG #5906: reload_detail refuses this too, before it reads anything; refused
+                # here as well so the failure hook sees it without reload_detail being entered.
                 raise RunnerLeaseLostError.for_reload()
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -3804,8 +3802,7 @@ class Engine:
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
-        rr = self._registry_runner
-        if not dry_run and rr is not None and rr.lease_lost:
+        if not dry_run and self._lease_lost():
             # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
             # here, before the preflights read the anchors and the load runs the config modules,
             # on every path that applies a reload: the inline route, a released hold and
