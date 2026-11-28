@@ -104,7 +104,7 @@ from messagefoundry.store.keyprovider_vault import (
     transit_key_name_setting,
     vault_failure_text,
 )
-from messagefoundry.store.row_seal import transit_mac_version
+from messagefoundry.store.row_seal import configure_transit_bulk_workers, transit_mac_version
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -1617,6 +1617,8 @@ def build_transit_cipher(
             f"[store].cipher_provider={PROVIDER_NAME!r} could not reach a Vault transit key "
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
+    # The bulk pool is process-wide; this cipher's calls are the ones it runs (BACKLOG #3929).
+    configure_transit_bulk_workers(settings.transit_bulk_workers)
     return TransitCipher(
         client,
         key_name,

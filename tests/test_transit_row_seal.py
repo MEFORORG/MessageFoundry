@@ -314,7 +314,7 @@ async def test_transit_calls_run_on_their_own_bounded_pool() -> None:
     with pytest.raises(TransitSealUnverifiableError):  # a refusal runs the probe on it too
         await sealer.verify_held_async(USER_KIND, FIELDS, with_version(stored, "5"))
     assert backend.probe_calls == 1
-    assert all(n.startswith("mefor-transit-seal") for n in backend.thread_names)
+    assert all(n.startswith(row_seal.TRANSIT_SEAL_THREAD_PREFIX) for n in backend.thread_names)
     # The bound, measured: more concurrent checks than workers never run more than that at once.
     running = 0
     peak = 0

@@ -214,6 +214,7 @@ from messagefoundry.store.row_seal import (
     RevokedRowSealError,
     RowSealError,
     SealPager,
+    cipher_bulk_call,
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
@@ -10399,7 +10400,7 @@ class SqlServerStore(ServerCipherWalk):
 
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
-        self._state_cache = await cipher_call(
+        self._state_cache = await cipher_bulk_call(
             self._cipher,
             self._decode_state_rows,
             await self._fetchall("SELECT namespace, [key], value FROM state"),
@@ -10462,7 +10463,7 @@ class SqlServerStore(ServerCipherWalk):
         ``reference_version`` (the authoritative active-version list) LEFT JOIN ``reference`` so a set
         synced to ZERO rows is still a present empty ``{}``. Returns
         ``({name: {key: value}}, {name: version})``."""
-        return await cipher_call(
+        return await cipher_bulk_call(
             self._cipher, self._decode_reference_rows, await self._reference_rows()
         )
 
@@ -10634,7 +10635,7 @@ class SqlServerStore(ServerCipherWalk):
         # next converge to compare again.
         held = dict(self._reference_versions)
         rows = await self._reference_rows()
-        cache, versions = await cipher_call(self._cipher, self._decode_reference_rows, rows)
+        cache, versions = await cipher_bulk_call(self._cipher, self._decode_reference_rows, rows)
         refreshed: list[str] = []
         for name, version in versions.items():
             current = self._reference_versions.get(name)
@@ -15477,7 +15478,7 @@ class SqlServerStore(ServerCipherWalk):
         :func:`hmac.compare_digest` over :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
-        return await cipher_call(
+        return await cipher_bulk_call(
             self._audit_mac_fn,
             verify_audit_rows,
             await self._audit_rows(),

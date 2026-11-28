@@ -126,7 +126,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.base import sealed_read_errors, store_connect_errors
 from messagefoundry.store.crypto import Cipher
-from messagefoundry.store.row_seal import probe_row_sealer_at_start
+from messagefoundry.store.row_seal import probe_row_sealer_at_start, shutdown_transit_pools
 from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
@@ -4540,6 +4540,13 @@ class Engine:
                 failure = exc
             else:
                 log.exception("the store close failed after an engine stop step failed")
+        try:
+            # After the store close, so no store call is still handing work to them (BACKLOG #3929).
+            await shutdown_transit_pools()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            log.exception("the Transit call pools did not shut down cleanly")
         cancelled = cancelled or (me is not None and me.cancelling() > baseline)
         if failure is not None and not isinstance(failure, Exception):
             raise failure  # SystemExit, KeyboardInterrupt: never swallowed by a cancel

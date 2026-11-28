@@ -51,6 +51,7 @@ import hashlib
 import hmac
 import logging
 import math
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -557,31 +558,104 @@ _UNVERIFIABLE: Final = "unverifiable"
 #: asyncio's default executor, so a slow Vault cannot fill the default executor with seal checks.
 #: The row sealer's own calls use it, through ``_in_transit_pool``, and so do the store cipher
 #: calls routed through :func:`cipher_call` under a cipher that blocks on I/O (BACKLOG #3929): a
-#: seal check can queue behind cell encrypts and decrypts. Other store paths still hand Transit
-#: calls to the default executor through ``asyncio.to_thread``. The
+#: seal check can queue behind single cell encrypts and decrypts. A bulk walk, one call that
+#: makes many round trips, goes to the bulk pool instead (:func:`cipher_bulk_call`), so it never
+#: holds a thread of this one. A store path that hands a Transit call to ``asyncio.to_thread``
+#: itself still uses the default executor. The
 #: queue past the bound has no deadline, so a check waits for a free thread for as long as the
 #: calls ahead of it take, each bounded by the Vault client's own timeout; a thread whose caller
 #: was cancelled finishes its call, and interpreter exit waits for it.
 TRANSIT_SEAL_WORKERS: Final = 8
+#: The name every thread of the seal pool's name starts with.
+TRANSIT_SEAL_THREAD_PREFIX: Final = "mefor-transit-seal"
+#: The bulk pool's size when ``[store].transit_bulk_workers`` is not set (BACKLOG #3929). A
+#: judgement, not a measurement: small, so concurrent bulk walks cannot hold many Vault round trips
+#: at once, and more than one, so one long walk does not queue every other.
+TRANSIT_BULK_WORKERS_DEFAULT: Final = 2
+#: The largest bulk pool size the setting accepts.
+TRANSIT_BULK_WORKERS_MAX: Final = 64
+#: The name every thread of the bulk pool's name starts with.
+TRANSIT_BULK_THREAD_PREFIX: Final = "mefor-transit-bulk"
+
+# The bulk pool's size, and the pool, built on first use like the seal pool. A size set after the
+# pool is built applies to the next one, built after :func:`shutdown_transit_pools`.
+_bulk_workers: int = TRANSIT_BULK_WORKERS_DEFAULT
+_bulk_pool: ThreadPoolExecutor | None = None
+_bulk_pool_lock: Final = threading.Lock()
 
 
 @functools.cache
 def _transit_pool() -> ThreadPoolExecutor:
     # Built on first use, so a process that never seals through Transit builds no pool.
     return ThreadPoolExecutor(
-        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix="mefor-transit-seal"
+        max_workers=TRANSIT_SEAL_WORKERS, thread_name_prefix=TRANSIT_SEAL_THREAD_PREFIX
     )
 
 
-async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-    """``call(*args, **kwargs)`` on the row-seal Transit pool, in a copy of the caller's context
-    as :func:`asyncio.to_thread` runs it."""
+def checked_transit_bulk_workers(value: object) -> int:
+    """``value`` as a bulk pool size, or :class:`ValueError` when it is not an int from 1 to
+    :data:`TRANSIT_BULK_WORKERS_MAX`. A bool is refused, though Python counts it as an int."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"the Transit bulk pool size must be an int, not {type(value).__name__}")
+    if not 1 <= value <= TRANSIT_BULK_WORKERS_MAX:
+        raise ValueError(
+            f"the Transit bulk pool size must be from 1 to {TRANSIT_BULK_WORKERS_MAX}, not {value}"
+        )
+    return value
+
+
+def configure_transit_bulk_workers(value: object) -> None:
+    """Size the bulk pool (``[store].transit_bulk_workers``), refusing what
+    :func:`checked_transit_bulk_workers` refuses. A pool already built keeps its size until
+    :func:`shutdown_transit_pools`; the next one built takes this one."""
+    global _bulk_workers
+    checked = checked_transit_bulk_workers(value)
+    with _bulk_pool_lock:
+        _bulk_workers = checked
+
+
+def _transit_bulk_pool() -> ThreadPoolExecutor:
+    global _bulk_pool
+    with _bulk_pool_lock:
+        if _bulk_pool is None:
+            _bulk_pool = ThreadPoolExecutor(
+                max_workers=_bulk_workers, thread_name_prefix=TRANSIT_BULK_THREAD_PREFIX
+            )
+        return _bulk_pool
+
+
+async def shutdown_transit_pools() -> None:
+    """Shut down the seal pool and the bulk pool; each is built again on its next use.
+
+    Each pool's queued and running calls finish first. The wait runs in a worker thread, so the
+    event loop keeps serving while a Transit call still running completes, each bounded by the
+    Vault client's own timeout. A call handed to a pool after this detached it goes to a new pool;
+    one handed over while the detach runs can be refused, which reads as an outage
+    (:class:`~messagefoundry.store.crypto.CipherUnavailableError`)."""
+    global _bulk_pool
+    pools: list[ThreadPoolExecutor] = []
+    if _transit_pool.cache_info().currsize:
+        pools.append(_transit_pool())
+        _transit_pool.cache_clear()
+    with _bulk_pool_lock:
+        if _bulk_pool is not None:
+            pools.append(_bulk_pool)
+            _bulk_pool = None
+    # Drained at once, so the stop waits for the slower pool, not for the sum of both.
+    await asyncio.gather(*(asyncio.to_thread(pool.shutdown, wait=True) for pool in pools))
+
+
+async def _in_pool[**P, T](
+    pool: Callable[[], ThreadPoolExecutor], call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """``call(*args, **kwargs)`` on ``pool()``, in a copy of the caller's context as
+    :func:`asyncio.to_thread` runs it."""
     context = contextvars.copy_context()
     loop = asyncio.get_running_loop()
     bound = functools.partial(context.run, call, *args, **kwargs)
     refused = False
     try:
-        future = loop.run_in_executor(_transit_pool(), bound)
+        future = loop.run_in_executor(pool(), bound)
     except (
         RuntimeError
     ):  # the pool refused it (shut down), or queued it but could not start a thread
@@ -596,6 +670,18 @@ async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs
     return await future
 
 
+async def _in_transit_pool[**P, T](call: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """``call(*args, **kwargs)`` on the row-seal Transit pool (:func:`_in_pool`)."""
+    return await _in_pool(_transit_pool, call, *args, **kwargs)
+
+
+async def _in_transit_bulk_pool[**P, T](
+    call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """``call(*args, **kwargs)`` on the Transit bulk pool (:func:`_in_pool`)."""
+    return await _in_pool(_transit_bulk_pool, call, *args, **kwargs)
+
+
 async def cipher_call[**P, T](
     cipher: object, call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
 ) -> T:
@@ -604,9 +690,30 @@ async def cipher_call[**P, T](
     The stores route many of their cell cipher calls and audit MAC calls through this (BACKLOG
     #3929), though not all: some still run on the loop or through :func:`asyncio.to_thread`. Under
     the ``vault_transit`` cipher each call is an HTTP round trip, which held the event loop. Under
-    an in-process cipher the call runs here, on the loop, with no thread hop and no suspension."""
+    an in-process cipher the call runs here, on the loop, with no thread hop and no suspension.
+
+    A call that makes many round trips goes through :func:`cipher_bulk_call` instead, so it does
+    not hold a thread the row seal checks need."""
     if cipher_blocks_on_io(cipher):
         return await _in_transit_pool(call, *args, **kwargs)
+    return call(*args, **kwargs)
+
+
+async def cipher_bulk_call[**P, T](
+    cipher: object, call: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """:func:`cipher_call` for a bulk walk: on the Transit BULK pool when ``cipher`` blocks on I/O,
+    else inline, as :func:`cipher_call` runs it.
+
+    A bulk walk is one call that makes many Transit round trips: at least an audit chain walk, a
+    reference cache decode, SQL Server's state cache load and an at-open seal batch (BACKLOG
+    #3929, vault BACKLOG #8331 item 2). On the seal pool each held one of
+    :data:`TRANSIT_SEAL_WORKERS` threads for all its round trips, so row seal checks on the auth
+    path queued behind them. The bulk pool is separate and bounded (``[store].transit_bulk_workers``,
+    :data:`TRANSIT_BULK_WORKERS_DEFAULT` unset): a bulk walk past that bound queues behind other
+    bulk walks, with no deadline, and never takes a seal pool thread."""
+    if cipher_blocks_on_io(cipher):
+        return await _in_transit_bulk_pool(call, *args, **kwargs)
     return call(*args, **kwargs)
 
 
@@ -640,7 +747,7 @@ async def seal_chunks(
       refuses (at least an HTTP 400, a 413, or a reply without its ``reference`` echo) is sent
       value by value inside the one call, up to one request per value more, while the seal's
       transaction waits. A cancelled seal can then leave up to :data:`BATCH_MAX_ITEMS` values
-      running on in the Transit pool.
+      running on in the Transit bulk pool.
       A cipher that stops batching between the cut and the call can still send that chunk's
       values alone inside the one call.
     - An in-process cipher, such as AES-GCM, keeps the store's shape from before batching: with
@@ -651,7 +758,7 @@ async def seal_chunks(
     Only the first case is sized here. The cipher itself may still measure a value:
     ``TransitCipher.encrypt_many`` sizes every value, alone or not.
 
-    Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as that
+    Each chunk is one :func:`cipher_bulk_call` of :func:`encrypt_many`, and a failure raises, as that
     does."""
     items = [
         (
@@ -678,7 +785,10 @@ async def seal_chunks(
             end = start + 1
         if start:
             await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
-        yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])
+        yield (
+            rows[start:end],
+            await cipher_bulk_call(cipher, encrypt_many, cipher, items[start:end]),
+        )
         start = end
 
 
