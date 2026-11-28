@@ -37,6 +37,7 @@
       SessionStart, Stop                    -> scripts/hooks/mail-drain.ps1          (deliver session mail)
       Stop                                  -> scripts/hooks/seat-record.ps1         (record this seat's episode)
       Stop                                  -> scripts/hooks/wiki-write-prompt.ps1   (after real work, ask for one fleet wiki note)
+      Stop                                  -> scripts/hooks/runbook-take-prompt.ps1 (a held batch the runbook reads FREE: print the --take command)
 
     RETIRED, STRIPPED ON EVERY RUN AND NEVER ADDED
       Stop (async rewake)                   -> scripts/hooks/mail-watch.ps1          (the urgent mail tier; ADR 0161)
@@ -161,6 +162,13 @@ $SEAT_MARKER = "mefor-seat"
 # No one of the six contains another in either direction. Separate from mefor-seat, although both sit
 # on Stop, so the prompt can be removed (-Script wiki-write-prompt -Uninstall) and the recorder stays.
 $WIKI_MARKER = "mefor-wiki"
+
+# A SEVENTH marker, for the runbook take prompt (scripts/hooks/runbook-take-prompt.ps1). Same pairwise
+# rule, re-checked rather than assumed:
+#   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat / mefor-wiki / mefor-runbook
+# No one of the seven contains another in either direction. Separate, so the prompt can be removed
+# (-Script runbook-take-prompt -Uninstall) without touching the other Stop rows.
+$RUNBOOK_MARKER = "mefor-runbook"
 
 # The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
 # the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
@@ -311,6 +319,12 @@ $WIRING = @(
     # prompts, and never while stop_hook_active is set. Timeout 25: the script caps its transcript read so it ends well inside that.
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/wiki-write-prompt.ps1"; Timeout = 25; Msg = "Checking for a fleet wiki note"; Marker = $WIKI_MARKER; Shim = "notice"
         Notice = "[wiki] scripts/hooks/wiki-write-prompt.ps1 is missing from this checkout -- the fleet wiki write prompt is wired but resolving nothing." }
+    # The runbook take prompt (owner decision 2026-11-27, "Stop hook + Lander"). It never blocks: its
+    # only output is a systemMessage naming the read_batch.py --take command for a batch this seat's
+    # claims hold while the workbook reads FREE or names someone else. Timeout 20: the script kills its
+    # openpyxl helper at 12 s, and an unchanged workbook and claims directory cost it no xlsx read.
+    @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/runbook-take-prompt.ps1"; Timeout = 20; Msg = "Checking the runbook for a held batch"; Marker = $RUNBOOK_MARKER; Shim = "notice"
+        Notice = "[runbook] scripts/hooks/runbook-take-prompt.ps1 is missing from this checkout -- the runbook take prompt is wired but resolving nothing." }
 
     # The URGENT tier: mail-watch.ps1, armed at Stop, which is the moment the session goes IDLE.
     #
