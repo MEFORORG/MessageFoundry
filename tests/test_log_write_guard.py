@@ -1652,6 +1652,84 @@ def test_a_flap_bound_trip_says_a_pending_cause(
     assert logging_guard._ENCODING_UNREADABLE_FAULT in err
 
 
+def test_a_sink_rolling_on_past_the_flap_bound_forces_one_report(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Past the bound every roll writes the stage-2 line again (repeat), but only the first one
+    # moved the sink into stage 2, so only that one forces the format-fault report.
+    # NEGATIVE CONTROL: with record_unwritable returning True on a repeat call too, each of the
+    # five rolls past the trip forced its own format-fault line.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Flaky:
+        fail_next = False
+
+        @property
+        def encoding(self) -> str:
+            raise RuntimeError("encoding unavailable")
+
+        def write(self, text: str) -> int:
+            if self.fail_next:
+                self.fail_next = False
+                raise OSError(5, "EIO")
+            return len(text)
+
+    stream = _Flaky()
+    monkeypatch.setattr(sys, "stdout", stream)
+    handler = GuardedStreamHandler(stream, guard=LogWriteGuard())  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("first"))  # said at once, which starts the interval
+    capsys.readouterr()
+    for _ in range(logging_guard._MAX_ROLLS_PER_WINDOW + 1):  # the last one trips the bound
+        clock.now += 1
+        stream.fail_next = True
+        handler.emit(_record("rolls"))
+    assert capsys.readouterr().err.count("format faults since") == 1
+    for _ in range(5):
+        clock.now += 1
+        stream.fail_next = True
+        handler.emit(_record("rolls on"))
+
+    err = capsys.readouterr().err
+    assert err.count("IS UNWRITABLE") == 5
+    assert err.count("format faults since") == 0
+
+
+def test_a_stream_class_that_cannot_be_classified_is_said(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A class whose MRO cannot be read is read as having no encoding, so the write is never
+    # failed, and the classification failure is counted on the rated stderr line.
+    # NEGATIVE CONTROL: with the failure swallowed and read as "no encoding", the line was written
+    # and nothing was said.
+    class _BadMro(type):
+        @property
+        def __mro__(cls) -> tuple[type, ...]:
+            raise TypeError("no mro")
+
+    def write(self: object, text: str) -> int:
+        written.append(text)
+        return len(text)
+
+    written: list[str] = []
+    stream = _BadMro("Writer", (), {"write": write})()
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("hello"))
+
+    assert events == []
+    assert written == ["hello\n"]
+    assert f"{logging_guard._CLASSIFY_FAULT} ('TypeError')" in capsys.readouterr().err
+
+
 def test_a_formatter_fault_stage_2_says_a_pending_cause(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -486,19 +486,22 @@ case; a replacing stream never raises, so on serve's default stdout that escape 
 line carried `?`. The escape holds for every line the guard writes: the stdout sink's record
 writes, a file sink record the strict UTF-8 stream refused, the stand-in notice, the roll notice,
 the probe, and the re-write after a roll, escaped for the stream the roll left. Its bounds are at
-least these. Whether an `encoding` read that raises `AttributeError` means "none" is decided
-by the stream's class: only a class on its MRO that defines `encoding`, other than an empty
-`__slots__` member, makes it a failed read. So a stream with no `encoding` is written as the
-line came. So is a proxy forwarding through `__getattr__` or `__getattribute__`, such as
-`codecs.StreamWriter`, whose target has none or is gone, and so is a class whose `encoding`
-is a C-level member, as `io.TextIOWrapper`'s is: on a replacing stream such a line can carry
-`?` with nothing said. A proxy class that inherits a property `encoding`, as an
-`io.TextIOBase` subclass does, is read as unreadable instead. A stream whose `encoding` read raises anything
-else, or whose class defines it, is written with everything outside ASCII escaped. Each line to it is counted on the stderr format-fault line described below,
-naming the exception's type, whether or not the write lands. When the sink then reaches
-stage 2, that line is said at once, inside the report interval too, whenever the guard writes
-the stage-2 stderr line; later records on a sink already down keep the rated line. A stream that refuses
-even the ASCII line, as cp864 refuses `%`, fails the write, and the two stages decide. One whose `encoding` names
+least these. A stream whose `encoding` reads as a string is escaped for that codec. A stream whose
+`encoding` is missing, or reads as anything but a string, is written as the line came; on a
+replacing stream such a line can carry `?` with nothing said. That covers a stream with no
+`encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
+`__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose target has none or is
+gone. A read that raises `AttributeError` counts as missing, unless a class on the stream's MRO
+defines `encoding` as something other than a member descriptor. A member descriptor is an empty
+`__slots__` member or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything
+else, or raises `AttributeError` from such a definition, is unreadable. An unreadable stream is
+written with everything outside ASCII escaped. Each line to it is counted on the stderr
+format-fault line described below, naming the exception's type, whether or not the write lands. If
+classifying the stream's class fails, the stream is read as having no `encoding`, and that failure
+is counted on the same line. When the sink first reaches stage 2, that line is said at once, inside
+the report interval too. Later records keep the rated line, a sink that goes on rolling past the
+flap bound included. A stream that refuses even the ASCII line, as cp864 refuses `%`, fails the
+write, and the two stages decide. A stream whose `encoding` names
 a codec other than the one it uses is written escaped for the named codec, so it escapes more
 than it needs to where the named codec is the narrower, and too little where it is the
 wider, leaving the rest to the ASCII fallback below. For a stream

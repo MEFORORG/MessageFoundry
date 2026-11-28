@@ -388,8 +388,10 @@ class LogWriteGuard:
 
         ``reason`` arrives already scrubbed; :meth:`record_rollover` states that precondition.
 
-        Returns whether this call wrote the stage-2 stderr line, which is how a guarded sink
-        knows to say its pending format faults at once (BACKLOG #5813)."""
+        Returns whether this call moved the sink into stage 2 (it was not already unwritable),
+        which is how a guarded sink knows to say its pending format faults at once (BACKLOG
+        #5813). A ``repeat`` call writes the stderr line again but returns False, so a sink that
+        goes on rolling past the flap bound does not force a report per record."""
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -439,7 +441,7 @@ class LogWriteGuard:
             f"{cause}: {reason}{others}"
         )
         self._fire_stage2(event)
-        return True
+        return not already_down
 
     def _fire_stage2(self, event: LogSinkEvent) -> None:
         """Fire a stage-2 event, and remember the break as owed one when the event was not
@@ -849,16 +851,19 @@ def _encoding_read_can_fail(cls: type) -> bool:
     such as ``io.TextIOWrapper``'s), so a property raised it. The metaclass
     is not searched, and a proxy forwarding through ``__getattr__`` or ``__getattribute__`` does
     not count: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not.
-    Never raises; any failure while classifying reads as "no encoding", so classifying can never
-    turn a healthy stream into a failed write. Walked per call, with no cache to hold classes."""
-    try:
-        for klass in cls.__mro__:
-            found = vars(klass).get("encoding", _NO_ATTRIBUTE)
-            if found is not _NO_ATTRIBUTE:
-                return not isinstance(found, types.MemberDescriptorType)
-    except Exception:  # an exotic class whose MRO or namespace cannot be read
-        return False
+    Raises what reading an exotic class's MRO or namespace raises; :meth:`_write_line` reads that
+    as "no encoding" and counts it, so classifying never turns a healthy stream into a failed
+    write. Walked per call, with no cache to hold classes."""
+    for klass in cls.__mro__:
+        found = vars(klass).get("encoding", _NO_ATTRIBUTE)
+        if found is not _NO_ATTRIBUTE:
+            return not isinstance(found, types.MemberDescriptorType)
     return False
+
+
+#: The stderr format-fault line's entry for a stream class that could not be classified, so its
+#: lines were written as they came (BACKLOG #5813). The entry names the exception's type.
+_CLASSIFY_FAULT = "the sink's stream class could not be classified"
 
 
 #: The start of the stderr format-fault line's entry for a stream whose ``encoding`` could not be
@@ -1121,7 +1126,7 @@ class _GuardedSinkMixin(_SinkBase):
         faults[detail] = faults.get(detail, 0) + 1
 
     def _say_faults(self, *, newly_down: bool) -> None:
-        """After a stage-2 call: when it wrote the stage-2 stderr line (``newly_down``), say every
+        """After a stage-2 call: when it moved the sink into stage 2 (``newly_down``), say every
         counted fault at once, the interval notwithstanding, since the sink is dead, no later
         write will, and a fault counted on the way (an unreadable encoding, say) can be the cause
         the operator needs. Otherwise the rated line, so each later record on a sink already down
@@ -1134,8 +1139,8 @@ class _GuardedSinkMixin(_SinkBase):
         ``force``. Faults counted inside that interval wait for the next call after it: the next
         fault, the next guard write (:meth:`_write_line` ends in this call, and the stdout sink
         writes every record through it), the next ``flush`` (a file sink record ends in one),
-        a stage-2 failure (:meth:`_say_faults`, which forces it when the guard writes the stage-2
-        line), or ``close``, which forces it. Called under the handler's lock. Never raises."""
+        a stage-2 failure (:meth:`_say_faults`, which forces it when the sink first goes into
+        stage 2), or ``close``, which forces it. Called under the handler's lock. Never raises."""
         # ``getattr``: logging can flush or close a handler whose constructor raised before
         # ``_init_guard`` ran.
         faults: dict[str, int] | None = getattr(self, "_format_faults", None)
@@ -1245,10 +1250,14 @@ class _GuardedSinkMixin(_SinkBase):
         ``UnicodeEncodeError``, as a stream with no
         ``encoding`` or one that does not name the encoder it uses can, the line is written again
         with everything outside ASCII escaped; if that changes nothing, or raises, that error
-        propagates. A stream whose ``encoding`` cannot be read is escaped for ASCII, and each
-        line is counted under that cause instead of as an escape, whether or not it lands. A
-        write whose line was escaped is counted for the stderr format-fault line. Called under the
-        handler's lock, which that count needs."""
+        propagates. An ``encoding`` that is missing or not a string is "no encoding": the line
+        goes as it came, so on a replacing stream it can carry ``?``. That includes a forwarding
+        proxy whose target has none or is gone, and an ``io.TextIOBase`` subclass whose
+        ``encoding`` is ``None``. An ``encoding`` whose read fails (:func:`_encoding_read_can_fail`
+        says which ``AttributeError`` counts) is escaped for ASCII, and each line is counted under
+        that cause instead of as an escape, whether or not it lands. A write whose line was escaped
+        is counted for the stderr format-fault line. Called under the handler's lock, which that
+        count needs."""
         unreadable: str | None = None
         encoding: object
         try:
@@ -1262,7 +1271,15 @@ class _GuardedSinkMixin(_SinkBase):
             # escaped for ASCII, which almost every text stream takes, and the cause is counted
             # before the write, so a write that then fails does not hide it. A stream that refuses
             # even that line (cp864 has no byte for ``%``) fails the write; the stages decide.
-            if isinstance(exc, AttributeError) and not _encoding_read_can_fail(type(self.stream)):
+            read_failed = True
+            if isinstance(exc, AttributeError):
+                try:
+                    read_failed = _encoding_read_can_fail(type(self.stream))
+                except Exception as classify_exc:
+                    # An exotic class: read as "no encoding", never a failed write, but said.
+                    read_failed = False
+                    self._note_format_fault(f"{_CLASSIFY_FAULT} ({_type_name(classify_exc)})")
+            if not read_failed:
                 encoding = None
             else:
                 encoding = "ascii"
