@@ -122,6 +122,13 @@ try {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    # A helper that ran past its bound is not started again for 30 minutes: UserPromptSubmit holds
+    # the user's prompt, so a hanging workbook or share must not cost every prompt 12 s.
+    $slow = Join-Path ([System.IO.Path]::GetTempPath()) "mefor-runbook-slow-$sessionId.stamp"
+    if ((Test-Path -LiteralPath $slow -PathType Leaf) -and ((Get-Date) - (Get-Item -LiteralPath $slow).LastWriteTime).TotalMinutes -lt 30) {
+        Write-Reason 'skipped: the helper ran past its bound less than 30 minutes ago'
+        exit 0
+    }
     $proc = [System.Diagnostics.Process]::Start($psi)
     $proc.StandardInput.Close()
     $outTask = $proc.StandardOutput.ReadToEndAsync()
@@ -129,6 +136,7 @@ try {
     if (-not $proc.WaitForExit($HelperTimeoutMs)) {
         try { $proc.Kill($true) } catch { }
         Write-Reason "the helper ran past $HelperTimeoutMs ms and was stopped"
+        try { Set-Content -LiteralPath $slow -Value '' -NoNewline } catch { }
         exit 0
     }
     $err = [string]$errTask.Result

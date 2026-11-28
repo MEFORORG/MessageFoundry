@@ -139,6 +139,10 @@ def test_key_readings() -> None:
     assert rt.key_targets("b472-PR3385-3765") == ({3765}, {472})
     assert rt.key_targets("3765-b2") == ({3765}, set())
     assert rt.key_targets("sub-b3-fix") == (set(), set())
+    assert rt.key_targets("1234-hl7-batch-mode") == ({1234}, set())
+    assert rt.key_targets("b64-carriage") == (set(), set())
+    assert rt.key_targets("b2b-x12-5850") == (set(), set())
+    assert rt.key_targets("b2026-11-27-notes") == (set(), set())
     assert rt.key_targets("batch-462-and-465") == (set(), {462, 465})
     assert rt.key_targets("batches-462-465-470") == (set(), {462, 463, 464, 465, 470})
     assert rt.key_targets("1719-items-22-35") == ({1719}, set())
@@ -181,6 +185,14 @@ def test_a_worktree_named_after_a_seat_does_not_match_every_seat_word() -> None:
     book = _book({514: ("FREE", "FREE", "Manager other-wt (ffff1234)")}, {9014: [(514, "")]})
     (p,) = rt.pending_batches(["9014"], book, names)
     assert not p.named_us
+
+
+def test_a_blank_state_with_our_name_is_not_a_recorded_hold() -> None:
+    book = _book({516: ("", "", f"Manager {WT} (old)")}, {9016: [(516, "Not started")]})
+    (p,) = rt.pending_batches(["9016"], book, NAMES)
+    assert p.named_us
+    text = rt.message([p], "py", "rb.py", "w.xlsx", f"Manager {WT} (sess1234)")
+    assert "--force-take" in text and "do not take it back" in text
 
 
 def test_a_batch_past_taken_is_not_named() -> None:
@@ -339,7 +351,7 @@ def test_an_unreadable_claim_is_reported_and_not_cached(
     assert "--take 501" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("seat", ["builder", "lander", "watchdog"])
+@pytest.mark.parametrize("seat", ["builder", "builder1", "lander", "land", "watchdog", "special"])
 def test_a_seat_that_never_takes_a_batch_is_never_warned(
     seat: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -353,8 +365,8 @@ def test_a_seat_that_never_takes_a_batch_is_never_warned(
     )
     assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0, "--seat", seat)) == 0
     assert capsys.readouterr().out == ""
-    # The control: the same state under a Manager warns.
-    assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0, "--seat", "manager")) == 0
+    # The control: the same state under a Manager label warns.
+    assert rt.main(_args(tmp_path, wt, claims, workbook, 1.0, "--seat", "manager-2")) == 0
     assert "--take 501" in capsys.readouterr().out
 
 
@@ -612,13 +624,16 @@ def test_the_hook_end_to_end_on_a_real_workbook(tmp_path: Path, key: str, warns:
     elsewhere = _git_repo(tmp_path / "elsewhere")
     refused = _hook(_payload(wt), env, cwd=elsewhere)
     assert refused.returncode == 0 and refused.stdout == "", refused.stdout
+    assert "nothing printed" not in refused.stderr, refused.stderr
     # The primary checkout is shared by unrelated sessions, so its own claims prompt nobody.
     in_primary = _hook(_payload(primary, "sess-primary"), env, cwd=primary)
     assert in_primary.returncode == 0 and in_primary.stdout == "", in_primary.stdout
+    assert "nothing printed" not in in_primary.stderr, in_primary.stderr
     proc = _hook(_payload(wt), env, cwd=wt)
     assert proc.returncode == 0, proc.stderr
     if not warns:
         assert proc.stdout == "", proc.stdout
+        assert "nothing printed" not in proc.stderr, proc.stderr
         return
     out = json.loads(proc.stdout)
     assert list(out) == ["hookSpecificOutput"], out

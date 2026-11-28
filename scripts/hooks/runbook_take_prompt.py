@@ -17,8 +17,10 @@ stderr, which the wrapper passes on to its own.
 WHOSE CLAIMS. Only claims whose ``worktree`` is this session's worktree, on this machine, and none at
 all in the primary checkout: claim.ps1 records the checkout of the copy it ran from, so the primary's
 claims belong to whichever sessions ran that copy. Builder, Lander and Watchdog seats are never told
-(``NEVER_TAKES``): a Manager takes a batch, and a Builder's claims sit under its Manager's hold by
-design (claim.ps1's header: the holder of a batch is not always the worktree a claim names).
+(only a seat label starting ``manager``, or no declared seat, is told): a Manager takes a batch,
+and a Builder's claims sit under its Manager's hold by design (claim.ps1's header: the holder of
+a batch is not always the worktree a claim names). A clone that sets git config
+``mefor.claimsRoot`` is read from that registry, the one hop claim.ps1 follows.
 
 WHO HOLDS A BATCH. Only the holder cell's CURRENT text counts, the part before any ``||`` history.
 It names this session when it carries the worktree name, the session id's first eight characters or
@@ -50,6 +52,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess  # nosec B404 - fixed argv, no shell
 import sys
 import time
 import unicodedata
@@ -61,9 +64,12 @@ from typing import Any
 
 COOLDOWN_SECONDS = 30 * 60
 STATE_RETENTION_DAYS = 14
-# Seats that never take a batch: a Manager does. A Builder's claims sit under its Manager's hold,
-# and the Lander and Watchdog claim rows to land or watch them, not to build a batch.
-NEVER_TAKES = frozenset({"builder", "lander", "watchdog"})
+# Only a Manager takes a batch, so only a Manager seat label (manager, manager-2) is told, plus a
+# session that has declared no seat yet: a respawned Manager may not have, and its --holder then
+# carries a <seat> placeholder it is told to replace. Every other label, aliases included, is not.
+TAKES_PREFIX = "manager"
+# Bumped whenever the classification changes, so a cached answer from older rules is not reused.
+RULES_VERSION = 2
 SEAT_WORDS = frozenset({"manager", "builder", "lander", "watchdog", "special"})
 # The States read_batch.py --take may write over without moving the dashboard backwards. A batch
 # at PR OPEN or later is past taking: --take would rewrite its State to TAKEN.
@@ -78,9 +84,11 @@ TAKEABLE_STATES = ("", "FREE", "TAKEN")
 #     (b472-3765-b), so a part suffix such as 3765-b2 is not batch 2.
 #   - Any other key names only its LEADING number, as a row (3765, 3765-b), and no row when it
 #     leads with a date.
-_LONG_BATCH = re.compile(r"(?i)batch")
-_SHORT_BATCH = re.compile(r"(?i)^b[-_.]?(\d+)(?!\d)")
-_NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)")
+# A marker is a whole word followed by a number (batch-472, never batch-mode), and a number stuck
+# to letters (hl7, x12) is no number. A short form must be followed by the key's end or a number.
+_LONG_BATCH = re.compile(r"(?i)(?<![a-z0-9])batch(?:es)?[-_.]?\d")
+_SHORT_BATCH = re.compile(r"(?i)^b[-_.]?(\d+)(?=$|[-_. ]+\d)")
+_NUMBER = re.compile(r"(?<![\da-z])\d{1,6}(?![\da-z])", re.IGNORECASE)
 _RANGE = re.compile(r"(?<!\d)(\d{1,6})\s*[-–]\s*(\d{1,6})(?!\d)")
 _LEADING = re.compile(r"^(\d{1,6})(?!\d)")
 _DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
@@ -150,7 +158,7 @@ def key_targets(key: str) -> tuple[set[int], set[int]]:
             if lo < hi <= lo + RANGE_MAX:
                 batches.update(range(lo, hi + 1))
         return set(), batches
-    short = _SHORT_BATCH.match(key)
+    short = _SHORT_BATCH.match(rest)
     if short:
         n = int(short.group(1))
         return {int(x) for x in _NUMBER.findall(rest[short.end() :])} - {n}, {n}
@@ -207,8 +215,9 @@ def _live(entry: QueueEntry) -> bool:
 
 
 def _ours(entry: QueueEntry, names: tuple[str, ...]) -> bool:
-    """The queue tab records this session as the holder, and does not read FREE."""
-    return not entry.state.upper().startswith("FREE") and holder_is_us(entry.holder, names)
+    """The queue tab records this session as the holder, and its State is set and not FREE."""
+    state = entry.state.upper()
+    return bool(state) and not state.startswith("FREE") and holder_is_us(entry.holder, names)
 
 
 def pending_batches(keys: Iterable[str], book: Book, names: Iterable[str]) -> list[Pending]:
@@ -307,6 +316,31 @@ def _load_coord_root() -> ModuleType:
     return mod
 
 
+def _claims_registry(worktree: str) -> str:
+    """The repository whose registry holds this worktree's claims: the one git config
+    mefor.claimsRoot names, as claim.ps1 and claim_check.py follow it (one hop), else this one."""
+
+    def git(*argv: str) -> str:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+            ["git", "-C", worktree, *argv], capture_output=True, text=True, check=False, timeout=5
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    root = git("config", "--get", "mefor.claimsRoot")
+    if not root:
+        return worktree
+    top = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        ["git", "-C", root, "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    if top.returncode != 0 or not top.stdout.strip():
+        raise OSError(f"mefor.claimsRoot names {root}, not a repository")
+    return top.stdout.strip()
+
+
 def _wt_key(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
@@ -377,7 +411,11 @@ def message(
         # read_batch.py refuses --take while the cell names any other text, our own older one too.
         force, advice = "", ""
         if p.named_us:
-            seen, force = "names this session but reads FREE in its State column", " --force-take"
+            seen, force = "names this session but its State does not read TAKEN", " --force-take"
+            advice = (
+                "If the batch was returned to FREE on purpose (ledger ruling R8, or by the owner), "
+                "do not take it back: release this session's claims on its rows instead."
+            )
         elif released(p.holder):
             seen = f'records a release ("{_display(now_text)}")'
             advice = (
@@ -461,7 +499,9 @@ def _cached_pending(state: dict[str, Any], key: list[Any]) -> list[Pending] | No
 
 def run(args: argparse.Namespace) -> str | None:
     """The context text to print, or None. Raises on what it cannot read."""
-    if not _SESSION_ID.fullmatch(args.session) or args.seat in NEVER_TAKES:
+    if not _SESSION_ID.fullmatch(args.session):
+        return None
+    if args.seat and not args.seat.startswith(TAKES_PREFIX):
         return None
     workbook = Path(args.workbook)
     wst = workbook.stat()
@@ -480,7 +520,12 @@ def run(args: argparse.Namespace) -> str | None:
         local_root = cr.local_root(args.worktree)
         if local_root is None:
             raise OSError(f"git could not name the common dir for {args.worktree}")
-        resolved = cr.resolve("claims", args.worktree, local=local_root)
+        registry = _claims_registry(args.worktree)
+        if registry != args.worktree:
+            local_root = cr.local_root(registry)
+            if local_root is None:
+                raise OSError(f"mefor.claimsRoot names {registry}, not a repository")
+        resolved = cr.resolve("claims", registry, local=local_root)
         if resolved.path is None:
             raise OSError(resolved.error or "no claims directory")
         claims = Path(resolved.path)
@@ -491,9 +536,10 @@ def run(args: argparse.Namespace) -> str | None:
         is_here = cr.record_is_here
         # claim.ps1 records the checkout of the copy it ran from, so the primary's claims belong to
         # whichever sessions ran the primary's copy; they say nothing about a session there.
-        if _wt_key(str(Path(local_root).parent.parent)) == _wt_key(args.worktree):
+        own_root = cr.local_root(args.worktree) if registry != args.worktree else local_root
+        if own_root is None or _wt_key(str(Path(own_root).parent.parent)) == _wt_key(args.worktree):
             return None
-        local = Path(args.state_dir) if args.state_dir else Path(local_root) / "runbook-take"
+        local = Path(args.state_dir) if args.state_dir else Path(own_root) / "runbook-take"
     if local is None:
         return None
     state_path = local / f"{args.session}.json"
@@ -514,7 +560,7 @@ def run(args: argparse.Namespace) -> str | None:
             # Not cached against the directory: a claim being written moves no directory mtime.
             stamp = None
             print(f"runbook-take-prompt: {unreadable} claim file(s) unreadable", file=sys.stderr)
-    key = [wst.st_mtime_ns, wst.st_size, wt, keys]
+    key = [RULES_VERSION, str(workbook), wst.st_mtime_ns, wst.st_size, wt, keys]
     names = session_names(args.worktree, args.session)
     pending = _cached_pending(state, key)
     if pending is None:
