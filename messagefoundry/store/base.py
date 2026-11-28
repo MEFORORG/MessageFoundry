@@ -38,6 +38,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
@@ -164,6 +165,7 @@ from messagefoundry.store.store import (
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.cipher_cells import CipherCellSource
     from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
@@ -5493,6 +5495,24 @@ def _server_store_class(backend: StoreBackend) -> type[SqlServerStore] | type[Po
 
         return PostgresStore
     raise NotImplementedError(f"store backend {backend.value!r} is not implemented yet")
+
+
+def open_cipher_walk_probe(
+    settings: StoreSettings, *, posture: HopPosture | None
+) -> AbstractAsyncContextManager[CipherCellSource]:
+    """A one-connection handle on a PostgreSQL or SQL Server store under the identity cipher, for
+    the walk's reads only, closed on exit (BACKLOG #1719 item 22).
+
+    For ``cipher-audit`` to tell, after :func:`~messagefoundry.store.base.open_store` refused its
+    keyless open as one that would start a keyless audit chain, a keyed store from a fresh one. It
+    is the backend's one-connection store that :func:`probe_store_privileges` reads through, not
+    :meth:`open`: it runs no schema step, binds no salt, loads no audit chain, and the handle it
+    yields is typed as the walk's reads, none of which writes, so it appends no audit row and
+    starts no chain. It never replaces that open: the refusal stands whatever it finds, and it
+    only names why."""
+    if settings.backend is StoreBackend.SQLITE:
+        raise ValueError("open_cipher_walk_probe: a server backend only, not sqlite")
+    return _server_store_class(settings.backend).cipher_walk_probe(settings, posture=posture)
 
 
 async def server_store_schema_found_anywhere(

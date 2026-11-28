@@ -4975,6 +4975,13 @@ class SqlServerStore(ServerCipherWalk):
             found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
         return {t: frozenset(c) for t, c in found.items()}
 
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+        """None of ``tables``: this backend's row filter, a SQL Server security policy, is not read
+        yet, so a walk under one is not reported as not audited whole. Its PostgreSQL twin reads
+        row-level security (BACKLOG #1719 item 35); reading security policies here is a follow-up,
+        unfiled."""
+        return frozenset()
+
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
         row = await self._fetchone(
@@ -6167,6 +6174,14 @@ class SqlServerStore(ServerCipherWalk):
                 await conn.rollback()
                 raise
         return found
+
+    @classmethod
+    def cipher_walk_probe(
+        cls, settings: StoreSettings, *, posture: HopPosture | None
+    ) -> AbstractAsyncContextManager[SqlServerStore]:
+        """The one-connection store, for ``base.open_cipher_walk_probe``, which says what
+        it is for and what it never does (BACKLOG #1719 item 22)."""
+        return cls._one_connection_store(settings, posture=posture)
 
     @classmethod
     async def probe_privileges(

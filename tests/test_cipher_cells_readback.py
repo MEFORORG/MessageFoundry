@@ -1191,6 +1191,8 @@ class _SqliteSource:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
         self.limits: dict[str, list[int]] = {}
+        #: The tables this source reports as row-filtered (BACKLOG #1719 item 35); none by default.
+        self.row_filtered: frozenset[str] = frozenset()
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
         found: dict[str, frozenset[str]] = {}
@@ -1199,6 +1201,9 @@ class _SqliteSource:
             if names:
                 found[table] = names
         return found
+
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+        return frozenset(t for t in tables if t in self.row_filtered)
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         row = self.conn.execute(

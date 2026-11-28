@@ -709,6 +709,13 @@ class CipherAudit:
     #: any is not audited whole, so no verdict over it may PASS (BACKLOG #1719 item 9). Always
     #: empty after a SQLite walk, whose missing cells an older store predates (``present``).
     hidden: list[str] = field(default_factory=list)
+    #: The tables the catalog shows whose rows this login may not see in full, because a server's
+    #: row filter may apply to it: on PostgreSQL, row-level security
+    #: (:meth:`CipherCellSource.cipher_walk_row_filtered`). The walk reads such a table, and what
+    #: it reads is tallied, but a value the filter hid was not read, so a store with any is not
+    #: audited whole either, and no verdict over it may PASS (BACKLOG #1719 item 35). Always empty
+    #: after a SQLite walk.
+    row_filtered: list[str] = field(default_factory=list)
 
     @property
     def opened(self) -> int:
@@ -733,6 +740,11 @@ class CipherAudit:
     @property
     def absent(self) -> list[str]:
         return [t.name for t in self.tallies if not t.present]
+
+    @property
+    def not_whole(self) -> bool:
+        """Whether the walk could not read the store whole, so no verdict over it may PASS."""
+        return bool(self.hidden or self.row_filtered)
 
 
 def with_first_failure(mismatch: str, first: str | None) -> str:
@@ -775,6 +787,7 @@ def _reset(into: CipherAudit | None) -> CipherAudit:
     into.tallies.clear()
     into.key_mismatch = None
     into.hidden = []
+    into.row_filtered = []
     return into
 
 
@@ -853,12 +866,18 @@ def audit_cipher_cells(
 
 
 class CipherCellSource(Protocol):
-    """What a server store offers :func:`read_server_cipher_cells`: four reads, implemented by
+    """What a server store offers :func:`read_server_cipher_cells`: five reads, implemented by
     ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
     more than one statement: at least SQL Server's column inventory, which asks once per table,
     and each backend's surface-sealed test."""
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
+
+    async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+        """Those of ``tables`` whose rows a server row filter may hide from this login, each one
+        the catalog read shows. Any doubt, a refused read of the catalog included, names the table:
+        a table named here is read as not audited whole, so the safe answer is to name it."""
+        ...
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None: ...
 
@@ -1048,6 +1067,10 @@ async def audit_server_cipher_cells(
     audit.hidden = audit.absent
     if not _keyed_surface_visible(columns):
         audit.hidden.append("keyed_surface")
+    shown = [t for t in server_walk_tables(wanted) if t in columns]
+    filtered = await source.cipher_walk_row_filtered(shown) if shown else frozenset()
+    # In the walk's own order, and only tables the catalog showed, so a name never comes from it.
+    audit.row_filtered = [t for t in shown if t in filtered]
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit
