@@ -217,6 +217,7 @@ tests/test_required_workflow_state.py
 tests/test_rescue_ref_provenance.py
 tests/test_review_standards.py
 tests/test_role_cards.py
+tests/test_runbook_take_prompt_hook.py
 tests/test_scan_forbidden_loaded_set.py
 tests/test_scan_path_mode_location_5446.py
 tests/test_sbom_finalize.py
