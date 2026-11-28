@@ -1669,8 +1669,9 @@ def test_a_flap_bound_trip_says_a_pending_cause(
     ],
 )
 def test_an_encoding_that_reads_back_as_no_str_is_escaped_and_counted(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], encoding: object
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, encoding: object
 ) -> None:
+    # capsys first, so monkeypatch, torn down first, restores sys.stdout before capsys does.
     # An encoding that reads back as neither a str nor None is unreadable: the line is escaped for
     # ASCII and the cause counted, never failed, and never written raw for a replacing stream to
     # turn into "?".
@@ -1693,7 +1694,7 @@ def test_an_encoding_that_reads_back_as_no_str_is_escaped_and_counted(
 
     assert events == []
     assert stream.getvalue() == "caf" + "\\" + "u00e9\n"
-    assert logging_guard._ENCODING_UNREADABLE_FAULT in capsys.readouterr().err
+    assert logging_guard._ENCODING_NOT_STR_FAULT in capsys.readouterr().err
 
 
 def test_a_classify_failure_still_counts_an_ascii_escape(

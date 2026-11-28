@@ -491,9 +491,9 @@ least these. A stream whose `encoding` reads as a string is escaped for that cod
 carry `?` with nothing said, except where classifying failed, below. That covers a stream with no
 `encoding`, an `io.TextIOBase` subclass whose `encoding` is `None`, and a proxy forwarding through
 `__getattr__` or `__getattribute__`, such as `codecs.StreamWriter`, whose class inherits no
-`encoding` definition, when its target has none or is gone. An `io.TextIOBase` subclass proxy
-inherits an `encoding` property that returns `None`, so one forwarding through `__getattr__` is
-written raw as well; only one forwarding through `__getattribute__` reaches the next rule. A read
+`encoding` definition, when its target has none or is gone. An `io.TextIOBase` subclass proxy inherits an `encoding` property that returns `None`, so one
+forwarding through `__getattr__` is written raw whatever its target's encoding, a target that
+names a codec included; one forwarding through `__getattribute__` reaches the next rule. A read
 that raises `AttributeError` counts as missing, unless a class on the stream's MRO defines
 `encoding` as something other than a member descriptor. A member descriptor is a `__slots__` member
 or a C-level one, such as `io.TextIOWrapper`'s. A read that raises anything else, raises

@@ -853,8 +853,10 @@ def _encoding_read_can_fail(cls: type) -> bool:
     is not searched, and forwarding through ``__getattr__`` or ``__getattribute__`` does not count
     by itself: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not. An
     ``io.TextIOBase`` subclass inherits a property ``encoding`` that returns ``None`` without
-    raising, so this is reached for one only when it forwards through ``__getattribute__``, which
-    then reads as failed; one forwarding through ``__getattr__`` reads ``None`` and is written raw.
+    raising, so one forwarding through ``__getattr__`` reads ``None``, never reaches this, and is
+    written raw whatever its target's encoding. One that does reach this, by raising
+    ``AttributeError`` from its own ``encoding`` or a ``__getattribute__``, is classified by the
+    rule above like any other class.
     Raises what reading an exotic class's MRO or namespace raises; :meth:`_write_line` reads that
     as "no encoding" and counts it, so classifying never turns a healthy stream into a failed
     write. Walked per call, with no cache to hold classes."""
@@ -874,6 +876,10 @@ _CLASSIFY_FAULT = "the sink's stream class could not be classified"
 #: read, so a line written to it was escaped for ASCII (BACKLOG #5813). The entry names the type
 #: of the exception the read raised.
 _ENCODING_UNREADABLE_FAULT = "the sink's stream encoding could not be read"
+
+#: The start of the entry for a stream whose ``encoding`` read back as neither a str nor ``None``,
+#: so a line written to it was escaped for ASCII (BACKLOG #5813). The entry names the type read.
+_ENCODING_NOT_STR_FAULT = "the sink's stream encoding is not a str"
 
 #: The stderr format-fault line's entry for a line the sink's stream could not encode, written
 #: escaped (BACKLOG #5813). The record formatted; it is counted on that line all the same.
@@ -896,9 +902,9 @@ _FORMAT_FAULT_KINDS = 16
 _FORMAT_FAULT_OTHER = "format faults of other kinds"
 
 
-def _type_name(exc: BaseException) -> str:
-    """``exc``'s type name through ``ascii()``, or a placeholder, which is said on the stderr
-    last-resort line. Never raises."""
+def _type_name(exc: object) -> str:
+    """The type name of ``exc``, an exception or any other value, through ``ascii()``, or a
+    placeholder, which is said on the stderr last-resort line. Never raises."""
     try:
         return ascii(type(exc).__name__)
     except Exception:
@@ -1311,14 +1317,9 @@ class _GuardedSinkMixin(_SinkBase):
             codec = None
         else:
             codec = "ascii"
-            try:
-                kind = ascii(type(encoding).__name__)
-            except Exception:
-                kind = _RECORD_LABEL_DROPPED
-            unreadable = kind
+            unreadable = _type_name(encoding)
             self._note_format_fault(
-                f"{_ENCODING_UNREADABLE_FAULT} (read as {kind}, not a str); lines to it are "
-                "escaped for ASCII"
+                f"{_ENCODING_NOT_STR_FAULT} ({unreadable}); lines to it are escaped for ASCII"
             )
         written = line
         if codec is not None and not (line.isascii() and _encodes_ascii(codec)):
