@@ -242,7 +242,10 @@
         if (selected && sameRow(selected.handler, selected.lineStart, selected.lineEnd) && selected.expectSrc === d.from) {
           selected.expectSrc = d.to;
         }
-      } catch (_) { /* no selection state to move */ }
+      } catch (e) {
+        // Only the uninitialized `selected` is expected here; anything else is a defect, so say so.
+        if (!(e instanceof ReferenceError)) { throw e; }
+      }
     }
     // Origin, source, channel token and payload shape are checked — see webviewMessaging.ts.
     window.addEventListener('message', (ev) => {

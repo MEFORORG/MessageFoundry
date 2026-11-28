@@ -132,8 +132,8 @@ suite("Steps edit -- the field-picker drain carries a queued typed edit over the
       const ed = new FakeEditor(source());
       const guard = new EditLoopGuard();
       await drainEdits(guard, edit("TYPED", name), ed.apply, undefined, undefined, ed.rebase);
-      // The pick was requested on the same page before that write was re-projected.
-      await pick(guard, ed, edit("PID-7", "path"));
+      // The pick was requested on the same page after that write, before it was re-projected.
+      await pick(guard, ed, { ...edit("PID-7", "path"), arrival: ed.rebaser.arrive() });
       assert.deepStrictEqual(ed.refused, [], `a pick after a typed ${name} write`);
       assert.deepStrictEqual(ed.applied, ["TYPED", "PID-7"]);
     }
@@ -144,8 +144,20 @@ suite("Steps edit -- the field-picker drain carries a queued typed edit over the
     ed.rebaser.project(2, source(), at);
     const guard = new EditLoopGuard();
     await drainEdits(guard, edit("TYPED", "path"), ed.apply, undefined, undefined, ed.rebase);
-    await pick(guard, ed, edit("PID-7", "path", ROW("PID-5", "OLD"), 2));
+    await pick(guard, ed, { ...edit("PID-7", "path", ROW("PID-5", "OLD"), 2), arrival: ed.rebaser.arrive() });
     assert.deepStrictEqual(ed.refused, ["PID-7"]);
+  });
+
+  test("a pick is not carried over a typed write of its param that arrived after the pick request", async () => {
+    // Review round 2 finding 1: the user types into the field while the picker is open. The pick's
+    // value was built from what the page held at the request, so carrying it would revert the typing.
+    const ed = new FakeEditor(source());
+    const guard = new EditLoopGuard();
+    const request = ed.rebaser.arrive(); // the pick request arrives, and the picker opens
+    await drainEdits(guard, edit("TYPED", "path"), ed.apply, undefined, undefined, ed.rebase);
+    await pick(guard, ed, { ...edit("PID-7", "path"), arrival: request });
+    assert.deepStrictEqual(ed.refused, ["PID-7"], "refused as stale, as on main, never written over the typing");
+    assert.strictEqual(ed.text, source("TYPED"));
   });
 
   test("a typed edit is checked against a pick even when the pick's output repeats an earlier buffer", async () => {
@@ -301,10 +313,11 @@ suite("Steps edit -- the row-source acknowledgement (BACKLOG #5943)", () => {
 
   test("the page's stamp is read from an edit and a pick request, and a malformed one is dropped", () => {
     const base = { command: "edit", handler: "h", lineStart: 3, lineEnd: 3, name: "value", value: "A", expectSrc: "x" };
-    const read = readEditMessage({ ...base, projection: 2, rowVer: 5 });
+    const read = readEditMessage({ ...base, projection: 2, rowVer: 5, arrival: 1 });
     assert.ok(read && "edit" in read);
     assert.strictEqual(read.edit.rowVer, 5);
     assert.strictEqual(read.edit.projection, 2);
+    assert.strictEqual(read.edit.arrival, undefined, "the arrival order is the provider's, never the page's");
     for (const bad of ["5", 1.5, Number.NaN, null]) {
       const r = readEditMessage({ ...base, rowVer: bad });
       assert.ok(r && "edit" in r);
@@ -484,6 +497,15 @@ suite("Steps page -- the row-source receiver (BACKLOG #5943)", () => {
 
 suite("Steps edit -- the provider wires the acknowledgement and the pick drain (BACKLOG #5943)", () => {
   const read = (...p: string[]): string => fs.readFileSync(path.join(__dirname, "..", "..", "..", ...p), "utf8");
+
+  test("a pick request's arrival is taken before the picker is awaited, and rides on the pick", () => {
+    const src = read("src", "stepsView.ts");
+    const body = src.slice(src.indexOf("const pickThenApply = async"), src.indexOf("// Undo / redo the document"));
+    const arrive = body.indexOf("const arrival = rebaser.arrive();");
+    const picker = body.indexOf("await pickHl7Path(");
+    assert.ok(arrive >= 0 && picker > arrive, "stamped on receipt, before the modal");
+    assert.ok(body.includes('applyPickedEdit({ command: "edit", ...coords, arrival, value: build(picked) })'));
+  });
 
   test("applyPickedEdit drains through the rebasing drain as a pick, never a bare applyOne loop", () => {
     const src = read("src", "stepsView.ts");

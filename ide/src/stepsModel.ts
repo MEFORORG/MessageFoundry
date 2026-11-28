@@ -1253,6 +1253,10 @@ export interface EditMessage {
   // row's `data-row-ver`; absent while the page shows the row as projected. Only the rebaser reads it,
   // and only a version it sent to that page counts (BACKLOG #5943). Not sent to the engine.
   rowVer?: number;
+  // The order the provider received the message in ({@link QueuedEditRebaser.arrive}), set by the
+  // provider on receipt and never read from the page: readEditMessage and readEditStamp ignore it. The
+  // page posts in order, so a write that arrived later was posted after this message (BACKLOG #5943).
+  arrival?: number;
 }
 
 /** The `lens rewrite` edit spec (mirror of messagefoundry_toolkit/lens.rewrite_source's contract). */
@@ -3077,11 +3081,13 @@ export async function drainEdits(
   onRefreshOwed?: () => void,
   rebase?: EditRebase,
 ): Promise<void> {
+  // A typed edit reaches here as the provider receives it, so this is its arrival (BACKLOG #5943).
+  const arrived = rebase !== undefined && first.arrival === undefined ? { ...first, arrival: rebase.rebaser.arrive() } : first;
   if (!guard.beginEdit()) {
-    guard.queue(first);
+    guard.queue(arrived);
     return;
   }
-  await drainHeldEdits(guard, first, "typed", apply, onError, onRefreshOwed, rebase);
+  await drainHeldEdits(guard, arrived, "typed", apply, onError, onRefreshOwed, rebase);
 }
 
 /**
@@ -3237,10 +3243,10 @@ export interface RowSourceAck {
   version: number;
 }
 
-/** A recorded write: the buffer it produced is the chain's buffer `seq`. */
+/** A recorded write. The i-th write produced the chain's buffer `startSeq + i + 1`. */
 interface ChainWrite {
-  readonly seq: number;
   readonly after: string;
+  readonly arrival: number | undefined;
   readonly lineStart: number;
   readonly lineEnd: number;
   readonly name: string;
@@ -3295,9 +3301,10 @@ export type ChainMark = number;
  *  - its `expectSrc` is the row's text in the buffer at that base or version;
  *  - every write since on a row overlapping the edit's row is on that same row, and each one that wrote
  *    the edit's own param is a typed write from the edit's own page. A write of another param of the
- *    row is carried over: the edit sets its own param only. The edit may be typed or a pick: a pick
- *    replaces the param's value with one the page's own field seeded, so it does not depend on a value
- *    the page never showed;
+ *    row is carried over: the edit sets its own param only. A same-param write is carried over only
+ *    when it arrived before the edit ({@link EditMessage.arrival}): the page posts in order, so it
+ *    was on the page when the edit was made. That holds for a pick too, whose request arrives before
+ *    its picker opens, so a value typed while the picker is open is never written over;
  *  - the live buffer, read just before the edit is sent, is exactly the chain's end. A change made
  *    between recorded writes (an undo, a structural op, another panel, split-view typing) leaves the
  *    edit unrebased. Split-view typing made while a rewrite is in flight is not covered: applyOne
@@ -3310,6 +3317,7 @@ export class QueuedEditRebaser {
   private startSeq = 0;
   private writes: ChainWrite[] = [];
   private projections = new Map<number, KeptProjection>();
+  private arrivals = 0;
   private latest: number | undefined;
   // Per projection, per row (`lineStart lineEnd`), the versions acknowledged to that page, oldest first.
   private readonly acked = new Map<number, Map<string, number[]>>();
@@ -3362,6 +3370,11 @@ export class QueuedEditRebaser {
     }
   }
 
+  /** The next arrival number, for a message the provider has just received ({@link EditMessage.arrival}). */
+  arrive(): number {
+    return ++this.arrivals;
+  }
+
   /** The chain's position when `source` is its end, or `undefined`. Call it where render reads the buffer. */
   mark(source: string): ChainMark | undefined {
     if (this.start === undefined || source !== this.bufferAt(this.endSeq)) {
@@ -3374,13 +3387,8 @@ export class QueuedEditRebaser {
    * The page now shows projection `id`, projected from `source`, which the chain held at `at` when the
    * render read it. A projection with no position in the chain starts a new chain at its buffer.
    */
-  project(id: number, source: string, at: ChainMark | undefined = this.mark(source)): void {
-    let base: number | undefined;
-    if (at !== undefined && this.bufferAt(at) === source) {
-      base = at;
-    } else {
-      base = this.mark(source);
-    }
+  project(id: number, source: string, at?: ChainMark): void {
+    const base = at !== undefined && this.bufferAt(at) === source ? at : this.mark(source);
     const prevId = this.latest;
     const prev = prevId === undefined ? undefined : this.projections.get(prevId);
     this.projections = new Map();
@@ -3390,8 +3398,10 @@ export class QueuedEditRebaser {
       this.projections.set(id, { source, base: this.startSeq });
       return;
     }
+    let oldest = base;
     if (prevId !== undefined && prev !== undefined && prev.base !== undefined) {
       this.projections.set(prevId, prev);
+      oldest = Math.min(oldest, prev.base);
     }
     this.projections.set(id, { source, base });
     for (const kept of [...this.acked.keys()]) {
@@ -3401,7 +3411,6 @@ export class QueuedEditRebaser {
     }
     // Drop the writes before the oldest kept base. Positions, not buffer text, so a value retyped back
     // or a render that finished out of order can never drop a kept projection's own buffer.
-    const oldest = Math.min(...[...this.projections.values()].map((p) => p.base ?? this.endSeq));
     const buffer = this.bufferAt(oldest);
     if (oldest > this.startSeq && buffer !== undefined) {
       this.writes = this.writes.slice(oldest - this.startSeq);
@@ -3434,8 +3443,8 @@ export class QueuedEditRebaser {
     }
     const seq = ++this.seqCounter;
     this.writes.push({
-      seq,
       after: write.after,
+      arrival: msg.arrival,
       lineStart: msg.lineStart,
       lineEnd: msg.lineEnd,
       name: msg.name,
@@ -3499,7 +3508,11 @@ export class QueuedEditRebaser {
     const carried = this.rowWritesSince(
       base,
       msg,
-      (w) => w.name !== msg.name || (w.kind === "typed" && w.projection === id),
+      (w) =>
+        w.name !== msg.name ||
+        (w.kind === "typed" &&
+          w.projection === id &&
+          !(msg.arrival !== undefined && w.arrival !== undefined && w.arrival > msg.arrival)),
     );
     if (!carried) {
       return msg;

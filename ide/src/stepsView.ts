@@ -313,9 +313,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // What THIS panel's last render projected (BACKLOG #5843): read by the picker scope and the Router
     // role check, so a second open Steps editor can never answer for this one.
     const panelState = new StepsPanelProjection();
-    // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
-    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
-    // tells it which buffer each new webview was projected from.
+    // The typed and picked param writes applied since the webview was last projected, so an edit on
+    // one of their rows is sent with the row's current source rather than refused as stale, and the
+    // row-source acknowledgements the page is sent (BACKLOG #5943). render() tells it which buffer
+    // each new webview was projected from.
     const rebaser = new QueuedEditRebaser();
     let projectionId = 0;
 
@@ -532,8 +533,20 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       onAck: (ack) => {
         if (!disposed && ack.projection === projectionId) {
           panelState.reSource(ack.handler, ack.lineStart, ack.lineEnd, ack.from, ack.to);
-          void postToWebview(panel.webview, { ...ack }).then(undefined, (err: unknown) =>
-            console.warn(`Steps row-source acknowledgement failed: ${errorText(err)}`),
+          // Undelivered: put the panel's record back and stop rebasing, so neither side keeps a
+          // version the page never applied; the next projection starts both afresh.
+          const undelivered = (why: string): void => {
+            panelState.reSource(ack.handler, ack.lineStart, ack.lineEnd, ack.to, ack.from);
+            rebaser.latch();
+            console.warn(`Steps row-source acknowledgement failed: ${why}`);
+          };
+          void postToWebview(panel.webview, { ...ack }).then(
+            (delivered) => {
+              if (!delivered) {
+                undelivered("not delivered");
+              }
+            },
+            (err: unknown) => undelivered(errorText(err)),
           );
         }
       },
@@ -670,6 +683,9 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       seed: string,
       build: (picked: string) => EditMessage["value"],
     ): Promise<void> => {
+      // The pick request's arrival, taken before the picker opens: a value typed while it is open
+      // arrives later, so the pick is never carried over it (#5943).
+      const arrival = rebaser.arrive();
       if (disposed) {
         return;
       }
@@ -688,7 +704,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       if (picked === undefined || disposed) {
         return; // cancelled — no write
       }
-      await applyPickedEdit({ command: "edit", ...coords, value: build(picked) });
+      await applyPickedEdit({ command: "edit", ...coords, arrival, value: build(picked) });
     };
 
     // Undo / redo the document's edit stack. Every Steps edit lands there as a WorkspaceEdit (see applyOne
