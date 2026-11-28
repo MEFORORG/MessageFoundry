@@ -1156,8 +1156,9 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ("receiver_open_slot_zero_write", 'def f(msg, p):\n    p.open("w")\n'),
     ("shutil_by_name", 'import shutil\n\ndef f(msg):\n    shutil.move("/tmp/i", "/tmp/o")\n'),
     # On a receiver not known to be a path, a 1st-positional string is as likely a path or a URL as
-    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit. Each passes on the letters
-    # in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not detected.
+    # a mode, so a w, a, x or + after a ':' or '|' in it is still a hit. Each is flagged on the
+    # letters in its literal alone: the call itself (dbm creation, HTTP egress, a browser) is not
+    # detected.
     (
         "dbm_open_drive_path_letters_after_colon",
         'import dbm\n\ndef f(msg):\n    dbm.open("C:\\\\mefor\\\\cache", "c")\n',
@@ -1170,6 +1171,35 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     (
         "webbrowser_url_letters_after_colon",
         'import webbrowser\n\ndef f(msg):\n    webbrowser.open("https://example.org/a")\n',
+    ),
+    # A receiver that reads as a path keeps the unsplit 1st-positional reading too, whether through
+    # a class named Path from any module, a name bound to one, an unbound Path, or a '/' join. Each
+    # is flagged on the letters in its literal alone, not on the body or data argument.
+    (
+        "path_named_import_url_letters_after_colon",
+        'from _helpers import Path\n\ndef f(msg):\n    Path("x").open("https://example.org/a")\n',
+    ),
+    (
+        "unbound_path_url_letters_after_colon",
+        'def f(msg, body):\n    Path("x").open("https://example.org/a", body)\n',
+    ),
+    (
+        "module_attribute_path_url_letters_after_colon",
+        "import _feeds\n\ndef f(msg, body):\n"
+        '    _feeds.Path("cfg").open("https://example.org/a", data=body)\n',
+    ),
+    (
+        "name_bound_to_path_url_letters_after_colon",
+        "from _feeds import Path\n\nfactory = Path\n\ndef f(msg, body):\n"
+        '    factory().open("https://example.org/a", body)\n',
+    ),
+    (
+        "div_join_url_letters_after_colon",
+        'def f(msg, p):\n    (p / "x").open("https://example.org/a")\n',
+    ),
+    (
+        "attribute_path_classmethod_drive_path_letters_after_colon",
+        'import client\n\ndef f(msg):\n    client.Path.home().open("C:\\\\mefor\\\\cache", "c")\n',
     ),
     # GzipFile with a fileobj and no mode takes the fileobj's mode, which may be a write.
     (
@@ -1216,6 +1246,7 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
         "path_open_read_literal",
         'from pathlib import Path\n\ndef f(msg):\n    Path("/tmp/i").open("rb")\n',
     ),
+    ("path_open_read_r", 'from pathlib import Path\n\ndef f(msg):\n    Path("x").open("r")\n'),
     ("receiver_open_read", 'def f(msg, zf):\n    zf.open("in.hl7")\n'),
     ("tempfile_gettempdir", "import tempfile\n\ndef f(msg):\n    return tempfile.gettempdir()\n"),
     ("os_path_join", 'import os\n\ndef f(msg):\n    return os.path.join("/tmp", "in.hl7")\n'),

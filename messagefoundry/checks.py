@@ -1624,8 +1624,9 @@ class _NameResolver:
         """True when ``node`` is a ``pathlib`` path: a ``Path(...)`` call or a classmethod on the
         class (``Path.home()``), through an alias too; a method or attribute on one
         (``Path(p).with_suffix(".x")``, ``.parent``); a ``/`` join; or a name in ``path_names``.
-        Pass an empty ``path_names`` to ask whether the expression itself is a path, which no
-        scope-blind name binding can make wrong."""
+        Pass an empty ``path_names`` to ask whether the expression itself reads as a path; any class
+        named like a pathlib class, from any module or through a name bound to one anywhere in the
+        file, reads as one."""
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             return True
         if isinstance(node, ast.Name):
@@ -1653,7 +1654,8 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
       as the last bullet reads one, so a literal path holding a ``w``, ``a``, ``x`` or ``+`` flags
       even a read-only ``os.open``: a false positive this advisory lint accepts.
     * ``.open`` on a ``pathlib`` path expression (``Path(p).open(mode)``): the mode is the 1st
-      positional, the only reading.
+      positional, read split at ':' or '|', after the unsplit 1st-positional reading every
+      ``.open`` gets.
     * ``.open`` on any other receiver, an aliased opener among them: a 1st-positional string
       holding a ``w``, ``a``, ``x`` or ``+`` anywhere, not split at ``:`` or ``|``, as the lint
       always read it, or a mode in the 2nd positional or the ``mode=`` keyword that is not provably
@@ -1682,17 +1684,18 @@ def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolv
     func = call.func
     if not (isinstance(func, ast.Attribute) and func.attr == "open"):
         return hit
-    if resolver.is_path_expr(func.value, frozenset()):
-        return hit or _mode_may_write(call, 0)
     first = call.args[0] if call.args else None
-    # Not split at ':' or '|': on a receiver not known to be a path, a 1st-positional string is as
-    # likely a path or URL as a mode, and main read any w/a/x/+ in it as a hit (BACKLOG #5382).
+    # Not split at ':' or '|': on a receiver that may not be a pathlib path, a 1st-positional string
+    # is as likely a path or URL as a mode, so any w/a/x/+ in it is a hit; no valid pathlib mode
+    # holds ':' or '|' (BACKLOG #5382).
     if (
         isinstance(first, ast.Constant)
         and isinstance(first.value, str)
         and any(c in first.value for c in ("w", "a", "x", "+"))
     ):
         return True
+    if resolver.is_path_expr(func.value, frozenset()):
+        return hit or _mode_may_write(call, 0)
     if resolver.is_path_expr(func.value, resolver.path_names) and _mode_may_write(call, 0):
         return True
     return hit or (not os_open and _mode_may_write(call, 1))
