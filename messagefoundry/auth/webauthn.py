@@ -149,7 +149,9 @@ class ChallengeCacheFullError(RuntimeError):
     """The global pending-ceremony safety bound was hit — new ceremonies are refused.
 
     Reachable only via mass account provisioning (per-user caps confine ordinary abuse to
-    self-eviction); ``admin_reset_mfa`` remains the always-available recovery (ADR 0068 §2).
+    self-eviction); ``admin_reset_mfa`` remains the recovery (ADR 0068 §2) for an account whose
+    record passes its integrity seal. The method itself has no actor check: the caller's own
+    account is refused by its route, ``POST /users/{id}/reset-mfa``, alone.
     """
 
 
