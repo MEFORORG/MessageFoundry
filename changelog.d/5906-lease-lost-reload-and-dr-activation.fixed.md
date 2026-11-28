@@ -9,6 +9,8 @@
   aborts with kind `lease` (a 503) and a `dr_activation_aborted` row. Before, a lease-lost node ran
   the cold-seed checks, the store recovery that re-pends in-flight rows and the takeover hook, and
   was refused only at the run-profile reload; a follower was not refused at all. A lease lost
-  after those reads is still refused at the run-profile step with kind `profile`, now before its
-  anchor preflight where the engine sees it. A node that holds the lease, and a single node, are
-  unchanged. (`BACKLOG #5906`)
+  after those reads is refused at the run-profile step with kind `profile` in at least these
+  cases: before its anchor preflight where the engine reads it, at the runner's reads, and when a
+  demotion stopped the graph during the step, which before was recorded active with nothing
+  bound. A lease lost after the runner's second read while the graph runs is still not refused.
+  A node that holds the lease, and a single node, are unchanged. (`BACKLOG #5906`)

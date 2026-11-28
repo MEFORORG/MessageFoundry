@@ -1342,6 +1342,9 @@ class Engine:
         # What an operator had bound before this call, which a failed activation does not unbind.
         # It does not bind again one the attempt's own reload had parked.
         listening = rr.listening_inbounds() if rr is not None else frozenset()
+        # Whether the graph ran when the profile step began, so one that stops during it is
+        # refused below rather than recorded active with nothing bound (BACKLOG #5906).
+        was_running = rr is not None and rr.running
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
         # graph is what the operator last applied, through whatever approval that reload needed, so
         # an activation must not swap in bytes edited since then with no second person, nor the
@@ -1374,6 +1377,18 @@ class Engine:
                 # The reload's build check and executor build still load each lookup CA file,
                 # with no bound, as a lane's build loads its own.
                 close_failures = await rr.reload(fhir_lookup_anchors=lookups)
+                if was_running and not rr.running:
+                    # BACKLOG #5906: the graph stopped during this step, as Engine._stop_graph
+                    # stops it on a demotion that lands during the preflight or before the
+                    # reload takes its lock. The reload then applied the graph to a stopped
+                    # runner and bound nothing, so the activation must not be recorded active.
+                    # Read after the reload, not after the preflight, so a stop that waits on the
+                    # reload lock is caught too. A graph that stops after this read is not.
+                    if self._dr_not_leading():
+                        raise DrProfileNotLeading(str(RunnerLeaseLostError.for_reload()))
+                    raise RuntimeError(
+                        "the engine's graph stopped during the activation, so nothing was bound"
+                    )
         except BaseException as exc:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator

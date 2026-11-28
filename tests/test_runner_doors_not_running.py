@@ -1077,6 +1077,7 @@ async def test_a_dr_activation_on_a_lease_lost_node_aborts_before_its_store_and_
         with pytest.raises(DrActivationError) as ei:
             await coordinator.activate(actor="op")
         assert ei.value.kind == "lease" and "lease" in str(ei.value)
+        assert "store recovery" not in str(ei.value)  # nothing ran, so the reason says nothing ran
         assert calls == []
         assert await _abort_kinds(store) == ["lease"]
     finally:
@@ -1146,6 +1147,37 @@ async def test_a_dr_activation_on_a_cluster_follower_aborts_before_its_store_ste
         with pytest.raises(DrActivationError):
             await coordinator.activate(actor="op")
         assert calls == ["verify_seed", "reset_stale_inflight", "takeover_hook"]
+    finally:
+        monkeypatch.undo()
+        await engine.stop()
+
+
+async def test_a_lease_lost_after_the_store_step_aborts_before_the_hook_and_says_what_ran(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The third read comes after the store recovery and the seed marker. Lost there, the
+    activation aborts before the takeover hook, and its reason says the recovery had run."""
+    engine = _dr_engine(store, tmp_path)
+    try:
+        coordinator = engine.dr_coordinator
+        assert coordinator is not None
+        calls: list[str] = []
+        _spy_dr_steps(monkeypatch, store, coordinator, calls)
+        runner = SimpleNamespace(lease_lost=False)
+        monkeypatch.setattr(engine, "_registry_runner", runner)
+
+        async def losing_marker(*_args: Any, **_kwargs: Any) -> str:
+            runner.lease_lost = True
+            return "segment"
+
+        monkeypatch.setattr(coordinator, "_record_seed_marker", losing_marker)
+        monkeypatch.setattr(coordinator, "_owned_lanes", None)  # no graph to scope the reset by
+        with pytest.raises(DrActivationError) as ei:
+            await coordinator.activate(actor="op")
+        assert ei.value.kind == "lease"
+        assert calls == ["verify_seed", "reset_stale_inflight"]
+        assert "store recovery had already run" in str(ei.value)
+        assert "takeover hook did not run" in str(ei.value)
     finally:
         monkeypatch.undo()
         await engine.stop()

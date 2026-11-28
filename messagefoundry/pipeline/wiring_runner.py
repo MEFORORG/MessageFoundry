@@ -9980,9 +9980,9 @@ class RegistryRunner:
         ``is_leader()`` is read twice here: once this method holds the reload lock, and again just
         before step 1. The engine reads it first for an ungated reload (``Engine.reload_detail``)
         and a DR activation's profile step, before their preflights; a released reload reaches
-        this lock after its preflights and the load. Each read is point in time: leadership lost after the second read is not
-        refused, and steps 1 to 3a then run on this node until ``Engine._stop_graph``, which waits
-        on the same lock, takes them down.
+        this lock after its preflights and the load. Each read is point in time: leadership lost
+        after the second read is not refused, and steps 1 to 3a then run on this node until
+        ``Engine._stop_graph``, which waits on the same lock, takes them down.
         """
         async with self._reload_lock:
             # BACKLOG #5906: refused at once too, so a lease-lost node does not hold the lock its

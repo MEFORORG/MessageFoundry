@@ -3056,11 +3056,16 @@ refused too, and its `dr_activation_aborted` row names the lease. Only an embedd
 settings check reaches that, since the service settings refuse `[dr]` together with `[cluster]`.
 There the activation reads the lease after its archive confinement, again before its store
 recovery and again before any takeover hook, and aborts with kind `lease` (**503**) at the first
-read that finds the flag false or finds this node a cluster follower. A lease lost after the last
-of those reads, after the store recovery, the seed marker and any takeover hook have run, is
-refused at the profile step with kind `profile`: before its preflight when the engine's read
-there finds it, or by the runner's read once the preflight has read the anchors and written their
-rows.
+read that finds the flag false or finds this node a cluster follower. The read before the hook
+comes after the store recovery and the seed marker, and its reason says so. A lease lost after
+the last of those reads, once any takeover hook has run, is refused at the profile step with kind
+`profile` in at least these cases: when the engine's read before the preflight finds it; when
+the runner's two reads of a reload find it, after the preflight has read the anchors and written
+their rows; and when the graph stopped during the step, as a demotion's teardown stops it, which
+the engine reads once the reload returns. At least these are still not refused: a lease lost
+after the runner's second read while the graph keeps running, whose reload binds and resumes
+lanes, so the activation is recorded active though the teardown then takes them down; and a
+graph that stops after the engine's read following the reload.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer
