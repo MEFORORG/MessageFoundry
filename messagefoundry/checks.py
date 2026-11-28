@@ -1553,6 +1553,14 @@ class _NameResolver:
         constant_targets: set[int] = set()
         values: list[tuple[list[str], ast.expr]] = []
         for node in ast.walk(tree):  # breadth-first, so an Assign is seen before its targets
+            # A module global may be rebound by name through globals(), vars(), locals(), exec or
+            # sys.modules, which no binding this resolver reads shows, so none is read as its module.
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"globals", "vars", "locals", "exec"}
+            ) or (isinstance(node, ast.Attribute) and node.attr == "modules"):
+                self._star_import = True
             rebound = _non_import_binding(node)
             if rebound is not None and id(node) not in constant_targets:
                 self._rebound.add(rebound)
@@ -1606,7 +1614,13 @@ class _NameResolver:
         """No binding but a plain ``import name`` names ``name``: none this resolver follows, no path
         binding, no relative or star import, and no other (:func:`_non_import_binding`) except an
         assignment of a constant, so a parameter, loop target or ``except`` name spelt like an
-        imported module is not read as that module."""
+        imported module is not read as that module. A file that calls ``globals``, ``vars``,
+        ``locals`` or ``exec`` by that bare name, or names an attribute ``modules`` in any context
+        (``sys.modules``), counts as a star import, since each may rebind a module name in a way no
+        binding here shows. Other rebinding routes are not seen, at least an alias or a
+        ``builtins.`` spelling of those names, ``from sys import modules``,
+        ``getattr(sys, "modules")``, a function's ``__globals__``, a frame's ``f_globals``,
+        ``del name`` followed by a ``builtins`` store, and a store from another module."""
         return (
             not self._star_import
             and name not in self._aliases

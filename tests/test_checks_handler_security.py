@@ -1300,6 +1300,60 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
         "import tarfile\n\ndef g():\n    del tarfile.open\n\ndef f(msg, p):\n"
         '    tarfile.open(p, mode="r:xz")\n',
     ),
+    # A module global rebound by name through at least these spellings of globals(), vars(),
+    # locals(), exec and sys.modules is not read as its module, so a read through it gets the
+    # stricter reading and is flagged. The is_unbound docstring names routes the lint misses.
+    (
+        "tarfile_rebound_by_globals_item_mode_keyword_xz",
+        'import tarfile\n\ndef g(obj):\n    globals()["tarfile"] = obj\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_vars_item_mode_keyword_xz",
+        'import tarfile\n\nvars()["tarfile"] = object()\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_locals_item_mode_keyword_xz",
+        'import tarfile\n\nlocals()["tarfile"] = object()\n\ndef f(msg, p):\n'
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_globals_update_mode_keyword_xz",
+        "import tarfile\n\ndef g(obj):\n    globals().update(tarfile=obj)\n\ndef f(msg, p):\n"
+        '    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_through_sys_modules_attribute_mode_keyword_xz",
+        "import sys\nimport tarfile\n\ndef g(obj):\n    sys.modules[__name__].tarfile = obj\n\n"
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_through_sys_modules_setattr_mode_keyword_xz",
+        "import sys\nimport tarfile\n\ndef g(obj):\n"
+        '    setattr(sys.modules[__name__], "tarfile", obj)\n\n'
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "tarfile_rebound_by_exec_mode_keyword_xz",
+        'import tarfile\n\ndef g(obj):\n    exec("global tarfile; tarfile = obj")\n\n'
+        'def f(msg, p):\n    tarfile.open(p, mode="r:xz")\n',
+    ),
+    (
+        "gzip_rebound_by_globals_item_slot_zero",
+        'import gzip\n\ndef g(obj):\n    globals()["gzip"] = obj\n\ndef f(msg):\n'
+        '    gzip.open("/data/a.gz")\n',
+    ),
+    (
+        "codecs_rebound_through_sys_modules_attribute_slot_zero",
+        "import codecs\nimport sys\n\ndef g(obj):\n    sys.modules[__name__].codecs = obj\n\n"
+        'def f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
+    (
+        "codecs_rebound_by_exec_slot_zero",
+        'import codecs\n\ndef g(obj):\n    exec("global codecs; codecs = obj")\n\n'
+        'def f(msg):\n    codecs.open("/data/a.txt")\n',
+    ),
     # A patched module opener is not read as the module's own, so its 1st positional is read too.
     (
         "gzip_open_patched_slot_zero_write",
@@ -1410,9 +1464,8 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
         "import tarfile\n\ndef g(o, c):\n    o.open = c\n\n"
         'def f(msg, p):\n    tarfile.open(p, "r:xz")\n',
     ),
-    # Not split, since x.open is not resolved as tarfile.open: read whole, "r:gz" holds no w, a, x
-    # or +, so this pin passes with or without a split.
-    ("receiver_open_mode_keyword_tarfile_read", 'def f(msg, x, p):\n    x.open(p, mode="r:gz")\n'),
+    # A read mode given by keyword to a receiver not resolved as an opener is read whole: a read.
+    ("receiver_open_read_mode_keyword", 'def f(msg, x, p):\n    x.open(p, mode="rb")\n'),
     # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
     ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
     ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
