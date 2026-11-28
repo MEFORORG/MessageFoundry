@@ -1249,6 +1249,9 @@ async def test_a_graph_stopped_during_the_preflight_is_refused(
         assert "cluster lease" not in text and "not running" in text
         # Nothing tried to bind, so the reason must not say a bind failed (BACKLOG #5906).
         assert "bound no listener" in text and "could not bind" not in text
+        # This node still leads, so the reason must not suggest a demotion.
+        assert "graph is not running, so the profile step bound no listener" in text
+        assert "demoted" not in text
     else:
         assert "no longer holds the cluster lease" in text and "bound no listener" in text
     assert coord.active is False and engine.dr_active is False
