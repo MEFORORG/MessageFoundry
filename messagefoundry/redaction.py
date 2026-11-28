@@ -1512,8 +1512,10 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     such a frame: pretty-printed ``{\n "given": [x]\n Doe}}`` is a residual.
 
     **A colon after a list or dict is a value here**, since neither can be a key; one after a call
-    or tuple is not. The full ``…(+N chars)`` note :func:`safe_text` writes is skipped, and the
-    token after it read; a peer can write it, so it is read past rather than trusted.
+    or tuple is not. One full ``…(+N chars)`` note, which :func:`safe_text` writes once, is
+    skipped and the token after it read; a peer can write it, so it is read past rather than
+    trusted. Only one, so a run of notes costs one step per closer rather than a rescan of the
+    run, and a second note reads as a value.
 
     **Not a value here:** a comma, a closer, a line end at the walk's top level, the end of the
     text, and anything after a container that is exactly the placeholder ``[redacted]``. A scrub
@@ -1528,22 +1530,26 @@ def _json_value_runs_on(text: str, pos: int, *, nested: bool) -> bool:
     if text.endswith(_REDACTED, 0, pos):
         return False
     closer = text[pos - 1]
-    while True:
-        match = _JSON_TOKEN.match(text, pos)
-        if match is not None and (space := match.group("ws")) is not None:
-            if not nested and ("\n" in space or "\r" in space):
-                return False
-            match = _JSON_TOKEN.match(text, match.end())
-        if match is None:
-            return False
-        note = _COUNT_NOTE.match(text, match.start())
-        if note is None:
-            break
-        pos = note.end()
+    match = _next_json_token(text, pos, nested)
+    if match is not None and (note := _COUNT_NOTE.match(text, match.start())) is not None:
+        match = _next_json_token(text, note.end(), nested)
+    if match is None:
+        return False
     punct = match.group("punct")
     if punct is not None:
         return punct in "{[(" or (punct == ":" and closer in "]}")
     return True
+
+
+def _next_json_token(text: str, pos: int, nested: bool) -> re.Match[str] | None:
+    """The token after ``pos`` past whitespace, or ``None`` at the end of the text, or at a line
+    break when ``nested`` is False."""
+    match = _JSON_TOKEN.match(text, pos)
+    if match is not None and (space := match.group("ws")) is not None:
+        if not nested and ("\n" in space or "\r" in space):
+            return None
+        match = _JSON_TOKEN.match(text, match.end())
+    return match
 
 
 def _runs_on_as_received(text: str) -> bool:
@@ -2169,8 +2175,9 @@ def redact(text: str) -> str:
     for the whole text (BACKLOG #5814)**, followed by any trailing bound note. So can a value
     straight after a container in such a key's value, with no delimiter between them
     (:func:`_json_value_runs_on`), which is how a stray closer of the container's own kind shows.
-    Text shaped like such a key can do it too, including text inside a JSON string. This can blank text beyond the key's
-    value, including some balanced inputs, and it misses some shapes. The code from
+    Text shaped like such a key can do it too, including text inside a JSON string. This can blank
+    text beyond the key's value, including some balanced inputs, and it misses some shapes. The
+    code from
     :func:`_redact_noted` down is the definition; the ``KNOWN_COST`` and ``MISSED`` lists in
     ``tests/test_b5814_stray_closer_before_flat_passes.py`` pin examples, neither of them a complete
     list."""

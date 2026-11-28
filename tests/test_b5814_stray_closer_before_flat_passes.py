@@ -15,6 +15,7 @@ import ast
 import functools
 import random
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -86,6 +87,17 @@ MISSED = [
     f'{{"given": [Jane]}}:{SECRET}}}',
     # A container after a scalar value.
     f'"given": x [{SECRET}]',
+    # A line break after the colon: the walk reads no value on the next line (as on origin/main).
+    f'"telecom":\n[a|b|c ) , {{"value": "{SECRET}"}}]',
+    f'{{"telecom":\n  [{{"value": "{SECRET}"}}]}}',
+    # The placeholder written by the text itself, inside a searched object.
+    f'{{"identifier": {{"system": "x", "value": [redacted] {SECRET}}}}}',
+    # A member after a comma with no key: the walk reads it under the object's policy.
+    f'{{"identifier": {{"value": ["x"], {SECRET}}}}}',
+    # A closer of the enclosing object's kind, then the token, then a stray closer.
+    f'{{"given": ["x"]}} {SECRET}}}',
+    # A colon after a tuple, which can be a dict key.
+    f'{{"given": (Jane): {SECRET}}}',
     # A token after a scalar value: the run-on rule reads only what follows a container.
     f'"family": "Doe" {SECRET}',
     # The placeholder written by the text itself, which a second pass must be able to read.
@@ -201,6 +213,10 @@ TRACEBACK = (
 #: Some texts blanked whole beyond the PHI value: examples, not a complete list.
 KNOWN_COST = [
     TRACEBACK,
+    # One line of a pretty-printed body, as the support bundle redacts it, line by line.
+    f'    "family": "{SECRET}"}},',
+    f'"name": "{SECRET}" stopped: code 3)',
+    f'"telecom": [{{"system": "{SECRET}"}}] (2 entries)',
     f'{{"family": "{SECRET}", "note": [1}}}}',
     f'"family": "{SECRET}", "note": [1}}',
     f'"family": "{SECRET}" rejected by peer (see [ref) for details',
@@ -232,10 +248,10 @@ def test_a_known_cost_blanks_the_whole_text(scrub: Callable[[str], str], text: s
 
 def _reference_walk(text: str) -> bool:
     """The check's walk as it stood before the structure-only step (engine head 79a11bc4f2b), over
-    every ``_JSON_TOKEN`` token, with the two rules BACKLOG #5814's run-on build added: a line break
-    inside a key does not disarm it, and an armed closer with nothing open is stray. It reads the live ``_JSON_TOKEN`` and
-    ``_JSON_PHI_KEY``, so it is that walk only while those two are unchanged. The shipped walk must
-    give the same verdict."""
+    every ``_JSON_TOKEN`` token, with the two rules BACKLOG #5814's run-on build added: a line
+    break inside a key does not disarm it, and an armed closer with nothing open is stray. It reads
+    the live ``_JSON_TOKEN`` and ``_JSON_PHI_KEY``, so it is that walk only while those two are
+    unchanged. The shipped walk must give the same verdict."""
     return _token_walk(text, run_on=True)
 
 
@@ -419,8 +435,8 @@ def test_no_text_prints_a_word_the_rules_off_scrubber_hid(monkeypatch: pytest.Mo
     """THE CONTROL'S DIFFERENTIAL. Over the corpus, the leak probes and a seeded fuzz, no scrubber
     prints a word that the rules-off form (``_rules_off``) hid. That form is origin/main
     4ad697da713's scrubber only while ``_rules_off`` names every rule this branch added; the
-    scratchpad run of this build against origin/main's own module, kept out of the suite because it
-    needs git, agreed on 72,208 texts. Every rule here only turns a text into the placeholder, so
+    build's own run against origin/main's module, kept out of the suite because it needs git, is
+    recorded in its commit message. Every rule here only turns a text into the placeholder, so
     this is the check that a later change keeps it that way."""
     texts = [*_corpus()[:4_000], *LEAK_PROBES, *RUN_ON, *KEPT, *_differential_fuzz(4_000)]
     # Neither rule reads a text with no PHI key, so only those can differ.
@@ -444,6 +460,22 @@ def test_the_differential_sees_a_leak(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_leak_probe_keeps_no_secret(text: str) -> None:
     for scrub in SCRUBBERS:
         assert SECRET not in scrub(text), (scrub, text)
+
+
+def test_the_count_note_pattern_reads_the_note_safe_text_writes() -> None:
+    """``_COUNT_NOTE`` spells the note ``_held_back`` writes; this pins the two together."""
+    cut = redaction._held_back("word " * 100, 40)
+    note = redaction._COUNT_NOTE.search(cut)
+    assert note is not None and note.end() == len(cut)
+
+
+def test_a_run_of_count_notes_stays_linear() -> None:
+    """Review round-7c41e93b2a: a skip loop over notes rescanned every later note at each closer,
+    so a peer's run of notes was quadratic. One note is skipped now; this bounds the work."""
+    text = '{"identifier": {"system": [1]' + "\u2026(+1 chars)" * 3_000 + "}}"
+    start = time.perf_counter()
+    safe_text(text)
+    assert time.perf_counter() - start < 5.0
 
 
 def test_the_count_note_after_a_closed_value_is_not_a_run_on() -> None:
