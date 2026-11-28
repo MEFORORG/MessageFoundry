@@ -486,15 +486,28 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
     )
 
 
-async def _outlive_caller[T](task: asyncio.Future[T]) -> T:
+async def _outlive_caller[T](task: asyncio.Future[T], label: str) -> T:
     """Await ``task`` so that cancelling the CALLER does not cancel it.
 
     Not ``asyncio.shield``. When a shield's caller is cancelled and the task later raises, the shield
     reports the error itself through the loop's exception handler ("exception in shielded future").
     The gate logs that error too, so one failure was logged twice (BACKLOG #2087). ``asyncio.wait``
-    never cancels what it waits on and reports nothing, so the gate's own log line is the only one."""
+    never cancels what it waits on and reports nothing, so the gate's own log line is the only one.
+
+    A cancellation of the caller reaches it as ``CancelledError``, and so does a cancellation of
+    ``task`` while the caller is cancelling too. ``task`` cancelled while the caller is NOT
+    cancelling raises :class:`OperationInterrupted` with ``label``, chaining the task's
+    ``CancelledError``: a bare one would reach a caller nobody cancelled (BACKLOG #5903). The
+    caller's ``cancelling()`` count tells the two apart, and a missing current task reads as not
+    cancelling, as ``api.app._write_through_cancel`` reads it."""
     await asyncio.wait((task,))
-    return task.result()
+    try:
+        return task.result()
+    except asyncio.CancelledError as exc:
+        caller = asyncio.current_task()
+        if caller is None or caller.cancelling() == 0:
+            raise OperationInterrupted(label) from exc
+        raise
 
 
 @dataclass(frozen=True)
@@ -521,18 +534,37 @@ class _Operation:
 class OperationInterrupted(Exception):
     """An outliving operation was cancelled while its caller was NOT (BACKLOG #5903).
 
-    :meth:`~messagefoundry.api.outlive.OutlivingOperations.run` raises it in place of the
-    operation's ``CancelledError``, which would reach a request as a cancellation nobody asked
-    for, past every exception handler. At least the shutdown drain cancels an operation that way
+    :func:`_outlive_caller` raises it in place of the awaited task's ``CancelledError``, which would
+    reach a request as a cancellation nobody asked for, past every exception handler. Its users
+    include at least :meth:`~messagefoundry.api.outlive.OutlivingOperations.run` and the approval
+    gate's shielded writes and claim. At least the shutdown drain cancels an operation that way
     (:meth:`~messagefoundry.api.outlive.OutlivingOperations.drain`). The operation may have run
     none, some or all of its effects, so the approval gate records a release that raised it as
     ``interrupted``, never ``failed``. Deliberately not an ``HTTPException``: the ``/ui`` routes
     render an ``HTTPException`` 503 as a refusal where nothing ran, which this is not. The app's
-    own handler answers it (``_operation_interrupted`` in ``api/app.py``)."""
+    own handler answers it (``_operation_interrupted`` in ``api/app.py``). At least the ``/ui``
+    approve and upload routes catch it first and render :attr:`operator_detail` as a page, and the
+    ``/ui`` upload delete answers it with a notice of its own.
+
+    ``released`` is set only by :meth:`ApprovalGate.approve`, on one raised out of a release, so
+    :attr:`operator_detail` names an approval only then."""
 
     def __init__(self, label: str) -> None:
         super().__init__(f"{label} was interrupted before it answered, and its outcome is unknown")
         self.label = label
+        self.released = False
+
+    @property
+    def operator_detail(self) -> str:
+        """The text an operator is answered with. It carries the label and fixed text only. Not
+        "retry": the operation may have landed."""
+        detail = f"{self}. Check the audit log and the state it changes before running it again."
+        if self.released:
+            detail += (
+                " It ran as an approval's release, so resolve that approval rather than approving "
+                "it again."
+            )
+        return detail
 
 
 class ApprovalError(Exception):
@@ -646,7 +678,7 @@ class ApprovalGate:
         if on_done is not None:
             task.add_done_callback(lambda _t: on_done())
         try:
-            return await _outlive_caller(task)
+            return await _outlive_caller(task, f"a write for approval {approval_id}")
         except asyncio.CancelledError:
             task.add_done_callback(lambda t: orphaned(t, approval_id))
             raise
@@ -1756,7 +1788,9 @@ class ApprovalGate:
         self._releasing[approval_id] += 1
         claimed = handed_off = False
         try:
-            claimed = await _outlive_caller(claim)
+            # A claim cancelled under an approve that was not raises OperationInterrupted, which
+            # the store-fault arm below answers as the claim's own 503.
+            claimed = await _outlive_caller(claim, f"the claim of approval {approval_id}")
         except RowSealError as exc:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
@@ -1806,7 +1840,9 @@ class ApprovalGate:
             # Encodable once, here, so the audit row and the caller's answer carry one form, and
             # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
             result = _encodable_result(await op.execute(params))
-        except (asyncio.CancelledError, OperationInterrupted):
+        except (asyncio.CancelledError, OperationInterrupted) as exc:
+            if isinstance(exc, OperationInterrupted):
+                exc.released = True  # its answer names the approval (BACKLOG #5903)
             # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
             # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
             # or all of its effects, so the outcome is UNKNOWN: record 'interrupted', never 'failed'

@@ -5277,24 +5277,15 @@ def create_app(
 
     @app.exception_handler(OperationInterrupted)
     async def _operation_interrupted(request: Request, exc: OperationInterrupted) -> JSONResponse:
-        # BACKLOG #5903: an outliving operation cancelled while its request still waited. Not
-        # "retry": it may have landed. When it ran as an approval's release, that approval is now
-        # 'interrupted', to be resolved rather than approved again. The label only is logged and
-        # answered.
+        # BACKLOG #5903: an outliving operation cancelled while its request still waited. The
+        # label only is logged and answered; the text names an approval only for a release.
         _log.warning(
             "%s %s: %s",
             scrub_log_argument(request.method),
             scrub_log_argument(request.url.path),
             exc,
         )
-        return JSONResponse(
-            {
-                "detail": f"{exc}. Check the audit log and the state it changes before running it "
-                "again. If it ran as an approval's release, that approval is now interrupted; "
-                "resolve it rather than approving it again."
-            },
-            status_code=503,
-        )
+        return JSONResponse({"detail": exc.operator_detail}, status_code=503)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

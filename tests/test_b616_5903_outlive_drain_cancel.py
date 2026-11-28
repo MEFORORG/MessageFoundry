@@ -161,8 +161,7 @@ async def test_a_route_whose_operation_is_drained_answers_503(engine: Engine) ->
     assert response.status_code == 503, response.text
     detail = response.json()["detail"]
     assert "DR release was interrupted" in detail and "outcome is unknown. Check" in detail
-    # Conditional, because an ungated operation released no approval.
-    assert (
-        "If it ran as an approval's release, that approval is now interrupted; resolve it rather "
-        "than approving it again." in detail
-    )
+    # An ungated operation released no approval, so its answer names none (BACKLOG #5903 added
+    # step 3; the release's own text is pinned in tests/test_b20014_5903_outlive_remainder.py).
+    assert "Check the audit log and the state it changes before running it again." in detail
+    assert "approval" not in detail

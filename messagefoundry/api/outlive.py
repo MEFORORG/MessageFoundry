@@ -121,16 +121,13 @@ class OutlivingOperations:
         self._inflight[task] = label
         task.add_done_callback(self._forget)
         try:
-            return await _outlive_caller(task)
-        except asyncio.CancelledError as exc:
+            # An operation cancelled under a caller that is not cancelling comes out of the helper
+            # as OperationInterrupted, and is not caught here.
+            return await _outlive_caller(task, label)
+        except asyncio.CancelledError:
             if task.cancelled():
-                # The operation was cancelled and raised this through task.result(); its own
+                # The operation was cancelled under a caller that is cancelling too. Its own
                 # cancellation arm has already run, and there is nothing left to read.
-                # task.result() raises the operation's cancel as CancelledError too. The caller's
-                # cancelling() count tells the two apart, read as _write_through_cancel reads it.
-                caller = asyncio.current_task()
-                if caller is None or caller.cancelling() == 0:
-                    raise OperationInterrupted(label) from exc
                 raise
             if not task.done():
                 log.warning(
