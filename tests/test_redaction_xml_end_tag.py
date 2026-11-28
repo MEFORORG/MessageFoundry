@@ -67,6 +67,9 @@ def _main() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(redaction, "_end_tag_rest", _main_end_tag_rest)
         patch.setattr(redaction, "_masked_only", _never_masked_only)
+        # Main copied an end tag naming no open element as it stood (BACKLOG #5925 item 13).
+        if hasattr(redaction, "_stray_end_tag_name"):
+            patch.setattr(redaction, "_stray_end_tag_name", lambda text, tag, mask: tag.group())
         yield
 
 
@@ -726,3 +729,39 @@ def test_the_mask_is_a_fixed_point() -> None:
     for _ in range(2_000):
         once = redact(_fragment(rand, element=True))
         assert redact(once) == once, once
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("<family>Smith</family:Zqxdoe>", "<family>[redacted]</family:Xxxxxx>"),
+        ("<family>Smith</family:Zqxdoe></family>", "<family>[redacted]</family:Xxxxxx></family>"),
+        ("<given>Smith</ns:Zqxdoe 4455>", "<given>[redacted]</ns:Xxxxxx 0000>"),
+    ],
+)
+def test_an_end_tag_naming_no_open_element_has_its_name_masked(text: str, want: str) -> None:
+    """BACKLOG #5925 item 13: inside a leaf element, an end tag that closes nothing is text of the
+    element, and ``</family:Zqxdoe>`` read as a qualified name printed its local part."""
+    with _main():
+        main = redact(text)
+    assert "Zqxdoe" in main  # the premise: main printed it
+    assert redact(text) == want
+    assert _is_main_masked(want, main)
+    assert redact(want) == want
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<family>Smith</family:Zqxdoe",  # nothing after the name: glued text could complete it
+        "<family>Smith</family:ZqMSH>",  # a word read with no boundary
+        "<family>Smith</family:userPwd>",  # a camel credential label
+        "<identifier><system>x</b:Zqxdoe></system></identifier>",  # not a leaf frame
+        "<family>Smith</Zqxdoe>",  # no prefix: an unprefixed name can be another pass's markup
+        "<family>Smith</ns:name>",  # a vocabulary local name: a later call reads it
+    ],
+)
+def test_an_end_tag_name_the_rules_refuse_stays_as_main_left_it(text: str) -> None:
+    with _main():
+        main = redact(text)
+    assert redact(text) == main

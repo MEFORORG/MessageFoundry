@@ -1810,8 +1810,9 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     note after it, a last word holding a digit, which keeps the whole rest (``</family Zqx
     4455``), and the end of a last word that glued text could complete, which stays while the
     words before it are masked (``</family zqxP`` masks to ``</family xxxP``, and ``shared``
-    stays whole); an end tag read as a qualified name, whose local part is the value
-    (``</family:Zqxdoe>``); and the text of an element that only a malformed end tag closes and
+    stays whole); an end tag naming no open element whose name :func:`_stray_end_tag_name` keeps,
+    at least an unprefixed one and one that ends the text (``</family:Zqxdoe`` with nothing
+    after it; with its ``>``, the local part is masked); and the text of an element that only a malformed end tag closes and
     whose text opens with whitespace (``<family> Smith</family Kim``), which is read as prose.
 
     **A rest this module's trailing bound note follows does not end the text** (``noted``, BACKLOG
@@ -1930,6 +1931,36 @@ def _mask_keeping_glue_head(rest: str) -> str | None:
     return masked
 
 
+#: Local names :func:`_stray_end_tag_name` never masks: the vocabulary and its ``value`` member.
+_XML_STRUCTURE_NAMES = frozenset({*_PHI_LEAF_KEYS, *_PHI_VALUE_KEYS, _VALUE_MEMBER})
+
+
+def _stray_end_tag_name(text: str, tag: re.Match[str], mask: bool) -> str:
+    """An end tag inside a leaf element that names no open element, with its local name masked in
+    place (BACKLOG #5925 item 13). Its name is text of the element, not markup: ``</family:Zqxdoe>``
+    reads as a qualified name whose local part is the value, and it printed. Masked only where
+    the name carries a prefix and its local part names no element a pass reads
+    (:data:`_XML_STRUCTURE_NAMES`): masking ``</name`` itself let a later call read the element
+    differently, and a value after it printed (measured by the composed-join differential). And
+    only where whitespace or the tag's ``>`` follows the name, so no caller's text can be glued to
+    it, and where :func:`_rest_words` and :func:`_ends_in_unbounded_word` allow it as they allow a
+    rest the tag's ``>`` ends. Otherwise, or with ``mask`` False, the tag is kept as it stood, at
+    least an unprefixed ``</Zqxdoe>`` and a ``</family:Zqxdoe`` that ends the text."""
+    whole = tag.group()
+    local = tag.group(3)
+    if (
+        not mask
+        or local == tag.group(2)  # no prefix: an unprefixed name can be another pass's markup
+        or local in _XML_STRUCTURE_NAMES
+        or text[tag.end() : tag.end() + 1] not in (">", " ", "\t", "\r", "\n")
+    ):
+        return whole
+    rest = " " + local
+    if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
+        return whole
+    return whole[: len(whole) - len(local)] + local.translate(_SHAPE)
+
+
 def _scrub_xml_element(
     text: str, match: re.Match[str], last_close: dict[str, int], mask: bool, *, noted: bool
 ) -> tuple[str, int]:
@@ -1961,7 +1992,10 @@ def _scrub_xml_element(
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
-            out.append(tag.group())
+            if not open_names.get(qname) and stack[-1][1] == _LEAF:
+                out.append(_stray_end_tag_name(text, tag, mask))
+            else:
+                out.append(tag.group())
             out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
             if open_names.get(qname):
                 while stack:
