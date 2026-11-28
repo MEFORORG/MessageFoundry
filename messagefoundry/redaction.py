@@ -1524,19 +1524,21 @@ _COUNT_NOTE = re.compile(r"\u2026\(\+[0-9]++ chars\)")
 
 def _padded(value: str) -> str:
     """``value``, which only the read-on past a placeholder scrubs (BACKLOG #5814), with each of its
-    tokens written as the placeholder, led by spaces to the token's length where the token is
-    longer. origin/main printed that value, or scrubbed some of its tokens with a later pass, so a
-    shorter answer would let a downstream length bound, such as :func:`safe_text`'s, keep text it
-    cut on main: the differential against origin/main found words printed that way, from one
-    placeholder written for a whole run and from a long token. Token by token, at a token's own
-    length at least, the answer is expected to cut no later than main's; that is measured, not
-    proved. The spaces LEAD because the value can end the text, and :func:`redact_bounded_head`
-    strips the answer's end before the bound cuts it."""
+    tokens written as the placeholder, repeated until it is at least as long as the token.
+
+    origin/main printed that value, or scrubbed some of its tokens with a later pass, so an answer
+    shorter there would let a downstream length bound, such as :func:`safe_text`'s, keep text it cut
+    on main: the differential against origin/main found words printed that way, from one
+    placeholder written for a whole run and from a long token. Padding with spaces split a token
+    main's whole-token cut dropped, and the differential found words printed that way too. So the
+    placeholder repeats, glued: no new whitespace, no new character, at least the token's length,
+    and a second pass reads the repeats as placeholders and leaves them. The answer is expected to
+    cut no later than main's; that is measured, not proved."""
     return _NON_SPACE.sub(_padded_token, value)
 
 
 def _padded_token(match: re.Match[str]) -> str:
-    return " " * (len(match.group()) - len(_REDACTED)) + _REDACTED
+    return _REDACTED * -(-len(match.group()) // len(_REDACTED))
 
 
 _NON_SPACE = re.compile(r"\S++")

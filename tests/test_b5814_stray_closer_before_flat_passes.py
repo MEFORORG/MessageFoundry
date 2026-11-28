@@ -167,7 +167,8 @@ def test_origin_main_kept_each_field_run_token(text: str, monkeypatch: pytest.Mo
 
 #: Texts the differential against origin/main found printing words main's bounded answer had cut,
 #: on earlier forms of the read-on: it wrote one placeholder for a long token, or for a run whose
-#: label and value main scrubbed in two passes, so the answer was shorter and the bound cut later.
+#: label and value main scrubbed in two passes, so the answer was shorter and the bound cut later;
+#: or it padded with spaces, which split a token the whole-token cut had dropped.
 CUT_SHIFT = [
     "A^B^C['given': Pqwertypassword=password=<value value=\n[redaction bound: x]'name':"
     "Authorization: Bearer <value value=password=PID|1||Hunter2pw>\n1980-05-05Hunter2pw>"
@@ -177,6 +178,11 @@ CUT_SHIFT = [
     " >OtherPatientIDs=DOE^JANE>frozenset(\"0010ABCD\": MRN: 'given': ",
     f'"given": a|b|c 1980-05-05Hunter2pw{SECRET}',
     '"given": a|b|c MRN 123456',
+    # Padding with spaces split a token main's whole-token cut dropped.
+    'PatientName=\nDOE^JANE^Q \'"name":<value value=[redacted]1980-05-05Doe, Jane',
+    '\\</name>"telecom":123-45-6789Hunter2pwQzorvex123-45-6789"telecom":MRN 123456',
+    'a|b|cA^B^C"telecom":\tQzorvex\\"telecom"::\'name\':Jane DoeIB_ACME_ADTPatientName=Hunter2pw'
+    "123-45-6789IB_ACME_ADT\n[redaction bound: x],\tpassword: ",
 ]
 
 
