@@ -250,13 +250,15 @@ and uses your user value or the default instead, until you trust the workspace (
   it through a junction or a directory symbolic link outside the folder (by real path), or a UNC
   loopback admin share (by file id), gets the same checks on the part below the folder; those three
   were measured on Windows with standalone Node v24.20.0, not the editor's Electron runtime.
-  Open limits: other spellings, a subst drive among them, are unmeasured and may be accepted as
-  written; where the workspace folder reports no file id, a UNC alias of it is accepted as written,
-  no looser than before; and an alias whose target passes through a link the repository holds, at
-  any depth (an alias onto `ws\linked\deeper`, measured), is followed where that link leads,
-  unchecked. In a window opened from a `.code-workspace` file, which
+  Open limits include at least: other spellings, a subst drive among them, are unmeasured and may
+  be accepted as written; where the workspace folder reports no file id, a UNC alias of it is
+  accepted as written, no looser than before; an alias whose target passes through a link the
+  repository holds, at any depth (an alias onto `ws\linked\deeper`, measured), is followed where
+  that link leads, unchecked; and a link made or a folder renamed between the check and the CLI's
+  write is not seen. In a window opened from a `.code-workspace` file, which
   chooses the workspace folder, a path inside that folder, the default one included, is refused
-  unless the folder lies inside the folder holding the file. The rules and the open limits are in the
+  unless the folder lies inside the folder holding the file, and a relative user value that leaves
+  the folder, by `..` or, on Windows, a path with no drive, is refused. The rules and the open limits are in the
   `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it, unless

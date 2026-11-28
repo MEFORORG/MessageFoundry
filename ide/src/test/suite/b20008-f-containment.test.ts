@@ -399,9 +399,16 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
       const got = securityConfigTarget(chosen, "messagefoundry.toml", inWindow(scope, workspaceFile), real);
       assert.ok(!got.ok && got.problem.includes(".code-workspace"), JSON.stringify(got));
     }
-    // The chosen folder spelled with a trailing dot, which the CLI's open drops, is refused too.
-    const dotted = securityConfigTarget(chosen, `${chosen}.\\messagefoundry.toml`, inWindow(user, workspaceFile), real);
-    assert.ok(!dotted.ok, JSON.stringify(dotted));
+    // On Windows the chosen folder spelled with a trailing dot, which the CLI's open drops, is
+    // refused too. Elsewhere no open drops the dot and the backslash is part of the name, so it
+    // names a file beside the chosen folder and is accepted as written.
+    const dottedPath = `${chosen}.\\messagefoundry.toml`;
+    const dotted = securityConfigTarget(chosen, dottedPath, inWindow(user, workspaceFile), real);
+    if (process.platform === "win32") {
+      assert.ok(!dotted.ok && dotted.problem.includes("dot or a space"), JSON.stringify(dotted));
+    } else {
+      assert.deepStrictEqual(dotted, { ok: true, path: dottedPath });
+    }
     // An absolute user path outside the chosen folder is the operator's, and is not refused for it.
     const mine = path.join(base, "mine.toml");
     assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
@@ -482,6 +489,34 @@ suite("b20008 F: a .code-workspace file cannot choose the folder a path is read 
     assert.deepStrictEqual(securityConfigTarget(chosen, plain, inWindow(user, workspaceFile), real), { ok: true, path: plain });
     const mine = path.join(base, "mine.toml");
     assert.deepStrictEqual(securityConfigTarget(chosen, mine, inWindow(user, workspaceFile), real), { ok: true, path: mine });
+  });
+
+  test("a relative user value that climbs out of the folder the file chose is refused (round-55360875 finding 2)", () => {
+    const repo = path.join(base, "repo");
+    const chosen = path.join(base, "chosen");
+    fs.mkdirSync(path.join(repo, "below"), { recursive: true });
+    fs.mkdirSync(path.join(chosen, "sub"), { recursive: true });
+    const workspaceFile = path.join(repo, "project.code-workspace");
+    const up = `..${path.sep}messagefoundry.toml`;
+    // Chosen from outside the file's folder, and chosen below it: either way the file picked the
+    // folder the climb starts from.
+    for (const folder of [chosen, path.join(repo, "below")]) {
+      const got = securityConfigTarget(folder, up, inWindow(user, workspaceFile), real);
+      assert.ok(!got.ok && got.problem.includes("relative path"), `${folder} ${JSON.stringify(got)}`);
+    }
+    if (process.platform === "win32") {
+      // A rooted path with no drive takes the chosen folder's drive, so it is read against it too.
+      const rooted = securityConfigTarget(chosen, `\\${path.relative(path.parse(base).root, base)}\\x.toml`, inWindow(user, workspaceFile), real);
+      assert.ok(!rooted.ok && rooted.problem.includes("relative path"), JSON.stringify(rooted));
+    }
+    // THE CONTROL: with no .code-workspace file the operator opened the folder, and the climb is
+    // theirs, as before; a full path is accepted in the window; a relative value that stays inside
+    // the folder is not this check's.
+    assert.deepStrictEqual(securityConfigTarget(chosen, up, user, real), { ok: true, path: path.join(base, "messagefoundry.toml") });
+    const full = path.join(base, "messagefoundry.toml");
+    assert.deepStrictEqual(securityConfigTarget(chosen, full, inWindow(user, workspaceFile), real), { ok: true, path: full });
+    const inside = securityConfigTarget(path.join(repo, "below"), `sub${path.sep}..${path.sep}m.toml`, inWindow(user, workspaceFile), real);
+    assert.deepStrictEqual(inside, { ok: true, path: path.join(repo, "below", "m.toml") });
   });
 
   (process.platform === "win32" ? test : test.skip)("the name checks still run first, with no file-system call", () => {

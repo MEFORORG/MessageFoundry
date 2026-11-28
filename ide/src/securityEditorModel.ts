@@ -285,6 +285,16 @@ function nameProblem(rel: string, inWhere: string): string | undefined {
   return undefined;
 }
 
+/** Whether `setting` names its path by itself rather than one read against the workspace folder:
+ *  absolute, and on Windows with its drive or share named too, since `\x` takes the folder's drive
+ *  and `C:x` the drive's current folder. */
+function namesItsOwnPath(setting: string): boolean {
+  if (process.platform !== "win32") {
+    return path.isAbsolute(setting);
+  }
+  return /^[A-Za-z]:[\\/]/.test(setting) || /^[\\/]{2}/.test(setting);
+}
+
 /** Whether the workspace folder `root` lies inside the folder that holds the `.code-workspace` file
  *  `workspaceFile`, an absolute path, as spelled and by real path; any realpath error refuses. */
 function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: LinkFs): boolean {
@@ -345,7 +355,10 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  *    real path and file id, with the same open limits.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` and a relative value included, it gets the checks of rule 2,
- *    and the folder itself is refused. Otherwise every folder and file name on its whole path gets
+ *    and the folder itself is refused. In a `.code-workspace` window, a value that does not name its
+ *    own path (relative, or on Windows one with no drive or share, such as `\x` or `C:x`) and leaves
+ *    the workspace folder, by `..` or by its root, is refused before any file-system call, since
+ *    the file chose the folder it is read against. Otherwise every folder and file name on its whole path gets
  *    rule 2's name checks first, before any file-system call: a name ending in a dot or a space,
  *    holding a colon, or that is a device name is refused, not normalised, since Node reads `ws.`
  *    as written while the CLI's Win32 open drops the dot and may reach the workspace folder. Then,
@@ -375,7 +388,7 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * included, refuses. Where the real paths differ, the file ids decide, as escapesByLink decides;
  * a caller that passes no `fileId` refuses then.
  *
- * Open limits. Rule 3's placement was measured on Windows 11 with standalone Node v24.20.0, not
+ * Open limits, at least these. Rule 3's placement was measured on Windows 11 with standalone Node v24.20.0, not
  * the editor's Electron runtime, for a junction and a directory symbolic link (by real path) and a
  * UNC loopback admin share (by file id), and nothing else: at least a subst or mapped drive, an
  * 8.3 short name, a bind mount and a macOS firmlink are UNMEASURED, and may be accepted as written
@@ -389,8 +402,8 @@ function insideWorkspaceFileFolder(root: string, workspaceFile: string, fsx: Lin
  * needed to see it. Where the
  * native realpath fails, at least with EISDIR on some RAM disks and virtual drives, every user-set
  * path refuses, as every rule 2 path already did. Its reads are synchronous, so a user-set path on a slow share holds the extension host while they
- * run. Nor does this check cover the files the CLI creates beside the target, or a link made
- * between this check and the CLI's write.
+ * run. Nor does this check cover the files the CLI creates beside the target, or a link made or a
+ * folder renamed between this check and the CLI's write, since the CLI opens the path itself, later.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -424,6 +437,17 @@ export function securityConfigTarget(
             : "messagefoundry.serviceConfig, set in workspace settings, is not a path inside the workspace folder " +
               `as spelled ${CASE_RULE}. Spell it with the folder's own case, or, to use a file elsewhere, set it ` +
               "in user settings",
+      };
+    }
+    // A relative user value is read against the workspace folder, which a .code-workspace file
+    // chooses, so one that leaves that folder lands where the file chose (round-55360875 finding
+    // 2). Refused before any read; a full path is the operator's own.
+    if (scope.workspaceFile !== undefined && !namesItsOwnPath(setting)) {
+      return {
+        ok: false,
+        problem:
+          "messagefoundry.serviceConfig is a relative path that leaves the workspace folder, and this window's " +
+          ".code-workspace file chose that folder. Give the full path, with its drive, in user settings",
       };
     }
     // Every folder and file name on a user-set path outside the folder, before any read: Node reads
