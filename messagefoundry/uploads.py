@@ -437,16 +437,18 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     (``os.path.samestat``), so this function returns no handle to, and nothing is read from, the
     link's target. A regular file put in its place, as an atomic replace does, is read.
 
-    An open the filesystem refuses is a :class:`_NotPlainError` too when a fresh ``lstat`` shows
-    the name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a
-    dangling link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which
-    answers ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. Any other
+    An open the filesystem refuses is a :class:`_NotPlainError` too when a fresh ``lstat`` shows the
+    name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a dangling
+    link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which answers
+    ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. Any other
     ``EINVAL``, as on a Windows reparse point ``_UNOPENABLE_REPARSE_TAGS`` does not list, is
     re-raised: the Windows CRT answers EINVAL for every Win32 error it does not map, so it may be a
-    sound file whose filter is not running. A refused open whose name is gone by that ``lstat``
+    sound file whose filter is not running. A refused open whose path is gone by that ``lstat``,
+    read with ``is_absent`` so that a missing folder or drive above the name counts as gone too,
     raises ``FileNotFoundError``, whatever the open met, so the race answers the same on every
-    platform; one whose share cannot be reached (``messagefoundry.path_reach``) raises :class:`_UnreachableError`, never ``FileNotFoundError``. Raises :class:`_NotPlainError`
-    for a refusal, and any other ``OSError`` the filesystem gives, ``FileNotFoundError`` and
+    platform; one whose share cannot be reached (``messagefoundry.path_reach``) raises
+    :class:`_UnreachableError`, never ``FileNotFoundError``. Raises :class:`_NotPlainError` for a
+    refusal, and any other ``OSError`` the filesystem gives, ``FileNotFoundError`` and
     ``PermissionError`` included. An error of the open itself carries the re-check's verdict for
     :func:`_refused_read`."""
     unreached: str | None = None
