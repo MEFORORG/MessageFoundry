@@ -4290,10 +4290,6 @@ _UNVERIFIABLE_ACCOUNT_REFUSAL: Final = (
     " check that Vault is healthy and that every node holds the audit key's latest version, then"
     " retry"
 )
-#: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
-#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
-#: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
-_BLANK_USERNAME_REFUSAL: Final = BLANK_USERNAME_REFUSAL
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -5555,7 +5551,7 @@ class AuthService:
         """
         username = username.strip()
         if not username:
-            raise FirstAdministratorRefused(_BLANK_USERNAME_REFUSAL)
+            raise FirstAdministratorRefused(BLANK_USERNAME_REFUSAL)
         # Checked ONCE, so every later write of it carries the same value: `create_user` seeds both
         # `users.email` and `notify_email` on a fresh create, and `set_user_notify_email` writes
         # `notify_email` alone. A REPAIR writes no `users.email`, so that column keeps what the row
@@ -6069,7 +6065,7 @@ class AuthService:
         name = username.strip()
         # In the write's order: the name first, then the address.
         if not name:
-            return _BLANK_USERNAME_REFUSAL
+            return BLANK_USERNAME_REFUSAL
         try:
             provision_notify_email(notify_email)
         except FirstAdministratorRefused as exc:
@@ -19909,8 +19905,9 @@ class AuthService:
     ) -> MfaReset:
         """Admin: clear a user's MFA — TOTP **and** every WebAuthn passkey (lost authenticator + no
         recovery path; ADR 0068 extends this to credentials) — and revoke their sessions so they
-        re-enroll. The always-available recovery for a locked-out passkey user. Raises
-        :class:`ValueError` for an unknown user.
+        re-enroll. The recovery for a locked-out passkey user whose record passes its seal. Raises
+        :class:`ValueError` for an unknown user, and for one whose record fails its seal, which
+        its loader reads as none.
 
         **IT COVERS A DIRECTORY ACCOUNT (BACKLOG #1144).** The non-local refusal that stood here was
         true while no directory account could hold an engine factor. Once one can, keeping it would

@@ -2005,12 +2005,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
         # SELF-EXCLUSION, AND IT BELONGS HERE RATHER THAN IN THE SERVICE (BACKLOG #1022).
         #
-        # `AuthService.admin_reset_mfa` is the ALWAYS-AVAILABLE RECOVERY for a locked-out passkey
-        # user and is deliberately unguarded (its own docstring, and ADR 0068 §2 via
-        # auth/webauthn.py). An actor check inside it would narrow the one path that exists when a
+        # `AuthService.admin_reset_mfa` is the RECOVERY for a locked-out passkey user whose record
+        # passes its seal (a failing one is refused below) and is deliberately unguarded (its own
+        # docstring, and ADR 0068 §2 via auth/webauthn.py). An actor check inside it would narrow the one path that exists when a
         # user has lost every factor. This route is the only caller today, so the distinction is
         # about WHICH CASE is refused, not about which function holds the line: cross-user recovery
-        # still reaches the service untouched, and only self-targeting is refused here.
+        # still reaches the service, and the only actor check here is the self-target refusal.
+        # The checked read below refuses no actor: it refuses a target whose record fails its
+        # seal (423), which the service's own loader already refused as "no such user".
         #
         # SELF-TARGETING IS NEVER RECOVERY, which is what makes the refusal safe. Reaching this
         # route at all requires passing `require_step_up_action(... ADMIN_RESET_MFA ...)`, which is
@@ -2032,6 +2034,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             op="mfa_reset",
             detail="use the self-service MFA settings for your own account",
         )
+        # BACKLOG #5520 item 13: a record that fails its seal answers the reads' 423, as
+        # reset-password does, not the service loader's 404. The service reads the account again
+        # before it writes.
+        await _checked_user(service, user_id)
         try:
             reset = await service.admin_reset_mfa(
                 user_id, actor=identity.username, actor_id=identity.user_id

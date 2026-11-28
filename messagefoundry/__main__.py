@@ -10715,7 +10715,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.policy import BreachCorpusUnavailable, PasswordPolicy
     from messagefoundry.auth.service import (
-        _BLANK_USERNAME_REFUSAL,
         HOLDER_NOTICE_DISPATCHED,
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
@@ -10725,6 +10724,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         _is_integrity_refusal,
         provision_notify_email,
     )
+    from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL
     from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
@@ -10753,7 +10753,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # /users/directory` and an AD sign-in that creates its mirror row do not apply it either.
     username = args.username.strip()
     if not username:
-        return _emit_error(_BLANK_USERNAME_REFUSAL, as_json=args.json)
+        return _emit_error(BLANK_USERNAME_REFUSAL, as_json=args.json)
     if len(username) > _NAME_MAX:
         return _emit_error(f"the username is longer than {_NAME_MAX} characters", as_json=args.json)
     # Read before the strip, as the console's bound reads the raw request body: stripped first, a
