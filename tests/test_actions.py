@@ -547,37 +547,83 @@ def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
     sent: str, expected: str, path: str
 ) -> None:
     # BACKLOG #5928: title case decides whether a letter starts a word from the character before
-    # it, and a run of hex escapes is read as UTF-8 where its bytes end in a UTF-8 character.
-    # NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character, the first five
-    # rows fail on every path.
-    m = _with_pid(sent)
+    # it, and under a UTF-8 MSH-18 a run of hex escapes is read as UTF-8 where its bytes end in a
+    # UTF-8 character. NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character,
+    # the first five rows fail on every path.
+    m = _with_pid_charset(sent, "UNICODE UTF-8")
     convert_case(m, path, "title")
     assert m["PID-5"] == expected
 
 
+def _with_pid_charset(pid5: str, msh18: str | None) -> Message:
+    """A message whose MSH-18 is ``msh18`` as sent, or which ends before MSH-18 where it is None."""
+    msh = _MSH if msh18 is None else _MSH.replace("2.5.1\r", f"2.5.1||||||{msh18}\r")
+    return Message.parse(f"{msh}PID|1||100^^^HOSP^MR||{pid5}\r")
+
+
+# Read as UTF-8, the run C3 A9 is one character, e-acute, which is cased, so the "e" after it stays
+# lower case. Read per byte, its last byte A9 is an uncased character, so the "e" starts a word.
+_UTF8_READ = "Ren\\XC3A9\\e"
+_PER_BYTE_READ = "Ren\\XC3A9\\E"
+
+
 @pytest.mark.parametrize(
-    ("charset", "expected"),
+    ("msh18", "expected"),
     [
+        # HL7 table 0211 spells UTF-8 "UNICODE UTF-8". The match ignores case and surrounding
+        # space, and "UTF-8" alone is taken too, as the owner ruled on 2026-11-27.
+        ("UNICODE UTF-8", _UTF8_READ),
+        ("unicode utf-8", _UTF8_READ),
+        ("  Unicode UTF-8 ", _UTF8_READ),
+        ("UTF-8", _UTF8_READ),
+        ("utf-8", _UTF8_READ),
+        (" Utf-8  ", _UTF8_READ),
+        # Only the first repetition names the message's own character set; a later one names an
+        # alternate set a \C..\ escape may switch to.
+        ("UNICODE UTF-8~8859/1", _UTF8_READ),
+        ("UTF-8~UNICODE UTF-16", _UTF8_READ),
+        ("8859/1~UNICODE UTF-8", _PER_BYTE_READ),
+        ("~UTF-8", _PER_BYTE_READ),
+        # An empty or absent MSH-18 declares ASCII, per HL7, so each byte is its own character.
+        ("", _PER_BYTE_READ),
+        ("   ", _PER_BYTE_READ),
+        (None, _PER_BYTE_READ),
         # ISO 8859-1 maps each byte to the character unescape decodes it to, so C3 A9 is two
-        # characters, the last one uncased, and the "e" after it starts a word.
-        ("8859/1", "Ren\\XC3A9\\E"),
-        # Another declared set is read per byte too, as unescape reads it.
-        ("ISO IR87", "Ren\\XC3A9\\E"),
-        ("UNICODE UTF-8", "Ren\\XC3A9\\e"),
-        ("", "Ren\\XC3A9\\e"),
+        # characters. Every other declared set is read per byte too, as unescape reads it.
+        ("8859/1", _PER_BYTE_READ),
+        ("ASCII", _PER_BYTE_READ),
+        ("ISO IR87", _PER_BYTE_READ),
+        ("UNICODE UTF-16", _PER_BYTE_READ),
+        ("UTF-8X", _PER_BYTE_READ),
+        ("UNICODE", _PER_BYTE_READ),
     ],
 )
 def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
-    charset: str, expected: str
+    msh18: str | None, expected: str
 ) -> None:
-    # BACKLOG #5928: the UTF-8 reading of a hex escape's bytes is taken only where MSH-18 is empty
-    # or names UTF-8. NEGATIVE CONTROL: on 630846bffc5, which read no MSH-18, the first two rows
-    # fail.
-    msh = _MSH.replace("2.5.1\r", f"2.5.1||||||{charset}\r")
-    m = Message.parse(msh + "PID|1||1||ren\\XC3A9\\e\r")
-    assert m["MSH-18"] == (charset or None)
+    # BACKLOG #5928, owner ruling 2026-11-27 ("Keep, tighten matching"): the UTF-8 reading of a
+    # hex escape's bytes is taken only where the first repetition of MSH-18, stripped, names UTF-8
+    # in either case. NEGATIVE CONTROL: on 1ad0d3e84b0, which matched "UNICODE UTF-8" exactly and
+    # read an empty MSH-18 as UTF-8, the rows for a lower-case, padded or bare "UTF-8" spelling,
+    # for "UTF-8~UNICODE UTF-16", for an empty first repetition, and for an empty, blank or absent
+    # MSH-18 fail.
+    m = _with_pid_charset("ren\\XC3A9\\e", msh18)
+    assert m["MSH-18"] == (msh18 or None)
     convert_case(m, "PID-5", "title")
     assert m["PID-5"] == expected
+
+
+@pytest.mark.parametrize("mode", ["upper", "lower"])
+@pytest.mark.parametrize("msh18", ["UNICODE UTF-8", "UTF-8", "", None])
+def test_convert_case_upper_and_lower_keep_hex_as_sent_whatever_msh18(
+    mode: Literal["upper", "lower"], msh18: str | None
+) -> None:
+    # Owner ruling 2026-11-27: escapes stay as sent for upper and lower case, as PR 2936 ruled, so
+    # MSH-18 changes nothing there; only literal text is cased.
+    m = _with_pid_charset("Ren\\XC3A9\\e", msh18)
+    convert_case(m, "PID-5", mode)
+    cased = "REN\\XC3A9\\E" if mode == "upper" else "ren\\XC3A9\\e"
+    assert m["PID-5"] == cased
 
 
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
