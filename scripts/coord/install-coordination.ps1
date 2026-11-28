@@ -33,6 +33,7 @@
     WHAT GETS WIRED
       SessionStart                          -> scripts/worktree/session-context.ps1  (who is live, what they build)
       PreToolUse Edit|Write|MultiEdit|Notebook -> scripts/hooks/collision_gate.ps1   (refuse a file a live session is changing)
+      PostToolUse Bash|PowerShell           -> scripts/hooks/runbook-done-prompt.ps1 (a PR just opened for a runbook batch: give the session the --done command)
       UserPromptSubmit                      -> scripts/hooks/announce-session.ps1    (tell the peers you exist, and what you intend)
       SessionStart, Stop                    -> scripts/hooks/mail-drain.ps1          (deliver session mail)
       Stop                                  -> scripts/hooks/seat-record.ps1         (record this seat's episode)
@@ -154,6 +155,13 @@ $WAKE_MARKER = "mefor-wake"
 # costs the session nothing -- but it is separate so the recorder can be removed
 # (-Only Stop -Uninstall) without disarming the mail drain, which shares the Stop event.
 $SEAT_MARKER = "mefor-seat"
+
+# A marker for the runbook done prompt (scripts/hooks/runbook-done-prompt.ps1), deliberately not
+# numbered, so a sibling marker added on another branch merges beside it. Same pairwise rule:
+#   mefor-coord / mefor-announce / mefor-mail / mefor-wake / mefor-seat / mefor-wiki /
+#   mefor-batch-done, and mefor-runbook (the take prompt's, on its own branch)
+# No one of them contains another in either direction. It is the only PostToolUse row.
+$BATCH_DONE_MARKER = "mefor-batch-done"
 
 # A SIXTH marker, for the fleet wiki write prompt (scripts/hooks/wiki-write-prompt.ps1). Same pairwise
 # rule, re-checked rather than assumed:
@@ -291,6 +299,12 @@ function New-NoticeShimCommand([string]$RelativeScript, [string]$Marker, [string
 $WIRING = @(
     @{ Event = "SessionStart"; Matcher = $null; Script = "scripts/worktree/session-context.ps1"; Timeout = 30; Msg = "Session coordination"; Marker = $MARKER; Shim = "std" }
     @{ Event = "PreToolUse"; Matcher = "Edit|Write|MultiEdit|NotebookEdit"; Script = "scripts/hooks/collision_gate.ps1"; Timeout = 20; Msg = "Checking for a colliding session"; Marker = $MARKER; Shim = "std" }
+    # The runbook done prompt (owner instruction 2026-11-28). PostToolUse, because it needs the
+    # command's result: a create that failed says nothing. It never blocks; its only output is
+    # additionalContext naming read_batch.py --done for the batch a just-opened PR names. It starts no
+    # Python unless the input holds "pr create" or "/pulls". Timeout 15 sits above the script's own
+    # bound on its helper ($HelperTimeoutMs in the script).
+    @{ Event = "PostToolUse"; Matcher = "Bash|PowerShell"; Script = "scripts/hooks/runbook-done-prompt.ps1"; Timeout = 15; Msg = "Checking for a runbook batch PR"; Marker = $BATCH_DONE_MARKER; Shim = "std" }
     @{ Event = "UserPromptSubmit"; Matcher = $null; Script = "scripts/hooks/announce-session.ps1"; Timeout = 15; Msg = "Announcing to sessions in this repo"; Marker = $ANNOUNCE_MARKER; Shim = "announce" }
     # The async mail drain, on TWO events and deliberately not on PreToolUse.
     #   SessionStart -- mail that was waiting before you arrived.
