@@ -1575,9 +1575,10 @@ def test_a_dead_sink_says_its_faults_once_not_per_record(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The forced report at stage 2 runs on the transition only. Later records on the dead sink
-    # go back to the rated line, so they cannot make a stderr storm.
+    # go back to the rated line: said once an interval has passed, never once per record.
     # NEGATIVE CONTROL: with the report forced on every pass through stage 2, each of the ten
-    # later records wrote its own format-fault line.
+    # later records wrote its own format-fault line; with no report on a sink already down
+    # (head 6c1f51acbee of this branch), the line after the interval never came.
     clock = _FakeClock()
     monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
 
@@ -1599,8 +1600,56 @@ def test_a_dead_sink_says_its_faults_once_not_per_record(
     assert capsys.readouterr().err.count("format faults since") == 1
     for _ in range(10):
         handler.emit(_record("later"))
-
     assert capsys.readouterr().err.count("format faults since") == 0
+    clock.now += logging_guard._FORMAT_FAULT_REPORT_SECONDS
+    handler.emit(_record("after the interval"))
+
+    assert capsys.readouterr().err.count("format faults since") == 1
+
+
+def test_a_flap_bound_trip_says_a_pending_cause(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The roll that trips the flap bound sends the sink to stage 2, and that forces the report
+    # too, so a cause counted inside the interval is on stderr with the stage-2 line.
+    # NEGATIVE CONTROL: with the rated report kept after record_rollover, the cause counted
+    # inside the interval was not said with the stage-2 line.
+    clock = _FakeClock()
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+
+    class _Flaky:
+        fail_next = False
+
+        @property
+        def encoding(self) -> str:
+            raise RuntimeError("encoding unavailable")
+
+        def write(self, text: str) -> int:
+            if self.fail_next:
+                self.fail_next = False
+                raise OSError(5, "EIO")
+            return len(text)
+
+    stream = _Flaky()
+    monkeypatch.setattr(sys, "stdout", stream)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = GuardedStreamHandler(stream, guard=guard)  # type: ignore[arg-type]
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    capsys.readouterr()
+
+    handler.emit(_record("first"))  # said at once, which starts the interval
+    capsys.readouterr()
+    for _ in range(logging_guard._MAX_ROLLS_PER_WINDOW + 1):
+        clock.now += 1
+        stream.fail_next = True
+        handler.emit(_record("rolls"))
+
+    assert [e.stage for e in events][-1] == "unwritable"
+    err = capsys.readouterr().err
+    assert "IS UNWRITABLE" in err
+    assert logging_guard._ENCODING_UNREADABLE_FAULT in err
 
 
 def test_a_formatter_fault_stage_2_says_a_pending_cause(

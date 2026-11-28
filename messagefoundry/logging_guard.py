@@ -285,7 +285,7 @@ class LogWriteGuard:
 
     # --- stage transitions ----------------------------------------------------
 
-    def record_rollover(self, sink: str, *, reason: str, rolled_aside: str | None) -> None:
+    def record_rollover(self, sink: str, *, reason: str, rolled_aside: str | None) -> bool:
         """Stage 1 rolled ``sink``, and its replacement took the notice and the re-written record.
 
         **Bounded, because "heals" and "keeps needing to be healed" are not the same sink.** A roll
@@ -305,6 +305,8 @@ class LogWriteGuard:
         touches a sink. The bound, the events this method and :meth:`record_unwritable` fire, their
         stop requests and the recorded status do not read it; :meth:`status`, :meth:`can_log`,
         :meth:`revalidate` and the stage-2 stderr line do.
+
+        Returns what :meth:`record_unwritable` returns when the roll trips the bound, else False.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -339,7 +341,7 @@ class LogWriteGuard:
         if tripped:
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
-            self.record_unwritable(
+            return self.record_unwritable(
                 sink,
                 reason=(
                     f"{reason}; the sink needed rolling {streak} times in "
@@ -347,10 +349,10 @@ class LogWriteGuard:
                 ),
                 repeat=repeat,
             )
-            return
         self._fire(
             LogSinkEvent(sink=sink, stage="rolled", reason=reason, rolled_aside=rolled_aside)
         )
+        return False
 
     def record_unwritable(
         self,
@@ -359,7 +361,7 @@ class LogWriteGuard:
         reason: str,
         cause: str = "after a rollover attempt",
         repeat: bool = False,
-    ) -> None:
+    ) -> bool:
         """Stage 2: record ``sink`` unwritable. Called when a roll's replacement could not be
         written, by :meth:`record_rollover` past the flap bound, and by
         :meth:`_GuardedSinkMixin.handleError`, with no roll, when the sink's formatter cannot
@@ -384,7 +386,10 @@ class LogWriteGuard:
         ``/status`` — visibility is unconditional; only the ENFORCEMENT is conditioned on the thing
         the enforcement is about.
 
-        ``reason`` arrives already scrubbed; :meth:`record_rollover` states that precondition."""
+        ``reason`` arrives already scrubbed; :meth:`record_rollover` states that precondition.
+
+        Returns whether this call wrote the stage-2 stderr line, which is how a guarded sink
+        knows to say its pending format faults at once (BACKLOG #5813)."""
         with self._lock:
             previous = self._sinks.get(sink)
             already_down = previous is not None and previous.state == "unwritable"
@@ -418,7 +423,7 @@ class LogWriteGuard:
             # the one message that mattered.
             if owed:
                 self._fire_stage2(event)
-            return
+            return False
         if all_down:
             others = ""
         elif all_reported_down:
@@ -434,6 +439,7 @@ class LogWriteGuard:
             f"{cause}: {reason}{others}"
         )
         self._fire_stage2(event)
+        return True
 
     def _fire_stage2(self, event: LogSinkEvent) -> None:
         """Fire a stage-2 event, and remember the break as owed one when the event was not
@@ -839,7 +845,8 @@ _NO_ATTRIBUTE = object()
 def _encoding_read_can_fail(cls: type) -> bool:
     """Whether an ``AttributeError`` from reading ``encoding`` on a ``cls`` stream is a read that
     failed rather than an attribute that is not there: a class on ``cls``'s own MRO defines
-    ``encoding``, other than an empty ``__slots__`` member, so a property raised it. The metaclass
+    ``encoding``, other than a member descriptor (an empty ``__slots__`` member, or a C-level one
+    such as ``io.TextIOWrapper``'s), so a property raised it. The metaclass
     is not searched, and a proxy forwarding through ``__getattr__`` or ``__getattribute__`` does
     not count: its target may simply have no ``encoding``, as ``codecs.StreamWriter``'s has not.
     Never raises; any failure while classifying reads as "no encoding", so classifying can never
@@ -979,9 +986,8 @@ class _GuardedSinkMixin(_SinkBase):
                         f"could not format a record ({kind}), nor the notice standing in for it "
                         f"({notice_kind}); nothing was written for it"
                     )
-                    was_down = self._sink_down()
                     # Built from literals and ``ascii()`` type names, so already scrubbed.
-                    self._guard.record_unwritable(
+                    newly_down = self._guard.record_unwritable(
                         self._sink_label,
                         reason=(
                             f"formatter fault: the sink's formatter could not format a record "
@@ -990,7 +996,7 @@ class _GuardedSinkMixin(_SinkBase):
                         ),
                         cause="because its formatter fails",
                     )
-                    self._say_faults_once_down(was_down)
+                    self._say_faults(newly_down=newly_down)
                     return
                 self._note_format_fault(
                     f"could not format a record ({kind}); a notice naming its logger is written "
@@ -1048,17 +1054,17 @@ class _GuardedSinkMixin(_SinkBase):
                 # each limb of the join has to arrive scrubbed. Bounding them SEPARATELY is also
                 # what keeps the stage-2 cause -- the operationally important half -- from being the
                 # part a single bound on the composed string would cut.
-                was_down = self._sink_down()
-                self._guard.record_unwritable(
+                newly_down = self._guard.record_unwritable(
                     self._sink_label,
                     reason=f"{reason}; the replacement failed too: {_safe_reason(roll_exc)}",
                 )
-                self._say_faults_once_down(was_down)
+                self._say_faults(newly_down=newly_down)
                 return
-            # A roll past the flap bound reads unwritable too: the same transition.
-            was_down = self._sink_down()
-            self._guard.record_rollover(self._sink_label, reason=reason, rolled_aside=rolled_aside)
-            self._say_faults_once_down(was_down)
+            # A roll past the flap bound goes to stage 2 too.
+            newly_down = self._guard.record_rollover(
+                self._sink_label, reason=reason, rolled_aside=rolled_aside
+            )
+            self._say_faults(newly_down=newly_down)
         finally:
             self._reentry.active = False
 
@@ -1114,20 +1120,13 @@ class _GuardedSinkMixin(_SinkBase):
             detail = _FORMAT_FAULT_OTHER
         faults[detail] = faults.get(detail, 0) + 1
 
-    def _sink_down(self) -> bool:
-        """Whether this sink reads ``unwritable`` now, as ``GET /status`` shows it."""
-        return any(
-            s.sink == self._sink_label and s.state == "unwritable" for s in self._guard.status()
-        )
-
-    def _say_faults_once_down(self, was_down: bool) -> None:
-        """On the transition into stage 2, say every counted fault at once, the interval
-        notwithstanding: the sink is dead, so no later write will, and a fault counted on the way
-        (an unreadable encoding, say) can be the cause the operator needs. Only on the transition:
-        each later record on a sink already down goes back to the rated line, so a dead sink
-        cannot make a stderr storm."""
-        if not was_down and self._sink_down():
-            self._report_format_faults(force=True)
+    def _say_faults(self, *, newly_down: bool) -> None:
+        """After a stage-2 call: when it wrote the stage-2 stderr line (``newly_down``), say every
+        counted fault at once, the interval notwithstanding, since the sink is dead, no later
+        write will, and a fault counted on the way (an unreadable encoding, say) can be the cause
+        the operator needs. Otherwise the rated line, so each later record on a sink already down
+        still has its faults said every interval, without a stderr storm."""
+        self._report_format_faults(force=newly_down)
 
     def _report_format_faults(self, *, force: bool = False) -> None:
         """Say on the stderr last-resort line the format faults counted since the last such line,
@@ -1135,8 +1134,8 @@ class _GuardedSinkMixin(_SinkBase):
         ``force``. Faults counted inside that interval wait for the next call after it: the next
         fault, the next guard write (:meth:`_write_line` ends in this call, and the stdout sink
         writes every record through it), the next ``flush`` (a file sink record ends in one),
-        the sink's transition into stage 2 (:meth:`_say_faults_once_down`), or ``close``; the last
-        two force it. Called under the handler's lock. Never raises."""
+        a stage-2 failure (:meth:`_say_faults`, which forces it when the guard writes the stage-2
+        line), or ``close``, which forces it. Called under the handler's lock. Never raises."""
         # ``getattr``: logging can flush or close a handler whose constructor raised before
         # ``_init_guard`` ran.
         faults: dict[str, int] | None = getattr(self, "_format_faults", None)

@@ -490,12 +490,14 @@ least these. Whether an `encoding` read that raises `AttributeError` means "none
 by the stream's class: only a class on its MRO that defines `encoding`, other than an empty
 `__slots__` member, makes it a failed read. So a stream with no `encoding` is written as the
 line came. So is a proxy forwarding through `__getattr__` or `__getattribute__`, such as
-`codecs.StreamWriter`, whose target has none or is gone: on a replacing stream its line can
-carry `?` with nothing said. A proxy class that inherits `encoding`, as an `io.TextIOBase`
-subclass does, is read as unreadable instead. A stream whose `encoding` read raises anything
+`codecs.StreamWriter`, whose target has none or is gone, and so is a class whose `encoding`
+is a C-level member, as `io.TextIOWrapper`'s is: on a replacing stream such a line can carry
+`?` with nothing said. A proxy class that inherits a property `encoding`, as an
+`io.TextIOBase` subclass does, is read as unreadable instead. A stream whose `encoding` read raises anything
 else, or whose class defines it, is written with everything outside ASCII escaped. Each line to it is counted on the stderr format-fault line described below,
 naming the exception's type, whether or not the write lands. When the sink then reaches
-stage 2, that line is said at once, inside the report interval too, on that transition only. A stream that refuses
+stage 2, that line is said at once, inside the report interval too, whenever the guard writes
+the stage-2 stderr line; later records on a sink already down keep the rated line. A stream that refuses
 even the ASCII line, as cp864 refuses `%`, fails the write, and the two stages decide. One whose `encoding` names
 a codec other than the one it uses is written escaped for the named codec, so it escapes more
 than it needs to where the named codec is the narrower, and too little where it is the
