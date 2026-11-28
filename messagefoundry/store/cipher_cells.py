@@ -92,6 +92,7 @@ __all__ = [
     "read_server_cipher_cells",
     "server_cell_present",
     "server_keyed_store_mismatch",
+    "RowFilterAnswer",
     "RowFilterRead",
     "RowFilterReading",
     "server_row_filtered",
@@ -735,6 +736,11 @@ class CipherAudit:
     #: was read at all (SQLite, SQL Server, or a run that read no catalog), so an empty
     #: :attr:`row_filtered` says nothing.
     row_filter: RowFilterRead = "unread"
+    #: Those of :attr:`row_filtered` named because the read could not see how their rows are
+    #: filtered at all: a view, a foreign table or another relation that is not an ordinary
+    #: table, or a name with no catalog row. No role clears these; auditing the underlying
+    #: tables does.
+    row_unseen: list[str] = field(default_factory=list)
 
     @property
     def opened(self) -> int:
@@ -812,6 +818,7 @@ def _reset(into: CipherAudit | None) -> CipherAudit:
     into.hidden = []
     into.row_filtered = []
     into.row_filter = "unread"
+    into.row_unseen = []
     return into
 
 
@@ -1065,10 +1072,24 @@ RowFilterRead = Literal["read", "failed", "unread"]
 
 @dataclass(frozen=True, slots=True)
 class RowFilterReading:
-    """What :func:`server_row_filtered` learned: the tables, and how."""
+    """What :func:`server_row_filtered` learned: the tables, how, and which of them it could not
+    see into (:attr:`CipherAudit.row_unseen`)."""
 
     tables: tuple[str, ...]
     state: RowFilterRead
+    unseen: tuple[str, ...] = ()
+
+
+class RowFilterAnswer(frozenset[str]):
+    """A backend's row-filter answer that also says which named tables it could not see into
+    (:attr:`CipherAudit.row_unseen`); a plain ``frozenset`` answer names none such."""
+
+    unseen: frozenset[str]
+
+    def __new__(cls, names: Iterable[str], unseen: Iterable[str] = ()) -> RowFilterAnswer:
+        answer = super().__new__(cls, names)
+        answer.unseen = frozenset(unseen)
+        return answer
 
 
 async def server_row_filtered(
@@ -1107,7 +1128,9 @@ async def server_row_filtered(
         return RowFilterReading(tuple(shown), "failed")
     if filtered is None:
         return RowFilterReading((), "unread")
-    return RowFilterReading(tuple(t for t in shown if t in filtered), "read")
+    unseen = filtered.unseen if isinstance(filtered, RowFilterAnswer) else frozenset()
+    named = tuple(t for t in shown if t in filtered)
+    return RowFilterReading(named, "read", tuple(t for t in named if t in unseen))
 
 
 async def server_keyed_store_mismatch(
@@ -1151,6 +1174,7 @@ async def audit_server_cipher_cells(
     )
     audit.row_filtered = list(rows_read.tables)
     audit.row_filter = rows_read.state
+    audit.row_unseen = list(rows_read.unseen)
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit

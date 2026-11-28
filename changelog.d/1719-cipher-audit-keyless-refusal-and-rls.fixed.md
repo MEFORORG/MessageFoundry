@@ -17,7 +17,9 @@
   is read as not the owner. A row-security catalog read that fails on the store, refused or
   not, names every table and is logged, and the reason then names the failed read rather than
   BYPASSRLS, so a run that can still finish is NOT_COVERED, never a PASS; a bug in that read is
-  raised. The `--json` output gains a `hidden` list of the cells the catalog did not show, and a
+  raised. For a view, a foreign table or a name with no catalog row, the reason says
+  cipher-audit cannot see whether every row is read and to audit the underlying tables, with no
+  role advice. The `--json` output gains a `hidden` list of the cells the catalog did not show, and a
   `row_filtered` list of the tables named, which is `null` where no row filter was read (at
   least SQLite, SQL Server, and an open refused before any catalog read) and `[]` only where it
   was read and none applies. SQL Server security policies are not read yet, so a SQL Server

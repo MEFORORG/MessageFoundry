@@ -1208,7 +1208,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "read; at least also a PostgreSQL table whose row-level security may hide rows from this "
         "login, or whose row-security catalog read failed, so its rows may not all have been "
         "read), 4 KEY_MISMATCH. With --json, row_filtered lists those tables, and is null where "
-        "no row filter was read (SQLite, SQL Server). Run it with the service's own key: a shell "
+        "no row filter was read, at least on SQLite, on SQL Server, and on a PostgreSQL open "
+        "refused as keyless before any catalog read. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
         "'vault_transit' values go to Transit in batches of up to 128 values and 524,288 "
         "characters of them, and a value past that bound alone (BACKLOG #1719, #6706)",
@@ -14348,16 +14349,25 @@ def _cipher_audit(args: argparse.Namespace) -> int:
             "login read on pg_catalog.pg_class and pg_catalog.pg_roles, check the link to the "
             "store, and run again"
         )
-    elif audit.row_filtered:
-        # Named by the row-security rule, on every verdict whose run read the catalog.
-        reason += (
-            f"; {len(audit.row_filtered)} table(s) of {_store_label(store)} may hide rows from "
-            "this login, through row-level security, or are not ordinary tables, or were not in "
-            "the catalog read, so values in them may not have been read: "
-            f"{', '.join(audit.row_filtered)}. Run it as a role that reads every row: "
-            "a role with BYPASSRLS, or the role that directly owns the table where the table "
-            "does not force row-level security; a superuser also does, but is not needed"
-        )
+    else:
+        # Named by the read, on every verdict whose run read the catalog: by the row-security
+        # rule, which a role can clear, or as unseen, which no role clears. Both where both.
+        by_rule = [t for t in audit.row_filtered if t not in audit.row_unseen]
+        if by_rule:
+            reason += (
+                f"; {len(by_rule)} table(s) of {_store_label(store)} may hide rows from this "
+                "login through row-level security, so values in them may not have been read: "
+                f"{', '.join(by_rule)}. Run it as a role that reads every row: a role with "
+                "BYPASSRLS, or the role that directly owns the table where the table does not "
+                "force row-level security; a superuser also does, but is not needed"
+            )
+        if audit.row_unseen:
+            reason += (
+                f"; {len(audit.row_unseen)} name(s) in {_store_label(store)} are a view, a "
+                "foreign table or another relation that is not an ordinary table, or have no "
+                "catalog row, so cipher-audit cannot see whether every row of them is read: "
+                f"{', '.join(audit.row_unseen)}. Audit the underlying tables instead"
+            )
 
     # A walk that stopped, on an error or on the key mismatch, prints no counts: what it counted
     # before the stop would read as the whole store's.

@@ -4113,6 +4113,8 @@ class PostgresStore(ServerCipherWalk):
         A member of the owning role is read as not the owner, though PostgreSQL exempts one that
         inherits the role's privileges: that errs toward naming the table. A failed read is
         raised, for ``cipher_cells.server_row_filtered`` to judge."""
+        from messagefoundry.store.cipher_cells import RowFilterAnswer
+
         names = list(dict.fromkeys(tables))
         if not names:
             return frozenset()
@@ -4128,20 +4130,22 @@ class PostgresStore(ServerCipherWalk):
             names,
         )
         # pg_class is unique on name and schema, so each table has at most one row. Only an
-        # ordinary ('r') or partitioned ('p') table is read by its flags.
-        hides = {
-            str(r["table_name"]): str(r["relkind"]) not in ("r", "p")
-            or row_security_hides_rows(
+        # ordinary ('r') or partitioned ('p') table is read by its flags; any other relation, or
+        # a name with no catalog row (a NULL relkind, or no row at all), is named as unseen.
+        kinds = {str(r["table_name"]): r["relkind"] for r in rows}
+        unseen = {t for t in names if kinds.get(t) not in ("r", "p")}
+        by_rule = {
+            str(r["table_name"])
+            for r in rows
+            if row_security_hides_rows(
                 enabled=r["relrowsecurity"],
                 forced=r["relforcerowsecurity"],
                 owned=r["owned"],
                 superuser=r["rolsuper"],
                 bypass=r["rolbypassrls"],
             )
-            for r in rows
         }
-        # A table the read did not return is a doubt too.
-        return frozenset(t for t in names if hides.get(t, True))
+        return RowFilterAnswer(unseen | (by_rule & set(names)), unseen)
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
         """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the catalog

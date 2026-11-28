@@ -913,3 +913,54 @@ def test_the_empty_log_note_stays_on_the_mismatch_line() -> None:
     assert tail == "messages.raw id=3 is a BLOB"
     plain = _keyed_refusal_mismatch("X is recorded as keyed", key_named=False)
     assert plain.startswith("X is recorded as keyed. The store's audit log also reads as empty")
+
+
+@pytest.mark.parametrize(
+    ("rule", "unseen"),
+    [({"state"}, set()), (set(), {"messages"}), ({"state"}, {"messages"})],
+    ids=["rule-only", "unseen-only", "both"],
+)
+def test_the_remedy_matches_why_each_table_was_named(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    rule: set[str],
+    unseen: set[str],
+) -> None:
+    """A table the rule named gets the BYPASSRLS remedy; a view, foreign table or missing
+    relation gets "audit the underlying tables", with no role advice, since no role clears it;
+    a run with both gets both."""
+    from messagefoundry.store.cipher_cells import RowFilterAnswer
+
+    db, settings = _copy(_template, tmp_path)
+
+    class _Handle(_FakeServerStore):
+        async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str] | None:
+            return RowFilterAnswer(rule | unseen, unseen)
+
+    async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 3 and payload["status"] == "NOT_COVERED", out
+    reason = payload["reason"]
+    assert ("BYPASSRLS" in reason) is bool(rule), out
+    assert ("superuser" in reason) is bool(rule), out
+    assert ("Audit the underlying tables" in reason) is bool(unseen), out
+    assert sorted(payload["row_filtered"]) == sorted(rule | unseen), out
+
+
+def test_the_postgres_read_says_which_tables_it_could_not_see_into() -> None:
+    """A view and a name with no catalog row are unseen; a table the rule named is not."""
+    store = _pg_reading(
+        [
+            _row("messages", relkind="v"),
+            _row("state", relrowsecurity=True, owned=False),
+            _row("queue"),
+        ]
+    )
+    got = asyncio.run(store.cipher_walk_row_filtered(["messages", "state", "queue", "users"]))
+    assert got == {"messages", "state", "users"}
+    assert getattr(got, "unseen", None) == {"messages", "users"}
