@@ -105,6 +105,19 @@ MISSED = [
     f'"given": a|b|c "{SECRET}"',
     # A token glued to a count note reads as a callable's name, which the walk keeps.
     f'"given": a|b|c {SECRET}\u2026(+12 chars)',
+    # The token ENDS the text: a caller can glue text after an answer, so the read-on leaves a
+    # token there for the passes that read what the glued text completes (`_PLAIN_RUN_END`).
+    f'"given": a|b|c {SECRET}',
+    f'"given": a|b|c 1980-05-05 {SECRET}',
+    f'"given": a|b|c 123-45-6789 {SECRET}',
+    f'"given": x a|b|c {SECRET}',
+    f'"identifier": a|b|c {SECRET}',
+    f'"name": a|b|c {SECRET}',
+    f'"address": a|b|c {SECRET}',
+    f'"given": a|b|c\t{SECRET}',
+    f'"given":\ta|b|c {SECRET}',
+    f'"given": a|b|c {SECRET}\n[redaction bound: dropped 12 more chars unscanned]',
+    f'"given": [redacted] {SECRET}',
     # A comma ends the value, as it does with no field run (`"given": Doe, Jane`).
     f'"given": a|b|c x, {SECRET}',
     # A container after a scalar value, or after the field run's placeholder.
@@ -128,28 +141,23 @@ MISSED = [
 #: (``_placeholder_runs_on``) and keeps a scrubbed container's policy after it
 #: (``_policy_after_close``). Not a value the walk blanks whole: each keeps its keys.
 FIELD_RUN = [
-    f'"given": a|b|c {SECRET}',
     f'{{"given": a|b|c {SECRET}}}',
     f'{{"family": DOE^JANE^Q {SECRET}}}',
     f'{{"identifier": {{"value": a|b|c {SECRET}}}}}',
     f'"given": a|b|c Jane Doe {SECRET}',
-    f'"given": a|b|c 1980-05-05 {SECRET}',
-    f'"given": a|b|c 123-45-6789 {SECRET}',
     f'"given": a|b|c {SECRET}, Jane',
     f'{{"given": x a|b|c {SECRET}}}',
-    f'"given": x a|b|c {SECRET}',
-    f'"identifier": a|b|c {SECRET}',
     f'[{{"given": a|b|c {SECRET}}}]',
     f'{{"telecom": [{{"value": a|b|c {SECRET}}}]}}',
-    f'"name": a|b|c {SECRET}',
-    f'"address": a|b|c {SECRET}',
     f'{{"name": a|b|c {SECRET}}}',
-    f'"given": a|b|c\t{SECRET}',
-    f'"given":\ta|b|c {SECRET}',
-    f'"given": a|b|c {SECRET}\n[redaction bound: dropped 12 more chars unscanned]',
-    # The placeholder written by the text itself, top level and inside a searched object.
-    f'"given": [redacted] {SECRET}',
+    # The placeholder written by the text itself, inside a searched object.
     f'{{"identifier": {{"system": "x", "value": [redacted] {SECRET}}}}}',
+    f'"given": a|b|c 1980-05-05 {SECRET}, x',
+    f'"given": a|b|c 123-45-6789 {SECRET}, x',
+    f'"given": x a|b|c {SECRET}, x',
+    f'"identifier": a|b|c {SECRET}, x',
+    f'"given": a|b|c\t{SECRET},',
+    f'"given": [redacted] {SECRET}, x',
 ]
 
 
@@ -244,6 +252,7 @@ FIELD_RUN_KEPT = [
 
 #: Review round-9b28b256be: trailing whitespace the answer's strip removes, which a first call
 #: read as more text and a second as the end, so the read-on took the value only on the second.
+#: Neither call reads on now, since the end of the text is not an end (`_PLAIN_RUN_END`).
 TRAILING_SPACE = [
     f'"given": a|b|c {SECRET}\u2028',
     f'"given": a|b|c {SECRET}\x0b',
@@ -255,10 +264,69 @@ TRAILING_SPACE = [
 
 
 @pytest.mark.parametrize("text", TRAILING_SPACE)
-def test_trailing_whitespace_reads_as_the_end_on_both_calls(text: str) -> None:
+def test_trailing_whitespace_reads_alike_on_both_calls(text: str) -> None:
     once = safe_text(text)
-    assert SECRET not in once, once
     assert safe_text(once) == once
+
+
+#: Review round-0709b3fe1b: text a caller glues straight after an answer and redacts again. An
+#: earlier form of the read-on wrote the placeholder over the answer's last token, which the glued
+#: text completes into a segment id, a backstop opener, a credential label or a name run.
+GLUED = [
+    ('"given": a|b|c ZqMSH', "*^~\\&*A*B\rPID*1**DOEX$JANEX"),
+    ('"given": a|b|c Zqnon', "numeric port: 'hunterpw@host'"),
+    ('"given": a|b|c pri', "vate_key=QzSecret1 done"),
+    ('"given": a|b|c MEFOR', "_DB_PW=QzSecret1"),
+    ('"given": a|b|c Doe', "\nSmith"),
+    ('"given": a|b|c Doe', ", Jane"),
+    ('"family": DOE^JANE^Q Doe', "\nSmith"),
+]
+
+
+@pytest.mark.parametrize(("head", "glued"), GLUED)
+def test_text_glued_after_an_answer_prints_no_word_the_rules_off_answer_hid(
+    head: str, glued: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def routes() -> list[str]:
+        return [
+            redact(redact(head) + glued),
+            safe_text(safe_text(head) + glued),
+            redact_log_line(safe_text(head) + glued),
+            _log_chain(safe_text(head) + glued),
+        ]
+
+    ours = routes()
+    with monkeypatch.context() as patch:
+        _rules_off(patch)
+        theirs = routes()
+    for mine, main in zip(ours, theirs, strict=True):
+        assert not _words(mine, escapes=True) - _words(main, escapes=True) - _NOTE_WORDS, (
+            mine,
+            main,
+        )
+
+
+def test_the_read_on_spellings_are_pinned() -> None:
+    """The token cap is spelled twice, and the placeholder in both end patterns."""
+    assert f"{{0,{redaction._PLAIN_RUN_TOKENS - 1}}}+" in redaction._PLAIN_RUN.pattern
+    for end in (redaction._PLAIN_RUN_END, redaction._PLAIN_RUN_END_NESTED):
+        assert re.escape(PLACEHOLDER) in end.pattern
+
+
+def test_the_credential_word_holds_the_words_later_passes_read() -> None:
+    """``_CREDENTIAL_WORD`` holds at least the label words the shipped credential filters and
+    ``_CREDENTIAL_AHEAD`` read, so a run holding one is never written as the placeholder."""
+    from messagefoundry import secretscrub
+
+    words = [
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_LABEL_WORDS,
+        *secretscrub._QUERY_CREDENTIAL_WORDS,
+        *re.findall(r"[a-z_-]{3,}", redaction._CREDENTIAL_AHEAD.pattern.split("(?:", 3)[-1]),
+    ]
+    assert len(words) > 20, words
+    missing = [word for word in words if redaction._CREDENTIAL_WORD.search(word) is None]
+    assert not missing, missing
 
 
 def _log_chain(text: str) -> str:
@@ -293,7 +361,10 @@ def test_the_log_chain_prints_no_credential(text: str, monkeypatch: pytest.Monke
     with monkeypatch.context() as patch:
         _rules_off(patch)
         theirs = _log_chain(text)
-    assert not _words(ours) - _words(theirs) - _NOTE_WORDS, (ours, theirs)
+    assert not _words(ours, escapes=True) - _words(theirs, escapes=True) - _NOTE_WORDS, (
+        ours,
+        theirs,
+    )
 
 
 def test_the_log_chain_differential(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -304,7 +375,7 @@ def test_the_log_chain_differential(monkeypatch: pytest.MonkeyPatch) -> None:
     with monkeypatch.context() as patch:
         _rules_off(patch)
         theirs = [[_log_chain(text)] for text in texts]
-    leaks, changed = _words_main_hid(texts, ours, theirs)
+    leaks, changed = _words_main_hid(texts, ours, theirs, escapes=True)
     assert not leaks, leaks[:5]
     assert changed > 20, changed
 
@@ -648,7 +719,7 @@ def _main_answers(texts: list[str], monkeypatch: pytest.MonkeyPatch) -> list[lis
 
 
 def _words_main_hid(
-    texts: list[str], ours: list[list[str]], mains: list[list[str]]
+    texts: list[str], ours: list[list[str]], mains: list[list[str]], *, escapes: bool = False
 ) -> tuple[list[str], int]:
     """``(leaks, changed)``: each text with an answer that prints a word the rules-off answer hid,
     and how many answers differ at all."""
@@ -658,17 +729,27 @@ def _words_main_hid(
         for got, main in zip(mine, theirs, strict=True):
             if got != main:
                 changed += 1
-                if _words(got) - _words(main) - _NOTE_WORDS:
+                if _words(got, escapes=escapes) - _words(main, escapes=escapes) - _NOTE_WORDS:
                     leaks.append(text)
     return leaks, changed
 
 
-def _words(answer: str) -> set[str]:
-    """The words of ``answer`` past its count notes and the log chain's escapes. A note's number
-    counts what a cut dropped, so a scrub that hides more moves it, and it is not text the answer
-    printed; an escape such as ``\\u0085`` is the chain's spelling of one character, which would
-    otherwise join the word after it."""
-    return set(_WORD.findall(_ESCAPE.sub(" ", redaction._COUNT_NOTE.sub("", answer))))
+def _words(answer: str, *, escapes: bool = False) -> set[str]:
+    """The words of ``answer`` past the count note ``safe_text`` appends, and with ``escapes`` the
+    log chain's escapes. That note's number counts what a cut dropped, so a scrub that hides more
+    moves it, and it is not text the answer printed; only the note last in the answer is skipped,
+    so a peer-written one mid-text is still read. An escape such as ``\\u0085`` is the log chain's
+    spelling of one character, which would otherwise join the word after it; only the log-chain
+    comparisons skip it."""
+    answer = _TRAILING_COUNT_NOTE.sub("", answer)
+    if escapes:
+        answer = _ESCAPE.sub(" ", answer)
+    return set(_WORD.findall(answer))
+
+
+_TRAILING_COUNT_NOTE = re.compile(
+    redaction._COUNT_NOTE.pattern + r"(?=(?: \[redaction bound: [^\]]*\])?\Z)"
+)
 
 
 _ESCAPE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[nrt])")
