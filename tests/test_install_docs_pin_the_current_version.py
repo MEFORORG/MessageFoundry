@@ -9,7 +9,7 @@ install command at ``0.1.0``, so a pasted block verified and installed a release
 Pinning those literals to ``__version__`` makes the release commit that bumps the version fail until
 the guides move with it.
 
-BACKLOG #1749 widened it in three ways. The web console wheel is versioned on its own line, so its
+BACKLOG #1749 widened it in three ways. The web console wheel has its own version root, so its
 ``messagefoundry-webconsole==`` pins are held to ``messagefoundry_webconsole.__version__``. Two
 pin-shaped prose forms, ``for engine X.Y.Z`` and ``engine X.Y.Z wheel``, are held to the engine
 version, because INSTALL-GUIDE's promotion diagram said ``engine 0.1.0 wheel`` three times after
@@ -48,8 +48,9 @@ _VERIFY_ASSIGN = re.compile(r'^\$V = "([^"]+)"', re.MULTILINE)
 # or comma is punctuation, not version. Truncating `0.4.0.post1` to `0.4.0` would read it as current.
 _V = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?)(?![\w+])"
 # The engine pin in a pip command or its inline prose, in any spelling pip accepts: any case, space
-# around `==`, spaced or hyphenated extras. The webconsole wheel has its own version, so
-# `messagefoundry-webconsole==` must not match; `$V` pins are not literals, so they must not either.
+# around `==`, spaced or hyphenated extras. The webconsole wheel's version is read from its own
+# root, so `messagefoundry-webconsole==` must not match; `$V` pins are not literals, so they must
+# not either.
 _ENGINE_PIN = re.compile(rf"(?<![\w-])messagefoundry(?:\[[\w,\s-]+\])?\s*==\s*{_V}", re.IGNORECASE)
 _CONSOLE_PIN = re.compile(rf"(?<![\w-])messagefoundry[-_]webconsole\s*==\s*{_V}", re.IGNORECASE)
 # Two pin-shaped prose forms: "the web console FOR engine 0.4.0" / "BUILT FOR engine 0.4.0", and a
@@ -165,6 +166,27 @@ def test_a_planted_stale_pin_is_caught(shape: str, stale_e: str, stale_c: str) -
     assert _stale_pins(planted), f"the sweep did not report {planted!r}"
     current = shape.format(e=__version__, c=_CONSOLE_VERSION)
     assert _stale_pins(current) == [], f"the sweep reported the shipped version in {current!r}"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "other_pin"),
+    [
+        (_ENGINE_PIN, 'pip install "messagefoundry-webconsole==9.9.9"'),
+        (_ENGINE_PIN, "pip install messagefoundry_webconsole==9.9.9"),
+        (_CONSOLE_PIN, 'pip install "messagefoundry==9.9.9"'),
+        (_CONSOLE_PIN, 'pip install "messagefoundry[harness]==9.9.9"'),
+    ],
+)
+def test_the_engine_and_console_pin_patterns_do_not_read_each_other(
+    pattern: re.Pattern[str], other_pin: str
+) -> None:
+    """NEGATIVE CONTROL: neither pin pattern reads the other distribution's pin.
+
+    The console carries the engine's version, so a shipped pair holds one number twice and the sweep
+    above cannot tell an engine pattern that also matched console pins from a correct one. Only a
+    distinct number, as here, shows the two patterns stay apart.
+    """
+    assert pattern.findall(other_pin) == [], f"{pattern.pattern!r} read {other_pin!r}"
 
 
 @pytest.mark.parametrize(

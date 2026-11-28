@@ -142,19 +142,50 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     ``mode`` is one of ``"upper"`` / ``"lower"`` / ``"title"``. Each leaf of the value is cased on
     its own, so a whole-field path keeps its components, repetitions and subcomponents. Only the
     literal text is cased: an escape sequence such as ``\\.br\\`` or ``\\S\\`` is kept as sent, and so
-    is the text a hex escape carries, though title case still reads what an escape decodes to when
-    it decides whether the next letter starts a word. A no-op on an absent field; raises
-    :class:`ValueError` on an unknown mode (fail loud rather than silently leaving the value), or on
-    field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
+    is the text a hex escape carries. Title case still reads the character before a letter to
+    decide whether it starts a word: an escape's decoded text, except that the bytes of a run of
+    adjacent hex escapes are read as UTF-8, where they end in a valid UTF-8 character, if the
+    message reads as UTF-8. It does when ``MSH-18.1``, the whole first component of the first
+    repetition (subcomponents included), unescaped, with leading and trailing ASCII spaces removed
+    and compared case-insensitively, is empty, ``UTF-8`` or HL7 table 0211's ``UNICODE UTF-8``; an
+    absent ``MSH-18`` counts as empty. HL7 says an empty ``MSH-18`` declares ASCII, whose bytes read
+    the same either way; the UTF-8 reading there is the owner's ruling of 2026-11-27 (BACKLOG
+    #5928), for senders that send UTF-8 without declaring it. Under any other value each byte is
+    its own character. A no-op on an absent field; raises
+    :class:`ValueError` on an unknown mode (fail loud rather than silently leaving the value), or
+    on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
     # A tuple test, not a dict one, so an unhashable mode from config raises the documented
     # ValueError rather than a TypeError.
     if mode not in tuple(_CASE_CONVERTERS):
         raise ValueError(f"convert_case mode must be 'upper', 'lower', or 'title', got {mode!r}")
     convert = _CASE_CONVERTERS[mode]
-    _edit_value(msg, path, lambda raw, seps: _case_leaf(raw, convert, seps), scope="leaves")
+    # Only title case reads the character before a run, so only it reads MSH-18.
+    utf8_hex = mode == "title" and _reads_hex_as_utf8(msg)
+    _edit_value(
+        msg,
+        path,
+        lambda raw, seps: _case_leaf(raw, convert, seps, utf8_hex=utf8_hex),
+        scope="leaves",
+    )
 
 
-# Each converter also takes whether the decoded character before the run is cased. Only title case
+#: The ``MSH-18.1`` values, case-folded, that name UTF-8. The rule is :func:`convert_case`'s
+#: docstring.
+_UTF8_CHARSET_NAMES = frozenset({"utf-8", "unicode utf-8"})
+
+
+def _reads_hex_as_utf8(msg: Message) -> bool:
+    """Whether title case reads a hex run's bytes as UTF-8, under :func:`convert_case`'s rule.
+
+    Not a test of the declared character set: an empty ``MSH-18`` declares ASCII, and passes. Only
+    the first repetition is read; a later one names an alternate set a ``\\C..\\`` escape may
+    switch to, and title case does not track such a switch, so the answer holds for the whole
+    message. So does the first ``MSH``'s answer for a batch."""
+    first = (msg.field("MSH-18.1") or "").strip(" ")
+    return not first or first.casefold() in _UTF8_CHARSET_NAMES
+
+
+# Each converter also takes whether the character before the run is cased. Only title case
 # needs it: str.title upper-cases a letter unless the character before it is cased, so a
 # one-character prefix carries that state into the run and is dropped again.
 _CASE_CONVERTERS: dict[str, Callable[[str, bool], str]] = {
@@ -907,23 +938,47 @@ class _Leaf:
         return "".join(out)
 
 
-def _case_leaf(raw: str, convert: Callable[[str, bool], str], seps: _Seps) -> str:
+def _case_leaf(
+    raw: str, convert: Callable[[str, bool], str], seps: _Seps, *, utf8_hex: bool
+) -> str:
     """One leaf with its literal text cased by ``convert`` and its escape sequences kept as sent.
 
-    ``convert`` also gets whether the decoded character before the run is cased, which title case
-    needs at the start of a run."""
+    ``convert`` also gets whether the character before the run is cased, which title case needs at
+    the start of a run. That character is the last one a unit decodes to. ``unescape`` decodes a
+    hex escape one byte to one character (ADR 0205, *The hex escape's meaning*), so the last byte
+    of a UTF-8 letter, such as the ``A9`` of ``\\XC3A9\\`` (e-acute), would read as a character
+    of its own, cased or not by accident. With ``utf8_hex``, which the caller sets from ``MSH-18``
+    by :func:`convert_case`'s rule, the last bytes of a run of adjacent hex escapes are read as
+    UTF-8 where they end in a valid UTF-8 character instead. This departs from the ADR's reading
+    only for the word-start test: the escapes are kept as sent, and a read of the value is
+    unchanged."""
     out: list[str] = []
     after_cased = False
+    hex_tail = b""  # the last bytes of the current run of adjacent hex escapes
     for unit_raw, decoded, kind in _leaf_units(raw, seps):
         if kind == "esc":
             out.append(unit_raw)
         else:
             cased = convert(decoded, after_cased)
             out.append(unit_raw if cased == decoded else _escape_data(cased, seps))
-        if decoded:
+        last = decoded[-1:]
+        if utf8_hex and kind == "esc" and unit_raw[1:2] == "X" and decoded:
+            # unescape's hex output is U+0000 to U+00FF, so latin-1 gives back the bytes sent.
+            hex_tail = (hex_tail + decoded[-4:].encode("latin-1"))[-4:]
+            last = _last_utf8_char(hex_tail) or last
+        else:
+            hex_tail = b""  # any other unit, one that decodes to nothing included, ends the run
+        if last:
             # str.title's own test: a following "a" stays lower case only after a cased character.
-            after_cased = (decoded[-1] + "a").title()[-1] == "a"
+            after_cased = (last + "a").title()[-1] == "a"
     return "".join(out)
+
+
+def _last_utf8_char(data: bytes) -> str | None:
+    """The character ``data``'s last bytes encode in UTF-8, or ``None`` where they end in none."""
+    # ``data`` may start inside a character, which decodes to replacement characters before it.
+    last = data.decode("utf-8", "replace")[-1:]
+    return None if last in ("", "\ufffd") else last
 
 
 def _replace_leaf(raw: str, old: str, new: str, seps: _Seps) -> str:

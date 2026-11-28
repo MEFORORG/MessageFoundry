@@ -5008,7 +5008,8 @@ class ServerCipherWalk:
         self: _SurfaceReads, table: str, column: str, *, keyed: bool
     ) -> bool:
         """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
-        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked. Up to two
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table is to be asked: the caller passes it only
+        when the catalog read shows the table with both columns this reads. Up to two
         statements: the surface's marker row, then one marked value."""
         check_walk_identifiers(table, column)
         if keyed and await self._surface_keyed(table, column):

@@ -45,6 +45,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import database
 from messagefoundry.transports.database import _build_odbc_dsn
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
+from tests._encrypted_pem_probe import PRIVATE_KEY_LABELS
 
 _CONNECTION = "OB_DB_GEN"
 _KEY_LABEL = "RSA PRIVATE" + " KEY"  # split, so a secret scanner does not read a real key
@@ -170,11 +171,8 @@ def test_a_plain_sslca_file_still_builds(tmp_path: Path) -> None:
     assert f"SSLCA={ca};" in _build(SSLCA=ca)
 
 
-#: BACKLOG #3745: a key block with no encryption header, PKCS#8 encrypted and plain.
-_KEY_SHAPES = [
-    pytest.param("ENCRYPTED PRIVATE" + " KEY", id="PKCS#8 encrypted"),
-    pytest.param("PRIVATE" + " KEY", id="plain"),
-]
+#: BACKLOG #3745: a key block with no encryption header, one for each label step 2 names.
+_KEY_SHAPES = PRIVATE_KEY_LABELS
 
 
 def _with_key(label: str) -> str:

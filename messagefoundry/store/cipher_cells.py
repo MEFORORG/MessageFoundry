@@ -474,8 +474,7 @@ def read_cipher_cells(
     allow (:meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many`)."""
     if chunk_rows < 1:
         raise ValueError(f"chunk_rows must be at least 1, not {chunk_rows}")
-    keyless = not cipher.encrypts
-    unmarked = unmarked and not keyless
+    unmarked = unmarked and cipher.encrypts
     version = _schema_version(conn)
     tables = store_tables(conn)
     for spec in cells:
@@ -500,24 +499,14 @@ def read_cipher_cells(
         width = len(spec.locator)
         last: int | None = None
         while True:
-            opening = _Opening(spec, cipher)
+            opening = _Opening(spec, cipher, unsealed_kind)
             count = 0
             bound = (chunk_rows,) if last is None else (last, chunk_rows)
             cursor = conn.execute(first if last is None else after, params + bound)
             for rowid, sealed, *row in cursor:
                 count, last = count + 1, int(rowid)
                 where, key, stored = tuple(row[:width]), row[width:-1], row[-1]
-                if not sealed:
-                    opening.note(CellReading(spec, unsealed_kind, where))
-                elif not isinstance(stored, str):
-                    # Only a BLOB is sealed and not text; see `_sealed_test` for why it fails.
-                    opening.note(CellReading(spec, "blob", where))
-                elif keyless:
-                    # The sealed test ignores case; the marker does not. A keyless store's plaintext
-                    # that only resembles it is not a sealed cell.
-                    if cipher.is_encrypted(stored):
-                        opening.note(CellReading(spec, "keyless", where))
-                elif opening.add(stored, key, where):
+                if opening.read(sealed, stored, key, where):
                     break  # the key service failed; see _open_queued
             cursor.close()  # ends the chunk's read transaction even when the loop broke early
             readings = _opened(opening)
@@ -547,15 +536,18 @@ def _failed(
 
 
 class _Opening:
-    """One chunk's sealed text values, queued to be opened under a key, each reading kept at its
-    row's place. Each value is opened with its cell's AAD and then put through its cell's
+    """One chunk's rows of one cell, each reading kept at its row's place. :meth:`read` classifies
+    each row the walk hands it, sealed or not, and queues a sealed text value to be opened under a
+    key. Each value is opened with its cell's AAD and then put through its cell's
     ``check``; the plaintext goes no further. A marker in another case fails without a decrypt:
     the cipher would otherwise hand it to its unmarked-value rule and, under
     ``allow_unmarked_ciphertext``, return it with no tag checked. :func:`_open_queued` opens the
     queue and :func:`_opened` ends the chunk."""
 
-    def __init__(self, spec: CipherCell, cipher: Cipher) -> None:
+    def __init__(self, spec: CipherCell, cipher: Cipher, unsealed_kind: ReadingKind) -> None:
         self.spec, self.cipher = spec, cipher
+        #: How :meth:`read` names a value the sealed test does not select (see :class:`CellReading`).
+        self.unsealed_kind: ReadingKind = unsealed_kind
         self.readings: list[CellReading | None] = []
         self.pending: list[tuple[int, str, list[object], tuple[object, ...], bytes]] = []
         self.chars = 0
@@ -565,10 +557,40 @@ class _Opening:
         self.limit = BATCH_MAX_ITEMS if isinstance(cipher, BatchCipher) else 1
         #: Whether a value failed because the key service did (:func:`_is_outage`).
         self.outage = False
+        self.keyless = not cipher.encrypts
 
     def note(self, reading: CellReading) -> None:
         """Place a reading that needed no decrypt at the next place."""
         self.readings.append(reading)
+
+    def read(
+        self,
+        sealed: bool | int,
+        stored: object,
+        key: list[object],
+        where: tuple[object, ...],
+    ) -> bool:
+        """Classify one row's value, by the one rule :func:`read_cipher_cells` and
+        :func:`_read_server_chunk` share, and queue it when it is to be opened. ``sealed`` is the
+        walk's own reading of whether the value is sealed: on SQLite a column the SELECT
+        computes (the sealed test as an integer, or the literal 1 where that test is the WHERE
+        clause), on a server store a test made in Python on the fetched value. Read for its
+        truth. True when the queue met an outage (:meth:`add`)."""
+        if not sealed:
+            self.note(CellReading(self.spec, self.unsealed_kind, where))
+        elif not isinstance(stored, str):
+            # A value the sealed test selects that is not text fails as a BLOB: on SQLite a BLOB
+            # (see `_sealed_test` for why), on a server store anything a driver hands back for a
+            # text column.
+            self.note(CellReading(self.spec, "blob", where))
+        elif self.keyless:
+            # The sealed test ignores case; the marker does not. A keyless store's plaintext that
+            # only resembles it is not a sealed cell.
+            if self.cipher.is_encrypted(stored):
+                self.note(CellReading(self.spec, "keyless", where))
+        else:
+            return self.add(stored, key, where)
+        return False
 
     def add(self, stored: str, key: list[object], where: tuple[object, ...]) -> bool:
         """Queue one value at the next place, opening the queue first when this value would take
@@ -677,6 +699,16 @@ class CipherAudit:
 
     tallies: list[CellTally] = field(default_factory=list)
     key_mismatch: str | None = None
+    #: What a server store's catalog read did not show, so the walk read none of it: each cell
+    #: asked for as ``table.column``, listed when its column or any AAD, order or locator column
+    #: it needs is hidden, then ``keyed_surface``, listed when the table or either column the walk
+    #: reads of it is hidden. Without that record the walk can miss at least a surface the store
+    #: has sealed, where no sealed value is left on it, and the key mismatch of a keyless walk of
+    #: a keyed store whose sealed values it never meets. Names from the inventory, never the
+    #: catalog. At least a missing grant, or a schema behind this build, hides one. A store with
+    #: any is not audited whole, so no verdict over it may PASS (BACKLOG #1719 item 9). Always
+    #: empty after a SQLite walk, whose missing cells an older store predates (``present``).
+    hidden: list[str] = field(default_factory=list)
 
     @property
     def opened(self) -> int:
@@ -733,14 +765,16 @@ def keyed_store_mismatch(
     return None if keyed is None else _keyed_mismatch_line(keyed[0], keyed[1], source)
 
 
-def _tally_into(into: CipherAudit | None, tallies: list[CellTally]) -> CipherAudit:
-    """``into`` reset to ``tallies``, or a new audit of them. A caller that passes ``into`` keeps
+def _reset(into: CipherAudit | None) -> CipherAudit:
+    """``into`` emptied of every finding, or a new empty audit. A caller that passes ``into`` keeps
     what the walk counted when it raises part way, on a store error or a key-service outage, so a
-    failure found before the stop can still be reported (BACKLOG #1719 item 1)."""
+    failure found before the stop can still be reported (BACKLOG #1719 item 1). Each walk resets
+    it before its catalog read, so a read that raises leaves no earlier walk's findings."""
     if into is None:
-        return CipherAudit(tallies)
-    into.tallies[:] = tallies
+        return CipherAudit()
+    into.tallies.clear()
     into.key_mismatch = None
+    into.hidden = []
     return into
 
 
@@ -796,12 +830,13 @@ def audit_cipher_cells(
 
     The verdict precedence is :func:`keyed_store_mismatch`'s, then a keyless reading's, then a
     failure's, so it does not depend on which value the walk meets first. What stops the walk is
-    :meth:`_Tallier.add`'s to say. :func:`_tally_into` says what ``into`` is for."""
+    :meth:`_Tallier.add`'s to say. :func:`_reset` says what ``into`` is for."""
     wanted = tuple(cells)
+    audit = _reset(into)
     tables = store_tables(conn)
-    audit = _tally_into(
-        into, [CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted]
-    )
+    audit.tallies[:] = [
+        CellTally(c.table, c.column, present=cell_present(conn, c, tables)) for c in wanted
+    ]
     audit.key_mismatch = keyed_store_mismatch(conn, cipher, tables)
     if audit.key_mismatch is not None:
         return audit
@@ -849,6 +884,18 @@ def server_cell_present(spec: CipherCell, columns: Mapping[str, frozenset[str]])
     return have is not None and have.issuperset(needed)
 
 
+#: The ``keyed_surface`` columns a server walk reads.
+_KEYED_SURFACE_COLUMNS = frozenset({"surface_table", "surface_column"})
+
+
+def _keyed_surface_visible(columns: Mapping[str, frozenset[str]]) -> bool:
+    """Whether the catalog read shows ``keyed_surface`` with every column the walk reads of it. A
+    table shown in part is read as hidden, so the walk asks for no column the catalog read did not
+    show. A column the catalog shows can still refuse a SELECT, at least where the catalog lists
+    a column for a privilege other than SELECT."""
+    return columns.get("keyed_surface", frozenset()) >= _KEYED_SURFACE_COLUMNS
+
+
 def server_walk_tables(cells: Iterable[CipherCell]) -> tuple[str, ...]:
     """The tables a server walk of ``cells`` asks the columns of: theirs and ``keyed_surface``."""
     return tuple(dict.fromkeys((*(c.table for c in cells), "keyed_surface")))
@@ -880,30 +927,21 @@ def _read_server_chunk(
     readings, the position of the last row read, and whether a key-service outage stopped it. Run
     in a worker thread: under ``vault_transit`` each batch of decrypts is a Transit request."""
     index = {c: i for i, c in enumerate(_server_select(spec))}
-    keyless = not cipher.encrypts
-    opening = _Opening(spec, cipher)
+    opening = _Opening(spec, cipher, unsealed_kind)
     for row in rows:
         position += 1
         stored = row[-1]
         where = tuple(position if c == POSITION else row[index[c]] for c in spec.locator)
-        if not isinstance(stored, str):
-            # Every server cipher column is text, so a driver handing back anything else is a
-            # damaged row, failed as SQLite fails a BLOB.
-            opening.note(CellReading(spec, "blob", where))
-            continue
-        if stored == "":
+        text = isinstance(stored, str)
+        if text and stored == "":
             continue  # every purge path writes '' (see read_cipher_cells)
-        if not _is_sealed_text(stored):
-            if unmarked:
-                opening.note(CellReading(spec, unsealed_kind, where))
-            continue
-        if keyless:
-            # The sealed test ignores case; the marker does not (see read_cipher_cells).
-            if cipher.is_encrypted(stored):
-                opening.note(CellReading(spec, "keyless", where))
-            continue
+        # Every server cipher column is text, so a driver handing back anything else is a damaged
+        # row, read as sealed so that it fails as SQLite fails a BLOB.
+        sealed = not text or _is_sealed_text(stored)
+        if not sealed and not unmarked:
+            continue  # not sealed, and this walk does not count unmarked values
         key = [row[index[c]] for c in spec.aad_columns]
-        if opening.add(stored, key, where):
+        if opening.read(sealed, stored, key, where):
             break
     # After an outage the walk ends, so the position returned with it is never read.
     return _opened(opening), position, opening.outage
@@ -934,7 +972,7 @@ async def read_server_cipher_cells(
     unmarked = unmarked and cipher.encrypts
     if columns is None:
         columns = await source.cipher_walk_columns(server_walk_tables(wanted))
-    keyed_table = "keyed_surface" in columns
+    keyed_table = _keyed_surface_visible(columns)
     for spec in wanted:
         if not server_cell_present(spec, columns):
             continue
@@ -980,7 +1018,7 @@ async def server_keyed_store_mismatch(
     source: CipherCellSource, cipher: Cipher, columns: Mapping[str, frozenset[str]]
 ) -> str | None:
     """:func:`keyed_store_mismatch` for a server store, ``columns`` naming the tables it holds."""
-    if cipher.encrypts or "keyed_surface" not in columns:
+    if cipher.encrypts or not _keyed_surface_visible(columns):
         return None
     keyed = await source.cipher_walk_keyed_surface()
     return None if keyed is None else _keyed_mismatch_line(keyed[0], keyed[1], "store")
@@ -999,12 +1037,17 @@ async def audit_server_cipher_cells(
     :func:`read_server_cipher_cells`, with the same precedence, the same stops and the same
     ``into``."""
     wanted = tuple(cells)
+    audit = _reset(into)
     if columns is None:
         columns = await source.cipher_walk_columns(server_walk_tables(wanted))
-    audit = _tally_into(
-        into,
-        [CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted],
-    )
+    audit.tallies[:] = [
+        CellTally(c.table, c.column, present=server_cell_present(c, columns)) for c in wanted
+    ]
+    # Before any value is read, so a stop on the key mismatch, an outage or a store error part way
+    # still says what the walk could not see.
+    audit.hidden = audit.absent
+    if not _keyed_surface_visible(columns):
+        audit.hidden.append("keyed_surface")
     audit.key_mismatch = await server_keyed_store_mismatch(source, cipher, columns)
     if audit.key_mismatch is not None:
         return audit

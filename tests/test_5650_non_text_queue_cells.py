@@ -28,7 +28,11 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStore
-from messagefoundry.store.cell_tag import NonTextListedCellError, open_listed_cell
+from messagefoundry.store.cell_tag import (
+    MESSAGE_TAG_FAILED_ACTION,
+    NonTextListedCellError,
+    open_listed_cell,
+)
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
@@ -164,3 +168,69 @@ async def test_a_planted_blob_last_error_fails_the_dead_letter_list_as_a_cipher_
             await store.list_dead(allowed_channels=None)
     finally:
         await store.close()
+
+
+async def test_a_later_rows_refusal_still_audits_an_earlier_rows_tag_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``list_dead`` audits the summary tag failures it collected even when a later row's planted
+    ``last_error`` fails the read. Before, the refusal skipped the report, so the earlier row's
+    tag-failed audit row was never written, on every retry."""
+    db = tmp_path / "audit_before_refusal.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key(), write_v2=True))
+    try:
+        moved = await store.enqueue_message(
+            channel_id="IB_A",
+            raw=RAW,
+            summary="SYNTH-SUMMARY",
+            deliveries=[("OB_A", "p")],
+            now=10.0,
+        )
+        planted = await store.enqueue_message(
+            channel_id="IB_A",
+            raw=RAW,
+            summary="SYNTH-SUMMARY",
+            deliveries=[("OB_A", "q")],
+            now=10.0,
+        )
+        for item in await store.claim_ready(now=10.0, destination_name="OB_A"):
+            await store.dead_letter_now(item.id, "synthetic permanent reject")
+        side = sqlite3.connect(db, timeout=30)  # a writer with no key, outside the store
+        try:
+            # The list reads newest first, so the moved message's row is opened first.
+            side.execute("UPDATE queue SET updated_at=20.0 WHERE message_id=?", (moved,))
+            side.execute("UPDATE queue SET updated_at=10.0 WHERE message_id=?", (planted,))
+            side.commit()
+        finally:
+            side.close()
+        # CONTROL: both rows list in full before the move and the plant.
+        assert [
+            (d["message_id"], d["summary"]) for d in await store.list_dead(allowed_channels=None)
+        ] == [
+            (moved, "SYNTH-SUMMARY"),
+            (planted, "SYNTH-SUMMARY"),
+        ]
+        side = sqlite3.connect(db, timeout=30)
+        try:
+            # A message moved to another channel fails its summary's tag (BACKLOG #2593).
+            side.execute("UPDATE messages SET channel_id='IB_MOVED' WHERE id=?", (moved,))
+            side.commit()
+        finally:
+            side.close()
+        _plant(db, "last_error", planted)
+        with pytest.raises(NonTextListedCellError):
+            await store.list_dead(allowed_channels=None)
+    finally:
+        await store.close()
+    side = sqlite3.connect(db, timeout=30)
+    try:
+        audited = [
+            d
+            for (d,) in side.execute(
+                "SELECT detail FROM audit_log WHERE action=?", (MESSAGE_TAG_FAILED_ACTION,)
+            )
+        ]
+    finally:
+        side.close()
+    # The read the plant failed still wrote the moved row's tag-failed audit row.
+    assert len(audited) == 1 and moved[:12] in audited[0], audited

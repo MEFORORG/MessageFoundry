@@ -4065,7 +4065,8 @@ class PostgresStore(ServerCipherWalk):
         return {t: frozenset(c) for t, c in found.items()}
 
     async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
-        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
+        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the catalog
+        shows the table with both columns this reads."""
         row = await self._fetchone(
             "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
         )
@@ -9545,29 +9546,32 @@ class PostgresStore(ServerCipherWalk):
         # — each binds to its own cell (ASVS 11.3.3).
         failures: list[CellTagError] = []
         out: list[dict[str, Any]] = []
-        for r in rows:
-            d = dict(r)
-            # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
-            d["last_error"] = await cipher_call(
-                self._cipher,
-                open_listed_cell,
-                self._cipher,
-                d["last_error"],
-                cell_aad("queue", "last_error", r["outbox_id"]),
-                table="queue",
-            )
-            await cipher_call(
-                self._cipher,
-                withhold_message_cells,
-                self._cipher,
-                d,
-                ("summary",),
-                message_id=r["message_id"],
-                channel_id=d.pop("message_channel_id"),
-                failures=failures,
-            )
-            out.append(d)
-        await report_cell_tag_failures(self, failures)
+        try:
+            for r in rows:
+                d = dict(r)
+                # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
+                d["last_error"] = await cipher_call(
+                    self._cipher,
+                    open_listed_cell,
+                    self._cipher,
+                    d["last_error"],
+                    cell_aad("queue", "last_error", r["outbox_id"]),
+                    table="queue",
+                )
+                await cipher_call(
+                    self._cipher,
+                    withhold_message_cells,
+                    self._cipher,
+                    d,
+                    ("summary",),
+                    message_id=r["message_id"],
+                    channel_id=d.pop("message_channel_id"),
+                    failures=failures,
+                )
+                out.append(d)
+        finally:
+            # A later row's refusal still audits the earlier rows' tag failures (BACKLOG #5650).
+            await report_cell_tag_failures(self, failures)
         return out
 
     async def count_dead(

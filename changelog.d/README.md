@@ -7,7 +7,7 @@ every pair of open pull requests conflicted there. Two pull requests that add di
 not conflict. Two that pick the same file name still do, so pick a name nobody else will.
 
 This folder is for the engine's changelog only. A web console change still goes straight into
-`packaging/messagefoundry-webconsole/CHANGELOG.md`, which has its own version and release.
+`packaging/messagefoundry-webconsole/CHANGELOG.md`, which has its own release tag.
 
 ## Write a fragment
 

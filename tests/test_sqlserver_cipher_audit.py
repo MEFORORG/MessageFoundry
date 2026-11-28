@@ -79,10 +79,8 @@ async def keyed() -> AsyncIterator[tuple[Any, str]]:
         await _clear(janitor)
         key = generate_key()
         cipher = make_cipher(key, write_v2=True)
-        # With the aesgcm cipher's audit MAC key, as a keyed service open passes it, so this open
-        # writes the chain's genesis row. Without it the log stays empty, and open_store refuses a
-        # keyless open of an empty log, read-only too, under the shared #1916 verdict the command
-        # passes: a keyless `cipher-audit` would exit 2 there, never reaching KEY_MISMATCH.
+        # The audit MAC key and function, for the genesis row: the PostgreSQL twin's fixture says
+        # why a keyless `cipher-audit` needs one to reach KEY_MISMATCH.
         store = await SqlServerStore.open(
             settings,
             cipher=cipher,
