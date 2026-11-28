@@ -742,20 +742,33 @@ def test_pr2815_item_15_a_device_named_entry_takes_the_full_walk(
     assert walked == [rf"C:\capath\{name}"]
 
 
-@pytest.mark.parametrize("folder", [r"C:\certs\NUL", r"C:\certs\nul\\", r"C:\certs\com1.d"])
+@pytest.mark.parametrize(
+    ("folder", "cwd"),
+    [
+        (r"C:\certs\NUL", r"C:\cwd"),
+        (r"C:\certs\nul\\", r"C:\cwd"),
+        (r"C:\certs\com1.d", r"C:\cwd"),
+        # Relative spellings that end on the folder only once joined to the working directory.
+        ("..", r"C:\svc\NUL\sub"),
+        (r"sub\..\..", r"C:\svc\NUL\sub"),
+    ],
+)
 def test_an_sslcapath_folder_named_like_a_device_is_refused_unlisted(
-    monkeypatch: pytest.MonkeyPatch, folder: str
+    monkeypatch: pytest.MonkeyPatch, folder: str, cwd: str
 ) -> None:
     """The folder's own walk read its last name as the device, since that is where the walk ends,
     but the driver passes through the folder to ``<hash>.0``. Measured on Windows 10.0.26300 (the
     #5515 review): a junction named ``NUL`` walked clear, and only a listing failure refused it.
-    Red under origin/main: the folder was listed, and its entries cleared it."""
+    A relative spelling is judged by the name the walk ends on, joined to the working directory.
+    Red on the #5515 head: the folder was listed (the stub raises), and on this branch's first
+    head the relative spellings were listed too."""
     listed: list[str] = []
 
     def scandir(path: str) -> Any:
         listed.append(path)
         raise AssertionError("a device-named folder must not be listed")
 
+    monkeypatch.setattr(os, "getcwd", lambda: cwd)
     monkeypatch.setattr(os, "scandir", scandir)
     assert database._capath_folder_clear(folder) is False
     assert listed == []

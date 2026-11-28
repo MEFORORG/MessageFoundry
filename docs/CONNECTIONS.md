@@ -2316,7 +2316,10 @@ the build sends, so `0` is checked as the path `0`. On Windows each entry of an 
 takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
 to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
 cannot list or one holding more entries than the cap `transports.database._MAX_CAPATH_ENTRIES`
-names. A missing folder, or a value that names a file, is left to the driver. The build runs
+names. A missing folder, or a value that names a file, is left to the driver. A value whose last
+name is one CPython's `ntpath.isreserved` lists as a DOS device name, such as `NUL` or `COM1.d`,
+is refused instead wherever the folder above it is there, missing or not: the walk reads that name
+as the device, where the driver passes through a folder of that name. The build runs
 these checks itself, so every build judges the entries and a refusal fails it. A running engine
 builds a connector in a worker thread, off its event loop, at least at a lane start (at boot, at
 an operator start and when a reload or a DR activation binds a lane), in a reload's build check,
