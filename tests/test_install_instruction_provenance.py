@@ -348,7 +348,7 @@ def test_the_synthetic_probe_name_is_not_a_real_distribution() -> None:
 #: ``pyproject.toml`` joined on BACKLOG #1944. Its comment on the console wheel said the wheel "isn't
 #: published to an index" for two months after the name was claimed, and this arm could not see it:
 #: the file was outside every glob, and the pattern had no contracted form. A build-config comment
-#: is read by exactly the person deciding whether to add the ``[webconsole]`` extra, so a stale
+#: is read by exactly the person maintaining the ``[webconsole]`` extra, so a stale
 #: publication claim there misleads the one decision it informs.
 _PROSE_ONLY_GLOBS = ("packaging/*/*.md", ".github/workflows/release.yml", "pyproject.toml")
 
