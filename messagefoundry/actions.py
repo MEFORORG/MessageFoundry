@@ -143,9 +143,12 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     its own, so a whole-field path keeps its components, repetitions and subcomponents. Only the
     literal text is cased: an escape sequence such as ``\\.br\\`` or ``\\S\\`` is kept as sent, and so
     is the text a hex escape carries. Title case still reads the character before a letter to
-    decide whether it starts a word: an escape's decoded text, except that where ``MSH-18`` is
-    empty or ``UNICODE UTF-8`` the bytes of a run of adjacent hex escapes are read as UTF-8 where
-    they end in a valid UTF-8 character. A no-op on an absent field; raises :class:`ValueError` on
+    decide whether it starts a word: an escape's decoded text, except that where the first
+    repetition of ``MSH-18`` names UTF-8 the bytes of a run of adjacent hex escapes are read as
+    UTF-8 where they end in a valid UTF-8 character. ``MSH-18`` names UTF-8 when, stripped of
+    surrounding space and in any case, it is HL7 table 0211's ``UNICODE UTF-8`` or the bare
+    ``UTF-8``. An empty or absent ``MSH-18`` declares ASCII, so there, as under every other set,
+    each byte is its own character. A no-op on an absent field; raises :class:`ValueError` on
     an unknown mode (fail loud rather than silently leaving the value), or on field 1 or 2 of
     ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
     # A tuple test, not a dict one, so an unhashable mode from config raises the documented
@@ -153,15 +156,29 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     if mode not in tuple(_CASE_CONVERTERS):
         raise ValueError(f"convert_case mode must be 'upper', 'lower', or 'title', got {mode!r}")
     convert = _CASE_CONVERTERS[mode]
-    # Only title case reads the character before a run, and only an empty or UTF-8 MSH-18 says
-    # how to read a hex escape's bytes as more than one character each.
-    utf8_hex = mode == "title" and (msg.field("MSH-18.1") or "").strip() in ("", "UNICODE UTF-8")
+    # Only title case reads the character before a run, and only a UTF-8 MSH-18 says how to read
+    # a hex escape's bytes as more than one character each.
+    utf8_hex = mode == "title" and _declares_utf8(msg)
     _edit_value(
         msg,
         path,
         lambda raw, seps: _case_leaf(raw, convert, seps, utf8_hex=utf8_hex),
         scope="leaves",
     )
+
+
+#: The ``MSH-18`` values, stripped and case-folded, that declare UTF-8: HL7 table 0211's
+#: ``UNICODE UTF-8``, and the bare ``UTF-8`` (owner ruling 2026-11-27, BACKLOG #5928).
+_UTF8_CHARSETS = frozenset({"unicode utf-8", "utf-8"})
+
+
+def _declares_utf8(msg: Message) -> bool:
+    """Whether the message's own character set, the first repetition of ``MSH-18``, is UTF-8.
+
+    A later repetition names an alternate set a ``\\C..\\`` escape may switch to, so it is not
+    read. An empty or absent ``MSH-18`` declares ASCII, per HL7, and is not UTF-8."""
+    first = msg.field("MSH-18", repetition=1) or ""
+    return first.strip().casefold() in _UTF8_CHARSETS
 
 
 # Each converter also takes whether the character before the run is cased. Only title case

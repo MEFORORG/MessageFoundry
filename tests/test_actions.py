@@ -441,8 +441,10 @@ def test_replace_literal() -> None:
 _MSH = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101120000||ADT^A01|MSG1|P|2.5.1\r"
 
 
-def _with_pid(pid5: str, pid4: str = "") -> Message:
-    return Message.parse(f"{_MSH}PID|1||100^^^HOSP^MR|{pid4}|{pid5}\r")
+def _with_pid(pid5: str, pid4: str = "", *, msh18: str | None = None) -> Message:
+    """A message whose MSH-18 is ``msh18`` as sent, or which ends before MSH-18 where it is None."""
+    msh = _MSH if msh18 is None else _MSH.replace("2.5.1\r", f"2.5.1||||||{msh18}\r")
+    return Message.parse(f"{msh}PID|1||100^^^HOSP^MR|{pid4}|{pid5}\r")
 
 
 def test_convert_case_keeps_a_rich_text_escape_on_a_whole_field() -> None:
@@ -550,15 +552,9 @@ def test_convert_case_title_reads_a_utf8_hex_escape_as_one_character(
     # it, and under a UTF-8 MSH-18 a run of hex escapes is read as UTF-8 where its bytes end in a
     # UTF-8 character. NEGATIVE CONTROL: on d055c0e8590, which read each byte as its own character,
     # the first five rows fail on every path.
-    m = _with_pid_charset(sent, "UNICODE UTF-8")
+    m = _with_pid(sent, msh18="UNICODE UTF-8")
     convert_case(m, path, "title")
     assert m["PID-5"] == expected
-
-
-def _with_pid_charset(pid5: str, msh18: str | None) -> Message:
-    """A message whose MSH-18 is ``msh18`` as sent, or which ends before MSH-18 where it is None."""
-    msh = _MSH if msh18 is None else _MSH.replace("2.5.1\r", f"2.5.1||||||{msh18}\r")
-    return Message.parse(f"{msh}PID|1||100^^^HOSP^MR||{pid5}\r")
 
 
 # Read as UTF-8, the run C3 A9 is one character, e-acute, which is cased, so the "e" after it stays
@@ -607,23 +603,24 @@ def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
     # read an empty MSH-18 as UTF-8, the rows for a lower-case, padded or bare "UTF-8" spelling,
     # for "UTF-8~UNICODE UTF-16", for an empty first repetition, and for an empty, blank or absent
     # MSH-18 fail.
-    m = _with_pid_charset("ren\\XC3A9\\e", msh18)
+    m = _with_pid("ren\\XC3A9\\e", msh18=msh18)
     assert m["MSH-18"] == (msh18 or None)
     convert_case(m, "PID-5", "title")
     assert m["PID-5"] == expected
 
 
-@pytest.mark.parametrize("mode", ["upper", "lower"])
-@pytest.mark.parametrize("msh18", ["UNICODE UTF-8", "UTF-8", "", None])
+@pytest.mark.parametrize(
+    ("mode", "expected"), [("upper", "REN\\XC3A9\\E"), ("lower", "ren\\XC3A9\\e")]
+)
+@pytest.mark.parametrize("msh18", ["UTF-8", None])
 def test_convert_case_upper_and_lower_keep_hex_as_sent_whatever_msh18(
-    mode: Literal["upper", "lower"], msh18: str | None
+    mode: Literal["upper", "lower"], expected: str, msh18: str | None
 ) -> None:
     # Owner ruling 2026-11-27: escapes stay as sent for upper and lower case, as PR 2936 ruled, so
     # MSH-18 changes nothing there; only literal text is cased.
-    m = _with_pid_charset("Ren\\XC3A9\\e", msh18)
+    m = _with_pid("Ren\\XC3A9\\e", msh18=msh18)
     convert_case(m, "PID-5", mode)
-    cased = "REN\\XC3A9\\E" if mode == "upper" else "ren\\XC3A9\\e"
-    assert m["PID-5"] == cased
+    assert m["PID-5"] == expected
 
 
 def test_substring_field_indexes_the_decoded_whole_field() -> None:
