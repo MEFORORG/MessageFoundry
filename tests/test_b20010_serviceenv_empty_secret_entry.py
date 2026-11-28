@@ -23,7 +23,7 @@ from messagefoundry.serviceenv import (
     service_env_enforced_refusal,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import EMPTY_CLASS_STEP, NAMED_EMPTY
+from tests._serviceenv_remedy import EMPTY_CLASS_STEP, EMPTY_PATH_FORM_STEP, NAMED_EMPTY
 from tests.test_b2595_service_env_secret_elsewhere import _machine
 from tests.test_service_env_secrets import _service
 
@@ -104,16 +104,87 @@ def test_an_empty_entry_beside_a_path_form_entry_of_its_name_refuses() -> None:
     assert NAMED_EMPTY in refusal
 
 
-def test_a_name_set_in_one_entry_and_empty_in_another_is_set() -> None:
-    """A name some entry sets to a secret is read as set, with that entry as its source, so
-    the remedy still says to move it; only a name no entry sets is an empty one. This pins
-    behaviour that stays as it was."""
-    posture = _service([f"{_PASSWORD}=", "Path=C:\\x", f"{_PASSWORD}=synthetic-pw"])
+def test_a_name_set_in_one_entry_and_empty_in_another_is_both() -> None:
+    """A name some entry sets to a secret is read as set, with that entry as its source, so the
+    remedy still says to move it. An entry that names it empty is named too, with its own
+    source, and the empty-entry step prints: the item after that entry may be the secret split
+    from its name, and without the step no step covers it (code review round 3 on this change,
+    finding 2). This fails on a0b245d3d6d, which hid the empty entry behind the set one."""
+    posture = _service(
+        [f"MEFOR_AI_ENVIRONMENT=prod\n{_PASSWORD}=", "Path=C:\\x", f"{_PASSWORD}=synthetic-pw"]
+    )
     assert posture.listed == (_PASSWORD,)
+    assert posture.empty_class_names == (_PASSWORD,)
     refusal = service_env_refusal(posture)
-    assert refusal is not None and NAMED_EMPTY not in refusal
+    assert refusal is not None
+    assert f"{_located(_PASSWORD, None)} is set and " in refusal
+    assert f"{_located(_PASSWORD, 2)} {NAMED_EMPTY}" in refusal
     assert f"Put {_PASSWORD} in" in refusal
-    assert posture.empty_class_names == ()
+    assert EMPTY_CLASS_STEP in refusal
+
+
+#: The split ``nssm set <service> AppEnvironmentExtra NAME = value`` writes: the name, an item of
+#: equals signs, and the value, here one the reader cannot tell from an ordinary variable that
+#: ends the empty value (``serviceenv._ends_blank_class``).
+_CANONICAL_SPLITS: dict[str, list[str]] = {
+    "password, = item": [_PASSWORD, "=", "Path=C:\\synthetic-split"],
+    "store key, = item": [_KEY, "=", "Path=C:\\synthetic-split"],
+    "password=, = item": [f"{_PASSWORD}=", "=", "Path=C:\\synthetic-split"],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_CANONICAL_SPLITS))
+def test_the_canonical_split_is_read_as_named_empty(shape: str) -> None:
+    """``NAME``, ``=``, ``<secret>`` reads ``NAME`` as set to ``=``, which still refuses as set;
+    it is named empty too, and the empty-entry step prints before the step that passes entries
+    back with ``nssm set``, which then leaves out the item that may hold the secret (code review
+    round 3 on this change, finding 1). This fails on a0b245d3d6d, where the step never printed
+    and the pass-back step kept that item."""
+    entries = _CANONICAL_SPLITS[shape]
+    posture = _service(entries)
+    name = entries[0].rstrip("=")
+    refusal = service_env_refusal(posture)
+    assert refusal is not None, shape
+    # Still refused as set, as it was: the refusal only gets stricter.
+    assert name in posture.listed, shape
+    assert posture.empty_class_names == (name,), shape
+    assert f"{_located(name, None)} {NAMED_EMPTY}" in refusal, shape
+    assert EMPTY_CLASS_STEP in refusal, shape
+    pass_back = refusal.find("`nssm set` replaces that whole list")
+    if pass_back != -1:
+        assert refusal.index(EMPTY_CLASS_STEP) < pass_back, shape
+
+
+def test_the_step_keeps_a_path_form_entry() -> None:
+    """An empty OIDC client key beside an entry that sets it to its path: the step says to
+    remove each entry that names it empty, and to keep the path, never to remove the name from
+    every list, which would take the path out (code review round 3 on this change, finding 3).
+    This fails on a0b245d3d6d, whose step said "remove it from each"."""
+    refusal = service_env_refusal(
+        _service([f"{_PEM_OR_PATH}=C:\\k.pem", "Path=C:\\x", f"{_PEM_OR_PATH}="])
+    )
+    assert refusal is not None
+    assert "remove it from each" not in refusal
+    assert EMPTY_PATH_FORM_STEP in refusal
+    assert refusal.index(EMPTY_CLASS_STEP) < refusal.index(EMPTY_PATH_FORM_STEP)
+
+
+def test_the_path_form_line_prints_only_for_the_oidc_key() -> None:
+    refusal = service_env_refusal(_service([f"{_PASSWORD}=", "Path=C:\\x"]))
+    assert refusal is not None and EMPTY_PATH_FORM_STEP not in refusal
+
+
+def test_an_empty_retired_key_is_sent_to_rotate_key() -> None:
+    """An empty retired-key entry: the step says a retired key belongs only in the shell that
+    runs `messagefoundry rotate-key`, not in a DPAPI key file (code review round 3 on this
+    change, finding 4). This fails on a0b245d3d6d, whose step named a DPAPI key file only."""
+    retired = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
+    assert retired in KEY_CLASS_NAMES
+    posture = _service([f"{retired}=", "Path=C:\\x"])
+    assert posture.empty_class_names == (retired,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "a retired key only in the shell that runs `messagefoundry rotate-key`" in refusal
 
 
 def test_an_empty_key_has_nothing_to_move_unless_the_process_holds_one() -> None:

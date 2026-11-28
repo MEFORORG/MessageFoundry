@@ -249,8 +249,11 @@ def test_a_line_that_may_be_the_secret_refuses_as_an_item_and_on_a_later_line(
     items = _read([f"{name}=", line])
     later = _read([f"Path=x\n{name}=\n{line}"])
     assert items.listed == later.listed == (name,), line
-    # Read as set to the line, not as an empty entry, which refuses on its own.
-    assert items.empty_class_names == later.empty_class_names == (), line
+    # Read as set to the line, not as an empty entry, which refuses on its own. A line of equals
+    # signs alone is both: set to ``=``, and empty, as the split ``nssm set ... NAME = value``
+    # leaves it (tests/test_b20010_serviceenv_empty_secret_entry.py).
+    empty = (name,) if line == "=" else ()
+    assert items.empty_class_names == later.empty_class_names == empty, line
     assert items.value_runs_on, line
     assert service_env_refusal(items) is not None
     assert service_env_refusal(later) is not None

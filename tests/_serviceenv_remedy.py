@@ -38,12 +38,21 @@ EMPTY_CLASS_STEP = (
     "from its name, into an entry or line after it, where the engine may not read it as that "
     "secret. Where an entry or line after such a name holds its secret, that entry or line is "
     "refused too: remove it with the name, and where it is one line of a string that sets other "
-    "variables, take out that line alone. The name is refused in every list and value that "
-    "names it, so remove it from each. Where such an empty entry is there to keep a value set "
-    "elsewhere, such as in the machine-wide environment, out of the service, remove that value "
-    "where it is set too, since without the entry it reaches the service. Where the setting is "
-    "wanted, keep a store key in a DPAPI-protected key file and any other secret in the secrets "
-    'directory: see docs/SERVICE.md, "Protect the store encryption key at rest"'
+    "variables, take out that line alone. Each entry and line that names such a name with "
+    "nothing set in it is refused, in every list and value, so remove each one. Where such an "
+    "empty entry is there to keep a value set elsewhere, such as in the machine-wide "
+    "environment, out of the service, remove that value where it is set too, since without the "
+    "entry it reaches the service. Where the setting is wanted, keep a store key in a "
+    "DPAPI-protected key file, a retired key only in the shell that runs `messagefoundry "
+    "rotate-key`, never in the service, and any other secret in the secrets directory: see "
+    'docs/SERVICE.md, "Protect the store encryption key at rest"'
+)
+
+#: Printed after ``EMPTY_CLASS_STEP`` where the OIDC client key, which takes either a key or its
+#: path, is named empty (vault BACKLOG #5394).
+EMPTY_PATH_FORM_STEP = (
+    "An entry that sets MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY to the path of its key file holds no "
+    "secret and is not refused: keep it"
 )
 
 #: Printed last, only where a refused value runs on into a directory entry and no directory
