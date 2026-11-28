@@ -15,8 +15,8 @@ HL7 library, ``config.atomic_edit``'s cross-process lock primitives (``edit_lock
 ``lock_path_for`` and ``LOCK_FILE_NAME``, which :func:`_pair_lock` here builds on), its link test
 and its ``_REFUSED`` errno set, and the leaf helpers ``controlchars``, ``path_reach`` and
 ``redaction``. The import block is the list of record. It never imports the store instance, a
-transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph. The
-cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
+transport, a connection, ``api/``, or ``pipeline/`` — the offline viewer is not wired into the graph.
+The cross-process quota ledger (ASVS 2.3.4) does not change that: the store handle arrives as a
 constructor argument typed against the narrow :class:`UploadQuotaLedger` protocol declared HERE, so
 no store module is imported. All disk + crypto + split work runs **off the event loop**
 (``asyncio.to_thread``).
@@ -344,11 +344,11 @@ def _sidecar_is_absent(sidecar: Path) -> bool:
     return False
 
 
-def _root_fault(root: Path, listed: os.stat_result) -> str | None:
-    """Why the uploads root no longer reads as the folder the sweep listed, whose ``stat`` was
-    ``listed``, or ``None`` when it still does. Its own ``stat`` failed, which is read as the root
-    being lost, since an entry's own error cannot show that: a dangling link can raise the codes a
-    lost share does. Or it answers as another file (``os.path.samestat``), as a share remounted, or
+def _root_fault(root: Path, pinned: os.stat_result) -> str | None:
+    """Why the uploads root no longer reads as the folder the sweep pinned, whose ``stat`` was
+    ``pinned``, taken before the listing, or ``None`` when it still does. Its own ``stat`` failed,
+    which is read as the root being lost, since an entry's own error cannot show that: a dangling
+    link can raise the codes a lost share does. Or it answers as another file (``os.path.samestat``), as a share remounted, or
     a folder swapped in, under the root's name does (BACKLOG #8341 item 2). An answer proves nothing
     about the entries under it, and a file system that reports no stable identity, such as one that
     answers every ``st_ino`` as 0, cannot show a swap, and one that mints an identity on the
@@ -359,13 +359,15 @@ def _root_fault(root: Path, listed: os.stat_result) -> str | None:
         now = root.stat()
     except OSError as exc:
         return f"stopped answering ({exc.strerror or type(exc).__name__})"
-    if not os.path.samestat(now, listed):
+    if not os.path.samestat(now, pinned):
         return _ROOT_SWAPPED
     return None
 
 
-#: :func:`_root_fault`'s reason for a root that answers as another folder than the one listed.
-_ROOT_SWAPPED = "now answers as a different folder than the one the sweep listed"
+#: :func:`_root_fault`'s reason for a root that answers as another folder than the one pinned. It
+#: names the pin, the ``stat`` taken before the listing, and not the listing: a swap between the two
+#: leaves the root answering as the folder listed, which is still not the folder pinned.
+_ROOT_SWAPPED = "now answers as a different folder than the one the sweep read before its listing"
 
 
 def _root_never_made(root: Path) -> bool:
@@ -4344,9 +4346,9 @@ class UploadStore:
         clean pass while they stay lost; :func:`_root_never_made` names what still is. Once the pin
         has succeeded, every listing error raises, absence included. A temp or body goes only
         once it is past the floor and the root still answers with the identity the pin read before
-        the listing, checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a body the
-        listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just before
-        that check, also reports the sidecar not there.
+        the listing, checked right before its unlink (:func:`_root_fault`, BACKLOG #8341 item 2); a
+        body the listing shows with no sidecar goes only once :func:`_sidecar_is_absent`, asked just
+        before that check, also reports the sidecar not there.
 
         **That report is the file system's answer, not proof that no sidecar exists.**
         :func:`~messagefoundry.path_reach.is_name_absent` states its limits, at least a POSIX
@@ -4412,7 +4414,7 @@ class UploadStore:
         # reads as never made, or is a folder by now; any other raises, and prune_expired logs
         # that and keeps its result (BACKLOG #6575, #8341 item 4).
         try:
-            listed = root.stat()
+            pinned = root.stat()
         except OSError as exc:
             # A save may make the root between the failed pin and this check, so a root that is
             # now a folder is an empty pass too, and the next one lists it.
@@ -4427,8 +4429,8 @@ class UploadStore:
         removed = 0
 
         def _root_lost(name: str) -> bool:
-            """Whether the root no longer reads as the folder listed, logging the stop if so."""
-            why = _root_fault(root, listed)
+            """Whether the root no longer reads as the folder pinned, logging the stop if so."""
+            why = _root_fault(root, pinned)
             if why is None:
                 return False
             # One memo key per cause, so a swap after a lost root inside the interval still logs.
@@ -4466,12 +4468,12 @@ class UploadStore:
                 if entry.stat().st_mtime > cutoff:
                     continue  # inside the floor; being past it does not prove it abandoned
                 # The listing is a snapshot and a share can return a short one with no error, so
-                # ask again, last, before the unlink.
+                # ask again, just before the root check and the unlink.
                 if sidecar is not None and not _sidecar_is_absent(sidecar):
                     continue
                 # The unlink acts on a name in whatever folder answers for the root now, and an
                 # absent sidecar answer is about a name there too, so a temp or a body goes only
-                # while that is the folder listed (BACKLOG #8341 item 2).
+                # while that is the folder pinned (BACKLOG #8341 item 2).
                 if _root_lost(name):
                     break
                 entry.unlink()

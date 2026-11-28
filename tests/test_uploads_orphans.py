@@ -475,6 +475,28 @@ async def test_an_unreachable_root_is_not_read_as_a_missing_one(
     assert orphan.exists()
 
 
+async def test_an_unreachable_root_at_the_pin_is_not_read_as_a_missing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The twin above faults the listing, which raises on any error once the pin answered, so it
+    would pass for a plain missing root too. This one faults the pin, the root's own ``stat``, the
+    one read where absence may still end the pass quietly: an unreachable share's
+    ``FileNotFoundError`` must raise there, not read as a root no save has made yet."""
+    store = _store(tmp_path)
+    orphan = _aged_orphan(store)
+    real = Path.stat
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == store._root:
+            raise _win_not_found(53)
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with pytest.raises(FileNotFoundError):
+        store._sweep_orphans_sync(now=time.time())
+    assert orphan.exists()
+
+
 async def test_an_aborted_sweep_keeps_the_passes_result_and_logs_no_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -529,7 +551,8 @@ async def test_a_sidecar_the_listing_did_not_show_keeps_its_body(
 async def test_a_sidecar_landing_during_the_age_check_keeps_its_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The sidecar check is the last read before the unlink, so the age check is not a gap."""
+    """The sidecar check comes after the age check, so the age check is not a gap. Only the root's
+    identity check sits between it and the unlink, and that reads the root, not the sidecar."""
     store = _store(tmp_path)
     body = _aged_orphan(store)
     sidecar = body.with_suffix(_META_SUFFIX)

@@ -126,7 +126,7 @@ def test_a_root_under_a_file_is_not_a_root_never_made(
         store._sweep_orphans_sync(now=time.time())
 
 
-# --- item 2, in part: the root must still be the folder the sweep listed ------------------------
+# --- item 2, in part: the root must still be the folder the sweep pinned ------------------------
 
 
 def _swap_root_after_listing(
@@ -380,3 +380,45 @@ def test_a_root_that_stops_answering_before_an_unlink_keeps_the_file(
     assert len(root_stats) == 2
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1 and "stopped answering" in errors[0]
+
+
+def test_a_root_swapped_between_the_pin_and_the_listing_logs_a_true_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The swap lands after the pin and before the listing, so the sweep lists the new folder and
+    # the root still answers as it. The stop's ERROR named "the one the sweep listed", which is
+    # the folder the root does answer as here; it must name the pin, the folder read before the
+    # listing, which is true whichever side of the listing the swap landed on.
+    store = _store(tmp_path / "uploads")
+    store._root.mkdir(mode=0o700, parents=True)
+    other = tmp_path / "another-folder"
+    other.mkdir()
+    name = f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    for folder in (store._root, other):
+        (folder / name).write_text("SYNTHETIC", encoding="utf-8")
+        _backdate(folder / name)
+    real_stat = Path.stat
+    real_iterdir = Path.iterdir
+    swapped: list[int] = []
+
+    def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == store._root and swapped:
+            return real_stat(other, follow_symlinks=follow_symlinks)
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    def _iterdir(self: Path) -> Any:
+        if self == store._root:
+            swapped.append(1)  # the remount lands before the listing reads the folder
+            return iter([self / entry.name for entry in real_iterdir(other)])
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        removed = store._sweep_orphans_sync(now=time.time())
+
+    assert removed == 0 and (store._root / name).exists() and (other / name).exists()
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "now answers as a different folder" in errors[0]
+    assert "the one the sweep listed" not in errors[0]
+    assert "read before its listing" in errors[0]
