@@ -4290,10 +4290,6 @@ _UNVERIFIABLE_ACCOUNT_REFUSAL: Final = (
     " check that Vault is healthy and that every node holds the audit key's latest version, then"
     " retry"
 )
-#: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
-#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
-#: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
-_BLANK_USERNAME_REFUSAL: Final = BLANK_USERNAME_REFUSAL
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -4349,8 +4345,10 @@ class _SealCheck:
 #: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
 #: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
 #: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
-#: check too. What happens once every pass has raced is each reader's to say: the settled read
-#: answers refused and reports only what each ``_verified`` check reported, while
+#: check too, and ``AuthService._settled_lookup``, the lookups by a key other than the id, which
+#: reads again only on a raced check (BACKLOG #5520 items 4 and 12). What happens once every pass
+#: has raced is each reader's to say: the two settled reads answer refused and report only what
+#: each ``_verified`` check reported, while
 #: :meth:`AuthService._checked_by_id` reports a seal failure.
 _CHECKED_READ_PASSES: Final = 3
 
@@ -5555,7 +5553,7 @@ class AuthService:
         """
         username = username.strip()
         if not username:
-            raise FirstAdministratorRefused(_BLANK_USERNAME_REFUSAL)
+            raise FirstAdministratorRefused(BLANK_USERNAME_REFUSAL)
         # Checked ONCE, so every later write of it carries the same value: `create_user` seeds both
         # `users.email` and `notify_email` on a fresh create, and `set_user_notify_email` writes
         # `notify_email` alone. A REPAIR writes no `users.email`, so that column keeps what the row
@@ -6069,7 +6067,7 @@ class AuthService:
         name = username.strip()
         # In the write's order: the name first, then the address.
         if not name:
-            return _BLANK_USERNAME_REFUSAL
+            return BLANK_USERNAME_REFUSAL
         try:
             provision_notify_email(notify_email)
         except FirstAdministratorRefused as exc:
@@ -14212,23 +14210,43 @@ class AuthService:
 
     async def _lookup_by_username(self, username: str) -> _UserLookup:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
-        the same read: a row that fails its seal still holds its name."""
-        raw = await read_user_or_unreadable(self._store.get_user_by_username(username))
-        return _UserLookup((await self._verified(raw)).user, raw is not None)
+        the same read: a row that fails its seal still holds its name. A check that raced a write
+        is read again, as :meth:`_settled_lookup` says."""
+        return await self._settled_lookup(lambda: self._store.get_user_by_username(username))
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
-        raw = await read_user_or_unreadable(self._store.get_user_by_directory_object_id(object_id))
-        return _UserLookup((await self._verified(raw)).user, raw is not None)
+        return await self._settled_lookup(
+            lambda: self._store.get_user_by_directory_object_id(object_id)
+        )
+
+    async def _settled_lookup(
+        self, read: Callable[[], Awaitable[UserRecord | None]]
+    ) -> _UserLookup:
+        """One lookup by a key other than the id, read again while its check raced a write
+        (BACKLOG #5520 items 4 and 12), up to :data:`_CHECKED_READ_PASSES` reads in all.
+
+        A check that raced a delete, a rename, a rebind or a re-key settles nothing and is not
+        reported (:meth:`_verified`), so it is not read as a record that fails its seal: the next
+        read decides, and one that finds no row is gone. A record :meth:`_verified` established
+        fails is refused at once. A row still there after every check raced is refused, which
+        fails closed, and, as :meth:`_lookup_user_settled` does, reports only what each check
+        reported."""
+        for _pass in range(_CHECKED_READ_PASSES):
+            raw = await read_user_or_unreadable(read())
+            check = await self._verified(raw)
+            if raw is None or check.settled:
+                return _UserLookup(check.user, raw is not None)
+        return _UserLookup(None, True)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
     ) -> VerifiedUser | None:
         """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
-        raw = await read_user_or_unreadable(
-            self._store.get_user_by_federated_subject(issuer, subject)
+        found = await self._settled_lookup(
+            lambda: self._store.get_user_by_federated_subject(issuer, subject)
         )
-        return (await self._verified(raw)).user
+        return found.user
 
     async def _load_users(self) -> list[VerifiedUser]:
         """Every account whose record passes its seal, in the store's order: the accounts

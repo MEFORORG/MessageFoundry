@@ -186,6 +186,8 @@ _CHECKED_WRITES = {
     "roles": ("PUT", "roles", {"roles": [Role.VIEWER.value]}, None),
     "channel-scope": ("PUT", "channel-scope", {"channels": ["*"]}, None),
     "reset-password": ("POST", "reset-password", None, "admin_reset_password"),
+    # Item 13's remainder: the factor reset, which reset-password's guard was copied from.
+    "reset-mfa": ("POST", "reset-mfa", None, "admin_reset_mfa"),
 }
 
 
@@ -193,11 +195,11 @@ _CHECKED_WRITES = {
 async def test_an_admin_write_answers_423_for_a_failing_record(
     keyed: tuple[Engine, Path], name: str
 ) -> None:
-    """#5520 items 2 and 13: ``PUT /users/{id}/roles``, ``PUT /users/{id}/channel-scope`` and
-    ``POST /users/{id}/reset-password`` read the account through the checked read, so a record
-    that fails its seal answers the 423 the reads answer, reported, rather than a 409 from the
-    write's own seal check or a 404 from the service's loader. Controls: an unknown id is still a
-    404, and an intact account is written."""
+    """#5520 items 2 and 13: ``PUT /users/{id}/roles``, ``PUT /users/{id}/channel-scope``,
+    ``POST /users/{id}/reset-password`` and ``POST /users/{id}/reset-mfa`` read the account through
+    the checked read, so a record that fails its seal answers the 423 the reads answer, reported,
+    rather than a 409 from the write's own seal check or a 404 from the service's loader. Controls:
+    an unknown id is still a 404, and an intact account is written."""
     method, suffix, body, action = _CHECKED_WRITES[name]
     engine, path = keyed
     service, alerts, intact, victim = await _setup(engine)
@@ -525,11 +527,12 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
         "the single-use `admin_reset_password` grant, so its 423, its 404 and the 503",
+        "the single-use `admin_reset_mfa` grant, at the same cost",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
     ):
         assert fact in body, fact
     rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
-    assert len(rows) == 8, rows
+    assert len(rows) == 9, rows
     for row in rows:
         assert "*What an admin user read reports* below this table" in row, row
         assert "audit row and alert" not in row and "audited and alerted" not in row, row

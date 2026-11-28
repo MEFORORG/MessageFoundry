@@ -2032,6 +2032,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             op="mfa_reset",
             detail="use the self-service MFA settings for your own account",
         )
+        # BACKLOG #5520 item 13: a record that fails its seal answers the reads' 423, as
+        # reset-password does, not the service loader's 404. The service reads the account again
+        # before it writes.
+        await _checked_user(service, user_id)
         try:
             reset = await service.admin_reset_mfa(
                 user_id, actor=identity.username, actor_id=identity.user_id
