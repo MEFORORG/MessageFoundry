@@ -1050,6 +1050,35 @@ FILE_EGRESS_FLAGGED: list[tuple[str, str]] = [
     ),
     ("receiver_open_mode_slot_one", 'def f(msg, zf):\n    zf.open("in.hl7", "w")\n'),
     ("receiver_open_mode_slot_one_variable", 'def f(msg, zf, m):\n    zf.open("in.hl7", m)\n'),
+    # Scope-blind bindings keep every reading: a name aliased to an opener module, or bound to a path,
+    # somewhere else in the file still gets the reading its own call calls for.
+    (
+        "module_alias_name_reused_as_param",
+        'import gzip as zf\n\ndef a(msg):\n    zf.open("/tmp/i")\n\n'
+        'def b(msg, zf):\n    zf.open("w")\n',
+    ),
+    ("module_bound_by_assignment", 'import io\n\nx = io\n\ndef f(msg):\n    x.open("w")\n'),
+    (
+        "path_name_reused_as_param",
+        'from pathlib import Path\n\ndef a(msg):\n    p = Path("/tmp/i")\n    return p\n\n'
+        'def b(msg, p):\n    p.open("in.hl7", "w")\n',
+    ),
+    (
+        "derived_path_name",
+        'from pathlib import Path\n\ndef f(msg, m):\n    p = Path("/tmp/i")\n    q = p.parent\n'
+        "    q.open(m)\n",
+    ),
+    (
+        "path_name_bound_from_path_name",
+        'from pathlib import Path\n\ndef f(msg, m):\n    q = p\n    p = Path("/tmp/i")\n'
+        "    q.open(m)\n",
+    ),
+    ("fs_write_method_bound", "def f(msg, out):\n    w = out.write_text\n    w(msg.raw)\n"),
+    ("builtins_exec", "import builtins\n\ndef f(msg):\n    builtins.exec(msg.raw)\n"),
+    ("builtins_eval_alias", "from builtins import eval as e\n\ndef f(msg):\n    e(msg.raw)\n"),
+    ("os_sendfile", "import os\n\ndef f(msg):\n    os.sendfile(3, 4, 0, 10)\n"),
+    ("zipfile_write", 'import zipfile\n\ndef f(msg):\n    zipfile.ZipFile("/tmp/i.zip", "w")\n'),
+    ("tarfile_write_stream", 'import tarfile\n\ndef f(msg):\n    tarfile.open("/tmp/i", "w|gz")\n'),
     # Already flagged before #5382; pinned so the widening cannot have lost them.
     ("open_literal_write", 'def f(msg):\n    open("/tmp/in.hl7", "w")\n'),
     ("open_keyword_write", 'def f(msg):\n    open("/tmp/in.hl7", mode="ab")\n'),
@@ -1085,6 +1114,12 @@ FILE_EGRESS_CLEAN: list[tuple[str, str]] = [
         "socket_readonly_from_import",
         "from socket import gethostname\n\ndef f(msg):\n    return gethostname()\n",
     ),
+    # The same slot-bug false positive for the other module openers, and tarfile's compression part.
+    ("gzip_open_read_path_with_a", 'import gzip\n\ndef f(msg):\n    gzip.open("/data/a.gz")\n'),
+    ("tarfile_read_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r:xz")\n'),
+    ("tarfile_read_stream_xz", 'import tarfile\n\ndef f(msg, p):\n    tarfile.open(p, "r|xz")\n'),
+    # A mode already given leaves a **kwargs splat nothing to carry: one there would raise.
+    ("open_read_with_kwargs_splat", 'def f(msg, p, kw):\n    open(p, "r", **kw)\n'),
     ("self_referencing_alias", "x = x\n\ndef f(msg):\n    return x.y()\n"),
 ]
 
@@ -1107,13 +1142,35 @@ def test_file_reads_are_not_flagged(tmp_path: Path, name: str, snippet: str) -> 
 
 @pytest.mark.timeout(30)
 def test_alias_lattice_resolves_in_linear_time(tmp_path: Path) -> None:
-    # Each name is bound from the two before it, so there are 2**38 paths from a39 back to os.write.
-    # Walking every path would hang `messagefoundry check`; each name is expanded once instead.
+    # Each name is bound from the two before it, so there are F(40), about 1.0e8, paths from a39 back
+    # to os.write. Walking every path would hang `messagefoundry check`; each name is expanded once.
     lines = ["import os", "a0 = os.write", "a1 = a0"]
     for i in range(2, 40):
         lines += [f"a{i} = a{i - 1}", f"a{i} = a{i - 2}"]
     lines += ["", "def f(msg):", "    a39(3, msg.raw)", ""]
     result = _run(tmp_path, "\n".join(lines))
+    assert "[ambient-authority]" in result.detail
+
+
+@pytest.mark.timeout(30)
+def test_bindings_that_lengthen_each_other_stay_bounded(tmp_path: Path) -> None:
+    # A tree walk rebinds a name from itself several ways, and two names that extend each other
+    # would grow without end; neither may make the expansion exponential.
+    snippet = (
+        "def walk(node, msg):\n"
+        "    node = node.left\n"
+        "    node = node.right\n"
+        "    node = node.parent\n"
+        "    a = b.x\n"
+        "    b = a.y\n"
+        "    b = a.z\n"
+        "    node.visit()\n"
+        "    node.visit()\n"
+        "    a.go()\n"
+        "    b.go()\n"
+        "    open(msg, mode)\n"
+    )
+    result = _run(tmp_path, snippet)
     assert "[ambient-authority]" in result.detail
 
 

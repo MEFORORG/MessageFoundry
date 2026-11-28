@@ -183,8 +183,8 @@ rules:
     pattern-sinks:
       # This rule does NOT lean on Control A, the ambient-authority lint in messagefoundry/checks.py:
       # that lint flags the opening call, not the data, so it cannot say PHI reached the file, and it
-      # has gaps of its own. What it flags and misses is stated once, in the docstrings of
-      # `_ambient_authority_hit` and `_open_write_hit` there (BACKLOG #5382).
+      # has gaps of its own. What it flags, and at least some of what it misses, is stated once, in
+      # the docstrings of `_ambient_authority_hit` and `_open_write_hit` there (BACKLOG #5382).
       - pattern: $P.write_text(...)
       - pattern: $P.write_bytes(...)
       - patterns:

@@ -886,6 +886,10 @@ _AMBIENT_OS_PATHS = frozenset(
         "os.pwritev",
         "os.truncate",
         "os.ftruncate",
+        "os.sendfile",
+        "os.copy_file_range",
+        "os.splice",
+        "os.posix_fallocate",
     }
 )
 # tempfile creates files and directories on disk; only its path lookups are exempt (BACKLOG #5382).
@@ -909,6 +913,8 @@ _MODULE_OPENERS = frozenset(
         "bz2.open",
         "lzma.open",
         "tarfile.open",
+        "zipfile.ZipFile",
+        "zipfile.PyZipFile",
     }
 )
 _PATH_CLASSES = frozenset(
@@ -1271,8 +1277,12 @@ def _unsafe_lookup_hit(
 
 
 def _is_write_mode(mode: str) -> bool:
-    """True when an ``open(...)`` mode string requests write/append/create/update access."""
-    return any(c in mode for c in ("w", "a", "x", "+"))
+    """True when an ``open(...)`` mode string requests write/append/create/update access.
+
+    A ``tarfile`` mode names its compression after a ``:`` or ``|`` (``"r:xz"``), which is not
+    access, so only the part before either is read. No other opener's mode holds those characters."""
+    access = mode.split(":", 1)[0].split("|", 1)[0]
+    return any(c in access for c in ("w", "a", "x", "+"))
 
 
 def _is_write_mode_literal(node: ast.expr) -> bool:
@@ -1286,17 +1296,21 @@ def _is_write_mode_literal(node: ast.expr) -> bool:
 
 def _mode_may_write(call: ast.Call, index: int) -> bool:
     """True unless the open-style ``call`` provably opens read-only, its mode in positional slot
-    ``index`` or the ``mode=`` keyword (BACKLOG #5382). A mode that is not a string literal, or a
-    ``*args``/``**kwargs`` splat that could carry one, cannot be proved read-only, so it counts as a
-    write. No mode at all is the opener's read default."""
+    ``index`` or the ``mode=`` keyword (BACKLOG #5382). A mode that is not a string literal counts as
+    a write, and so does a ``*args`` splat at or before the slot, or a ``**kwargs`` splat where no
+    mode is given otherwise (with one given, a mode in the splat would raise). No mode at all is the
+    opener's read default."""
     if any(isinstance(arg, ast.Starred) for arg in call.args[: index + 1]):
         return True
     modes: list[ast.expr] = call.args[index : index + 1]
+    splat = False
     for kw in call.keywords:
         if kw.arg is None:
-            return True
-        if kw.arg == "mode":
+            splat = True
+        elif kw.arg == "mode":
             modes.append(kw.value)
+    if splat and not modes:
+        return True
     return any(
         _is_write_mode_literal(mode)
         or not (isinstance(mode, ast.Constant) and isinstance(mode.value, str))
@@ -1304,126 +1318,153 @@ def _mode_may_write(call: ast.Call, index: int) -> bool:
     )
 
 
-#: A module's name bindings this lint can follow: each local name to every dotted name it may stand
-#: for, from ``import a as x``, ``from m import n [as x]`` and ``x = <dotted name>``.
-_Aliases = dict[str, set[str]]
-#: The longest dotted name :func:`_expand_alias` produces, in parts.
+#: Bounds on one :meth:`_NameResolver.expand`: the longest dotted name it produces, in parts, and the
+#: most names it returns. Bindings that extend each other (``a = b.x`` and ``b = a.y``) would grow
+#: without end; no real call chain comes near either bound.
 _MAX_ALIAS_PARTS = 16
+_MAX_ALIAS_NAMES = 256
 
 
-def _module_aliases(tree: ast.Module) -> tuple[_Aliases, frozenset[str]]:
-    """The import and assignment aliases of ``tree`` (:data:`_Aliases`), and the names bound to a
-    ``pathlib`` path expression, so ``p = Path(x); p.open(mode)`` reads ``p`` as a path.
+class _NameResolver:
+    """The name bindings of one config module that the ambient-authority rule follows (BACKLOG
+    #5382): ``import a as x``, ``from m import n [as x]`` and ``x = <dotted name>``, each local name
+    to every dotted name it may stand for; and the names bound to a ``pathlib`` path expression, so
+    ``p = Path(x); p.open(mode)`` reads ``p`` as a path.
 
     Scope-blind on purpose: a binding anywhere in the file counts everywhere in it, which
     over-reports rather than let an alias in another function go unseen (ADR 0144: a filter, not a
-    boundary). Relative and star imports bind nothing here."""
-    aliases: _Aliases = {}
-    path_values: list[tuple[list[str], ast.expr]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.asname:
-                    aliases.setdefault(alias.asname, set()).add(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module is None or node.level:
-                continue
-            for alias in node.names:
-                if alias.name != "*":
-                    local = alias.asname or alias.name
-                    aliases.setdefault(local, set()).add(f"{node.module}.{alias.name}")
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [name for target in targets for name in _assigned_names(target)]
-            dotted = (
-                _dotted_call_name(node.value)
-                if isinstance(node.value, (ast.Name, ast.Attribute))
-                else None
-            )
-            if dotted is not None:
-                for name in names:
-                    aliases.setdefault(name, set()).add(dotted)
-            path_values.append((names, node.value))
-    path_names: set[str] = set()
-    # A second pass, so a path bound before the alias that names its class is still seen.
-    for names, value in path_values:
-        if _is_path_expr(value, aliases, frozenset()):
-            path_names.update(names)
-    return aliases, frozenset(path_names)
+    boundary). So a name it resolves is only *possibly* that binding, and the open-mode reading in
+    :func:`_open_write_hit` keeps every reading a possible binding calls for. Relative and star
+    imports bind nothing here, and neither does a binding from the bound name itself
+    (``node = node.left``), which names no module."""
 
+    def __init__(self, tree: ast.Module) -> None:
+        self._aliases: dict[str, set[str]] = {}
+        self._cache: dict[str, frozenset[str]] = {}
+        values: list[tuple[list[str], ast.expr]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        self._bind(alias.asname, alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module is None or node.level:
+                    continue
+                for alias in node.names:
+                    if alias.name != "*":
+                        self._bind(alias.asname or alias.name, f"{node.module}.{alias.name}")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [name for target in targets for name in _assigned_names(target)]
+                if isinstance(node.value, (ast.Name, ast.Attribute)):
+                    dotted = _dotted_call_name(node.value)
+                    if dotted is not None:
+                        for name in names:
+                            self._bind(name, dotted)
+                values.append((names, node.value))
+        # Repeated to a fixed point, so a name bound from another path name (q = p.parent) is a
+        # path too, whichever order the two bindings come in.
+        path_names: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for names, value in values:
+                if not path_names.issuperset(names) and self.is_path_expr(value, path_names):
+                    path_names.update(names)
+                    changed = True
+        self.path_names = frozenset(path_names)
 
-def _expand_alias(dotted: str, aliases: Mapping[str, set[str]]) -> set[str]:
-    """``dotted`` as written plus every name its head may stand for under ``aliases``.
+    def _bind(self, name: str, dotted: str) -> None:
+        if dotted.partition(".")[0] != name:
+            self._aliases.setdefault(name, set()).add(dotted)
 
-    Each distinct name is expanded once, whatever path reached it, so a lattice of names assigned
-    from one another costs the number of names it reaches, not the number of paths through it. A
-    self-extending binding such as ``x = x.y`` would grow without end, so a name of more than
-    :data:`_MAX_ALIAS_PARTS` parts is not produced; no real call chain is that long."""
-    names = {dotted}
-    stack = [dotted]
-    while stack:
-        head, _, rest = stack.pop().partition(".")
-        for target in aliases.get(head, ()):
-            full = f"{target}.{rest}" if rest else target
-            if full not in names and full.count(".") < _MAX_ALIAS_PARTS:
-                names.add(full)
-                stack.append(full)
-    return names
+    def is_aliased(self, name: str) -> bool:
+        """``name`` has a binding this resolver follows."""
+        return name in self._aliases
 
+    def expand(self, dotted: str) -> frozenset[str]:
+        """``dotted`` as written plus every name its head may stand for. Each distinct name is
+        expanded once, whatever path reached it, so a lattice of names bound from one another costs
+        the number of names it reaches, not the number of paths through it; and the result is cached
+        per name, because a module calls the same names many times."""
+        cached = self._cache.get(dotted)
+        if cached is not None:
+            return cached
+        names = {dotted}
+        stack = [dotted]
+        while stack and len(names) < _MAX_ALIAS_NAMES:
+            head, _, rest = stack.pop().partition(".")
+            for target in self._aliases.get(head, ()):
+                full = f"{target}.{rest}" if rest else target
+                if full not in names and full.count(".") < _MAX_ALIAS_PARTS:
+                    names.add(full)
+                    stack.append(full)
+        result = frozenset(names)
+        self._cache[dotted] = result
+        return result
 
-def _call_names(func: ast.expr, aliases: Mapping[str, set[str]]) -> set[str]:
-    """Every dotted name a call's ``func`` may resolve to, or an empty set when it is not a dotted
-    chain (``Path(p).open``)."""
-    dotted = _dotted_call_name(func)
-    return set() if dotted is None else _expand_alias(dotted, aliases)
+    def call_names(self, func: ast.expr) -> frozenset[str]:
+        """Every dotted name a call's ``func`` may resolve to, or none when it is not a dotted chain
+        (``Path(p).open``)."""
+        dotted = _dotted_call_name(func)
+        return frozenset() if dotted is None else self.expand(dotted)
 
-
-def _is_path_expr(
-    node: ast.expr, aliases: Mapping[str, set[str]], path_names: frozenset[str]
-) -> bool:
-    """True when ``node`` is a ``pathlib`` path: a ``Path(...)`` call (through an alias too), a
-    method or attribute on one (``Path(p).with_suffix(".x")``, ``.parent``), a ``/`` join, or a name
-    bound to one of those."""
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-        return True
-    if isinstance(node, ast.Name):
-        return node.id in path_names
-    if isinstance(node, ast.Call):
-        if any(n.rsplit(".", 1)[-1] in _PATH_CLASSES for n in _call_names(node.func, aliases)):
+    def is_path_expr(self, node: ast.expr, path_names: Set[str]) -> bool:
+        """True when ``node`` is a ``pathlib`` path: a ``Path(...)`` call (through an alias too), a
+        method or attribute on one (``Path(p).with_suffix(".x")``, ``.parent``), a ``/`` join, or a
+        name in ``path_names``. Pass an empty ``path_names`` to ask whether the expression itself is
+        a path, which no scope-blind name binding can make wrong."""
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             return True
-        node = node.func
-    if isinstance(node, ast.Attribute):
-        return _is_path_expr(node.value, aliases, path_names)
-    return False
+        if isinstance(node, ast.Name):
+            return node.id in path_names
+        if isinstance(node, ast.Call):
+            if any(n.rsplit(".", 1)[-1] in _PATH_CLASSES for n in self.call_names(node.func)):
+                return True
+            node = node.func
+        if isinstance(node, ast.Attribute):
+            return self.is_path_expr(node.value, path_names)
+        return False
 
 
-def _open_write_hit(
-    call: ast.Call, names: set[str], aliases: Mapping[str, set[str]], path_names: frozenset[str]
-) -> bool:
+def _open_write_hit(call: ast.Call, names: frozenset[str], resolver: _NameResolver) -> bool:
     """An open-style call that may write (BACKLOG #5382), its mode read from the slot it really has.
 
     * A module opener (:data:`_MODULE_OPENERS`: builtin ``open``, ``codecs.open``, ``io.open``,
-      ``os.fdopen``, ...), however aliased: the mode is the 2nd positional.
-    * ``.open`` on a ``pathlib`` path: the mode is the 1st positional.
-    * ``.open`` on any other receiver (``ZipFile.open(name, mode)``, a parameter whose type the lint
-      cannot see): a write-mode literal in the 1st positional, as the lint always read it, or a mode
-      in the 2nd positional that is not provably read-only. A non-literal 1st positional there is
-      not flagged, because it is as likely a member name as a mode: a known gap.
+      ``os.fdopen``, ``zipfile.ZipFile``, ...): the mode is the 2nd positional. Called by its own
+      name, unaliased, that is the only reading.
+    * ``.open`` on a ``pathlib`` path expression (``Path(p).open(mode)``): the mode is the 1st
+      positional, the only reading.
+    * ``.open`` on any other receiver, an aliased opener among them: a write-mode literal in the
+      1st positional, as the lint always read it, or a mode in the 2nd positional that is not
+      provably read-only; and on a name bound to a path somewhere in the file, a 1st-positional
+      mode that is not provably read-only too. Because a binding is only possibly the one in force,
+      every reading it calls for is kept.
 
-    Any mode that is not a string literal counts as a write (:func:`_mode_may_write`)."""
+    Any mode that is not a string literal counts as a write (:func:`_mode_may_write`). A
+    non-literal 1st positional on a receiver not known to be a path is not flagged, because it is as
+    likely a member name as a mode."""
+    hit = False
     if names & _MODULE_OPENERS:
-        return _mode_may_write(call, 1)
+        hit = _mode_may_write(call, 1)
+        as_written = _dotted_call_name(call.func)
+        if as_written in _MODULE_OPENERS and not resolver.is_aliased(as_written.partition(".")[0]):
+            return hit
     func = call.func
     if not (isinstance(func, ast.Attribute) and func.attr == "open"):
-        return False
-    if _is_path_expr(func.value, aliases, path_names):
-        return _mode_may_write(call, 0)
-    return bool(call.args and _is_write_mode_literal(call.args[0])) or _mode_may_write(call, 1)
+        return hit
+    if resolver.is_path_expr(func.value, frozenset()):
+        return hit or _mode_may_write(call, 0)
+    if call.args and _is_write_mode_literal(call.args[0]):
+        return True
+    if resolver.is_path_expr(func.value, resolver.path_names) and _mode_may_write(call, 0):
+        return True
+    return hit or _mode_may_write(call, 1)
 
 
 def _ambient_name_hit(dotted: str) -> bool:
     """One resolved dotted call name reaches past the sanctioned Send/db_lookup boundary."""
-    if dotted in _AMBIENT_BARE_NAMES:
+    if dotted.removeprefix("builtins.") in _AMBIENT_BARE_NAMES:
         return True
     parts = dotted.split(".")
     root = parts[0]
@@ -1441,22 +1482,26 @@ def _ambient_name_hit(dotted: str) -> bool:
     return dotted == "importlib.import_module"
 
 
-def _ambient_authority_hit(
-    call: ast.Call, aliases: Mapping[str, set[str]], path_names: frozenset[str]
-) -> bool:
+def _ambient_authority_hit(call: ast.Call, resolver: _NameResolver) -> bool:
     """The call reaches past the sanctioned Send/db_lookup boundary (subprocess/socket/eval/raw
     HTTP/dynamic-import/file-write). The sanctioned reads and pure stdlib data ops are exempt.
 
-    ``aliases`` and ``path_names`` come from :func:`_module_aliases`. With them a name bound by an
-    import alias, a ``from`` import or a plain assignment is checked as every name it may stand for
-    (``import shutil as sh``, ``from os import write``, ``opener = open``; BACKLOG #5382). A binding
-    made any other way, such as ``functools.partial(open, mode="w")`` or a dynamic ``getattr``, is
-    not followed."""
+    The call is checked as every name ``resolver`` says it may stand for, so an import alias, a
+    ``from`` import or a plain assignment is followed (``import shutil as sh``, ``from os import
+    write``, ``opener = open``, ``w = out.write_text``; BACKLOG #5382). Known gaps include at least:
+    an opener or writer bound any other way (``functools.partial(open, mode="w")``, a dynamic
+    ``getattr``, a walrus); a non-literal mode in the 1st slot of an ``X.open`` whose receiver it
+    cannot tell is a path; a write through a handle passed in, or by ``json.dump``/``csv.writer``;
+    an opener not in :data:`_MODULE_OPENERS` (``dbm.open``, ``tarfile.TarFile``) or an archive
+    extraction; and any ``os`` call not named in :data:`_AMBIENT_OS_PATHS`. The other rules in this
+    check follow no alias."""
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr in _AMBIENT_FS_WRITE_ATTRS:
         return True
-    names = _call_names(func, aliases)
-    if _open_write_hit(call, names, aliases, path_names):
+    names = resolver.call_names(func)
+    if any("." in name and name.rsplit(".", 1)[1] in _AMBIENT_FS_WRITE_ATTRS for name in names):
+        return True
+    if _open_write_hit(call, names, resolver):
         return True
     return any(_ambient_name_hit(name) for name in names)
 
@@ -1894,13 +1939,13 @@ def _check_handler_security(
         # composed a line earlier and passed by name is seen (BACKLOG #1658).
         scoped = list(_scoped_nodes(tree))
         lookup_envs = _lookup_scope_envs(scoped)
-        aliases, path_names = _module_aliases(tree)
+        resolver = _NameResolver(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if _unsafe_lookup_hit(node, lookup_envs.get(id(node))):
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
-            if _ambient_authority_hit(node, aliases, path_names):
+            if _ambient_authority_hit(node, resolver):
                 file_hits.append((node.lineno, "ambient-authority"))
         file_hits += _leaf_to_whole_field_hits(scoped)
         # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
