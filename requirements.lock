@@ -631,6 +631,9 @@ lxml==6.1.3 ; (python_full_version < '3.15' and platform_python_implementation =
     # via
     #   messagefoundry
     #   signxml
+messagefoundry-webconsole==0.5.3 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
+    --hash=sha256:2fb71eda340c503b02a2296d204aba427c09ff40d7a630c71a0a22c9054dc038
+    # via messagefoundry
 mypy==2.4.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:01b7718552d017f88d1151f3cc9d6556d778a90bd58060a2c3d87d070f9099fb \
     --hash=sha256:080cf64a60b90a73435542feecf4171904cc5710658165b40c6869115d4aa100 \

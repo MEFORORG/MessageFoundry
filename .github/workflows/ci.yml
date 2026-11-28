@@ -380,7 +380,7 @@ jobs:
           # that import messagefoundry_webconsole (test_webconsole_mount.py and others) run on this
           # full-suite leg. The console's own suite, packaging/messagefoundry-webconsole/tests/, runs
           # in its own job further down.
-          # It is NOT a published extra yet (would break uv lock), so install it by path.
+          # By path, not via the [webconsole] extra (the published wheel), so this tests the checkout's.
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
