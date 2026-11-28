@@ -567,23 +567,29 @@ _PER_BYTE_READ = "Ren\\XC3A9\\E"
     ("msh18", "expected"),
     [
         # HL7 table 0211 spells UTF-8 "UNICODE UTF-8". The match ignores case and surrounding
-        # space, and "UTF-8" alone is taken too, as the owner ruled on 2026-11-27.
+        # spaces, and "UTF-8" alone is taken too, as the owner ruled on 2026-11-27.
         ("UNICODE UTF-8", _UTF8_READ),
         ("unicode utf-8", _UTF8_READ),
         ("  Unicode UTF-8 ", _UTF8_READ),
         ("UTF-8", _UTF8_READ),
         ("utf-8", _UTF8_READ),
         (" Utf-8  ", _UTF8_READ),
+        # Only spaces are stripped, so a tab around the name is part of it.
+        ("\tUTF-8", _PER_BYTE_READ),
+        # The value read is MSH-18.1, the first component, so a later component is not read.
+        ("UNICODE UTF-8^", _UTF8_READ),
+        ("UTF-8^x", _UTF8_READ),
         # Only the first repetition names the message's own character set; a later one names an
         # alternate set a \C..\ escape may switch to.
         ("UNICODE UTF-8~8859/1", _UTF8_READ),
         ("UTF-8~UNICODE UTF-16", _UTF8_READ),
         ("8859/1~UNICODE UTF-8", _PER_BYTE_READ),
-        ("~UTF-8", _PER_BYTE_READ),
-        # An empty or absent MSH-18 declares ASCII, per HL7, so each byte is its own character.
-        ("", _PER_BYTE_READ),
-        ("   ", _PER_BYTE_READ),
-        (None, _PER_BYTE_READ),
+        # An empty MSH-18.1 reads as UTF-8 too (owner ruling 2026-11-27, corrected): an empty
+        # first repetition, a blank value, an empty or an absent MSH-18.
+        ("~8859/1", _UTF8_READ),
+        ("", _UTF8_READ),
+        ("   ", _UTF8_READ),
+        (None, _UTF8_READ),
         # ISO 8859-1 maps each byte to the character unescape decodes it to, so C3 A9 is two
         # characters. Every other declared set is read per byte too, as unescape reads it.
         ("8859/1", _PER_BYTE_READ),
@@ -597,12 +603,11 @@ _PER_BYTE_READ = "Ren\\XC3A9\\E"
 def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
     msh18: str | None, expected: str
 ) -> None:
-    # BACKLOG #5928, owner ruling 2026-11-27 ("Keep, tighten matching"): the UTF-8 reading of a
-    # hex escape's bytes is taken only where the first repetition of MSH-18, stripped, names UTF-8
-    # in either case. NEGATIVE CONTROL: on 1ad0d3e84b0, which matched "UNICODE UTF-8" exactly and
-    # read an empty MSH-18 as UTF-8, the rows for a lower-case, padded or bare "UTF-8" spelling,
-    # for "UTF-8~UNICODE UTF-16", for an empty first repetition, and for an empty, blank or absent
-    # MSH-18 fail.
+    # BACKLOG #5928, owner ruling 2026-11-27 (corrected): the UTF-8 reading of a hex escape's
+    # bytes is taken where MSH-18.1 is empty or names UTF-8; the rule is convert_case's docstring.
+    # NEGATIVE CONTROL: on f46051350ea, which read the whole first repetition, stripped any
+    # whitespace and read an empty MSH-18 per byte, the rows for a tab, for a later component,
+    # and for an empty MSH-18.1 fail.
     m = _with_pid("ren\\XC3A9\\e", msh18=msh18)
     assert m["MSH-18"] == (msh18 or None)
     convert_case(m, "PID-5", "title")
@@ -610,15 +615,24 @@ def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected"), [("upper", "REN\\XC3A9\\E"), ("lower", "ren\\XC3A9\\e")]
+    ("sent", "mode", "expected"),
+    [
+        # Lower-case hex digits: a casing of the escape's wire text would upper-case them.
+        ("ren\\Xc3a9\\e", "upper", "REN\\Xc3a9\\E"),
+        # UTF-8 E-acute (C3 89): a casing of the letter the escape carries would write C3 A9, and
+        # a casing of the wire text would lower-case the X and the digits.
+        ("REN\\XC389\\E", "lower", "ren\\XC389\\e"),
+    ],
 )
-@pytest.mark.parametrize("msh18", ["UTF-8", None])
+@pytest.mark.parametrize("msh18", ["UNICODE UTF-8", "UTF-8", None, "8859/1"])
 def test_convert_case_upper_and_lower_keep_hex_as_sent_whatever_msh18(
-    mode: Literal["upper", "lower"], expected: str, msh18: str | None
+    sent: str, mode: Literal["upper", "lower"], expected: str, msh18: str | None
 ) -> None:
     # Owner ruling 2026-11-27: escapes stay as sent for upper and lower case, as PR 2936 ruled, so
-    # MSH-18 changes nothing there; only literal text is cased.
-    m = _with_pid("Ren\\XC3A9\\e", msh18=msh18)
+    # MSH-18 changes nothing there; only literal text is cased. NEGATIVE CONTROL: a mutation that
+    # cases a hex escape's wire text in every mode wherever MSH-18 reads as UTF-8 fails every row
+    # but the 8859/1 ones.
+    m = _with_pid(sent, msh18=msh18)
     convert_case(m, "PID-5", mode)
     assert m["PID-5"] == expected
 

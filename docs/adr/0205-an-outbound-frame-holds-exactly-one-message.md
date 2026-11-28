@@ -173,15 +173,12 @@ carry them raw. For the other C0 characters it is a behaviour change, accepted o
 existing `hl7_raw_separators` escape hatch does not reverse it (it emits only the four structural
 separators raw).
 
-*(Note 2026-11-27, vault BACKLOG #5928, owner ruling of 2026-11-27 on that row: "Keep, tighten
-matching".)* Title case in `convert_case` departs from this per-byte reading in one place: when it
-decides whether a letter starts a word, it reads the bytes of a run of adjacent hex escapes as
-UTF-8, where they end in a valid UTF-8 character, if the message declares UTF-8. It does so only
-where the first repetition of `MSH-18`, stripped of surrounding space and compared in any case, is
-`UNICODE UTF-8`, HL7 table 0211's spelling, or the bare `UTF-8`. An empty or absent `MSH-18`
-declares ASCII, per HL7, so there, as under every other declared set, each byte is its own
-character. The escapes are still kept as sent in every case mode, as ruled on engine PR 2936, and
-`unescape`'s reading of a value is unchanged.
+*(Note 2026-11-27, vault BACKLOG #5928, owner ruling of 2026-11-27 on that row.)* Title case in
+`convert_case` departs from this per-byte reading in one place: when it decides whether a letter
+starts a word, it may read the bytes of a run of adjacent hex escapes as UTF-8, depending on
+`MSH-18`. Which values of `MSH-18` allow that is stated once, in the docstring of `convert_case` in
+[`messagefoundry/actions.py`](../../messagefoundry/actions.py). The escapes are still kept as sent
+in every case mode, as ruled on engine PR 2936, and `unescape`'s reading of a value is unchanged.
 
 ## Acceptance Criteria
 
