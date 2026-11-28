@@ -420,12 +420,14 @@ def _root_never_made(root: Path) -> bool:
     ``False`` when the root's own name is there, as a link, junction or mount point whose target is
     lost is; when an ancestor's name is there but does not answer, as a dangling link; when none
     answers, as above a drive letter that is no longer mapped; when one answers as something else;
-    or when one fails for any other cause. The sweep then raises rather than reports a clean pass,
-    unless the root answers as a folder by the time it checks again, which
+    or when an ancestor's ``stat`` fails for any other cause. The sweep then raises rather than
+    reports a clean pass, unless the root answers as a folder by the time it checks again, which
     :meth:`UploadStore._sweep_orphans_sync` reads as a save having just made it (BACKLOG #8341
     item 4). At least these still read as a root never made: a root deleted after
-    its first save, and a root under a POSIX mount point whose share dropped, since that mount point
-    still answers."""
+    its first save; a root under a POSIX mount point whose share dropped, since that mount point
+    still answers; and a root, or an ancestor whose ``stat`` reads as absence, whose ``lstat`` then
+    fails for a cause other than absence, as on a flapping share, since ``os.path.lexists``, which
+    reads whether a name is there, answers no for any ``lstat`` failure."""
     if os.path.lexists(root):
         return False
     for parent in root.absolute().parents:
