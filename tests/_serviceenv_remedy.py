@@ -28,6 +28,24 @@ RUNS_ON = (
     "runs on into with it, or the value stays in the registry key"
 )
 
+#: How the refusal names a secret-class name an entry names with nothing set in it (vault
+#: BACKLOG #5394), after the name and its source.
+NAMED_EMPTY = "is named with nothing set in it"
+
+#: Printed before ``REMOVE`` wherever such a name refuses (vault BACKLOG #5394).
+EMPTY_CLASS_STEP = (
+    "A secret-class name with nothing set in it refuses because a secret can be written apart "
+    "from its name, into an entry or line after it, where the engine may not read it as that "
+    "secret. Where an entry or line after such a name holds its secret, that entry or line is "
+    "refused too: remove it with the name, and where it is one line of a string that sets other "
+    "variables, take out that line alone. The name is refused in every list and value that "
+    "names it, so remove it from each. Where such an empty entry is there to keep a value set "
+    "elsewhere, such as in the machine-wide environment, out of the service, remove that value "
+    "where it is set too, since without the entry it reaches the service. Where the setting is "
+    "wanted, keep a store key in a DPAPI-protected key file and any other secret in the secrets "
+    'directory: see docs/SERVICE.md, "Protect the store encryption key at rest"'
+)
+
 #: Printed last, only where a refused value runs on into a directory entry and no directory
 #: entry is in doubt, as ``ServiceEnvPosture.directory_in_doubt``'s doc says: one entry stays, in
 #: AppEnvironmentExtra, rewritten to the path, and every other directory line goes (the Lander's

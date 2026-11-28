@@ -23,6 +23,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   them without printing a name it read from the registry. The way in is the secrets directory,
   or the environment's value file for a value that is not a secret and is the same for every
   instance.
+* **So does an entry there that names a store key or another engine secret with nothing set in
+  it**, empty or blank or the name written alone, whatever ``[security].enforcement`` says (vault
+  BACKLOG #5394). A secret can be written apart from its name, into an entry or line after it,
+  where the reader may not read it as that secret, so the empty entry may be the one sign of it.
 * **Each refusal above is ``serve``'s and ``supervise``'s, and the API app factories'.**
   ``create_app`` and ``create_managed_app`` raise on the same finding as they are built (vault
   BACKLOG #8212 item 1). The loosening ``secret_in_service_environment`` names it for a caller
@@ -162,11 +166,11 @@ class ServiceEnvPosture:
     #: of the repr, with the other fields below that hold registry text: an operator may have
     #: typed a value where a ``MEFOR_VALUE_*`` name goes.
     listed: tuple[str, ...] = field(default=(), repr=False)
-    #: ``(name, registry value)`` for each name in ``listed``, so a refusal can say which value
-    #: to change.
+    #: ``(name, registry value)`` for each name in ``listed`` and ``empty_class_names``, so a
+    #: refusal can say which value to change.
     sources: tuple[tuple[str, str], ...] = field(default=(), repr=False)
-    #: ``(name, line)`` for each name in ``listed`` that is not on its registry string's first
-    #: line, so a refusal can say where in that string to look.
+    #: ``(name, line)`` for each name in ``listed`` and ``empty_class_names`` that is not on its
+    #: registry string's first line, so a refusal can say where in that string to look.
     source_lines: tuple[tuple[str, int], ...] = field(default=(), repr=False)
     #: The key-class names set, and not empty, in THIS process's environment, wherever they came
     #: from. Empty when ``status`` is ``NOT_A_SERVICE``.
@@ -198,10 +202,11 @@ class ServiceEnvPosture:
     #: refusal itself.
     nothing_to_move_names: tuple[str, ...] = field(default=(), repr=False)
     #: The secret-class names that an entry in the lists names with nothing in it, empty or
-    #: blank or the name written alone, and that no entry sets to anything (:func:`_named_empty`),
-    #: so none is in ``listed``. Each comes from the constant lists, never from the registry.
-    #: Each refuses on its own (vault BACKLOG #5394), and the remedy says to delete its entries.
-    empty_class_names: tuple[str, ...] = field(default=(), repr=False)
+    #: blank or the name written alone, and that are not in ``listed`` (:func:`_named_empty`): no
+    #: entry sets them to a secret, though one may set a path-form OIDC key to its path. Each
+    #: comes from the constant lists, never from the registry, so it stays in the repr. Each
+    #: refuses on its own (vault BACKLOG #5394), and ``sources`` and ``source_lines`` locate it.
+    empty_class_names: tuple[str, ...] = ()
     #: Whether any registry string in the lists is a directory entry in doubt
     #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
     #: ``MEFOR_SECRETS_DIRECTORY``, and the string alone is not plainly a path. Where this is
@@ -1232,24 +1237,29 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
     return tuple((name, where, line) for name, (where, line) in names.items())
 
 
-def _named_empty(variables: Sequence[_Variable]) -> tuple[str, ...]:
+def _named_empty(
+    variables: Sequence[_Variable], listed: set[str]
+) -> tuple[tuple[str, str, int | None], ...]:
     """The secret-class names (:data:`_REFUSED_CLASS_NAMES`) an entry names with nothing in it,
-    set empty or blank or written alone, that no entry sets to anything, a path-form OIDC key
-    (:func:`_path_form`) included, key-class names first, each list in its own order. The refusal reads these
-    as well (vault BACKLOG #5394, the deferred scope of engine PR 3134): ``nssm set`` can write a
-    secret apart from its name, into the entry after it, and where that entry ends the empty
-    value (:func:`_ends_blank_class`) the reader does not read it as the secret, so the empty
-    entry is the one sign of it left. A name some entry sets is read as :func:`_names` reads it,
-    and a path-form OIDC key is not empty, so neither is refused here. Unlike :func:`_names`
-    this keeps no source: the remedy says to delete every entry that names one."""
-    empty: set[str] = set()
-    set_somewhere: set[str] = set()
+    set empty or blank or written alone, that are not in ``listed`` (:func:`_names`), each with
+    the first registry value and line that names it so, as :func:`_names` returns its names. The
+    refusal reads these as well (vault BACKLOG #5394, the deferred scope of engine PR 3134): a
+    secret can be written apart from its name, into an entry or line after it, and where that
+    one ends the empty value (:func:`_ends_blank_class`) the reader does not read it as the
+    secret, so the empty entry is the one sign of it left. A path-form OIDC key elsewhere in the
+    lists is no secret and leaves its name out of ``listed``, so an empty entry of that name
+    beside it still counts here, an error toward refusing (code review round 2 on this change)."""
+    names: dict[str, tuple[str, int | None]] = {}
     for variable in variables:
         name = variable.written.upper()
-        if variable.counted and name in _REFUSED_CLASS_NAMES:
-            (set_somewhere if variable.value.strip() else empty).add(name)
-    only_empty = empty - set_somewhere
-    return tuple(n for n in (*KEY_CLASS_NAMES, *DIRECTORY_CLASS_NAMES) if n in only_empty)
+        if (
+            variable.counted
+            and name in _REFUSED_CLASS_NAMES
+            and name not in listed
+            and not variable.value.strip()
+        ):
+            names.setdefault(name, (variable.where, variable.line))
+    return tuple((name, where, line) for name, (where, line) in names.items())
 
 
 def _value_entry_shapes(
@@ -1371,12 +1381,16 @@ def read_service_env_posture(
     # Every registry string as written, never the variables read from them, so a line absorbed
     # into a broken name or an uncounted twin is still judged.
     doubt = any(_directory_entry_in_doubt(entry) for _where, entry in entries)
+    # An entry that only names a secret-class variable refuses as well (vault BACKLOG #5394). Its
+    # source is kept beside the listed names', so the refusal says where it is.
+    named_empty = _named_empty(variables, listed_names)
+    located = (*found, *named_empty)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
         listed=tuple(name for name, _where, _line in found),
-        sources=tuple((name, where) for name, where, _line in found),
-        source_lines=tuple((name, line) for name, _where, line in found if line is not None),
+        sources=tuple((name, where) for name, where, _line in located),
+        source_lines=tuple((name, line) for name, _where, line in located if line is not None),
         keys_in_environment=keys,
         others_in_environment=others,
         others_machine_wide=machine,
@@ -1384,8 +1398,7 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
-        # An entry that only names a secret-class variable refuses as well (vault BACKLOG #5394).
-        empty_class_names=_named_empty(variables),
+        empty_class_names=tuple(name for name, _where, _line in named_empty),
         directory_in_doubt=doubt,
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
         directory_in_refused=doubt and _take_out_changes_refused(entries, variables),
@@ -1553,6 +1566,22 @@ _MOVE = (
 )
 
 
+#: The remedy step for a secret-class name named with nothing set in it (vault BACKLOG #5394).
+#: It holds no value and names no variable; tests/_serviceenv_remedy.py pins its text.
+_EMPTY_CLASS_STEP = (
+    "A secret-class name with nothing set in it refuses because a secret can be written apart "
+    "from its name, into an entry or line after it, where the engine may not read it as that "
+    "secret. Where an entry or line after such a name holds its secret, that entry or line is "
+    "refused too: remove it with the name, and where it is one line of a string that sets other "
+    "variables, take out that line alone. The name is refused in every list and value that "
+    "names it, so remove it from each. Where such an empty entry is there to keep a value set "
+    "elsewhere, such as in the machine-wide environment, out of the service, remove that value "
+    "where it is set too, since without the entry it reaches the service. Where the setting is "
+    "wanted, keep a store key in a DPAPI-protected key file and any other secret in the secrets "
+    'directory: see docs/SERVICE.md, "Protect the store encryption key at rest"'
+)
+
+
 def _machine_wide_finding(posture: ServiceEnvPosture) -> str | None:
     """What :func:`service_env_enforced_refusal` refuses on and the remedy, without its
     enforcement note. Names only, each from :data:`DIRECTORY_CLASS_NAMES`."""
@@ -1605,7 +1634,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             named.append(posture.counted_with_source(values))
         said = [f"{', '.join(named)} is set"] if named else []
         if empties:
-            said.append(f"{', '.join(empties)} is named with nothing set in it")
+            said.append(f"{posture.named_with_source(empties)} is named with nothing set in it")
         found = f"{' and '.join(said)} in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
         if not (posture.keys_in_environment or posture.others_in_environment):
@@ -1851,16 +1880,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if posture.empty_class_names:
         # Before the removal step, so the entry or line it names counts among those refused when
         # that step and any pass-back step below run (vault BACKLOG #5394).
-        steps.append(
-            "A secret-class name with nothing set in it refuses because a secret can be written "
-            "apart from its name, into the entry or line after it, where the engine may not read "
-            "it as that secret. Where the entry or line after such a name holds its secret, that "
-            "entry or line is refused too: remove it with the name, and where it is one line of a "
-            "string that sets other variables, take out that line alone. The name is refused in "
-            "every list and value that names it, so remove it from each. Where the setting is "
-            "wanted, keep a store key in a DPAPI-protected key file and any other secret in the "
-            'secrets directory: see docs/SERVICE.md, "Protect the store encryption key at rest"'
-        )
+        steps.append(_EMPTY_CLASS_STEP)
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
     steps.append(
