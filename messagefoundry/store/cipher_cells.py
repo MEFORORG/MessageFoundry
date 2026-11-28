@@ -32,6 +32,7 @@ flipped byte fails it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import (
     AsyncGenerator,
@@ -67,6 +68,8 @@ from messagefoundry.store.crypto import (
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, QueueTagError, queue_row_aad
 from messagefoundry.store.store import MessageStore, _sqlite_readonly_uri, marker_test_sql
 
+log = logging.getLogger(__name__)
+
 __all__ = [
     "COMPOSITE_CIPHER_CELLS",
     "DEFAULT_CHUNK_ROWS",
@@ -89,6 +92,7 @@ __all__ = [
     "read_server_cipher_cells",
     "server_cell_present",
     "server_keyed_store_mismatch",
+    "server_row_filtered",
     "server_walk_tables",
     "store_tables",
     "with_first_failure",
@@ -874,8 +878,8 @@ def audit_cipher_cells(
 
 
 class CipherCellSource(Protocol):
-    """What a server store offers :func:`read_server_cipher_cells`: five reads, implemented by
-    ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
+    """What a server store offers :func:`read_server_cipher_cells` and its callers: at least
+    these reads, implemented by ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
     more than one statement: at least SQL Server's column inventory, which asks once per table,
     and each backend's surface-sealed test."""
 
@@ -1048,9 +1052,27 @@ async def server_row_filtered(
 ) -> list[str]:
     """The tables of a walk of ``cells`` that ``source`` says a row filter may hide rows in, of
     those the catalog read ``columns`` shows, in the walk's order (BACKLOG #1719 item 35). A name
-    the source returns that the catalog did not show is never recorded."""
+    the source returns that the catalog did not show is never recorded.
+
+    A read that fails names every shown table, logged by class: a read nobody finished is a
+    doubt, and a doubt reads as not audited whole, never as covered. So the walk goes on, and a
+    run it can finish is NOT_COVERED rather than stopped, and a keyless probe still reads its key
+    mismatch after it. A defect is raised."""
+    from messagefoundry.store.base import driver_sqlstate, store_call_errors
+
     shown = [t for t in server_walk_tables(cells) if t in columns]
-    filtered = await source.cipher_walk_row_filtered(shown) if shown else frozenset()
+    if not shown:
+        return []
+    try:
+        filtered = await source.cipher_walk_row_filtered(shown)
+    except store_call_errors() as exc:
+        log.warning(
+            "cipher-audit: the row-filter read failed (%s, SQLSTATE %s); every table is read "
+            "as row-filtered",
+            type(exc).__name__,
+            driver_sqlstate(exc),
+        )
+        return shown
     return [t for t in shown if t in filtered]
 
 

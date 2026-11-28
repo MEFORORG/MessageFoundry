@@ -50,6 +50,15 @@ from tests.test_cipher_cells_readback import (
 _BACKENDS = ["postgres", "sqlserver"]
 
 
+class _Syntax(sqlite3.DatabaseError):
+    """A server driver's syntax error, class 42 but not a refused grant."""
+
+    sqlstate = "42601"
+
+
+_SYNTAX_ERROR = _Syntax("synthetic: syntax")
+
+
 # --- item 22: the probe behind the keyless-chain refusal ----------------------------------------
 
 
@@ -141,6 +150,7 @@ def test_a_keyless_run_over_a_keyed_store_with_an_empty_log_is_key_mismatch(
     rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, backend)
     assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
     assert "keyless open of a keyed store" in payload["reason"], out
+    assert "audit log also reads as empty" in payload["reason"], out
     assert payload["keyed"] is False
     [handle] = opened
     assert handle.closed, "the guard's refused handle was left open"
@@ -216,26 +226,121 @@ def test_a_key_the_provider_did_not_resolve_keeps_the_refusal_s_cause(
         assert payload["reason"].startswith(cause) is key_named, out
 
 
-def test_a_failed_row_security_read_is_could_not_start(
+@pytest.mark.parametrize(
+    "error",
+    [ConnectionResetError("synthetic: lost"), _SYNTAX_ERROR],
+    ids=["link", "syntax"],
+)
+def test_a_failed_row_security_read_is_not_covered(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    """A row-filter read that fails is a doubt over every table, so a run that can still finish
+    is NOT_COVERED, exit 3, naming each table the catalog showed, never a PASS and never stopped
+    by that read alone."""
+    db, settings = _copy(_template, tmp_path)
+
+    class _Handle(_FakeServerStore):
+        async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
+            raise error
+
+    async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 3 and payload["status"] == "NOT_COVERED", out
+    assert "messages" in payload["row_filtered"] and "keyed_surface" in payload["row_filtered"]
+
+
+def test_a_failed_row_security_read_does_not_stop_the_probe_s_key_mismatch(
     tmp_path: Path,
     _template: tuple[Path, StoreSettings],  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The row-security read is a catalog read before any value, so a lost link there is exit 2,
-    as one in the column catalog read is, never the FAIL a walk stopped part way earns."""
+    """Inside the probe the row-filter read decides nothing, so its failure still lets the
+    key-mismatch read run: exit 4, never the refusal's exit 2."""
+    db, _settings = _copy(_template, tmp_path)
+    _serve_an_empty_log(monkeypatch, db, build_store_cipher(StoreSettings(path=str(db))))
+
+    async def failing(self: _SqliteSource, tables: Sequence[str]) -> frozenset[str]:
+        raise ConnectionResetError("synthetic: lost")
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_row_filtered", failing)
+    _probe_from(monkeypatch, db)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+
+
+def test_the_row_filter_is_not_read_when_no_cipher_table_is_visible(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A catalog that shows only ``keyed_surface`` has nothing to audit, so the command says so
+    without the row-filter read."""
     db, settings = _copy(_template, tmp_path)
+    asked: list[Sequence[str]] = []
 
     class _Handle(_FakeServerStore):
+        async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+            found = await super().cipher_walk_columns(tables)
+            return {t: c for t, c in found.items() if t == "keyed_surface"}
+
         async def cipher_walk_row_filtered(self, tables: Sequence[str]) -> frozenset[str]:
-            raise ConnectionResetError("synthetic: lost")
+            asked.append(tables)
+            return frozenset()
 
     async def fake_open_store(_settings: StoreSettings, **kw: Any) -> _FakeServerStore:
         return _Handle(connect_readonly(db, busy_timeout=5.0), build_store_cipher(settings))
 
     monkeypatch.setattr(store_base, "open_store", fake_open_store)
     rc, out = _run_server_cli_raw(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 2 and "nothing here this command can audit" in out, out
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TypeError("synthetic: defect"), KeyError("synthetic"), ConnectionResetError("lost")],
+    ids=["type", "key", "link"],
+)
+def test_any_probe_failure_leaves_exit_2(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    """The probe only chooses between exit 4 and the refusal's exit 2, so whatever it raises, a
+    defect included, the refusal stands: never the exit 1 a FAIL uses."""
+    db, _settings = _copy(_template, tmp_path)
+    _serve_an_empty_log(monkeypatch, db, build_store_cipher(StoreSettings(path=str(db))))
+    _probe_from(monkeypatch, db, error=error)
+    rc, out = _run_server_cli_raw(tmp_path, monkeypatch, capsys, "postgres")
     assert rc == 2, out
+    assert "would start a KEYLESS audit chain" in out, out
+
+
+def test_the_shared_cause_and_the_public_names() -> None:
+    """The configured-key cause is one sentence, the refusal's and the probe's, and the new entry
+    points are each module's public names."""
+    refusal = store_base.KeylessAuditChainRefused("x", "y", key_named=True)
+    assert store_base.KEY_NAMED_UNRESOLVED in str(refusal) and refusal.key_named
+    assert "open_cipher_walk_probe" in store_base.__all__
+    assert "KEY_NAMED_UNRESOLVED" in store_base.__all__
+    assert "server_row_filtered" in cipher_cells_all()
+
+
+def cipher_cells_all() -> list[str]:
+    import messagefoundry.store.cipher_cells as module
+
+    return list(module.__all__)
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
@@ -482,6 +587,14 @@ def test_a_table_the_catalog_read_did_not_return_is_named() -> None:
     assert got == {"state"}
 
 
+def test_another_class_42_error_is_raised() -> None:
+    """Only insufficient_privilege is a refusal this read answers itself; a syntax or catalog
+    fault is raised, for the caller to log as what it is."""
+    store = _pg_reading(_SYNTAX_ERROR)
+    with pytest.raises(_Syntax):
+        asyncio.run(store.cipher_walk_row_filtered(["messages"]))
+
+
 def test_a_refused_catalog_read_names_every_table() -> None:
     store = _pg_reading(_Refused("synthetic: permission denied"))
     assert asyncio.run(store.cipher_walk_row_filtered(["messages", "state"])) == {
@@ -576,6 +689,7 @@ def test_cipher_audit_is_not_covered_under_row_level_security(
     assert rc == 3 and payload["status"] == "NOT_COVERED", out
     assert "row-level security" in payload["reason"], out
     assert next(iter(filtered)) in payload["reason"], out
+    assert "a a " not in payload["reason"] and ": a role with BYPASSRLS" in payload["reason"], out
     assert payload["row_filtered"] == sorted(filtered) and payload["hidden"] == [], out
     assert payload["opened"] and payload["opened"] > 0
 

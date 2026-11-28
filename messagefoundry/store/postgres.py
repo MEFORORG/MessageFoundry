@@ -118,7 +118,6 @@ from messagefoundry.store.base import (
     acquire_pooled,
     check_walk_identifiers,
     driver_sqlstate,
-    is_store_shape_error,
     seed_filter_clause,
     store_call_errors,
     warm_pool_connections,
@@ -4108,13 +4107,12 @@ class PostgresStore(ServerCipherWalk):
         """Those of ``tables`` whose rows row-level security may hide from this login (BACKLOG
         #1719 item 35): :func:`row_security_hides_rows` over ``pg_class`` and ``pg_roles``, read in
         the schema :meth:`cipher_walk_columns` reads. A table with no row there, or a flag read as
-        NULL, is named, and a read a grant or access rule refused names every table: a doubt
-        reads as not audited whole, never as covered.
+        NULL, is named, and a read refused as insufficient_privilege (42501) names every table:
+        a doubt reads as not audited whole, never as covered.
 
         A member of the owning role is read as not the owner, though PostgreSQL exempts one that
         inherits the role's privileges: that errs toward naming the table. Any other failure, a
-        lost connection or a statement timeout among them, is raised, as every other walk read
-        raises it."""
+        lost connection, a statement timeout or another class-42 error among them, is raised."""
         names = list(dict.fromkeys(tables))
         if not names:
             return frozenset()
@@ -4130,9 +4128,11 @@ class PostgresStore(ServerCipherWalk):
                 names,
             )
         except store_call_errors() as exc:
-            if not is_store_shape_error(exc):
-                raise  # a link, a timeout or a server fault, which the walk reports as any read's
-            # A grant or access rule refused the catalog read: a doubt over every table.
+            if driver_sqlstate(exc) != "42501":
+                # Not a refused grant: a link, a timeout, a syntax or catalog fault. The caller,
+                # `cipher_cells.server_row_filtered`, reads it as a doubt too, and logs it.
+                raise
+            # insufficient_privilege refused the catalog read: a doubt over every table.
             log.warning(
                 "cipher-audit: the row-level security catalog read was refused (%s, SQLSTATE %s)",
                 type(exc).__name__,

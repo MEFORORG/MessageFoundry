@@ -203,6 +203,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "KEY_NAMED_UNRESOLVED",
     "KeylessAuditChainRefused",
     "SCHEMA_SEED_FILTERS",
     "StoreNotFoundError",
@@ -217,6 +218,7 @@ __all__ = [
     "backend_supports_reference_sets",
     "check_walk_identifiers",
     "make_spec",
+    "open_cipher_walk_probe",
     "open_store",
     "probe_store_privileges",
     "server_store_schema_found_anywhere",
@@ -4798,6 +4800,13 @@ class SchemaProvisionResult:
     remedy: str | None = None
 
 
+#: The cause :class:`KeylessAuditChainRefused` names when the settings name a store key that the
+#: key provider did not resolve, shared with ``cipher-audit``'s KEY_MISMATCH behind that refusal.
+KEY_NAMED_UNRESOLVED: Final = (
+    "A store key is configured, but [store].key_provider resolved no key in this environment"
+)
+
+
 class KeylessAuditChainRefused(RuntimeError):
     """:func:`open_store` found a FRESH store with no keying secret, and the caller did not pass the
     audited opt-out's verdict (BACKLOG #1916). ``refused_by`` names the deciding setting.
@@ -4808,12 +4817,7 @@ class KeylessAuditChainRefused(RuntimeError):
         self.path = path
         self.refused_by = refused_by
         self.key_named = key_named
-        cause = (
-            "A store key is configured, but [store].key_provider resolved no key in this "
-            "environment, so the store opened keyless. "
-            if key_named
-            else ""
-        )
+        cause = f"{KEY_NAMED_UNRESOLVED}, so the store opened keyless. " if key_named else ""
         super().__init__(
             f"refusing to open {path} keyless: its audit log is empty, so the first audit row this "
             "command wrote would start a KEYLESS audit chain, and a keyed open later reports a "
@@ -4979,9 +4983,9 @@ def is_store_shape_error(exc: BaseException) -> bool:
 
 
 # --- the read-only cipher-cell walk the server stores share (BACKLOG #1719) --------------------
-# `cipher_cells.read_server_cipher_cells` and `audit_server_cipher_cells` read a PostgreSQL or SQL
-# Server store through the five methods of `cipher_cells.CipherCellSource`, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
-# own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
+# `cipher_cells.read_server_cipher_cells` and its callers read a PostgreSQL or SQL Server store
+# through the methods of `cipher_cells.CipherCellSource`, for `messagefoundry cipher-audit`. Each
+# backend writes its catalog and chunk reads in its own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
 # once. Every identifier a walk read is given is a declared constant from `cipher_cells`, and only
 # values are bound as parameters. A read may run more than one statement. Each statement takes its
 # own connection borrow and ends its read transaction before it returns, so no read transaction

@@ -13,7 +13,7 @@
   names the table in its reason. The `--json` output gains a `row_filtered` list of those tables
   and a `hidden` list of the cells the catalog did not show. The exceptions are a login that is
   a superuser, has BYPASSRLS, or is itself the table's owner while the table does not force
-  row-level security; a member of the owning role is read as not the owner. A catalog read that
-  a grant or access rule refuses names every table; any other failure of that read is could not
-  start, exit 2, as a failed read of the column catalog is. SQL Server security policies are not
+  row-level security; a member of the owning role is read as not the owner. A row-security
+  catalog read that fails, refused or not, names every table and is logged, so a run that can
+  still finish is NOT_COVERED, never a PASS. SQL Server security policies are not
   read yet, so a SQL Server store's verdict is unchanged. (`BACKLOG #1719`)
