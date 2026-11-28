@@ -177,9 +177,10 @@ _UTF8_CHARSET_NAMES = frozenset({"utf-8", "unicode utf-8"})
 def _reads_hex_as_utf8(msg: Message) -> bool:
     """Whether title case reads a hex run's bytes as UTF-8, under :func:`convert_case`'s rule.
 
-    Not a test of the declared character set: an empty ``MSH-18`` declares ASCII, and passes. A
-    later repetition of ``MSH-18`` names an alternate set a ``\\C..\\`` escape may switch to,
-    so only the first is read."""
+    Not a test of the declared character set: an empty ``MSH-18`` declares ASCII, and passes. Only
+    the first repetition is read; a later one names an alternate set a ``\\C..\\`` escape may
+    switch to, and title case does not track such a switch, so the answer holds for the whole
+    message. So does the first ``MSH``'s answer for a batch."""
     first = (msg.field("MSH-18.1") or "").strip(" ")
     return not first or first.casefold() in _UTF8_CHARSET_NAMES
 

@@ -609,9 +609,9 @@ def test_convert_case_title_reads_hex_as_utf8_only_where_msh18_allows(
 ) -> None:
     # BACKLOG #5928, owner ruling 2026-11-27 (corrected): the UTF-8 reading of a hex escape's
     # bytes is taken where MSH-18.1 is empty or names UTF-8; the rule is convert_case's docstring.
-    # NEGATIVE CONTROL: on f46051350ea, which read the whole first repetition, stripped any
-    # whitespace and read an empty MSH-18 per byte, the rows for a tab, for a later component,
-    # and for an empty MSH-18.1 fail.
+    # NEGATIVE CONTROL: on f46051350ea, which read the whole first repetition raw, stripped any
+    # whitespace and read an empty MSH-18 per byte, at least the rows for a tab, a no-break space,
+    # a later component, an escaped name and an empty MSH-18.1 fail.
     m = _with_pid("ren\\XC3A9\\e", msh18=msh18)
     assert m["MSH-18"] == (msh18 or None)
     convert_case(m, "PID-5", "title")
